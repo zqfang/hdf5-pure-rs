@@ -7,9 +7,9 @@ use super::FractalHeapHeader;
 
 impl FractalHeapHeader {
     pub(super) fn read_tiny(&self, heap_id: &[u8]) -> Result<Vec<u8>> {
-        let length = (heap_id[0] & 0x0F) as usize + 1;
+        let length = usize::from(heap_id[0] & 0x0f) + 1;
         let data = tiny_heap_payload(heap_id, length)?.to_vec();
-        self.trace_tiny_object(heap_id, length as u64);
+        self.trace_tiny_object(heap_id, u64::try_from(length).unwrap_or(u64::MAX));
         Ok(data)
     }
 }

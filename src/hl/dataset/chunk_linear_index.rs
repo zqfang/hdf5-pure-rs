@@ -5,7 +5,7 @@ use crate::filters;
 use crate::io::reader::HdfReader;
 
 use super::chunk_read::ChunkReadContext;
-use super::{usize_from_u64, Dataset, DatasetInfo};
+use super::{u64_from_usize, usize_from_u64, Dataset, DatasetInfo};
 
 impl Dataset {
     pub(super) fn read_chunked_fixed_array<R: Read + Seek>(
@@ -22,7 +22,7 @@ impl Dataset {
             Self::filtered_chunk_size_len(
                 info,
                 chunk_ctx.chunk_bytes,
-                reader.sizeof_size() as usize,
+                usize::from(reader.sizeof_size()),
             )?
         } else {
             0
@@ -36,7 +36,9 @@ impl Dataset {
         )?;
         let chunks_per_dim = Self::chunks_per_dim(chunk_ctx.data_dims, chunk_ctx.chunk_dims)?;
         let mut output = if Self::has_full_linear_chunk_coverage_1d(elements.iter(), chunk_ctx)? {
-            Self::uninitialized_output(chunk_ctx.total_bytes)
+            // Optimization opportunity: this path should fully overwrite the buffer, but proving
+            // every fallback/error edge is safe needs a deeper audit before using uninitialized memory.
+            Self::scratch_output(chunk_ctx.total_bytes)
         } else {
             Self::filled_data(
                 chunk_ctx.total_bytes / chunk_ctx.element_size,
@@ -50,9 +52,12 @@ impl Dataset {
             Self::trace_linear_chunk_lookup(
                 "hdf5.chunk_index.fixed_array.lookup",
                 chunk_ctx.idx_addr,
-                chunk_index as u64,
+                u64_from_usize(chunk_index, "fixed-array chunk index")?,
                 element.addr,
-                element.nbytes.unwrap_or(chunk_ctx.chunk_bytes as u64),
+                element.nbytes.unwrap_or(u64_from_usize(
+                    chunk_ctx.chunk_bytes,
+                    "fixed-array chunk size",
+                )?),
                 element.filter_mask,
             );
 
@@ -63,7 +68,10 @@ impl Dataset {
             let coords =
                 Self::implicit_chunk_coords(chunk_index, chunk_ctx.chunk_dims, &chunks_per_dim)?;
             let read_size = usize_from_u64(
-                element.nbytes.unwrap_or(chunk_ctx.chunk_bytes as u64),
+                element.nbytes.unwrap_or(u64_from_usize(
+                    chunk_ctx.chunk_bytes,
+                    "fixed-array chunk size",
+                )?),
                 "fixed-array chunk size",
             )?;
             if Self::try_read_full_chunk_1d_into_output(
@@ -126,7 +134,7 @@ impl Dataset {
             Self::filtered_chunk_size_len(
                 info,
                 chunk_ctx.chunk_bytes,
-                reader.sizeof_size() as usize,
+                usize::from(reader.sizeof_size()),
             )?
         } else {
             0
@@ -140,7 +148,9 @@ impl Dataset {
         )?;
         let chunks_per_dim = Self::chunks_per_dim(chunk_ctx.data_dims, chunk_ctx.chunk_dims)?;
         let mut output = if Self::has_full_linear_chunk_coverage_1d(elements.iter(), chunk_ctx)? {
-            Self::uninitialized_output(chunk_ctx.total_bytes)
+            // Optimization opportunity: this path should fully overwrite the buffer, but proving
+            // every fallback/error edge is safe needs a deeper audit before using uninitialized memory.
+            Self::scratch_output(chunk_ctx.total_bytes)
         } else {
             Self::filled_data(
                 chunk_ctx.total_bytes / chunk_ctx.element_size,
@@ -154,9 +164,12 @@ impl Dataset {
             Self::trace_linear_chunk_lookup(
                 "hdf5.chunk_index.extensible_array.lookup",
                 chunk_ctx.idx_addr,
-                chunk_index as u64,
+                u64_from_usize(chunk_index, "extensible-array chunk index")?,
                 element.addr,
-                element.nbytes.unwrap_or(chunk_ctx.chunk_bytes as u64),
+                element.nbytes.unwrap_or(u64_from_usize(
+                    chunk_ctx.chunk_bytes,
+                    "extensible-array chunk size",
+                )?),
                 element.filter_mask,
             );
 
@@ -167,7 +180,10 @@ impl Dataset {
             let coords =
                 Self::implicit_chunk_coords(chunk_index, chunk_ctx.chunk_dims, &chunks_per_dim)?;
             let read_size = usize_from_u64(
-                element.nbytes.unwrap_or(chunk_ctx.chunk_bytes as u64),
+                element.nbytes.unwrap_or(u64_from_usize(
+                    chunk_ctx.chunk_bytes,
+                    "extensible-array chunk size",
+                )?),
                 "extensible-array chunk size",
             )?;
             if Self::try_read_full_chunk_1d_into_output(
@@ -257,7 +273,7 @@ impl Dataset {
         } else {
             nbytes
         });
-        th.output_u64(filter_mask as u64);
+        th.output_u64(u64::from(filter_mask));
         th.finish();
     }
 

@@ -145,13 +145,22 @@ pub struct ExtensibleArrayCreateParams {
 
 pub fn test_dst_context() {}
 
-pub fn test_encode(params: &ExtensibleArrayCreateParams) -> Vec<u8> {
+pub fn test_encode(params: &ExtensibleArrayCreateParams) -> Result<Vec<u8>> {
     let mut out = Vec::new();
-    out.extend_from_slice(&(params.raw_element_size as u64).to_le_bytes());
+    out.extend_from_slice(
+        &u64_from_usize(params.raw_element_size, "extensible array raw element size")?
+            .to_le_bytes(),
+    );
     out.push(params.index_block_elements);
-    out.extend_from_slice(&(params.data_block_min_elements as u64).to_le_bytes());
+    out.extend_from_slice(
+        &u64_from_usize(
+            params.data_block_min_elements,
+            "extensible array data block minimum elements",
+        )?
+        .to_le_bytes(),
+    );
     out.extend_from_slice(&params.max_index_set.to_le_bytes());
-    out
+    Ok(out)
 }
 
 pub fn test_debug(params: &ExtensibleArrayCreateParams) -> String {
@@ -260,7 +269,8 @@ pub(super) fn log2_power2(value: u64) -> Result<usize> {
             "extensible array value {value} is not a power of two"
         )));
     }
-    Ok(value.trailing_zeros() as usize)
+    usize::try_from(value.trailing_zeros())
+        .map_err(|_| Error::InvalidFormat("extensible array log2 value is too large".into()))
 }
 
 pub(super) fn usize_from_u64(value: u64, context: &str) -> Result<usize> {

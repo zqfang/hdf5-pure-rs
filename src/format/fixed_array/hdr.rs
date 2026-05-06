@@ -155,7 +155,12 @@ pub(super) fn read_header<R: Read + Seek>(
     }
 
     let class_id = reader.read_u8()?;
-    let raw_element_size = reader.read_u8()? as usize;
+    let raw_element_size = usize::from(reader.read_u8()?);
+    if raw_element_size == 0 {
+        return Err(Error::InvalidFormat(
+            "fixed array element size must be nonzero".into(),
+        ));
+    }
     let max_page_elements_bits = reader.read_u8()?;
     let elements = reader.read_length()?;
     let element_count = super::usize_from_u64(elements, "fixed array element count")?;
@@ -208,4 +213,32 @@ pub(super) fn verify_checksum<R: Read + Seek>(
         Error::InvalidFormat(format!("{context} checksum end offset overflow"))
     })?)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+
+    use crate::io::HdfReader;
+
+    use super::read_header;
+
+    #[test]
+    fn fixed_array_header_rejects_zero_element_size() {
+        let mut bytes = b"FAHD".to_vec();
+        bytes.push(0);
+        bytes.push(1);
+        bytes.push(0);
+        bytes.push(4);
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&crate::io::reader::UNDEF_ADDR.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+
+        let mut reader = HdfReader::new(Cursor::new(bytes));
+        let err = read_header(&mut reader, 0).expect_err("zero element size should fail");
+        assert!(
+            err.to_string().contains("element size"),
+            "unexpected error: {err}"
+        );
+    }
 }

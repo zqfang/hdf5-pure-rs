@@ -3,7 +3,7 @@ use std::io::{Seek, SeekFrom, Write};
 use crate::error::{Error, Result};
 use crate::format::messages::data_layout::LayoutClass;
 use crate::format::object_header::{
-    self, HDR_ATTR_STORE_PHASE_CHANGE, HDR_CHUNK0_SIZE_MASK, HDR_STORE_TIMES,
+    self, HDR_ATTR_STORE_PHASE_CHANGE, HDR_CHUNK0_SIZE_MASK, HDR_STORE_TIMES, HDR_V2_KNOWN_FLAGS,
 };
 
 use super::MutableFile;
@@ -46,7 +46,7 @@ impl MutableFile {
         let (msg_data_offset, msg_data_len, oh_start, oh_check_len) =
             self.find_message_in_oh(ds_addr, object_header::MSG_DATASPACE)?;
 
-        let new_ds_bytes = Self::encode_dataspace_v2(new_dims, info.dataspace.max_dims.as_deref());
+        let new_ds_bytes = Self::encode_dataspace_v2(new_dims, info.dataspace.max_dims.as_deref())?;
 
         if new_ds_bytes.len() != msg_data_len {
             return Err(Error::InvalidFormat(format!(
@@ -91,6 +91,11 @@ impl MutableFile {
         }
 
         let flags = reader.read_u8()?;
+        if flags & !HDR_V2_KNOWN_FLAGS != 0 {
+            return Err(Error::InvalidFormat(format!(
+                "object header v2 flags contain reserved bits: {flags:#04x}"
+            )));
+        }
         if flags & HDR_STORE_TIMES != 0 {
             reader.skip(16)?;
         }
@@ -101,17 +106,23 @@ impl MutableFile {
         let chunk0_size_bytes = 1u8 << (flags & HDR_CHUNK0_SIZE_MASK);
         let chunk0_data_size = reader.read_uint(chunk0_size_bytes)?;
         let chunk0_data_start = reader.position()?;
-        let chunk0_data_end = chunk0_data_start + chunk0_data_size;
-        let oh_check_len = (chunk0_data_end - oh_addr) as usize;
+        let chunk0_data_end = chunk0_data_start
+            .checked_add(chunk0_data_size)
+            .ok_or_else(|| Error::InvalidFormat("object-header chunk range overflow".into()))?;
+        let oh_check_len = usize::try_from(chunk0_data_end - oh_addr)
+            .map_err(|_| Error::InvalidFormat("object-header checksum range overflow".into()))?;
 
         while reader.position()? < chunk0_data_end {
             let msg_header_pos = reader.position()?;
-            if msg_header_pos + 4 > chunk0_data_end {
+            if msg_header_pos
+                .checked_add(4)
+                .is_none_or(|end| end > chunk0_data_end)
+            {
                 break;
             }
 
-            let msg_type = reader.read_u8()? as u16;
-            let msg_size = reader.read_u16()? as usize;
+            let msg_type = u16::from(reader.read_u8()?);
+            let msg_size = usize::from(reader.read_u16()?);
             let _msg_flags = reader.read_u8()?;
 
             if flags & object_header::HDR_ATTR_CRT_ORDER_TRACKED != 0 {
@@ -119,12 +130,21 @@ impl MutableFile {
             }
 
             let msg_data_offset = reader.position()?;
+            let msg_size_u64 = Self::usize_to_u64(msg_size, "object-header message size")?;
+            if msg_data_offset
+                .checked_add(msg_size_u64)
+                .is_none_or(|end| end > chunk0_data_end)
+            {
+                return Err(Error::InvalidFormat(
+                    "object-header message payload exceeds chunk".into(),
+                ));
+            }
 
             if msg_type == target_msg_type {
                 return Ok((msg_data_offset, msg_size, oh_addr, oh_check_len));
             }
 
-            reader.skip(msg_size as u64)?;
+            reader.skip(msg_size_u64)?;
         }
 
         Err(Error::InvalidFormat(format!(
@@ -133,12 +153,21 @@ impl MutableFile {
     }
 
     /// Encode a v2 dataspace message with the given dims and optional max_dims.
-    fn encode_dataspace_v2(dims: &[u64], max_dims: Option<&[u64]>) -> Vec<u8> {
+    fn encode_dataspace_v2(dims: &[u64], max_dims: Option<&[u64]>) -> Result<Vec<u8>> {
+        if let Some(max) = max_dims {
+            if max.len() != dims.len() {
+                return Err(Error::InvalidFormat(format!(
+                    "dataspace max rank {} does not match rank {}",
+                    max.len(),
+                    dims.len()
+                )));
+            }
+        }
         let mut buf = Vec::new();
         let has_max = max_dims.is_some();
 
         buf.push(2);
-        buf.push(dims.len() as u8);
+        buf.push(Self::usize_to_u8(dims.len(), "dataspace rank")?);
         buf.push(if has_max { 0x01 } else { 0x00 });
         buf.push(1);
 
@@ -152,6 +181,27 @@ impl MutableFile {
             }
         }
 
-        buf
+        Ok(buf)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resize_dataspace_encoder_rejects_rank_narrowing_and_mismatch() {
+        let dims = vec![1u64; usize::from(u8::MAX) + 1];
+        let err = MutableFile::encode_dataspace_v2(&dims, None).unwrap_err();
+        assert!(
+            err.to_string().contains("dataspace rank"),
+            "unexpected error: {err}"
+        );
+
+        let err = MutableFile::encode_dataspace_v2(&[1, 2], Some(&[10])).unwrap_err();
+        assert!(
+            err.to_string().contains("dataspace max rank"),
+            "unexpected error: {err}"
+        );
     }
 }

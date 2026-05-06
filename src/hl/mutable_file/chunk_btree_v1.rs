@@ -25,7 +25,7 @@ impl MutableFile {
         element_size: u32,
     ) -> Result<()> {
         let ndims = chunk_coords.len();
-        let sa = self.superblock.sizeof_addr as usize;
+        let sa = usize::from(self.superblock.sizeof_addr);
 
         let mut guard = self.inner.lock();
         guard.reader.seek(btree_addr)?;
@@ -34,7 +34,7 @@ impl MutableFile {
         }
         let node_type = guard.reader.read_u8()?;
         let level = guard.reader.read_u8()?;
-        let entries_used = guard.reader.read_u16()? as usize;
+        let entries_used = usize::from(guard.reader.read_u16()?);
         if node_type != 1 {
             return Err(Error::InvalidFormat(format!(
                 "expected raw-data chunk B-tree, got type {node_type}"
@@ -285,13 +285,14 @@ impl MutableFile {
         ndims: usize,
     ) -> Result<Vec<ChunkBTreeEntry>> {
         let mut guard = self.inner.lock();
-        Self::collect_chunk_btree_entries_with_reader(&mut guard.reader, node_addr, ndims)
+        Self::collect_chunk_btree_entries_with_reader(&mut guard.reader, node_addr, ndims, None)
     }
 
     fn collect_chunk_btree_entries_with_reader<R: std::io::Read + Seek>(
         reader: &mut HdfReader<R>,
         node_addr: u64,
         ndims: usize,
+        expected_level: Option<u8>,
     ) -> Result<Vec<ChunkBTreeEntry>> {
         reader.seek(node_addr)?;
         if reader.read_bytes(4)? != [b'T', b'R', b'E', b'E'] {
@@ -304,7 +305,14 @@ impl MutableFile {
             )));
         }
         let level = reader.read_u8()?;
-        let entries_used = reader.read_u16()? as usize;
+        if let Some(expected_level) = expected_level {
+            if level != expected_level {
+                return Err(Error::InvalidFormat(format!(
+                    "chunk B-tree child level {level} does not match expected {expected_level}"
+                )));
+            }
+        }
+        let entries_used = usize::from(reader.read_u16()?);
         if entries_used > CHUNK_BTREE_MAX_LEAF_ENTRIES {
             return Err(Error::InvalidFormat(format!(
                 "chunk B-tree node entry count {entries_used} exceeds v1 node capacity"
@@ -355,8 +363,17 @@ impl MutableFile {
 
             let mut entries = Vec::new();
             for child_addr in child_addrs {
-                let child_entries =
-                    Self::collect_chunk_btree_entries_with_reader(reader, child_addr, ndims)?;
+                if crate::io::reader::is_undef_addr(child_addr) {
+                    return Err(Error::InvalidFormat(
+                        "chunk B-tree child address is undefined".into(),
+                    ));
+                }
+                let child_entries = Self::collect_chunk_btree_entries_with_reader(
+                    reader,
+                    child_addr,
+                    ndims,
+                    Some(level - 1),
+                )?;
                 let new_len = Self::chunk_btree_checked_usize_add(
                     entries.len(),
                     child_entries.len(),
@@ -461,10 +478,12 @@ impl MutableFile {
         buf.extend_from_slice(b"TREE");
         buf.push(1);
         buf.push(level);
-        buf.extend_from_slice(&(entries.len() as u16).to_le_bytes());
-        let undef = crate::io::reader::UNDEF_ADDR.to_le_bytes();
-        buf.extend_from_slice(&undef[..sizeof_addr]);
-        buf.extend_from_slice(&undef[..sizeof_addr]);
+        buf.extend_from_slice(
+            &Self::usize_to_u16(entries.len(), "chunk B-tree entry count")?.to_le_bytes(),
+        );
+        let undef = Self::undefined_addr_bytes(sizeof_addr, "chunk B-tree sibling address")?;
+        buf.extend_from_slice(&undef);
+        buf.extend_from_slice(&undef);
 
         for entry in entries {
             buf.extend_from_slice(&entry.chunk_size.to_le_bytes());
@@ -473,7 +492,11 @@ impl MutableFile {
                 buf.extend_from_slice(&coord.to_le_bytes());
             }
             buf.extend_from_slice(&0u64.to_le_bytes());
-            buf.extend_from_slice(&entry.child_addr.to_le_bytes()[..sizeof_addr]);
+            buf.extend_from_slice(&Self::encode_uint_le(
+                entry.child_addr,
+                sizeof_addr,
+                "chunk B-tree child address",
+            )?);
         }
 
         let final_coords = &entries[entries.len() - 1].coords;
@@ -482,7 +505,7 @@ impl MutableFile {
         for &coord in final_coords {
             buf.extend_from_slice(&coord.to_le_bytes());
         }
-        buf.extend_from_slice(&(element_size as u64).to_le_bytes());
+        buf.extend_from_slice(&u64::from(element_size).to_le_bytes());
         buf.resize(node_size, 0);
         Ok(buf)
     }
@@ -517,8 +540,11 @@ impl MutableFile {
             self.write_handle.write_all(&coord.to_le_bytes())?;
         }
         self.write_handle.write_all(&0u64.to_le_bytes())?;
-        self.write_handle
-            .write_all(&chunk_addr.to_le_bytes()[..sizeof_addr])?;
+        self.write_handle.write_all(&Self::encode_uint_le(
+            chunk_addr,
+            sizeof_addr,
+            "chunk B-tree child address",
+        )?)?;
 
         Ok(())
     }
@@ -536,13 +562,17 @@ impl MutableFile {
             self.write_handle.write_all(&coord.to_le_bytes())?;
         }
         self.write_handle
-            .write_all(&(element_size as u64).to_le_bytes())?;
+            .write_all(&u64::from(element_size).to_le_bytes())?;
         Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::io::Cursor;
+
+    use crate::io::HdfReader;
+
     use super::MutableFile;
 
     #[test]
@@ -572,5 +602,55 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("child key coordinate count"));
+    }
+
+    #[test]
+    fn chunk_btree_collect_rejects_child_level_mismatch() {
+        fn leaf_node(level: u8, addr: u64) -> Vec<u8> {
+            let mut node = Vec::new();
+            node.extend_from_slice(b"TREE");
+            node.push(1);
+            node.push(level);
+            node.extend_from_slice(&1u16.to_le_bytes());
+            node.extend_from_slice(&u64::MAX.to_le_bytes());
+            node.extend_from_slice(&u64::MAX.to_le_bytes());
+            node.extend_from_slice(&16u32.to_le_bytes());
+            node.extend_from_slice(&0u32.to_le_bytes());
+            node.extend_from_slice(&0u64.to_le_bytes());
+            node.extend_from_slice(&0u64.to_le_bytes());
+            node.extend_from_slice(&addr.to_le_bytes());
+            node.extend_from_slice(&0u32.to_le_bytes());
+            node.extend_from_slice(&0u32.to_le_bytes());
+            node.extend_from_slice(&0u64.to_le_bytes());
+            node.extend_from_slice(&0u64.to_le_bytes());
+            node
+        }
+
+        let mut root = Vec::new();
+        root.extend_from_slice(b"TREE");
+        root.push(1);
+        root.push(1);
+        root.extend_from_slice(&1u16.to_le_bytes());
+        root.extend_from_slice(&u64::MAX.to_le_bytes());
+        root.extend_from_slice(&u64::MAX.to_le_bytes());
+        root.extend_from_slice(&0u32.to_le_bytes());
+        root.extend_from_slice(&0u32.to_le_bytes());
+        root.extend_from_slice(&0u64.to_le_bytes());
+        root.extend_from_slice(&0u64.to_le_bytes());
+        root.extend_from_slice(&128u64.to_le_bytes());
+        root.extend_from_slice(&0u32.to_le_bytes());
+        root.extend_from_slice(&0u32.to_le_bytes());
+        root.extend_from_slice(&0u64.to_le_bytes());
+        root.extend_from_slice(&0u64.to_le_bytes());
+
+        let mut file = root;
+        file.resize(128, 0);
+        file.extend_from_slice(&leaf_node(1, 256)); // should be level 0 under root level 1.
+
+        let mut reader = HdfReader::new(Cursor::new(file));
+        reader.set_sizeof_addr(8);
+        let err = MutableFile::collect_chunk_btree_entries_with_reader(&mut reader, 0, 1, None)
+            .expect_err("child level mismatch should fail");
+        assert!(err.to_string().contains("child level"));
     }
 }

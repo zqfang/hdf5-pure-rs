@@ -168,6 +168,36 @@ fn test_real_world_10x_feature_barcode_matrix_smoke() {
 }
 
 #[test]
+#[ignore = "reproduces vlen string read hang for files written by the current pure Rust writer"]
+fn test_real_world_counthovd_sparse_matrix_strings() {
+    let Some(f) = open_real_world_fixture("tests/data/real_world/counthovd.10.h5") else {
+        return;
+    };
+
+    let data: Vec<u32> = f.dataset("X/data").unwrap().read::<u32>().unwrap();
+    let indices: Vec<u64> = f.dataset("X/indices").unwrap().read::<u64>().unwrap();
+    let indptr: Vec<u64> = f.dataset("X/indptr").unwrap().read::<u64>().unwrap();
+    let shape: Vec<u32> = f.dataset("X/shape").unwrap().read::<u32>().unwrap();
+    let obs_index = f.dataset("obs/_index").unwrap().read_strings().unwrap();
+    let var_index = f.dataset("var/_index").unwrap().read_strings().unwrap();
+    let unmapped: Vec<u32> = f.dataset("obs/_unmapped").unwrap().read::<u32>().unwrap();
+
+    assert_eq!(shape, vec![665, 4537]);
+    assert_eq!(data.len(), 17823);
+    assert_eq!(indices.len(), data.len());
+    assert_eq!(indptr.len(), shape[0] as usize + 1);
+    assert_eq!(obs_index.len(), shape[0] as usize);
+    assert_eq!(var_index.len(), shape[1] as usize);
+    assert_eq!(unmapped.len(), shape[0] as usize);
+    assert_eq!(indptr[0], 0);
+    assert_eq!(*indptr.last().unwrap(), data.len() as u64);
+    assert!(data.iter().any(|count| *count > 0));
+    assert!(indices.iter().all(|index| *index < shape[1] as u64));
+    assert!(obs_index.iter().all(|name| !name.is_empty()));
+    assert!(var_index.iter().all(|name| !name.is_empty()));
+}
+
+#[test]
 fn test_real_world_netcdf4_like_smoke() {
     let Some(f) = open_real_world_fixture("tests/data/real_world/netcdf4_like_climate.nc") else {
         return;

@@ -1,6 +1,8 @@
 use crate::error::{Error, Result};
-use crate::format::messages::dataspace::DataspaceMessage;
+use crate::format::messages::dataspace::{DataspaceMessage, DataspaceType};
 use crate::format::messages::datatype::DatatypeMessage;
+
+const ATTRIBUTE_FLAGS_ALL: u8 = 0x03;
 
 /// Parsed Attribute message (type 0x000C).
 #[derive(Debug, Clone)]
@@ -39,25 +41,14 @@ impl AttributeMessage {
     fn decode_v1(raw: &[u8]) -> Result<Self> {
         // v1: version(1) + reserved(1) + name_size(2) + datatype_size(2) + dataspace_size(2)
         ensure_available(raw, 0, 8, "attribute v1 header")?;
-        let name_size = read_u16_le_at(raw, 2, "attribute v1 name size")? as usize;
-        let dt_size = read_u16_le_at(raw, 4, "attribute v1 datatype size")? as usize;
-        let ds_size = read_u16_le_at(raw, 6, "attribute v1 dataspace size")? as usize;
-        if name_size == 0 {
-            return Err(Error::InvalidFormat(
-                "attribute message name length is zero".into(),
-            ));
-        }
+        let name_size = usize::from(read_u16_le_at(raw, 2, "attribute v1 name size")?);
+        let dt_size = usize::from(read_u16_le_at(raw, 4, "attribute v1 datatype size")?);
+        let ds_size = usize::from(read_u16_le_at(raw, 6, "attribute v1 dataspace size")?);
         let mut pos = 8;
 
         // Name (null-padded to 8-byte boundary)
         ensure_available(raw, pos, name_size, "attribute v1 name")?;
-        let name_field_end = checked_end(pos, name_size, "attribute v1 name")?;
-        let name_len = raw[pos..name_field_end]
-            .iter()
-            .position(|&b| b == 0)
-            .unwrap_or(name_size);
-        let name_end = checked_end(pos, name_len, "attribute v1 name")?;
-        let name = String::from_utf8_lossy(&raw[pos..name_end]).to_string();
+        let name = decode_attribute_name(raw, pos, name_size, "attribute v1 name")?;
         let name_padded = align8(name_size, "attribute v1 name")?;
         ensure_available(raw, pos, name_padded, "attribute v1 padded name")?;
         advance_pos(&mut pos, name_padded, "attribute v1 padded name")?;
@@ -80,6 +71,7 @@ impl AttributeMessage {
 
         // Data
         let data = raw[pos..].to_vec();
+        validate_attribute_data_length(&datatype, &dataspace, data.len())?;
 
         Ok(Self {
             version: 1,
@@ -94,25 +86,15 @@ impl AttributeMessage {
     fn decode_v2(raw: &[u8]) -> Result<Self> {
         // v2: version(1) + flags(1) + name_size(2) + datatype_size(2) + dataspace_size(2)
         ensure_available(raw, 0, 8, "attribute v2 header")?;
-        let name_size = read_u16_le_at(raw, 2, "attribute v2 name size")? as usize;
-        let dt_size = read_u16_le_at(raw, 4, "attribute v2 datatype size")? as usize;
-        let ds_size = read_u16_le_at(raw, 6, "attribute v2 dataspace size")? as usize;
-        if name_size == 0 {
-            return Err(Error::InvalidFormat(
-                "attribute message name length is zero".into(),
-            ));
-        }
+        validate_attribute_flags(raw[1])?;
+        let name_size = usize::from(read_u16_le_at(raw, 2, "attribute v2 name size")?);
+        let dt_size = usize::from(read_u16_le_at(raw, 4, "attribute v2 datatype size")?);
+        let ds_size = usize::from(read_u16_le_at(raw, 6, "attribute v2 dataspace size")?);
         let mut pos = 8;
 
         // Name (NOT padded in v2)
         ensure_available(raw, pos, name_size, "attribute v2 name")?;
-        let name_field_end = checked_end(pos, name_size, "attribute v2 name")?;
-        let name_len = raw[pos..name_field_end]
-            .iter()
-            .position(|&b| b == 0)
-            .unwrap_or(name_size);
-        let name_end = checked_end(pos, name_len, "attribute v2 name")?;
-        let name = String::from_utf8_lossy(&raw[pos..name_end]).to_string();
+        let name = decode_attribute_name(raw, pos, name_size, "attribute v2 name")?;
         advance_pos(&mut pos, name_size, "attribute v2 name")?;
 
         // Datatype (NOT padded in v2)
@@ -128,6 +110,7 @@ impl AttributeMessage {
         advance_pos(&mut pos, ds_size, "attribute v2 dataspace")?;
 
         let data = raw[pos..].to_vec();
+        validate_attribute_data_length(&datatype, &dataspace, data.len())?;
 
         Ok(Self {
             version: 2,
@@ -142,26 +125,20 @@ impl AttributeMessage {
     fn decode_v3(raw: &[u8]) -> Result<Self> {
         // v3: version(1) + flags(1) + name_size(2) + datatype_size(2) + dataspace_size(2) + encoding(1)
         ensure_available(raw, 0, 9, "attribute v3 header")?;
-        let _flags = raw[1];
-        let name_size = read_u16_le_at(raw, 2, "attribute v3 name size")? as usize;
-        let dt_size = read_u16_le_at(raw, 4, "attribute v3 datatype size")? as usize;
-        let ds_size = read_u16_le_at(raw, 6, "attribute v3 dataspace size")? as usize;
+        validate_attribute_flags(raw[1])?;
+        let name_size = usize::from(read_u16_le_at(raw, 2, "attribute v3 name size")?);
+        let dt_size = usize::from(read_u16_le_at(raw, 4, "attribute v3 datatype size")?);
+        let ds_size = usize::from(read_u16_le_at(raw, 6, "attribute v3 dataspace size")?);
         let encoding = raw[8]; // character encoding: 0=ASCII, 1=UTF-8
-        if name_size == 0 {
-            return Err(Error::InvalidFormat(
-                "attribute message name length is zero".into(),
-            ));
+        if encoding > 1 {
+            return Err(Error::InvalidFormat(format!(
+                "invalid attribute character encoding {encoding}"
+            )));
         }
         let mut pos = 9;
 
         ensure_available(raw, pos, name_size, "attribute v3 name")?;
-        let name_field_end = checked_end(pos, name_size, "attribute v3 name")?;
-        let name_len = raw[pos..name_field_end]
-            .iter()
-            .position(|&b| b == 0)
-            .unwrap_or(name_size);
-        let name_end = checked_end(pos, name_len, "attribute v3 name")?;
-        let name = String::from_utf8_lossy(&raw[pos..name_end]).to_string();
+        let name = decode_attribute_name(raw, pos, name_size, "attribute v3 name")?;
         advance_pos(&mut pos, name_size, "attribute v3 name")?;
 
         ensure_available(raw, pos, dt_size, "attribute v3 datatype")?;
@@ -175,6 +152,7 @@ impl AttributeMessage {
         advance_pos(&mut pos, ds_size, "attribute v3 dataspace")?;
 
         let data = raw[pos..].to_vec();
+        validate_attribute_data_length(&datatype, &dataspace, data.len())?;
 
         Ok(Self {
             version: 3,
@@ -188,13 +166,13 @@ impl AttributeMessage {
 
     /// Get total number of elements.
     pub fn num_elements(&self) -> Result<u64> {
-        if self.dataspace.dims.is_empty() {
-            Ok(1) // scalar
-        } else {
-            self.dataspace.dims.iter().try_fold(1u64, |acc, &dim| {
+        match self.dataspace.space_type {
+            DataspaceType::Null => Ok(0),
+            DataspaceType::Scalar => Ok(1),
+            DataspaceType::Simple => self.dataspace.dims.iter().try_fold(1u64, |acc, &dim| {
                 acc.checked_mul(dim)
                     .ok_or_else(|| Error::InvalidFormat("attribute element count overflow".into()))
-            })
+            }),
         }
     }
 
@@ -202,10 +180,80 @@ impl AttributeMessage {
     pub fn data_size(&self) -> Result<usize> {
         let elements = usize::try_from(self.num_elements()?)
             .map_err(|_| Error::InvalidFormat("attribute element count overflow".into()))?;
+        let datatype_size = usize::try_from(self.datatype.size)
+            .map_err(|_| Error::InvalidFormat("attribute datatype size overflow".into()))?;
         elements
-            .checked_mul(self.datatype.size as usize)
+            .checked_mul(datatype_size)
             .ok_or_else(|| Error::InvalidFormat("attribute data size overflow".into()))
     }
+}
+
+fn validate_attribute_data_length(
+    datatype: &DatatypeMessage,
+    dataspace: &DataspaceMessage,
+    actual_len: usize,
+) -> Result<()> {
+    let elements = match dataspace.space_type {
+        DataspaceType::Null => 0usize,
+        DataspaceType::Scalar => 1usize,
+        DataspaceType::Simple => dataspace.dims.iter().try_fold(1usize, |acc, &dim| {
+            let dim = usize::try_from(dim)
+                .map_err(|_| Error::InvalidFormat("attribute element count overflow".into()))?;
+            acc.checked_mul(dim)
+                .ok_or_else(|| Error::InvalidFormat("attribute element count overflow".into()))
+        })?,
+    };
+    let datatype_size = usize::try_from(datatype.size)
+        .map_err(|_| Error::InvalidFormat("attribute datatype size overflow".into()))?;
+    let expected_len = elements
+        .checked_mul(datatype_size)
+        .ok_or_else(|| Error::InvalidFormat("attribute data size overflow".into()))?;
+    if actual_len < expected_len {
+        return Err(Error::InvalidFormat(format!(
+            "attribute data is truncated: expected at least {expected_len} bytes, got {actual_len}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_attribute_flags(flags: u8) -> Result<()> {
+    if flags & !ATTRIBUTE_FLAGS_ALL != 0 {
+        return Err(Error::InvalidFormat(format!(
+            "attribute message flags {flags:#x} are invalid"
+        )));
+    }
+    Ok(())
+}
+
+fn decode_attribute_name(
+    raw: &[u8],
+    pos: usize,
+    name_size: usize,
+    context: &str,
+) -> Result<String> {
+    if name_size <= 1 {
+        return Err(Error::InvalidFormat(
+            "attribute message name length is invalid".into(),
+        ));
+    }
+    let name_text_len = name_size
+        .checked_sub(1)
+        .ok_or_else(|| Error::InvalidFormat(format!("{context} length underflow")))?;
+    let name_text = checked_window(raw, pos, name_text_len, context)?;
+    if name_text.contains(&0) {
+        return Err(Error::InvalidFormat(
+            "attribute name has different length than stored length".into(),
+        ));
+    }
+    let null_pos = checked_end(pos, name_text_len, context)?;
+    if raw.get(null_pos).copied() != Some(0) {
+        return Err(Error::InvalidFormat(
+            "attribute name has different length than stored length".into(),
+        ));
+    }
+    std::str::from_utf8(name_text)
+        .map(str::to_string)
+        .map_err(|_| Error::InvalidFormat("attribute name is not UTF-8".into()))
 }
 
 fn ensure_available(raw: &[u8], pos: usize, len: usize, context: &str) -> Result<()> {

@@ -50,7 +50,7 @@ impl MutableFile {
         let chunk_data_dims = Self::chunk_data_dims(&info)?;
         Self::validate_chunk_coords(chunk_coords, &chunk_data_dims)?;
 
-        let element_size = info.datatype.size as usize;
+        let element_size = Self::u64_to_usize(u64::from(info.datatype.size), "datatype size")?;
         let expected_len = Self::expected_chunk_len(&chunk_data_dims, element_size)?;
         Self::validate_chunk_write_len(data.len(), expected_len)?;
         let filtered = Self::encode_chunk_write_data(&info, data, element_size)?;
@@ -67,7 +67,7 @@ impl MutableFile {
             &info,
             chunk_coords,
             &chunk_data_dims,
-            filtered.len() as u64,
+            Self::usize_to_u64(filtered.len(), "filtered chunk size")?,
             chunk_addr,
             expected_len,
             element_size,
@@ -116,10 +116,11 @@ impl MutableFile {
     }
 
     fn expected_chunk_len(chunk_data_dims: &[u64], element_size: usize) -> Result<usize> {
-        let chunk_elements = chunk_data_dims
-            .iter()
-            .try_fold(1usize, |acc, &dim| acc.checked_mul(dim as usize))
-            .ok_or_else(|| Error::InvalidFormat("chunk element count overflow".into()))?;
+        let chunk_elements = chunk_data_dims.iter().try_fold(1usize, |acc, &dim| {
+            let dim = Self::u64_to_usize(dim, "chunk dimension")?;
+            acc.checked_mul(dim)
+                .ok_or_else(|| Error::InvalidFormat("chunk element count overflow".into()))
+        })?;
         chunk_elements
             .checked_mul(element_size)
             .ok_or_else(|| Error::InvalidFormat("chunk byte size overflow".into()))
@@ -206,9 +207,9 @@ impl MutableFile {
             WritableChunkIndexKind::BTreeV1 => self.rewrite_leaf_chunk_btree(
                 index_addr,
                 chunk_coords,
-                filtered_len as u32,
+                Self::u64_to_u32(filtered_len, "filtered chunk size")?,
                 chunk_addr,
-                element_size as u32,
+                Self::usize_to_u32(element_size, "datatype size")?,
             ),
         }
     }
@@ -220,5 +221,19 @@ impl MutableFile {
             Some(ChunkIndexType::BTreeV2) => WritableChunkIndexKind::BTreeV2,
             _ => WritableChunkIndexKind::BTreeV1,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expected_chunk_len_rejects_element_count_overflow() {
+        let err = MutableFile::expected_chunk_len(&[u64::MAX, 2], 1).unwrap_err();
+        assert!(
+            err.to_string().contains("chunk element count"),
+            "unexpected error: {err}"
+        );
     }
 }

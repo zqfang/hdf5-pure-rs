@@ -13,7 +13,7 @@ impl FractalHeapHeader {
     pub(super) fn max_direct_rows(&self) -> usize {
         let start_bits = log2_power2(self.start_block_size);
         let max_direct_bits = log2_power2(self.max_direct_block_size);
-        (max_direct_bits - start_bits + 2) as usize
+        usize::try_from(max_direct_bits - start_bits + 2).unwrap_or(usize::MAX)
     }
 
     pub(super) fn indirect_data_span<R: Read + Seek>(
@@ -21,7 +21,7 @@ impl FractalHeapHeader {
         reader: &HdfReader<R>,
         nrows: usize,
     ) -> Result<u64> {
-        let width = self.table_width as u64;
+        let width = u64::from(self.table_width);
         let max_direct_rows = self.max_direct_rows();
         let mut span = 0u64;
 
@@ -66,7 +66,7 @@ impl FractalHeapHeader {
 
     pub(super) fn child_indirect_rows(&self, row: usize) -> Result<usize> {
         let first_row_bits =
-            log2_power2(self.start_block_size) + log2_power2(self.table_width as u64);
+            log2_power2(self.start_block_size) + log2_power2(u64::from(self.table_width));
         let block_bits = log2_floor(self.checked_row_block_size(row)?);
         if block_bits < first_row_bits {
             return Err(Error::InvalidFormat(

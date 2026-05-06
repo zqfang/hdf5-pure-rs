@@ -103,6 +103,8 @@ impl Dataset {
     }
 
     fn decode_virtual_mapping_flags(data: &[u8], pos: &mut usize, version: u8) -> Result<u8> {
+        const VDS_MAPPING_KNOWN_FLAGS: u8 = 0x07;
+
         if version == 0 {
             return Ok(0);
         }
@@ -110,6 +112,17 @@ impl Dataset {
             Error::InvalidFormat("truncated virtual dataset mapping flags".into())
         })?;
         *pos += 1;
+        if flags & !VDS_MAPPING_KNOWN_FLAGS != 0 {
+            return Err(Error::InvalidFormat(format!(
+                "virtual dataset mapping flags contain unknown bits 0x{flags:02x}"
+            )));
+        }
+        if flags & 0x04 != 0 && flags & 0x01 != 0 {
+            return Err(Error::InvalidFormat(
+                "virtual dataset mapping cannot use both same-file and shared file-name flags"
+                    .into(),
+            ));
+        }
         Ok(flags)
     }
 
@@ -229,14 +242,7 @@ impl Dataset {
                 "virtual all-selection version {version}"
             )));
         }
-        *pos = pos
-            .checked_add(8)
-            .ok_or_else(|| Error::InvalidFormat("virtual all-selection offset overflow".into()))?;
-        if *pos > data.len() {
-            return Err(Error::InvalidFormat(
-                "truncated virtual all-selection header".into(),
-            ));
-        }
+        skip_reserved(data, pos, 8, "virtual all-selection reserved bytes")?;
         Ok(VirtualSelection::All)
     }
 
@@ -265,11 +271,9 @@ impl Dataset {
 
     fn decode_virtual_point_enc_size(data: &[u8], pos: &mut usize, version: u32) -> Result<usize> {
         let enc_size = if version >= 2 {
-            read_u8_at(data, pos)? as usize
+            usize::from(read_u8_at(data, pos)?)
         } else if version == 1 {
-            *pos = pos.checked_add(8).ok_or_else(|| {
-                Error::InvalidFormat("virtual point-selection offset overflow".into())
-            })?;
+            skip_reserved(data, pos, 8, "virtual point-selection reserved bytes")?;
             4
         } else {
             return Err(Error::Unsupported(format!(
@@ -310,18 +314,14 @@ impl Dataset {
 
         let (flags, enc_size) = if version >= 3 {
             let flags = read_u8_at(data, pos)?;
-            let enc_size = read_u8_at(data, pos)? as usize;
+            let enc_size = usize::from(read_u8_at(data, pos)?);
             (flags, enc_size)
         } else if version == 2 {
             let flags = read_u8_at(data, pos)?;
-            *pos = pos
-                .checked_add(4)
-                .ok_or_else(|| Error::InvalidFormat("virtual hyperslab offset overflow".into()))?;
+            skip_reserved(data, pos, 4, "virtual hyperslab selection reserved bytes")?;
             (flags, 8)
         } else if version == 1 {
-            *pos = pos
-                .checked_add(8)
-                .ok_or_else(|| Error::InvalidFormat("virtual hyperslab offset overflow".into()))?;
+            skip_reserved(data, pos, 8, "virtual hyperslab selection reserved bytes")?;
             (0, 4)
         } else {
             return Err(Error::Unsupported(format!(
@@ -339,7 +339,10 @@ impl Dataset {
     }
 
     fn decode_virtual_selection_rank(data: &[u8], pos: &mut usize) -> Result<usize> {
-        let rank = usize_from_u64(read_le_u32_at(data, pos)? as u64, "virtual selection rank")?;
+        let rank = usize_from_u64(
+            u64::from(read_le_u32_at(data, pos)?),
+            "virtual selection rank",
+        )?;
         if rank == 0 || rank > MAX_VDS_SELECTION_RANK {
             return Err(Error::InvalidFormat(format!(
                 "virtual selection rank {rank} exceeds supported maximum {MAX_VDS_SELECTION_RANK}"
@@ -462,7 +465,7 @@ fn trace_selection_deserialize(data: &[u8], sel_type: u32) {
     let mut th = tracehash::th_call!("hdf5.selection.deserialize");
     th.input_bytes(data);
     th.output_value(&(true));
-    th.output_u64(sel_type as u64);
+    th.output_u64(u64::from(sel_type));
     th.finish();
 }
 
@@ -505,8 +508,8 @@ fn read_c_string(bytes: &[u8], pos: &mut usize) -> Result<String> {
 
 fn decode_hyperslab_extent(value: u64, enc_size: usize) -> u64 {
     match enc_size {
-        2 if value == u16::MAX as u64 => u64::MAX,
-        4 if value == u32::MAX as u64 => u64::MAX,
+        2 if value == u64::from(u16::MAX) => u64::MAX,
+        4 if value == u64::from(u32::MAX) => u64::MAX,
         8 if value == u64::MAX => u64::MAX,
         _ => value,
     }
@@ -521,6 +524,17 @@ fn validate_vds_selection_enc_size(enc_size: usize, kind: &str) -> Result<()> {
     }
 }
 
+fn skip_reserved(data: &[u8], pos: &mut usize, len: usize, context: &str) -> Result<()> {
+    let end = pos
+        .checked_add(len)
+        .ok_or_else(|| Error::InvalidFormat(format!("{context} offset overflow")))?;
+    if end > data.len() {
+        return Err(Error::InvalidFormat(format!("{context} are truncated")));
+    }
+    *pos = end;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -528,7 +542,7 @@ mod tests {
     #[test]
     fn c_string_rejects_start_past_buffer() {
         let mut pos = 2;
-        let err = read_c_string(&[b'a'], &mut pos).unwrap_err();
+        let err = read_c_string(b"a", &mut pos).unwrap_err();
         assert!(
             err.to_string().contains("truncated string field"),
             "unexpected error: {err}"

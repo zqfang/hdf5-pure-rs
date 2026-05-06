@@ -26,7 +26,7 @@ impl LinkInfoMessage {
 
     fn decode_impl(data: &[u8], sizeof_addr: u8) -> Result<Self> {
         let mut pos = 0;
-        let sa = sizeof_addr as usize;
+        let sa = usize::from(sizeof_addr);
 
         let version = read_u8(data, &mut pos, "link info message version")?;
         if version != 0 {
@@ -36,19 +36,25 @@ impl LinkInfoMessage {
         }
 
         let flags = read_u8(data, &mut pos, "link info message flags")?;
+        if flags & !0x03 != 0 {
+            return Err(Error::InvalidFormat(format!(
+                "link info message flags {flags:#x} are invalid"
+            )));
+        }
 
         let has_max_crt_order = flags & 0x01 != 0;
         let has_corder_btree = flags & 0x02 != 0;
 
         let max_creation_index = if has_max_crt_order {
             let val = read_le_u64(data, &mut pos, 8, "link info max creation index")?;
-            // libhdf5 bounds this field at H5L_MAX_CRT_IDX_VAL == (uint32_t)-1.
-            // Reject larger values to match `H5O__linfo_decode`'s "invalid
-            // max creation order value for message" check.
-            if val > u32::MAX as u64 {
+            // libhdf5 decodes this as int64_t and rejects negative values.
+            let max_i64 = u64::try_from(i64::MAX).map_err(|_| {
+                Error::InvalidFormat("link info max creation index bound is invalid".into())
+            })?;
+            if val > max_i64 {
                 return Err(Error::InvalidFormat(format!(
                     "link info max creation index {val} exceeds supported maximum {}",
-                    u32::MAX
+                    i64::MAX
                 )));
             }
             Some(val)

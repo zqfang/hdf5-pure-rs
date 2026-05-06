@@ -92,7 +92,9 @@ pub(super) fn read_v2_continuation<R: Read + Seek>(
     // Verify checksum
     reader.seek(data_end)?;
     let stored_checksum = reader.read_u32()?;
-    let check_len = (data_end - addr) as usize;
+    let check_len = usize::try_from(data_end - addr).map_err(|_| {
+        Error::InvalidFormat("continuation chunk checksum span exceeds usize".into())
+    })?;
     reader.seek(addr)?;
     let check_data = reader.read_bytes(check_len)?;
     let computed = checksum_metadata(&check_data);

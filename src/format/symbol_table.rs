@@ -49,10 +49,9 @@ impl SymbolTableNode {
             )));
         }
 
-        // Reserved byte
         reader.skip(1)?;
 
-        let num_symbols = reader.read_u16()? as usize;
+        let num_symbols = usize::from(reader.read_u16()?);
 
         let mut entries = Vec::with_capacity(num_symbols);
         for _ in 0..num_symbols {
@@ -68,7 +67,6 @@ impl SymbolTableNode {
         let obj_header_addr = reader.read_addr()?;
         let cache_type = reader.read_u32()?;
 
-        // Reserved 4 bytes
         reader.skip(4)?;
 
         // Scratch-pad space: 16 bytes
@@ -82,7 +80,7 @@ impl SymbolTableNode {
                 // Group: B-tree addr + name heap addr
                 let btree = reader.read_addr()?;
                 let heap = reader.read_addr()?;
-                let used = (reader.sizeof_addr() as u64)
+                let used = u64::from(reader.sizeof_addr())
                     .checked_mul(2)
                     .ok_or_else(|| {
                         Error::InvalidFormat("symbol table scratch-pad size overflow".into())
@@ -103,9 +101,10 @@ impl SymbolTableNode {
                 reader.skip(12)?; // remaining scratch-pad
                 (None, None, Some(offset))
             }
-            _ => {
-                reader.skip(16)?;
-                (None, None, None)
+            other => {
+                return Err(Error::InvalidFormat(format!(
+                    "invalid symbol table entry cache type {other}"
+                )));
             }
         };
 

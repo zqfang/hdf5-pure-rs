@@ -52,8 +52,8 @@ impl FractalHeapHeader {
         reader: &mut HdfReader<R>,
         heap_id: &[u8],
     ) -> Result<Vec<u8>> {
-        let addr_size = self.sizeof_addr as usize;
-        let len_size = self.sizeof_size as usize;
+        let addr_size = usize::from(self.sizeof_addr);
+        let len_size = usize::from(self.sizeof_size);
 
         let direct_id_len = checked_huge_len(&[1, addr_size, len_size], "direct huge heap ID")?;
         if self.io_filter_len == 0 && heap_id.len() >= direct_id_len {
@@ -147,8 +147,11 @@ impl FractalHeapHeader {
                         Error::InvalidFormat("filtered huge object missing filter pipeline".into())
                     })?;
                     data = crate::filters::apply_pipeline_reverse(&data, pipeline, 1)?;
+                    let decoded_len = u64::try_from(data.len()).map_err(|_| {
+                        Error::InvalidFormat("filtered huge heap object length overflow".into())
+                    })?;
                     data.truncate(heap_object_len(
-                        huge.obj_size.unwrap_or(data.len() as u64),
+                        huge.obj_size.unwrap_or(decoded_len),
                         "filtered huge heap object size",
                     )?);
                 }
@@ -170,8 +173,8 @@ impl FractalHeapHeader {
     }
 
     pub(super) fn decode_huge_record(&self, record: &[u8]) -> Result<HugeRecord> {
-        let sa = self.sizeof_addr as usize;
-        let ss = self.sizeof_size as usize;
+        let sa = usize::from(self.sizeof_addr);
+        let ss = usize::from(self.sizeof_size);
 
         let unfiltered_direct = checked_huge_len(&[sa, ss], "unfiltered direct huge record")?;
         if record.len() == unfiltered_direct {

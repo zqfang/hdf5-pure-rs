@@ -180,11 +180,20 @@ impl GlobalHeapCollection {
             return Err(Error::Unsupported(format!("global heap version {version}")));
         }
 
-        // Reserved (3 bytes)
-        reader.skip(3)?;
+        reader.read_bytes(3)?;
 
         // Collection size (includes header)
         let collection_size = reader.read_length()?;
+        if collection_size < 16 {
+            return Err(Error::InvalidFormat(
+                "global heap collection is smaller than its header".into(),
+            ));
+        }
+        if collection_size % 8 != 0 {
+            return Err(Error::InvalidFormat(
+                "global heap collection size is not 8-byte aligned".into(),
+            ));
+        }
 
         Ok(GlobalHeapHeader {
             addr,
@@ -193,8 +202,8 @@ impl GlobalHeapCollection {
     }
 
     /// Walk the object table from the reader's current position (which the
-    /// header decoder already advanced to). Stops at the end of the
-    /// declared collection or at an index-0 sentinel entry.
+    /// header decoder already advanced to). Index-0 records are free-space
+    /// objects whose size includes their 16-byte header.
     pub fn walk_objects<R: Read + Seek>(
         reader: &mut HdfReader<R>,
         header: &GlobalHeapHeader,
@@ -214,15 +223,27 @@ impl GlobalHeapCollection {
                 break;
             }
 
-            let index = reader.read_u16()? as u32;
-            if index == 0 {
-                // Object index 0 marks free space/end of the collection.
-                break;
-            }
+            let index = u32::from(reader.read_u16()?);
             let _reference_count = reader.read_u16()?;
-            // Reserved (4 bytes)
-            reader.skip(4)?;
+            reader.read_u32()?;
             let obj_size = reader.read_length()?;
+
+            if index == 0 {
+                if obj_size == 0 {
+                    break;
+                }
+                let next_pos = pos.checked_add(obj_size).ok_or_else(|| {
+                    Error::InvalidFormat("global heap free object offset overflow".into())
+                })?;
+                if next_pos > data_end {
+                    return Err(Error::InvalidFormat(
+                        "global heap free object exceeds collection bounds".into(),
+                    ));
+                }
+                reader.seek(next_pos)?;
+                continue;
+            }
+
             let obj_len = heap_object_len(obj_size, "global heap object size")?;
             let padded = obj_size
                 .checked_add(7)
@@ -294,12 +315,57 @@ pub fn read_global_heap_object<R: Read + Seek>(
 fn trace_global_heap_deref(gh_ref: &GlobalHeapRef, data: &[u8]) {
     let mut th = tracehash::th_call!("hdf5.global_heap.deref");
     th.input_u64(gh_ref.collection_addr);
-    th.input_u64(gh_ref.object_index as u64);
+    th.input_u64(u64::from(gh_ref.object_index));
     th.output_value(&(true));
-    th.output_u64(data.len() as u64);
+    th.output_u64(u64::try_from(data.len()).unwrap_or(u64::MAX));
     th.output_value(data);
     th.finish();
 }
 
 #[cfg(not(feature = "tracehash"))]
 fn trace_global_heap_deref(_gh_ref: &GlobalHeapRef, _data: &[u8]) {}
+
+#[cfg(test)]
+mod tests {
+    use super::GlobalHeapCollection;
+    use crate::error::Error;
+    use crate::io::reader::HdfReader;
+    use std::io::Cursor;
+
+    fn heap_with_size(collection_size: u64) -> Vec<u8> {
+        let mut heap = b"GCOL".to_vec();
+        heap.push(1);
+        heap.extend_from_slice(&[0; 3]);
+        heap.extend_from_slice(&collection_size.to_le_bytes());
+        let collection_size =
+            usize::try_from(collection_size).expect("test collection size should fit in usize");
+        heap.resize(collection_size.max(16), 0);
+        heap
+    }
+
+    #[test]
+    fn global_heap_rejects_invalid_collection_sizes() {
+        let mut reader = HdfReader::new(Cursor::new(heap_with_size(8)));
+        let err = GlobalHeapCollection::read_at(&mut reader, 0).unwrap_err();
+        assert!(matches!(err, Error::InvalidFormat(_)));
+
+        let mut reader = HdfReader::new(Cursor::new(heap_with_size(17)));
+        let err = GlobalHeapCollection::read_at(&mut reader, 0).unwrap_err();
+        assert!(matches!(err, Error::InvalidFormat(_)));
+    }
+
+    #[test]
+    fn global_heap_ignores_trailing_fragment_smaller_than_object_header() {
+        let mut heap = b"GCOL".to_vec();
+        heap.push(1);
+        heap.extend_from_slice(&[0; 3]);
+        heap.extend_from_slice(&24u64.to_le_bytes());
+        heap.extend_from_slice(&1u16.to_le_bytes());
+        heap.extend_from_slice(&0u16.to_le_bytes());
+        heap.extend_from_slice(&[0; 4]);
+
+        let mut reader = HdfReader::new(Cursor::new(heap));
+        let collection = GlobalHeapCollection::read_at(&mut reader, 0).unwrap();
+        assert!(collection.objects.is_empty());
+    }
+}

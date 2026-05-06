@@ -71,9 +71,14 @@ impl DataLayoutMessage {
             let mut th = tracehash::th_call!("hdf5.data_layout.decode");
             th.input_bytes(data);
             th.output_value(&(true));
-            th.output_u64(message.version as u64);
-            th.output_u64(message.layout_class as u64);
-            th.output_u64(message.chunk_index_type.map(|t| t as u64).unwrap_or(0));
+            th.output_u64(u64::from(message.version));
+            th.output_u64(layout_class_trace_value(message.layout_class));
+            th.output_u64(
+                message
+                    .chunk_index_type
+                    .map(chunk_index_trace_value)
+                    .unwrap_or(0),
+            );
             th.finish();
         }
 
@@ -86,8 +91,8 @@ impl DataLayoutMessage {
         }
 
         let version = data[0];
-        let sa = sizeof_addr as usize;
-        let ss = sizeof_size as usize;
+        let sa = usize::from(sizeof_addr);
+        let ss = usize::from(sizeof_size);
         match version {
             1 | 2 => Self::decode_v1_v2(data, version, sa),
             3 | 4 => Self::decode_v3_v4(data, version, sa, ss),
@@ -99,7 +104,7 @@ impl DataLayoutMessage {
 
     fn decode_v1_v2(data: &[u8], version: u8, sizeof_addr: usize) -> Result<Self> {
         ensure_available(data, 0, 8, "data layout v1/v2 header")?;
-        let ndims = data[1] as usize;
+        let ndims = usize::from(data[1]);
         if ndims == 0 {
             return Err(Error::InvalidFormat(
                 "data layout v1/v2 rank must be positive".into(),
@@ -110,6 +115,9 @@ impl DataLayoutMessage {
                 "data layout rank {ndims} exceeds supported maximum {MAX_LAYOUT_RANK}"
             )));
         }
+        // `H5O__layout_decode` only skips these reserved bytes after the
+        // header availability check.
+        ensure_available(data, 3, 5, "data layout v1/v2 reserved bytes")?;
 
         let layout_class = decode_layout_class(data[2], false)?;
         let mut pos = 8;
@@ -126,7 +134,11 @@ impl DataLayoutMessage {
 
         let mut dims = Vec::with_capacity(ndims);
         for _ in 0..ndims {
-            dims.push(read_u32_le(data, &mut pos, "data layout v1/v2 dimensions")? as u64);
+            dims.push(u64::from(read_u32_le(
+                data,
+                &mut pos,
+                "data layout v1/v2 dimensions",
+            )?));
         }
 
         let mut result = Self::empty(version, layout_class);
@@ -134,8 +146,7 @@ impl DataLayoutMessage {
 
         match layout_class {
             LayoutClass::Compact => {
-                let compact_size =
-                    read_u32_le(data, &mut pos, "data layout v1/v2 compact size")? as usize;
+                let compact_size = read_u32_len(data, &mut pos, "data layout v1/v2 compact size")?;
                 ensure_available(data, pos, compact_size, "data layout v1/v2 compact data")?;
                 let compact_end = checked_end(pos, compact_size, "data layout v1/v2 compact data")?;
                 result.compact_data = Some(data[pos..compact_end].to_vec());
@@ -158,7 +169,11 @@ impl DataLayoutMessage {
                     }
                     let chunk_dims = &dims[..dims.len() - 1];
                     validate_chunk_dims_positive(chunk_dims, "data layout v1/v2")?;
-                    result.chunk_element_size = Some(last as u32);
+                    result.chunk_element_size = Some(u32::try_from(last).map_err(|_| {
+                        Error::InvalidFormat(
+                            "data layout v1/v2 chunk element size exceeds u32".into(),
+                        )
+                    })?);
                     result.chunk_dims = Some(chunk_dims.to_vec());
                 }
             }
@@ -222,7 +237,7 @@ impl DataLayoutMessage {
         } else {
             "data layout v4 compact size"
         };
-        let size = read_u16_le(data, pos, context)? as usize;
+        let size = usize::from(read_u16_le(data, pos, context)?);
         let context = if version == 3 {
             "data layout v3 compact data"
         } else {
@@ -291,6 +306,11 @@ impl DataLayoutMessage {
         sizeof_addr: usize,
         result: &mut Self,
     ) -> Result<()> {
+        if version < 4 {
+            return Err(Error::InvalidFormat(
+                "data layout virtual layout requires version 4".into(),
+            ));
+        }
         let addr = read_le_u64(
             data,
             pos,
@@ -321,7 +341,7 @@ impl DataLayoutMessage {
         sizeof_addr: usize,
         result: &mut Self,
     ) -> Result<()> {
-        let ndims = read_u8(data, pos, "data layout v3 chunk rank")? as usize;
+        let ndims = usize::from(read_u8(data, pos, "data layout v3 chunk rank")?);
         if ndims < 2 {
             return Err(Error::InvalidFormat(
                 "data layout v3 chunk rank must be at least 2".into(),
@@ -336,7 +356,11 @@ impl DataLayoutMessage {
 
         let mut dims = Vec::with_capacity(ndims);
         for _ in 0..ndims {
-            dims.push(read_u32_le(data, pos, "data layout v3 chunk dimensions")? as u64);
+            dims.push(u64::from(read_u32_le(
+                data,
+                pos,
+                "data layout v3 chunk dimensions",
+            )?));
         }
         if let Some(&last) = dims.last() {
             if last == 0 {
@@ -346,7 +370,9 @@ impl DataLayoutMessage {
             }
             let chunk_dims = &dims[..dims.len() - 1];
             validate_chunk_dims_positive(chunk_dims, "data layout v3")?;
-            result.chunk_element_size = Some(last as u32);
+            result.chunk_element_size = Some(u32::try_from(last).map_err(|_| {
+                Error::InvalidFormat("data layout v3 chunk element size exceeds u32".into())
+            })?);
             result.chunk_dims = Some(chunk_dims.to_vec());
         }
         result.chunk_index_addr = Some(addr);
@@ -410,7 +436,7 @@ impl DataLayoutMessage {
                 "data layout v4 chunk flags {flags:#x} are invalid"
             )));
         }
-        let ndims = read_u8(data, pos, "data layout v4 chunk rank")? as usize;
+        let ndims = usize::from(read_u8(data, pos, "data layout v4 chunk rank")?);
         if ndims == 0 {
             return Err(Error::InvalidFormat(
                 "data layout v4 chunk rank must be positive".into(),
@@ -422,7 +448,7 @@ impl DataLayoutMessage {
             )));
         }
         let enc_bytes_per_dim =
-            read_u8(data, pos, "data layout v4 encoded dimension size")? as usize;
+            usize::from(read_u8(data, pos, "data layout v4 encoded dimension size")?);
         if enc_bytes_per_dim == 0 || enc_bytes_per_dim > 8 {
             return Err(Error::InvalidFormat(format!(
                 "data layout v4 encoded dimension size {enc_bytes_per_dim} is invalid"
@@ -549,7 +575,12 @@ impl DataLayoutMessage {
         sizeof_addr: usize,
         result: &mut Self,
     ) -> Result<()> {
-        let _node_size = read_u32_le(data, pos, "data layout v4 btree2 node size")?;
+        let node_size = read_u32_le(data, pos, "data layout v4 btree2 node size")?;
+        if node_size == 0 {
+            return Err(Error::InvalidFormat(
+                "data layout v4 btree2 node size must be positive".into(),
+            ));
+        }
         let split_percent = read_u8(data, pos, "data layout v4 btree2 split percent")?;
         let merge_percent = read_u8(data, pos, "data layout v4 btree2 merge percent")?;
         if split_percent == 0 || split_percent > 100 {
@@ -649,6 +680,11 @@ fn read_u32_le(data: &[u8], pos: &mut usize, context: &str) -> Result<u32> {
     Ok(value)
 }
 
+fn read_u32_len(data: &[u8], pos: &mut usize, context: &'static str) -> Result<usize> {
+    usize::try_from(read_u32_le(data, pos, context)?)
+        .map_err(|_| Error::InvalidFormat(format!("{context} does not fit in usize")))
+}
+
 fn read_le_u64(data: &[u8], pos: &mut usize, size: usize, context: &str) -> Result<u64> {
     if !(1..=8).contains(&size) {
         return Err(Error::InvalidFormat(format!(
@@ -659,10 +695,32 @@ fn read_le_u64(data: &[u8], pos: &mut usize, size: usize, context: &str) -> Resu
     let end = checked_end(*pos, size, context)?;
     let mut val = 0u64;
     for (i, byte) in data[*pos..end].iter().enumerate() {
-        val |= (*byte as u64) << (i * 8);
+        val |= u64::from(*byte) << (i * 8);
     }
     advance_pos(pos, size, context)?;
     Ok(val)
+}
+
+#[cfg(feature = "tracehash")]
+fn layout_class_trace_value(layout_class: LayoutClass) -> u64 {
+    match layout_class {
+        LayoutClass::Compact => 0,
+        LayoutClass::Contiguous => 1,
+        LayoutClass::Chunked => 2,
+        LayoutClass::Virtual => 3,
+    }
+}
+
+#[cfg(feature = "tracehash")]
+fn chunk_index_trace_value(chunk_index_type: ChunkIndexType) -> u64 {
+    match chunk_index_type {
+        ChunkIndexType::BTreeV1 => 0,
+        ChunkIndexType::SingleChunk => 1,
+        ChunkIndexType::Implicit => 2,
+        ChunkIndexType::FixedArray => 3,
+        ChunkIndexType::ExtensibleArray => 4,
+        ChunkIndexType::BTreeV2 => 5,
+    }
 }
 
 fn checked_end(pos: usize, len: usize, context: &str) -> Result<usize> {

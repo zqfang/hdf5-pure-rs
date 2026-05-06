@@ -7,6 +7,7 @@
 use std::io::{Read, Seek};
 
 use crate::error::{Error, Result};
+use crate::format::checksum::checksum_metadata;
 use crate::io::reader::{is_undef_addr, HdfReader};
 
 use super::dblock::append_data_block_elements;
@@ -60,7 +61,7 @@ pub(super) fn cache_sblock_image_len(
         .checked_add(1)
         .and_then(|value| value.checked_add(1))
         .and_then(|value| value.checked_add(addr_size))
-        .and_then(|value| value.checked_add(header.array_offset_size as usize))
+        .and_then(|value| value.checked_add(usize::from(header.array_offset_size)))
         .and_then(|value| value.checked_add(page_init_len))
         .and_then(|value| value.checked_add(addr_len))
         .and_then(|value| value.checked_add(4))
@@ -157,7 +158,7 @@ pub(super) fn decode_super_block<R: Read + Seek>(
         data_block_addrs.push(reader.read_addr()?);
     }
 
-    let _checksum = reader.read_u32()?;
+    verify_reader_checksum(reader, super_block_addr, "extensible array super block")?;
     Ok(ExtArraySuperBlock {
         page_init,
         page_init_size,
@@ -181,6 +182,33 @@ fn verify_trailing_checksum(data: &[u8], context: &str) -> Result<()> {
             "{context} checksum mismatch: stored={stored:#010x}, computed={computed:#010x}"
         )));
     }
+    Ok(())
+}
+
+fn verify_reader_checksum<R: Read + Seek>(
+    reader: &mut HdfReader<R>,
+    start: u64,
+    context: &str,
+) -> Result<()> {
+    let checksum_pos = reader.position()?;
+    let stored = reader.read_u32()?;
+    let check_len = usize::try_from(
+        checksum_pos
+            .checked_sub(start)
+            .ok_or_else(|| Error::InvalidFormat(format!("{context} checksum span underflow")))?,
+    )
+    .map_err(|_| Error::InvalidFormat(format!("{context} checksum span is too large")))?;
+    reader.seek(start)?;
+    let bytes = reader.read_bytes(check_len)?;
+    let computed = checksum_metadata(&bytes);
+    if stored != computed {
+        return Err(Error::InvalidFormat(format!(
+            "{context} checksum mismatch: stored={stored:#010x}, computed={computed:#010x}"
+        )));
+    }
+    reader.seek(checksum_pos.checked_add(4).ok_or_else(|| {
+        Error::InvalidFormat(format!("{context} checksum end offset overflow"))
+    })?)?;
     Ok(())
 }
 
@@ -210,11 +238,13 @@ pub(super) fn read_super_block<R: Read + Seek>(
     let sblock = decode_super_block(reader, header_addr, header, super_block_addr, info)?;
 
     for (data_block_index, &data_block_addr) in sblock.data_block_addrs.iter().enumerate() {
-        if elements.len() as u64 >= header.max_index_set {
+        let elements_len =
+            super::u64_from_usize(elements.len(), "extensible array decoded element count")?;
+        if elements_len >= header.max_index_set {
             break;
         }
         let remaining = super::usize_from_u64(
-            header.max_index_set - elements.len() as u64,
+            header.max_index_set - elements_len,
             "extensible array remaining element count",
         )?;
         let count = info.data_block_elements.min(remaining);
@@ -250,4 +280,55 @@ pub(super) fn read_super_block<R: Read + Seek>(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+
+    use crate::io::HdfReader;
+
+    use super::*;
+
+    fn header() -> ExtensibleArrayHeader {
+        ExtensibleArrayHeader {
+            class_id: 1,
+            raw_element_size: 8,
+            index_block_elements: 0,
+            max_index_set: 0,
+            index_block_addr: 0,
+            array_offset_size: 1,
+            data_block_page_elements: 4,
+            index_block_super_blocks: 0,
+            index_block_data_block_addrs: 0,
+            index_block_super_block_addrs: 0,
+            super_block_info: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn extensible_array_super_block_rejects_bad_checksum() {
+        let mut bytes = b"EASB".to_vec();
+        bytes.push(0);
+        bytes.push(1);
+        bytes.extend_from_slice(&100u64.to_le_bytes());
+        bytes.push(0); // block offset, array_offset_size = 1
+        bytes.extend_from_slice(&55u64.to_le_bytes());
+        let checksum = checksum_metadata(&bytes);
+        bytes.extend_from_slice(&checksum.to_le_bytes());
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xff;
+
+        let info = SuperBlockInfo {
+            data_blocks: 1,
+            data_block_elements: 1,
+            start_data_block: 0,
+        };
+        let mut reader = HdfReader::new(Cursor::new(bytes));
+        let err = match decode_super_block(&mut reader, 100, &header(), 0, &info) {
+            Ok(_) => panic!("bad extensible array super block checksum should fail"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("checksum"));
+    }
 }

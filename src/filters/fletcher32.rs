@@ -54,7 +54,7 @@ fn fletcher32(data: &[u8]) -> u32 {
         // Process in batches of 360 words to avoid overflow.
         for word in batch.chunks_exact(2) {
             // Big-endian 16-bit word (matching HDF5 C library)
-            let val = ((word[0] as u32) << 8) | (word[1] as u32);
+            let val = (u32::from(word[0]) << 8) | u32::from(word[1]);
             sum1 += val;
             sum2 += sum1;
         }
@@ -66,7 +66,7 @@ fn fletcher32(data: &[u8]) -> u32 {
 
     // Handle odd byte
     if data.len() % 2 != 0 {
-        sum1 += (data[even_len] as u32) << 8;
+        sum1 += u32::from(data[even_len]) << 8;
         sum2 += sum1;
         sum1 = (sum1 & 0xffff) + (sum1 >> 16);
         sum2 = (sum2 & 0xffff) + (sum2 >> 16);

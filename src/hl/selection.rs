@@ -678,7 +678,7 @@ impl Selection {
         match self {
             Selection::None => vec![0],
             Selection::All => ds_shape.to_vec(),
-            Selection::Points(points) => vec![points.len() as u64],
+            Selection::Points(points) => vec![u64::try_from(points.len()).unwrap_or(u64::MAX)],
             Selection::Hyperslab(dims) => dims.iter().map(HyperslabDim::output_count).collect(),
             Selection::Slice(slices) => slices.iter().map(|s| s.count()).collect(),
         }
@@ -855,9 +855,11 @@ impl Selection {
             ));
         };
         let rank = points.first().map_or(0, Vec::len);
+        let rank_u64 = usize_to_u64(rank, "point selection rank")?;
+        let point_count_u64 = usize_to_u64(points.len(), "point selection point count")?;
         let mut out = Vec::with_capacity(self.point_serial_size()?);
-        push_u64(&mut out, rank as u64);
-        push_u64(&mut out, points.len() as u64);
+        push_u64(&mut out, rank_u64);
+        push_u64(&mut out, point_count_u64);
         for point in points {
             if point.len() != rank {
                 return Err(Error::InvalidFormat(
@@ -874,8 +876,23 @@ impl Selection {
     /// Deserialize an explicit point selection.
     pub fn point_deserialize(bytes: &[u8]) -> Result<Selection> {
         let mut offset = 0;
-        let rank = read_u64(bytes, &mut offset)? as usize;
-        let count = read_u64(bytes, &mut offset)? as usize;
+        let rank = read_usize_u64(bytes, &mut offset, "point selection rank")?;
+        let count = read_usize_u64(bytes, &mut offset, "point selection point count")?;
+        let expected_words = 2usize
+            .checked_add(rank.checked_mul(count).ok_or_else(|| {
+                Error::InvalidFormat("point selection serialization size overflow".into())
+            })?)
+            .ok_or_else(|| {
+                Error::InvalidFormat("point selection serialization size overflow".into())
+            })?;
+        let expected_len = expected_words.checked_mul(8).ok_or_else(|| {
+            Error::InvalidFormat("point selection serialization size overflow".into())
+        })?;
+        if bytes.len() != expected_len {
+            return Err(Error::InvalidFormat(
+                "point selection serialization has invalid length".into(),
+            ));
+        }
         let mut points = Vec::with_capacity(count);
         for _ in 0..count {
             let mut point = Vec::with_capacity(rank);
@@ -951,7 +968,7 @@ impl Selection {
                 }
                 let first = indexes[0];
                 let last = indexes[indexes.len() - 1];
-                Ok(last - first + 1 == indexes.len() as u64)
+                Ok(last - first + 1 == usize_to_u64(indexes.len(), "selection index count")?)
             }
         }
     }
@@ -1788,7 +1805,7 @@ impl Selection {
     pub fn hyper_serialize(&self) -> Result<Vec<u8>> {
         let dims = self.hyper_copy_span_helper()?;
         let mut out = Vec::with_capacity(self.hyper_get_enc_size_real()?);
-        push_u64(&mut out, dims.len() as u64);
+        push_u64(&mut out, usize_to_u64(dims.len(), "hyperslab rank")?);
         for dim in dims {
             push_u64(&mut out, dim.start);
             push_u64(&mut out, dim.stride);
@@ -1801,7 +1818,20 @@ impl Selection {
     /// Deserialize hyperslab span dimensions.
     pub fn hyper_deserialize(bytes: &[u8]) -> Result<Selection> {
         let mut offset = 0;
-        let rank = read_u64(bytes, &mut offset)? as usize;
+        let rank = read_usize_u64(bytes, &mut offset, "hyperslab rank")?;
+        let expected_words = 1usize
+            .checked_add(rank.checked_mul(4).ok_or_else(|| {
+                Error::InvalidFormat("hyperslab serialization size overflow".into())
+            })?)
+            .ok_or_else(|| Error::InvalidFormat("hyperslab serialization size overflow".into()))?;
+        let expected_len = expected_words
+            .checked_mul(8)
+            .ok_or_else(|| Error::InvalidFormat("hyperslab serialization size overflow".into()))?;
+        if bytes.len() != expected_len {
+            return Err(Error::InvalidFormat(
+                "hyperslab serialization has invalid length".into(),
+            ));
+        }
         let mut dims = Vec::with_capacity(rank);
         for _ in 0..rank {
             dims.push(HyperslabDim::new(
@@ -2004,6 +2034,1342 @@ impl Selection {
     }
 }
 
+#[allow(non_snake_case)]
+pub fn H5Sselect_copy(selection: &Selection) -> Selection {
+    selection.select_copy()
+}
+
+#[allow(non_snake_case)]
+pub fn H5S_copy_pnt_list(points: &[Vec<u64>]) -> Vec<Vec<u64>> {
+    Selection::copy_pnt_list(points)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__copy_pnt_list(points: &[Vec<u64>]) -> Vec<Vec<u64>> {
+    Selection::copy_pnt_list(points)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__free_pnt_list(points: Vec<Vec<u64>>) {
+    Selection::free_pnt_list(points)
+}
+
+#[allow(non_snake_case)]
+pub fn H5Sget_select_npoints(selection: &Selection, ds_shape: &[u64]) -> Option<u64> {
+    selection.selected_count(ds_shape)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S_get_select_npoints(selection: &Selection, ds_shape: &[u64]) -> Option<u64> {
+    H5Sget_select_npoints(selection, ds_shape)
+}
+
+#[allow(non_snake_case)]
+pub fn H5Sselect_valid(selection: &Selection, ds_shape: &[u64]) -> bool {
+    selection.select_valid(ds_shape)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S_select_deserialize(bytes: &[u8]) -> Result<Selection> {
+    Selection::select_deserialize(bytes)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__decode(bytes: &[u8]) -> Result<Selection> {
+    Selection::select_deserialize(bytes)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S_select_release(_selection: Selection) {}
+
+#[allow(non_snake_case)]
+pub fn H5S_select_serial_size(selection: &Selection) -> Result<usize> {
+    Ok(selection.encode1()?.len())
+}
+
+#[allow(non_snake_case)]
+pub fn H5S_select_serialize(selection: &Selection) -> Result<Vec<u8>> {
+    selection.encode1()
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__encode(selection: &Selection) -> Result<Vec<u8>> {
+    selection.encode1()
+}
+
+#[allow(non_snake_case)]
+pub fn H5Sencode1(selection: &Selection) -> Result<Vec<u8>> {
+    selection.encode1()
+}
+
+#[allow(non_snake_case)]
+pub fn H5Sget_select_bounds(
+    selection: &Selection,
+    ds_shape: &[u64],
+) -> Option<(Vec<u64>, Vec<u64>)> {
+    selection.bounds(ds_shape)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S_get_select_bounds(
+    selection: &Selection,
+    ds_shape: &[u64],
+) -> Option<(Vec<u64>, Vec<u64>)> {
+    H5Sget_select_bounds(selection, ds_shape)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S_get_select_unlim_dim(selection: &Selection, max_dims: &[u64]) -> Option<usize> {
+    selection.select_unlim_dim(max_dims)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S_get_select_num_elem_non_unlim(
+    selection: &Selection,
+    ds_shape: &[u64],
+    max_dims: &[u64],
+) -> Result<u64> {
+    selection.select_num_elem_non_unlim(ds_shape, max_dims)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S_select_is_contiguous(selection: &Selection, ds_shape: &[u64]) -> Result<bool> {
+    selection.select_is_contiguous(ds_shape)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S_select_is_single(selection: &Selection, ds_shape: &[u64]) -> bool {
+    selection.select_is_single(ds_shape)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S_select_is_regular(selection: &Selection) -> bool {
+    selection.is_regular()
+}
+
+#[allow(non_snake_case)]
+pub fn H5S_select_none() -> Selection {
+    Selection::select_none()
+}
+
+#[allow(non_snake_case)]
+pub fn H5Sselect_none() -> Selection {
+    Selection::select_none_api()
+}
+
+#[allow(non_snake_case)]
+pub fn H5S_select_all() -> Selection {
+    Selection::select_all()
+}
+
+#[allow(non_snake_case)]
+pub fn H5Sselect_all() -> Selection {
+    Selection::select_all_api()
+}
+
+#[allow(non_snake_case)]
+pub fn H5S_select_elements(points: Vec<Vec<u64>>) -> Selection {
+    Selection::select_elements(points)
+}
+
+#[allow(non_snake_case)]
+pub fn H5Sselect_elements(points: Vec<Vec<u64>>) -> Selection {
+    Selection::select_elements_api(points)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S_select_hyperslab(dims: Vec<HyperslabDim>) -> Selection {
+    Selection::select_hyperslab(dims)
+}
+
+#[allow(non_snake_case)]
+pub fn H5Sselect_hyperslab(dims: Vec<HyperslabDim>) -> Selection {
+    Selection::select_hyperslab_api(dims)
+}
+
+#[allow(non_snake_case)]
+pub fn H5Sget_select_hyper_nblocks(selection: &Selection, ds_shape: &[u64]) -> Option<u64> {
+    selection.hyperslab_block_count(ds_shape)
+}
+
+#[allow(non_snake_case)]
+pub fn H5Sget_select_hyper_blocklist(
+    selection: &Selection,
+    ds_shape: &[u64],
+) -> Result<Option<Vec<(Vec<u64>, Vec<u64>)>>> {
+    selection.hyperslab_blocklist(ds_shape)
+}
+
+#[allow(non_snake_case)]
+pub fn H5Sget_select_elem_npoints(selection: &Selection) -> Option<u64> {
+    selection.element_point_count()
+}
+
+#[allow(non_snake_case)]
+pub fn H5Sget_select_elem_pointlist(selection: &Selection) -> Option<&[Vec<u64>]> {
+    selection.element_pointlist()
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__get_select_elem_pointlist(selection: &Selection) -> Option<&[Vec<u64>]> {
+    selection.get_select_elem_pointlist_internal()
+}
+
+#[allow(non_snake_case)]
+pub fn H5S_select_intersect_block(
+    selection: &Selection,
+    ds_shape: &[u64],
+    start: &[u64],
+    end: &[u64],
+) -> Result<bool> {
+    Ok(selection
+        .materialize_points(ds_shape)?
+        .iter()
+        .any(|point| point_is_inside_block(point, start, end)))
+}
+
+#[allow(non_snake_case)]
+pub fn H5Sselect_intersect_block(
+    selection: &Selection,
+    ds_shape: &[u64],
+    start: &[u64],
+    end: &[u64],
+) -> Result<bool> {
+    H5S_select_intersect_block(selection, ds_shape, start, end)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S_select_adjust_u(selection: &Selection, offsets: &[u64]) -> Result<Selection> {
+    selection.select_adjust_unsigned(offsets)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S_select_adjust_s(selection: &Selection, offsets: &[i64]) -> Result<Selection> {
+    selection.select_adjust_signed(offsets)
+}
+
+#[allow(non_snake_case)]
+pub fn H5Sselect_adjust(selection: &Selection, offsets: &[i64]) -> Result<Selection> {
+    H5S_select_adjust_s(selection, offsets)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S_select_project_simple(
+    selection: &Selection,
+    ds_shape: &[u64],
+    kept_dims: &[usize],
+) -> Result<Selection> {
+    selection.project(ds_shape, kept_dims)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S_select_project_scalar(selection: &Selection, ds_shape: &[u64]) -> Result<Selection> {
+    selection.project(ds_shape, &[])
+}
+
+#[allow(non_snake_case)]
+pub fn H5S_select_iter_init(selection: &Selection, ds_shape: &[u64]) -> Result<SelectionPointIter> {
+    selection.select_iter_init(ds_shape)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S_select_iter_coords(iter: &SelectionPointIter) -> Option<&[u64]> {
+    iter.point_iter_coords()
+}
+
+#[allow(non_snake_case)]
+pub fn H5S_select_iter_nelmts(iter: &SelectionPointIter) -> usize {
+    iter.select_iter_nelmts()
+}
+
+#[allow(non_snake_case)]
+pub fn H5S_select_iter_next(iter: &mut SelectionPointIter) -> Option<Vec<u64>> {
+    iter.select_iter_next()
+}
+
+#[allow(non_snake_case)]
+pub fn H5S_select_iter_get_seq_list(
+    iter: &mut SelectionPointIter,
+    max_points: usize,
+) -> Vec<Vec<u64>> {
+    iter.select_iter_get_seq_list(max_points)
+}
+
+#[allow(non_snake_case)]
+pub fn H5Ssel_iter_reset(iter: &mut SelectionPointIter) {
+    iter.select_iter_reset()
+}
+
+#[allow(non_snake_case)]
+pub fn H5S_select_iter_release(iter: SelectionPointIter) {
+    iter.select_iter_release()
+}
+
+#[allow(non_snake_case)]
+pub fn H5S_select_iterate<F>(selection: &Selection, ds_shape: &[u64], callback: F) -> Result<()>
+where
+    F: FnMut(&[u64]) -> Result<()>,
+{
+    selection.select_iterate(ds_shape, callback)
+}
+
+#[allow(non_snake_case)]
+pub fn H5Sget_select_type(selection: &Selection) -> SelectionType {
+    selection.selection_type()
+}
+
+#[allow(non_snake_case)]
+pub fn H5S_get_select_type(selection: &Selection) -> SelectionType {
+    H5Sget_select_type(selection)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S_select_shape_same(left: &Selection, right: &Selection, ds_shape: &[u64]) -> bool {
+    left.select_shape_same(right, ds_shape)
+}
+
+#[allow(non_snake_case)]
+pub fn H5Sselect_shape_same(left: &Selection, right: &Selection, ds_shape: &[u64]) -> bool {
+    H5S_select_shape_same(left, right, ds_shape)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S_select_construct_projection(
+    selection: &Selection,
+    ds_shape: &[u64],
+    kept_dims: &[usize],
+) -> Result<Selection> {
+    selection.select_construct_projection(ds_shape, kept_dims)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S_select_project_intersection(
+    left: &Selection,
+    right: &Selection,
+    ds_shape: &[u64],
+    kept_dims: &[usize],
+) -> Result<Selection> {
+    left.select_project_intersection(right, ds_shape, kept_dims)
+}
+
+#[allow(non_snake_case)]
+pub fn H5Sselect_project_intersection(
+    left: &Selection,
+    right: &Selection,
+    ds_shape: &[u64],
+    kept_dims: &[usize],
+) -> Result<Selection> {
+    H5S_select_project_intersection(left, right, ds_shape, kept_dims)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S_select_fill<T: Clone>(
+    selection: &Selection,
+    ds_shape: &[u64],
+    buffer: &mut [T],
+    value: T,
+) -> Result<()> {
+    selection.select_fill(ds_shape, buffer, value)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S_combine_hyperslab(
+    left: &Selection,
+    right: &Selection,
+    ds_shape: &[u64],
+) -> Result<Selection> {
+    left.combine_hyperslab(right, ds_shape)
+}
+
+#[allow(non_snake_case)]
+pub fn H5Scombine_hyperslab(
+    left: &Selection,
+    right: &Selection,
+    ds_shape: &[u64],
+) -> Result<Selection> {
+    H5S_combine_hyperslab(left, right, ds_shape)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__modify_select(
+    left: &Selection,
+    right: &Selection,
+    ds_shape: &[u64],
+) -> Result<Selection> {
+    left.modify_select_internal(right, ds_shape)
+}
+
+#[allow(non_snake_case)]
+pub fn H5Smodify_select(
+    left: &Selection,
+    right: &Selection,
+    ds_shape: &[u64],
+) -> Result<Selection> {
+    left.modify_select(right, ds_shape)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__mpio_all_type(selection: &Selection) -> bool {
+    selection.mpio_all_type()
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__mpio_none_type(selection: &Selection) -> bool {
+    selection.mpio_none_type()
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__mpio_point_type(selection: &Selection) -> bool {
+    selection.mpio_point_type()
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__mpio_permute_type(selection: &Selection) -> bool {
+    selection.mpio_permute_type()
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__mpio_reg_hyper_type(selection: &Selection) -> bool {
+    selection.mpio_reg_hyper_type()
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__mpio_span_hyper_type(selection: &Selection) -> bool {
+    selection.mpio_span_hyper_type()
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__none_iter_block() -> Option<Vec<u64>> {
+    Selection::none_iter_block()
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__none_iter_nelmts() -> usize {
+    Selection::none_iter_nelmts()
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__none_iter_get_seq_list() -> Vec<Vec<u64>> {
+    Selection::none_iter_get_seq_list()
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__none_iter_release() {
+    Selection::none_iter_release()
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__none_release() {
+    Selection::none_release()
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__none_copy() -> Selection {
+    Selection::none_copy()
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__none_is_valid() -> bool {
+    Selection::none_is_valid()
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__none_serialize() -> Vec<u8> {
+    Selection::none_serialize()
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__none_deserialize(bytes: &[u8]) -> Result<Selection> {
+    Selection::none_deserialize(bytes)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__none_bounds() -> Option<(Vec<u64>, Vec<u64>)> {
+    Selection::none_bounds()
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__none_offset(offsets: &[i64]) -> Selection {
+    Selection::none_offset(offsets)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__none_is_contiguous() -> bool {
+    Selection::none_is_contiguous()
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__none_is_single() -> bool {
+    Selection::none_is_single()
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__none_is_regular() -> bool {
+    Selection::none_is_regular()
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__none_intersect_block(start: &[u64], end: &[u64]) -> bool {
+    Selection::none_intersect_block(start, end)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__none_adjust_u(offsets: &[u64]) -> Selection {
+    Selection::none_adjust_u(offsets)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__none_adjust_s(offsets: &[i64]) -> Selection {
+    Selection::none_adjust_s(offsets)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__none_project_simple() -> Selection {
+    Selection::none_project_simple()
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__all_iter_init(ds_shape: &[u64]) -> Result<SelectionPointIter> {
+    Selection::all_iter_init(ds_shape)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__all_iter_coords(ds_shape: &[u64]) -> Result<Option<Vec<u64>>> {
+    Selection::all_iter_coords(ds_shape)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__all_iter_block(ds_shape: &[u64]) -> Option<(Vec<u64>, Vec<u64>)> {
+    Selection::all_iter_block(ds_shape)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__all_iter_nelmts(ds_shape: &[u64]) -> Result<u64> {
+    Selection::all_iter_nelmts(ds_shape)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__all_iter_has_next_block(ds_shape: &[u64]) -> bool {
+    Selection::all_iter_has_next_block(ds_shape)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__all_iter_next(iter: &mut SelectionPointIter) -> Option<Vec<u64>> {
+    Selection::all_iter_next(iter)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__all_iter_next_block(ds_shape: &[u64]) -> Option<(Vec<u64>, Vec<u64>)> {
+    Selection::all_iter_next_block(ds_shape)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__all_iter_get_seq_list(ds_shape: &[u64], max_points: usize) -> Result<Vec<Vec<u64>>> {
+    Selection::all_iter_get_seq_list(ds_shape, max_points)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__all_iter_release(iter: SelectionPointIter) {
+    Selection::all_iter_release(iter)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__all_release() {
+    Selection::all_release()
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__all_copy() -> Selection {
+    Selection::all_copy()
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__all_is_valid(ds_shape: &[u64]) -> bool {
+    Selection::all_is_valid(ds_shape)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__all_serial_size() -> usize {
+    Selection::all_serial_size()
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__all_serialize() -> Vec<u8> {
+    Selection::all_serialize()
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__all_deserialize(bytes: &[u8]) -> Result<Selection> {
+    Selection::all_deserialize(bytes)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__all_bounds(ds_shape: &[u64]) -> Option<(Vec<u64>, Vec<u64>)> {
+    Selection::all_bounds(ds_shape)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__all_offset(offsets: &[i64]) -> Result<Selection> {
+    Selection::all_offset(offsets)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__all_unlim_dim(max_dims: &[u64]) -> Option<usize> {
+    Selection::all_unlim_dim(max_dims)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__all_is_contiguous() -> bool {
+    Selection::all_is_contiguous()
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__all_is_single(ds_shape: &[u64]) -> bool {
+    Selection::all_is_single(ds_shape)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__all_is_regular() -> bool {
+    Selection::all_is_regular()
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__all_intersect_block(ds_shape: &[u64], start: &[u64], end: &[u64]) -> bool {
+    Selection::all_intersect_block(ds_shape, start, end)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__all_adjust_u(offsets: &[u64]) -> Result<Selection> {
+    Selection::all_adjust_u(offsets)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__all_adjust_s(offsets: &[i64]) -> Result<Selection> {
+    Selection::all_adjust_s(offsets)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__all_project_simple(ds_shape: &[u64], kept_dims: &[usize]) -> Result<Selection> {
+    Selection::all_project_simple(ds_shape, kept_dims)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__point_iter_init(selection: &Selection, ds_shape: &[u64]) -> Result<SelectionPointIter> {
+    selection.point_iter_init(ds_shape)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__point_iter_coords(iter: &SelectionPointIter) -> Option<&[u64]> {
+    iter.point_iter_coords()
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__point_iter_nelmts(iter: &SelectionPointIter) -> usize {
+    iter.point_iter_nelmts()
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__point_iter_next(iter: &mut SelectionPointIter) -> Option<Vec<u64>> {
+    iter.point_iter_next()
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__point_iter_next_block(iter: &mut SelectionPointIter) -> Option<Vec<u64>> {
+    iter.point_iter_next_block()
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__point_iter_get_seq_list(
+    iter: &mut SelectionPointIter,
+    max_points: usize,
+) -> Vec<Vec<u64>> {
+    iter.point_iter_get_seq_list(max_points)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__point_iter_release(iter: SelectionPointIter) {
+    iter.point_iter_release()
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__point_copy(selection: &Selection) -> Result<Selection> {
+    selection.point_copy()
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__point_add(selection: &mut Selection, point: Vec<u64>) -> Result<()> {
+    selection.point_add(point)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__point_get_version_enc_size(selection: &Selection) -> Result<(u8, usize)> {
+    selection.point_get_version_enc_size()
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__point_serial_size(selection: &Selection) -> Result<usize> {
+    selection.point_serial_size()
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__point_serialize(selection: &Selection) -> Result<Vec<u8>> {
+    selection.point_serialize()
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__point_deserialize(bytes: &[u8]) -> Result<Selection> {
+    Selection::point_deserialize(bytes)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__point_offset(selection: &Selection, offsets: &[i64]) -> Result<Selection> {
+    selection.point_offset(offsets)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__point_unlim_dim(selection: &Selection, max_dims: &[u64]) -> Option<usize> {
+    selection.point_unlim_dim(max_dims)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__point_is_contiguous(selection: &Selection, ds_shape: &[u64]) -> Result<bool> {
+    selection.point_is_contiguous(ds_shape)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__point_is_single(selection: &Selection, ds_shape: &[u64]) -> bool {
+    selection.point_is_single(ds_shape)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__point_is_regular(selection: &Selection) -> bool {
+    selection.point_is_regular()
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__point_shape_same(left: &Selection, right: &Selection, ds_shape: &[u64]) -> bool {
+    left.point_shape_same(right, ds_shape)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__point_intersect_block(selection: &Selection, start: &[u64], end: &[u64]) -> bool {
+    selection.point_intersect_block(start, end)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__point_adjust_u(selection: &Selection, offsets: &[u64]) -> Result<Selection> {
+    selection.point_adjust_u(offsets)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__point_adjust_s(selection: &Selection, offsets: &[i64]) -> Result<Selection> {
+    selection.point_adjust_s(offsets)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__point_project_scalar(selection: &Selection, ds_shape: &[u64]) -> Result<Selection> {
+    selection.point_project_scalar(ds_shape)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__point_project_simple(
+    selection: &Selection,
+    ds_shape: &[u64],
+    kept_dims: &[usize],
+) -> Result<Selection> {
+    selection.point_project_simple(ds_shape, kept_dims)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__hyper_iter_init(selection: &Selection, ds_shape: &[u64]) -> Result<SelectionPointIter> {
+    selection.hyper_iter_init(ds_shape)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__hyper_iter_block(selection: &Selection, ds_shape: &[u64]) -> Result<Option<Vec<u64>>> {
+    selection.hyper_iter_block(ds_shape)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__hyper_iter_has_next_block(selection: &Selection, ds_shape: &[u64]) -> Result<bool> {
+    selection.hyper_iter_has_next_block(ds_shape)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__hyper_iter_next(iter: &mut SelectionPointIter) -> Option<Vec<u64>> {
+    iter.hyper_iter_next()
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__hyper_iter_next_block(iter: &mut SelectionPointIter) -> Option<Vec<u64>> {
+    iter.hyper_iter_next_block()
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__hyper_iter_get_seq_list(
+    iter: &mut SelectionPointIter,
+    max_points: usize,
+) -> Vec<Vec<u64>> {
+    iter.hyper_iter_get_seq_list(max_points)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__hyper_iter_get_seq_list_gen(
+    iter: &mut SelectionPointIter,
+    max_points: usize,
+) -> Vec<Vec<u64>> {
+    iter.hyper_iter_get_seq_list_gen(max_points)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__hyper_get_seq_list_gen(
+    selection: &Selection,
+    ds_shape: &[u64],
+    max_points: usize,
+) -> Result<Vec<Vec<u64>>> {
+    Ok(selection
+        .hyper_iter_init(ds_shape)?
+        .hyper_iter_get_seq_list_gen(max_points))
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__hyper_iter_nelmts(iter: &SelectionPointIter) -> usize {
+    iter.hyper_iter_nelmts()
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__hyper_iter_get_seq_list_opt(
+    iter: &mut SelectionPointIter,
+    max_points: usize,
+) -> Vec<Vec<u64>> {
+    iter.hyper_iter_get_seq_list_opt(max_points)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__hyper_iter_get_seq_list_single(
+    iter: &mut SelectionPointIter,
+    max_points: usize,
+) -> Vec<Vec<u64>> {
+    iter.hyper_iter_get_seq_list_single(max_points)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__hyper_iter_release(iter: SelectionPointIter) {
+    iter.hyper_iter_release()
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__hyper_copy(selection: &Selection) -> Result<Selection> {
+    selection.hyper_copy()
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__hyper_new_span(start: u64, stride: u64, count: u64, block: u64) -> HyperslabDim {
+    Selection::hyper_new_span(start, stride, count, block)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__hyper_new_span_info(dims: Vec<HyperslabDim>) -> Selection {
+    Selection::hyper_new_span_info(dims)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__hyper_copy_span_helper(selection: &Selection) -> Result<Vec<HyperslabDim>> {
+    selection.hyper_copy_span_helper()
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__hyper_copy_span(selection: &Selection) -> Result<Vec<HyperslabDim>> {
+    selection.hyper_copy_span()
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__hyper_cmp_spans(left: &Selection, right: &Selection) -> bool {
+    left.hyper_cmp_spans(right)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__hyper_print_spans(selection: &Selection) -> Result<String> {
+    selection.hyper_print_spans()
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__hyper_print_spans_helper(selection: &Selection) -> Result<String> {
+    selection.hyper_print_spans_helper()
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__space_print_spans(selection: &Selection) -> Result<String> {
+    selection.space_print_spans()
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__hyper_print_diminfo(selection: &Selection) -> Result<String> {
+    selection.hyper_print_diminfo()
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__hyper_print_diminfo_helper(selection: &Selection) -> Result<String> {
+    selection.hyper_print_diminfo_helper()
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__hyper_print_spans_dfs(selection: &Selection) -> Result<String> {
+    selection.hyper_print_spans_dfs()
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__hyper_print_space_dfs(selection: &Selection) -> Result<String> {
+    selection.hyper_print_space_dfs()
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__hyper_free_span(selection: Selection) {
+    selection.hyper_free_span()
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__hyper_release(selection: Selection) {
+    selection.hyper_release()
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__hyper_get_enc_size_real(selection: &Selection) -> Result<usize> {
+    selection.hyper_get_enc_size_real()
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__hyper_get_version_enc_size(selection: &Selection) -> Result<(u8, usize)> {
+    selection.hyper_get_version_enc_size()
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__hyper_serialize(selection: &Selection) -> Result<Vec<u8>> {
+    selection.hyper_serialize()
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__hyper_serialize_helper(selection: &Selection) -> Result<Vec<u8>> {
+    selection.hyper_serialize_helper()
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__hyper_deserialize(bytes: &[u8]) -> Result<Selection> {
+    Selection::hyper_deserialize(bytes)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__hyper_decode(bytes: &[u8]) -> Result<Selection> {
+    Selection::hyper_deserialize(bytes)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__hyper_is_valid(selection: &Selection, ds_shape: &[u64]) -> bool {
+    selection.hyper_is_valid(ds_shape)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__hyper_span_nblocks(selection: &Selection, ds_shape: &[u64]) -> Option<u64> {
+    selection.hyper_span_nblocks(ds_shape)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__hyper_span_blocklist(
+    selection: &Selection,
+    ds_shape: &[u64],
+) -> Result<Option<Vec<(Vec<u64>, Vec<u64>)>>> {
+    selection.hyper_span_blocklist(ds_shape)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__get_select_hyper_nblocks(selection: &Selection, ds_shape: &[u64]) -> Option<u64> {
+    selection.get_select_hyper_nblocks_internal(ds_shape)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__get_select_hyper_blocklist(
+    selection: &Selection,
+    ds_shape: &[u64],
+) -> Result<Option<Vec<(Vec<u64>, Vec<u64>)>>> {
+    selection.get_select_hyper_blocklist_internal(ds_shape)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__hyper_intersect_block_helper(
+    selection: &Selection,
+    ds_shape: &[u64],
+    start: &[u64],
+    end: &[u64],
+) -> bool {
+    selection.hyper_intersect_block_helper(ds_shape, start, end)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__hyper_bounds(selection: &Selection, ds_shape: &[u64]) -> Option<(Vec<u64>, Vec<u64>)> {
+    selection.hyper_bounds(ds_shape)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__hyper_offset(selection: &Selection, offsets: &[i64]) -> Result<Selection> {
+    selection.hyper_offset(offsets)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__hyper_unlim_dim(selection: &Selection, max_dims: &[u64]) -> Option<usize> {
+    selection.hyper_unlim_dim(max_dims)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__hyper_num_elem_non_unlim(
+    selection: &Selection,
+    ds_shape: &[u64],
+    max_dims: &[u64],
+) -> Result<u64> {
+    selection.hyper_num_elem_non_unlim(ds_shape, max_dims)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__hyper_is_contiguous(selection: &Selection, ds_shape: &[u64]) -> Result<bool> {
+    selection.hyper_is_contiguous(ds_shape)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__hyper_is_single(selection: &Selection, ds_shape: &[u64]) -> bool {
+    selection.hyper_is_single(ds_shape)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__hyper_is_regular(selection: &Selection) -> bool {
+    selection.hyper_is_regular()
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__hyper_spans_nelem(selection: &Selection, ds_shape: &[u64]) -> Option<u64> {
+    selection.hyper_spans_nelem(ds_shape)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__hyper_spans_nelem_helper(selection: &Selection, ds_shape: &[u64]) -> Option<u64> {
+    selection.hyper_spans_nelem_helper(ds_shape)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__hyper_shape_same(left: &Selection, right: &Selection, ds_shape: &[u64]) -> bool {
+    left.hyper_shape_same(right, ds_shape)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__hyper_spans_shape_same_helper(
+    left: &Selection,
+    right: &Selection,
+    ds_shape: &[u64],
+) -> bool {
+    left.hyper_spans_shape_same_helper(right, ds_shape)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__hyper_spans_shape_same(left: &Selection, right: &Selection, ds_shape: &[u64]) -> bool {
+    left.hyper_spans_shape_same(right, ds_shape)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__hyper_regular_and_single_block(selection: &Selection, ds_shape: &[u64]) -> bool {
+    selection.hyper_regular_and_single_block(ds_shape)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__hyper_get_regular_hyperslab(selection: &Selection) -> Result<Vec<HyperslabDim>> {
+    selection.hyper_copy_span_helper()
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__hyper_coord_to_span(selection: &Selection, coord: &[u64], ds_shape: &[u64]) -> bool {
+    selection.hyper_coord_to_span(coord, ds_shape)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S_hyper_add_span_element(selection: &mut Selection, dim: HyperslabDim) -> Result<()> {
+    selection.hyper_add_span_element(dim)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__hyper_append_span(selection: &mut Selection, dim: HyperslabDim) -> Result<()> {
+    selection.hyper_append_span(dim)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__hyper_clip_spans(
+    selection: &Selection,
+    ds_shape: &[u64],
+    start: &[u64],
+    end: &[u64],
+) -> Result<Selection> {
+    selection.hyper_clip_spans(ds_shape, start, end)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__hyper_merge_spans_helper(
+    left: &Selection,
+    right: &Selection,
+    ds_shape: &[u64],
+) -> Result<Selection> {
+    left.hyper_merge_spans_helper(right, ds_shape)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__hyper_merge_spans(
+    left: &Selection,
+    right: &Selection,
+    ds_shape: &[u64],
+) -> Result<Selection> {
+    left.hyper_merge_spans(right, ds_shape)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__hyper_add_disjoint_spans(
+    left: &Selection,
+    right: &Selection,
+    ds_shape: &[u64],
+) -> Result<Selection> {
+    left.hyper_add_disjoint_spans(right, ds_shape)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__hyper_make_spans(dims: Vec<HyperslabDim>) -> Selection {
+    Selection::hyper_make_spans(dims)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__hyper_update_diminfo(selection: &Selection) -> Result<Vec<HyperslabDim>> {
+    selection.hyper_update_diminfo()
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__hyper_rebuild_helper(selection: &Selection) -> Result<Selection> {
+    selection.hyper_rebuild_helper()
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__hyper_rebuild(selection: &Selection) -> Result<Selection> {
+    selection.hyper_rebuild()
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__hyper_generate_spans(selection: &Selection) -> Result<Selection> {
+    selection.hyper_generate_spans()
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__check_spans_overlap(
+    left: &Selection,
+    right: &Selection,
+    ds_shape: &[u64],
+) -> Result<bool> {
+    left.check_spans_overlap(right, ds_shape)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__fill_in_new_space(selection: &Selection, ds_shape: &[u64]) -> Result<Selection> {
+    selection.fill_in_new_space(ds_shape)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__set_regular_hyperslab(dims: Vec<HyperslabDim>) -> Selection {
+    Selection::set_regular_hyperslab(dims)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__fill_in_select(selection: &Selection) -> Selection {
+    selection.fill_in_select()
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__hyper_adjust_u(selection: &Selection, offsets: &[u64]) -> Result<Selection> {
+    selection.hyper_adjust_u(offsets)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__hyper_adjust_u_helper(selection: &Selection, offsets: &[u64]) -> Result<Selection> {
+    selection.hyper_adjust_u_helper(offsets)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__hyper_adjust_s(selection: &Selection, offsets: &[i64]) -> Result<Selection> {
+    selection.hyper_adjust_s(offsets)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__hyper_adjust_s_helper(selection: &Selection, offsets: &[i64]) -> Result<Selection> {
+    selection.hyper_adjust_s_helper(offsets)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S_hyper_normalize_offset(selection: &Selection, offsets: &[i64]) -> Result<Selection> {
+    selection.hyper_normalize_offset(offsets)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S_hyper_denormalize_offset(selection: &Selection, offsets: &[i64]) -> Result<Selection> {
+    selection.hyper_denormalize_offset(offsets)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__hyper_project_scalar(selection: &Selection, ds_shape: &[u64]) -> Result<Selection> {
+    selection.hyper_project_scalar(ds_shape)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__hyper_project_simple(
+    selection: &Selection,
+    ds_shape: &[u64],
+    kept_dims: &[usize],
+) -> Result<Selection> {
+    selection.hyper_project_simple(ds_shape, kept_dims)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__hyper_project_simple_lower(
+    selection: &Selection,
+    ds_shape: &[u64],
+    kept_dims: &[usize],
+) -> Result<Selection> {
+    selection.hyper_project_simple_lower(ds_shape, kept_dims)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__hyper_project_simple_higher(
+    selection: &Selection,
+    ds_shape: &[u64],
+    kept_dims: &[usize],
+) -> Result<Selection> {
+    selection.hyper_project_simple_higher(ds_shape, kept_dims)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__hyper_proj_int_build_proj(
+    left: &Selection,
+    right: &Selection,
+    ds_shape: &[u64],
+    kept_dims: &[usize],
+) -> Result<Selection> {
+    left.hyper_proj_int_build_proj(right, ds_shape, kept_dims)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__hyper_proj_int_iterate(
+    left: &Selection,
+    right: &Selection,
+    ds_shape: &[u64],
+    kept_dims: &[usize],
+) -> Result<Vec<Vec<u64>>> {
+    left.hyper_proj_int_iterate(right, ds_shape, kept_dims)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__hyper_project_intersection(
+    left: &Selection,
+    right: &Selection,
+    ds_shape: &[u64],
+    kept_dims: &[usize],
+) -> Result<Selection> {
+    left.hyper_project_intersection(right, ds_shape, kept_dims)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__hyper_get_clip_diminfo(
+    selection: &Selection,
+    ds_shape: &[u64],
+) -> Option<(Vec<u64>, Vec<u64>)> {
+    selection.hyper_get_clip_diminfo(ds_shape)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S_hyper_clip_unlim(selection: &Selection, ds_shape: &[u64]) -> Result<Selection> {
+    selection.hyper_clip_unlim(ds_shape)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__hyper_get_clip_extent_real(
+    selection: &Selection,
+    ds_shape: &[u64],
+) -> Option<(Vec<u64>, Vec<u64>)> {
+    selection.hyper_get_clip_extent_real(ds_shape)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__hyper_get_clip_extent(
+    selection: &Selection,
+    ds_shape: &[u64],
+) -> Option<(Vec<u64>, Vec<u64>)> {
+    selection.hyper_get_clip_extent(ds_shape)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S_hyper_get_clip_extent(
+    selection: &Selection,
+    ds_shape: &[u64],
+) -> Option<(Vec<u64>, Vec<u64>)> {
+    selection.hyper_get_clip_extent(ds_shape)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__hyper_get_clip_extent_match(
+    left: &Selection,
+    right: &Selection,
+    ds_shape: &[u64],
+) -> bool {
+    left.hyper_get_clip_extent_match(right, ds_shape)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S_hyper_get_clip_extent_match(
+    left: &Selection,
+    right: &Selection,
+    ds_shape: &[u64],
+) -> bool {
+    left.hyper_get_clip_extent_match(right, ds_shape)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__hyper_get_unlim_block(selection: &Selection, max_dims: &[u64]) -> Option<usize> {
+    selection.hyper_get_unlim_block(max_dims)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S_hyper_get_unlim_block(selection: &Selection, max_dims: &[u64]) -> Option<usize> {
+    selection.hyper_get_unlim_block(max_dims)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__get_rebuild_status_test(selection: &Selection) -> bool {
+    selection.get_rebuild_status_test()
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__get_diminfo_status_test(selection: &Selection) -> bool {
+    selection.get_diminfo_status_test()
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__check_spans_tail_ptr(selection: &Selection) -> bool {
+    selection.check_spans_tail_ptr()
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__check_internal_consistency(selection: &Selection, ds_shape: &[u64]) -> bool {
+    selection.check_internal_consistency(ds_shape)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__internal_consistency_test(selection: &Selection, ds_shape: &[u64]) -> bool {
+    selection.internal_consistency_test(ds_shape)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__verify_offsets(selection: &Selection, offsets: &[i64]) -> bool {
+    selection.verify_offsets(offsets)
+}
+
 fn is_hyperslab_like(selection: &Selection) -> bool {
     matches!(
         selection,
@@ -2065,6 +3431,10 @@ fn push_u64(out: &mut Vec<u8>, value: u64) {
     out.extend_from_slice(&value.to_le_bytes());
 }
 
+fn usize_to_u64(value: usize, context: &str) -> Result<u64> {
+    u64::try_from(value).map_err(|_| Error::InvalidFormat(format!("{context} exceeds u64")))
+}
+
 fn read_u64(bytes: &[u8], offset: &mut usize) -> Result<u64> {
     let end = offset
         .checked_add(8)
@@ -2076,6 +3446,11 @@ fn read_u64(bytes: &[u8], offset: &mut usize) -> Result<u64> {
     Ok(u64::from_le_bytes(
         word.try_into().expect("slice length checked"),
     ))
+}
+
+fn read_usize_u64(bytes: &[u8], offset: &mut usize, context: &str) -> Result<usize> {
+    let value = read_u64(bytes, offset)?;
+    usize::try_from(value).map_err(|_| Error::InvalidFormat(format!("{context} exceeds usize")))
 }
 
 fn projected_shape(ds_shape: &[u64], kept_dims: &[usize]) -> Vec<u64> {
@@ -2443,6 +3818,7 @@ mod tests {
             points
         );
         assert_eq!(points.point_get_version_enc_size().unwrap().0, 1);
+        assert!(Selection::point_deserialize(&u64::MAX.to_le_bytes()).is_err());
 
         let hyper = Selection::select_hyperslab(vec![
             HyperslabDim::new(0, 2, 2, 1),
@@ -2459,6 +3835,7 @@ mod tests {
             hyper
         );
         assert_eq!(hyper.hyper_get_version_enc_size().unwrap().0, 1);
+        assert!(Selection::hyper_deserialize(&u64::MAX.to_le_bytes()).is_err());
         assert_eq!(hyper.hyper_spans_nelem(&[4, 4]), Some(6));
         assert!(hyper.hyper_coord_to_span(&[0, 1], &[4, 4]));
         assert!(hyper.hyper_spans_shape_same(&hyper, &[4, 4]));
@@ -2470,5 +3847,585 @@ mod tests {
             .hyper_add_span_element(HyperslabDim::new(1, 1, 1, 1))
             .unwrap();
         assert_eq!(editable.hyper_copy_span().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn h5s_selection_aliases_dispatch_to_selection_methods() {
+        let selection = Selection::select_hyperslab(vec![
+            HyperslabDim::new(0, 1, 2, 1),
+            HyperslabDim::new(1, 1, 2, 1),
+        ]);
+        let ds_shape = [4, 4];
+
+        assert_eq!(H5Sselect_copy(&selection), selection);
+        assert_eq!(
+            H5S__copy_pnt_list(&[vec![0, 0], vec![1, 1]]),
+            vec![vec![0, 0], vec![1, 1]]
+        );
+        H5S__free_pnt_list(vec![vec![0, 0]]);
+        assert_eq!(H5Sget_select_npoints(&selection, &ds_shape), Some(4));
+        assert_eq!(H5S_get_select_npoints(&selection, &ds_shape), Some(4));
+        assert!(H5Sselect_valid(&selection, &ds_shape));
+        assert_eq!(
+            H5Sget_select_bounds(&selection, &ds_shape),
+            Some((vec![0, 1], vec![1, 2]))
+        );
+        assert_eq!(
+            H5S_get_select_bounds(&selection, &ds_shape),
+            Some((vec![0, 1], vec![1, 2]))
+        );
+        assert_eq!(
+            H5S_get_select_unlim_dim(&selection, &[4, u64::MAX]),
+            Some(1)
+        );
+        assert_eq!(
+            H5S_get_select_num_elem_non_unlim(&selection, &ds_shape, &[4, u64::MAX]).unwrap(),
+            2
+        );
+        assert!(!H5S_select_is_contiguous(&selection, &ds_shape).unwrap());
+        assert!(!H5S_select_is_single(&selection, &ds_shape));
+        assert!(H5S_select_is_regular(&selection));
+        assert_eq!(H5Sget_select_type(&selection), SelectionType::Hyperslab);
+        assert_eq!(H5S_get_select_type(&selection), SelectionType::Hyperslab);
+        assert_eq!(H5S_select_none(), Selection::None);
+        assert_eq!(H5Sselect_none(), Selection::None);
+        assert_eq!(H5S_select_all(), Selection::All);
+        assert_eq!(H5Sselect_all(), Selection::All);
+        assert_eq!(
+            H5S_select_elements(vec![vec![2, 3]]),
+            Selection::Points(vec![vec![2, 3]])
+        );
+        assert_eq!(
+            H5Sselect_elements(vec![vec![3, 2]]),
+            Selection::Points(vec![vec![3, 2]])
+        );
+        assert_eq!(
+            H5S_select_hyperslab(vec![HyperslabDim::new(0, 1, 1, 1)]),
+            Selection::Hyperslab(vec![HyperslabDim::new(0, 1, 1, 1)])
+        );
+        assert_eq!(
+            H5Sselect_hyperslab(vec![HyperslabDim::new(1, 1, 1, 1)]),
+            Selection::Hyperslab(vec![HyperslabDim::new(1, 1, 1, 1)])
+        );
+        assert_eq!(H5Sget_select_hyper_nblocks(&selection, &ds_shape), Some(4));
+        assert_eq!(
+            H5Sget_select_hyper_blocklist(&selection, &ds_shape).unwrap(),
+            Some(vec![
+                (vec![0, 1], vec![0, 1]),
+                (vec![0, 2], vec![0, 2]),
+                (vec![1, 1], vec![1, 1]),
+                (vec![1, 2], vec![1, 2])
+            ])
+        );
+        let point_selection = Selection::Points(vec![vec![0, 0], vec![3, 3]]);
+        assert_eq!(H5Sget_select_elem_npoints(&point_selection), Some(2));
+        assert_eq!(
+            H5Sget_select_elem_pointlist(&point_selection),
+            Some(&[vec![0, 0], vec![3, 3]][..])
+        );
+        assert_eq!(
+            H5S__get_select_elem_pointlist(&point_selection),
+            Some(&[vec![0, 0], vec![3, 3]][..])
+        );
+        assert!(H5S_select_intersect_block(&selection, &ds_shape, &[1, 2], &[1, 2]).unwrap());
+        assert!(!H5Sselect_intersect_block(&selection, &ds_shape, &[3, 3], &[3, 3]).unwrap());
+
+        let adjusted = H5S_select_adjust_u(&selection, &[1, 0]).unwrap();
+        assert_eq!(
+            H5Sget_select_bounds(&adjusted, &ds_shape),
+            Some((vec![1, 1], vec![2, 2]))
+        );
+        let adjusted = H5Sselect_adjust(&selection, &[0, -1]).unwrap();
+        assert_eq!(
+            H5Sget_select_bounds(&adjusted, &ds_shape),
+            Some((vec![0, 0], vec![1, 1]))
+        );
+
+        let encoded = selection.encode1().unwrap();
+        assert_eq!(H5S_select_serial_size(&selection).unwrap(), encoded.len());
+        assert_eq!(H5S_select_serialize(&selection).unwrap(), encoded);
+        assert_eq!(H5S__encode(&selection).unwrap(), encoded);
+        assert_eq!(H5Sencode1(&selection).unwrap(), encoded);
+        assert_eq!(H5S_select_deserialize(&encoded).unwrap(), selection);
+        assert_eq!(H5S__decode(&encoded).unwrap(), selection);
+        H5S_select_release(selection.clone());
+        let projected = H5S_select_project_simple(&selection, &ds_shape, &[1]).unwrap();
+        assert_eq!(
+            projected.materialize_points(&[4]).unwrap(),
+            vec![vec![1], vec![2]]
+        );
+        assert_eq!(
+            H5S_select_project_scalar(&selection, &ds_shape).unwrap(),
+            Selection::Points(vec![vec![]])
+        );
+        assert_eq!(
+            H5S_select_construct_projection(&selection, &ds_shape, &[0]).unwrap(),
+            Selection::Points(vec![vec![0], vec![1]])
+        );
+        assert!(H5Sselect_shape_same(&selection, &selection, &ds_shape));
+
+        let mut iter = H5S_select_iter_init(&selection, &ds_shape).unwrap();
+        assert_eq!(H5S_select_iter_coords(&iter), Some(&[0, 1][..]));
+        assert_eq!(H5S_select_iter_nelmts(&iter), 4);
+        assert_eq!(H5S_select_iter_next(&mut iter), Some(vec![0, 1]));
+        assert_eq!(
+            H5S_select_iter_get_seq_list(&mut iter, 2),
+            vec![vec![0, 2], vec![1, 1]]
+        );
+        H5Ssel_iter_reset(&mut iter);
+        assert_eq!(H5S_select_iter_next(&mut iter), Some(vec![0, 1]));
+        H5S_select_iter_release(iter);
+
+        let mut visited = Vec::new();
+        H5S_select_iterate(&selection, &ds_shape, |point| {
+            visited.push(point.to_vec());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(visited.len(), 4);
+
+        let other = Selection::select_hyperslab(vec![
+            HyperslabDim::new(1, 1, 1, 1),
+            HyperslabDim::new(2, 1, 1, 1),
+        ]);
+        assert_eq!(
+            H5S_select_project_intersection(&selection, &other, &ds_shape, &[0]).unwrap(),
+            Selection::Points(vec![vec![1]])
+        );
+        assert_eq!(
+            H5Sselect_project_intersection(&selection, &other, &ds_shape, &[1]).unwrap(),
+            Selection::Points(vec![vec![2]])
+        );
+        assert_eq!(
+            H5S_combine_hyperslab(&selection, &other, &ds_shape)
+                .unwrap()
+                .selected_count(&ds_shape),
+            Some(4)
+        );
+        assert_eq!(
+            H5Scombine_hyperslab(&selection, &other, &ds_shape)
+                .unwrap()
+                .selected_count(&ds_shape),
+            Some(4)
+        );
+        assert_eq!(
+            H5S__modify_select(&selection, &other, &ds_shape)
+                .unwrap()
+                .selected_count(&ds_shape),
+            Some(4)
+        );
+        assert_eq!(
+            H5Smodify_select(&selection, &other, &ds_shape)
+                .unwrap()
+                .selected_count(&ds_shape),
+            Some(4)
+        );
+        assert!(H5S__mpio_reg_hyper_type(&selection));
+        assert!(!H5S__mpio_all_type(&selection));
+        assert!(!H5S__mpio_none_type(&selection));
+        assert!(!H5S__mpio_point_type(&selection));
+        assert!(!H5S__mpio_permute_type(&selection));
+        assert!(!H5S__mpio_span_hyper_type(&selection));
+
+        let mut buffer = vec![0u8; 16];
+        H5S_select_fill(&selection, &ds_shape, &mut buffer, 7).unwrap();
+        assert_eq!(buffer[1], 7);
+        assert_eq!(buffer[2], 7);
+        assert_eq!(buffer[5], 7);
+        assert_eq!(buffer[6], 7);
+    }
+
+    #[test]
+    fn h5s_selection_class_aliases_dispatch_to_selection_methods() {
+        assert_eq!(H5S__none_iter_block(), None);
+        assert_eq!(H5S__none_iter_nelmts(), 0);
+        assert_eq!(H5S__none_iter_get_seq_list(), Vec::<Vec<u64>>::new());
+        H5S__none_iter_release();
+        H5S__none_release();
+        assert_eq!(H5S__none_copy(), Selection::None);
+        assert!(H5S__none_is_valid());
+        assert_eq!(H5S__none_serialize(), Vec::<u8>::new());
+        assert_eq!(H5S__none_deserialize(&[]).unwrap(), Selection::None);
+        assert_eq!(H5S__none_bounds(), None);
+        assert_eq!(H5S__none_offset(&[1, -1]), Selection::None);
+        assert!(H5S__none_is_contiguous());
+        assert!(!H5S__none_is_single());
+        assert!(H5S__none_is_regular());
+        assert!(!H5S__none_intersect_block(&[0], &[0]));
+        assert_eq!(H5S__none_adjust_u(&[1]), Selection::None);
+        assert_eq!(H5S__none_adjust_s(&[-1]), Selection::None);
+        assert_eq!(H5S__none_project_simple(), Selection::None);
+
+        let ds_shape = [2, 3];
+        let mut all_iter = H5S__all_iter_init(&ds_shape).unwrap();
+        assert_eq!(H5S__all_iter_coords(&ds_shape).unwrap(), Some(vec![0, 0]));
+        assert_eq!(
+            H5S__all_iter_block(&ds_shape),
+            Some((vec![0, 0], vec![1, 2]))
+        );
+        assert_eq!(H5S__all_iter_nelmts(&ds_shape).unwrap(), 6);
+        assert!(H5S__all_iter_has_next_block(&ds_shape));
+        assert_eq!(H5S__all_iter_next(&mut all_iter), Some(vec![0, 0]));
+        assert_eq!(
+            H5S__all_iter_next_block(&ds_shape),
+            Some((vec![0, 0], vec![1, 2]))
+        );
+        assert_eq!(
+            H5S__all_iter_get_seq_list(&ds_shape, 3).unwrap(),
+            vec![vec![0, 0], vec![0, 1], vec![0, 2]]
+        );
+        H5S__all_iter_release(all_iter);
+        H5S__all_release();
+        assert_eq!(H5S__all_copy(), Selection::All);
+        assert!(H5S__all_is_valid(&ds_shape));
+        assert_eq!(H5S__all_serial_size(), 0);
+        assert_eq!(H5S__all_serialize(), Vec::<u8>::new());
+        assert_eq!(H5S__all_deserialize(&[]).unwrap(), Selection::All);
+        assert_eq!(H5S__all_bounds(&ds_shape), Some((vec![0, 0], vec![1, 2])));
+        assert_eq!(H5S__all_offset(&[0, 0]).unwrap(), Selection::All);
+        assert_eq!(H5S__all_unlim_dim(&[2, u64::MAX]), Some(1));
+        assert!(H5S__all_is_contiguous());
+        assert!(!H5S__all_is_single(&ds_shape));
+        assert!(H5S__all_is_regular());
+        assert!(H5S__all_intersect_block(&ds_shape, &[1, 2], &[1, 2]));
+        assert_eq!(H5S__all_adjust_u(&[0, 0]).unwrap(), Selection::All);
+        assert_eq!(H5S__all_adjust_s(&[0, 0]).unwrap(), Selection::All);
+        assert_eq!(
+            H5S__all_project_simple(&ds_shape, &[1]).unwrap(),
+            Selection::Points(vec![vec![0], vec![1], vec![2]])
+        );
+
+        let mut points = Selection::Points(vec![vec![0, 1], vec![1, 2]]);
+        let mut point_iter = H5S__point_iter_init(&points, &ds_shape).unwrap();
+        assert_eq!(H5S__point_iter_coords(&point_iter), Some(&[0, 1][..]));
+        assert_eq!(H5S__point_iter_nelmts(&point_iter), 2);
+        assert_eq!(H5S__point_iter_next(&mut point_iter), Some(vec![0, 1]));
+        assert_eq!(
+            H5S__point_iter_next_block(&mut point_iter),
+            Some(vec![1, 2])
+        );
+        let mut point_iter = H5S__point_iter_init(&points, &ds_shape).unwrap();
+        assert_eq!(
+            H5S__point_iter_get_seq_list(&mut point_iter, 2),
+            vec![vec![0, 1], vec![1, 2]]
+        );
+        H5S__point_iter_release(point_iter);
+        assert_eq!(H5S__point_copy(&points).unwrap(), points);
+        H5S__point_add(&mut points, vec![0, 2]).unwrap();
+        assert_eq!(points.selected_count(&ds_shape), Some(3));
+        assert_eq!(H5S__point_get_version_enc_size(&points).unwrap().0, 1);
+        let point_payload = H5S__point_serialize(&points).unwrap();
+        assert_eq!(
+            H5S__point_serial_size(&points).unwrap(),
+            point_payload.len()
+        );
+        assert_eq!(H5S__point_deserialize(&point_payload).unwrap(), points);
+        assert_eq!(
+            H5S__get_select_elem_pointlist(&points),
+            Some(&[vec![0, 1], vec![1, 2], vec![0, 2]][..])
+        );
+        assert_eq!(
+            H5S__point_offset(&points, &[1, 0]).unwrap().bounds(&[3, 3]),
+            Some((vec![1, 1], vec![2, 2]))
+        );
+        assert_eq!(H5S__point_unlim_dim(&points, &[2, u64::MAX]), Some(1));
+        assert!(!H5S__point_is_contiguous(&points, &ds_shape).unwrap());
+        assert!(!H5S__point_is_single(&points, &ds_shape));
+        assert!(!H5S__point_is_regular(&points));
+        assert!(H5S__point_shape_same(&points, &points, &ds_shape));
+        assert!(H5S__point_intersect_block(&points, &[1, 2], &[1, 2]));
+        assert_eq!(
+            H5S__point_adjust_u(&points, &[1, 0])
+                .unwrap()
+                .bounds(&[3, 3]),
+            Some((vec![1, 1], vec![2, 2]))
+        );
+        assert_eq!(
+            H5S__point_adjust_s(&points, &[0, -1])
+                .unwrap()
+                .bounds(&ds_shape),
+            Some((vec![0, 0], vec![1, 1]))
+        );
+        assert_eq!(
+            H5S__point_project_scalar(&points, &ds_shape).unwrap(),
+            Selection::Points(vec![vec![]])
+        );
+        assert_eq!(
+            H5S__point_project_simple(&points, &ds_shape, &[0]).unwrap(),
+            Selection::Points(vec![vec![0], vec![1]])
+        );
+
+        let hyper = Selection::Hyperslab(vec![
+            HyperslabDim::new(0, 1, 2, 1),
+            HyperslabDim::new(1, 1, 2, 1),
+        ]);
+        let mut hyper_iter = H5S__hyper_iter_init(&hyper, &ds_shape).unwrap();
+        assert_eq!(
+            H5S__hyper_iter_block(&hyper, &ds_shape).unwrap(),
+            Some(vec![0, 1])
+        );
+        assert!(H5S__hyper_iter_has_next_block(&hyper, &ds_shape).unwrap());
+        assert_eq!(H5S__hyper_iter_next(&mut hyper_iter), Some(vec![0, 1]));
+        assert_eq!(
+            H5S__hyper_iter_next_block(&mut hyper_iter),
+            Some(vec![0, 2])
+        );
+        let mut hyper_iter = H5S__hyper_iter_init(&hyper, &ds_shape).unwrap();
+        assert_eq!(
+            H5S__hyper_iter_get_seq_list(&mut hyper_iter, 2),
+            vec![vec![0, 1], vec![0, 2]]
+        );
+        let mut hyper_iter = H5S__hyper_iter_init(&hyper, &ds_shape).unwrap();
+        assert_eq!(
+            H5S__hyper_iter_get_seq_list_gen(&mut hyper_iter, 1),
+            vec![vec![0, 1]]
+        );
+        let mut hyper_iter = H5S__hyper_iter_init(&hyper, &ds_shape).unwrap();
+        assert_eq!(
+            H5S__hyper_iter_get_seq_list_opt(&mut hyper_iter, 1),
+            vec![vec![0, 1]]
+        );
+        let mut hyper_iter = H5S__hyper_iter_init(&hyper, &ds_shape).unwrap();
+        assert_eq!(
+            H5S__hyper_iter_get_seq_list_single(&mut hyper_iter, 1),
+            vec![vec![0, 1]]
+        );
+        assert_eq!(H5S__hyper_iter_nelmts(&hyper_iter), 3);
+        H5S__hyper_iter_release(hyper_iter);
+        assert_eq!(
+            H5S__hyper_get_seq_list_gen(&hyper, &ds_shape, 2).unwrap(),
+            vec![vec![0, 1], vec![0, 2]]
+        );
+        assert_eq!(H5S__hyper_copy(&hyper).unwrap(), hyper);
+        assert_eq!(
+            H5S__hyper_new_span(0, 1, 1, 1),
+            HyperslabDim::new(0, 1, 1, 1)
+        );
+        assert_eq!(
+            H5S__hyper_new_span_info(vec![HyperslabDim::new(0, 1, 1, 1)]),
+            Selection::Hyperslab(vec![HyperslabDim::new(0, 1, 1, 1)])
+        );
+        assert_eq!(H5S__hyper_copy_span(&hyper).unwrap().len(), 2);
+        assert_eq!(H5S__hyper_copy_span_helper(&hyper).unwrap().len(), 2);
+        assert!(H5S__hyper_cmp_spans(&hyper, &hyper));
+        assert!(H5S__hyper_print_spans_helper(&hyper)
+            .unwrap()
+            .contains("HyperslabDim"));
+        assert!(H5S__hyper_print_spans(&hyper)
+            .unwrap()
+            .contains("HyperslabDim"));
+        assert!(H5S__space_print_spans(&hyper)
+            .unwrap()
+            .contains("HyperslabDim"));
+        assert!(H5S__hyper_print_diminfo_helper(&hyper)
+            .unwrap()
+            .contains("start=0"));
+        assert!(H5S__hyper_print_diminfo(&hyper)
+            .unwrap()
+            .contains("start=0"));
+        assert!(H5S__hyper_print_spans_dfs(&hyper)
+            .unwrap()
+            .contains("HyperslabDim"));
+        assert!(H5S__hyper_print_space_dfs(&hyper)
+            .unwrap()
+            .contains("HyperslabDim"));
+        assert_eq!(
+            H5S__hyper_get_enc_size_real(&hyper).unwrap(),
+            H5S__hyper_serialize(&hyper).unwrap().len()
+        );
+        assert_eq!(H5S__hyper_get_version_enc_size(&hyper).unwrap().0, 1);
+        let hyper_payload = H5S__hyper_serialize(&hyper).unwrap();
+        assert_eq!(H5S__hyper_serialize_helper(&hyper).unwrap(), hyper_payload);
+        assert_eq!(H5S__hyper_deserialize(&hyper_payload).unwrap(), hyper);
+        assert_eq!(H5S__hyper_decode(&hyper_payload).unwrap(), hyper);
+        assert!(H5S__hyper_is_valid(&hyper, &ds_shape));
+        assert_eq!(H5S__hyper_span_nblocks(&hyper, &ds_shape), Some(4));
+        assert_eq!(H5S__get_select_hyper_nblocks(&hyper, &ds_shape), Some(4));
+        assert_eq!(
+            H5S__hyper_span_blocklist(&hyper, &ds_shape)
+                .unwrap()
+                .unwrap()
+                .len(),
+            4
+        );
+        assert_eq!(
+            H5S__get_select_hyper_blocklist(&hyper, &ds_shape)
+                .unwrap()
+                .unwrap()
+                .len(),
+            4
+        );
+        assert!(H5S__hyper_intersect_block_helper(
+            &hyper,
+            &ds_shape,
+            &[1, 2],
+            &[1, 2]
+        ));
+        assert_eq!(
+            H5S__hyper_bounds(&hyper, &ds_shape),
+            Some((vec![0, 1], vec![1, 2]))
+        );
+        assert_eq!(
+            H5S__hyper_offset(&hyper, &[1, 0]).unwrap().bounds(&[3, 3]),
+            Some((vec![1, 1], vec![2, 2]))
+        );
+        assert_eq!(H5S__hyper_unlim_dim(&hyper, &[2, u64::MAX]), Some(1));
+        assert_eq!(
+            H5S__hyper_num_elem_non_unlim(&hyper, &ds_shape, &[2, u64::MAX]).unwrap(),
+            2
+        );
+        assert!(!H5S__hyper_is_contiguous(&hyper, &ds_shape).unwrap());
+        assert!(!H5S__hyper_is_single(&hyper, &ds_shape));
+        assert!(H5S__hyper_is_regular(&hyper));
+        assert_eq!(H5S__hyper_spans_nelem(&hyper, &ds_shape), Some(4));
+        assert_eq!(H5S__hyper_spans_nelem_helper(&hyper, &ds_shape), Some(4));
+        assert!(H5S__hyper_shape_same(&hyper, &hyper, &ds_shape));
+        assert!(H5S__hyper_spans_shape_same_helper(
+            &hyper, &hyper, &ds_shape
+        ));
+        assert!(H5S__hyper_spans_shape_same(&hyper, &hyper, &ds_shape));
+        assert!(!H5S__hyper_regular_and_single_block(&hyper, &ds_shape));
+        assert_eq!(H5S__hyper_get_regular_hyperslab(&hyper).unwrap().len(), 2);
+        assert!(H5S__hyper_coord_to_span(&hyper, &[0, 1], &ds_shape));
+        let mut editable_hyper = H5S__hyper_make_spans(vec![HyperslabDim::new(0, 1, 1, 1)]);
+        H5S_hyper_add_span_element(&mut editable_hyper, HyperslabDim::new(1, 1, 1, 1)).unwrap();
+        H5S__hyper_append_span(&mut editable_hyper, HyperslabDim::new(2, 1, 1, 1)).unwrap();
+        assert_eq!(H5S__hyper_update_diminfo(&editable_hyper).unwrap().len(), 3);
+        assert_eq!(H5S__hyper_rebuild_helper(&hyper).unwrap(), hyper);
+        assert_eq!(H5S__hyper_rebuild(&hyper).unwrap(), hyper);
+        assert_eq!(H5S__hyper_generate_spans(&hyper).unwrap(), hyper);
+        assert_eq!(H5S__fill_in_select(&hyper), hyper);
+        assert_eq!(H5S__fill_in_new_space(&hyper, &ds_shape).unwrap(), hyper);
+        assert_eq!(
+            H5S__set_regular_hyperslab(vec![HyperslabDim::new(0, 1, 1, 1)]),
+            Selection::Hyperslab(vec![HyperslabDim::new(0, 1, 1, 1)])
+        );
+        let disjoint = Selection::Hyperslab(vec![
+            HyperslabDim::new(0, 1, 1, 1),
+            HyperslabDim::new(0, 1, 1, 1),
+        ]);
+        assert!(H5S__check_spans_overlap(&hyper, &hyper, &ds_shape).unwrap());
+        assert_eq!(
+            H5S__hyper_clip_spans(&hyper, &ds_shape, &[1, 2], &[1, 2]).unwrap(),
+            Selection::Points(vec![vec![1, 2]])
+        );
+        assert_eq!(
+            H5S__hyper_merge_spans_helper(&disjoint, &hyper, &ds_shape)
+                .unwrap()
+                .selected_count(&ds_shape),
+            Some(5)
+        );
+        assert_eq!(
+            H5S__hyper_merge_spans(&disjoint, &hyper, &ds_shape)
+                .unwrap()
+                .selected_count(&ds_shape),
+            Some(5)
+        );
+        assert_eq!(
+            H5S__hyper_add_disjoint_spans(
+                &disjoint,
+                &Selection::Hyperslab(vec![
+                    HyperslabDim::new(1, 1, 1, 1),
+                    HyperslabDim::new(2, 1, 1, 1),
+                ]),
+                &ds_shape
+            )
+            .unwrap()
+            .selected_count(&ds_shape),
+            Some(2)
+        );
+        assert_eq!(
+            H5S__hyper_adjust_u(&hyper, &[1, 0])
+                .unwrap()
+                .bounds(&[3, 3]),
+            Some((vec![1, 1], vec![2, 2]))
+        );
+        assert_eq!(
+            H5S__hyper_adjust_s(&hyper, &[0, -1])
+                .unwrap()
+                .bounds(&ds_shape),
+            Some((vec![0, 0], vec![1, 1]))
+        );
+        assert_eq!(
+            H5S__hyper_adjust_u_helper(&hyper, &[1, 0])
+                .unwrap()
+                .bounds(&[3, 3]),
+            Some((vec![1, 1], vec![2, 2]))
+        );
+        assert_eq!(
+            H5S__hyper_adjust_s_helper(&hyper, &[0, -1])
+                .unwrap()
+                .bounds(&ds_shape),
+            Some((vec![0, 0], vec![1, 1]))
+        );
+        assert_eq!(
+            H5S_hyper_normalize_offset(&hyper, &[1, 0])
+                .unwrap()
+                .bounds(&[3, 3]),
+            Some((vec![1, 1], vec![2, 2]))
+        );
+        assert_eq!(
+            H5S_hyper_denormalize_offset(&hyper, &[1, 0])
+                .unwrap()
+                .bounds(&[3, 3]),
+            Some((vec![1, 1], vec![2, 2]))
+        );
+        assert_eq!(
+            H5S__hyper_project_scalar(&hyper, &ds_shape).unwrap(),
+            Selection::Points(vec![vec![]])
+        );
+        assert_eq!(
+            H5S__hyper_project_simple(&hyper, &ds_shape, &[0]).unwrap(),
+            Selection::Points(vec![vec![0], vec![1]])
+        );
+        assert_eq!(
+            H5S__hyper_project_simple_lower(&hyper, &ds_shape, &[0]).unwrap(),
+            Selection::Points(vec![vec![0], vec![1]])
+        );
+        assert_eq!(
+            H5S__hyper_project_simple_higher(&hyper, &ds_shape, &[1]).unwrap(),
+            Selection::Points(vec![vec![1], vec![2]])
+        );
+        assert_eq!(
+            H5S__hyper_proj_int_build_proj(&hyper, &hyper, &ds_shape, &[0]).unwrap(),
+            Selection::Points(vec![vec![0], vec![1]])
+        );
+        assert_eq!(
+            H5S__hyper_proj_int_iterate(&hyper, &hyper, &ds_shape, &[1]).unwrap(),
+            vec![vec![1], vec![2]]
+        );
+        assert_eq!(
+            H5S__hyper_project_intersection(&hyper, &hyper, &ds_shape, &[1]).unwrap(),
+            Selection::Points(vec![vec![1], vec![2]])
+        );
+        assert_eq!(
+            H5S__hyper_get_clip_diminfo(&hyper, &ds_shape),
+            Some((vec![0, 1], vec![1, 2]))
+        );
+        assert_eq!(H5S_hyper_clip_unlim(&hyper, &ds_shape).unwrap(), hyper);
+        assert_eq!(
+            H5S__hyper_get_clip_extent_real(&hyper, &ds_shape),
+            Some((vec![0, 1], vec![1, 2]))
+        );
+        assert_eq!(
+            H5S__hyper_get_clip_extent(&hyper, &ds_shape),
+            Some((vec![0, 1], vec![1, 2]))
+        );
+        assert_eq!(
+            H5S_hyper_get_clip_extent(&hyper, &ds_shape),
+            Some((vec![0, 1], vec![1, 2]))
+        );
+        assert!(H5S__hyper_get_clip_extent_match(&hyper, &hyper, &ds_shape));
+        assert!(H5S_hyper_get_clip_extent_match(&hyper, &hyper, &ds_shape));
+        assert_eq!(H5S__hyper_get_unlim_block(&hyper, &[2, u64::MAX]), Some(1));
+        assert_eq!(H5S_hyper_get_unlim_block(&hyper, &[2, u64::MAX]), Some(1));
+        assert!(H5S__get_rebuild_status_test(&hyper));
+        assert!(H5S__get_diminfo_status_test(&hyper));
+        assert!(H5S__check_spans_tail_ptr(&hyper));
+        assert!(H5S__check_internal_consistency(&hyper, &ds_shape));
+        assert!(H5S__internal_consistency_test(&hyper, &ds_shape));
+        assert!(H5S__verify_offsets(&hyper, &[0, 0]));
+        H5S__hyper_free_span(hyper.clone());
+        H5S__hyper_release(hyper);
     }
 }

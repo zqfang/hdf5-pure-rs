@@ -423,7 +423,7 @@ impl<'a> Parser<'a> {
         let mut expr = self.parse_term()?;
         loop {
             self.skip_ws();
-            let Some(op) = self.consume_op(&[b'+', b'-']) else {
+            let Some(op) = self.consume_op(b"+-") else {
                 break;
             };
             let right = self.parse_term()?;
@@ -436,7 +436,7 @@ impl<'a> Parser<'a> {
         let mut expr = self.parse_factor()?;
         loop {
             self.skip_ws();
-            let Some(op) = self.consume_op(&[b'*', b'/']) else {
+            let Some(op) = self.consume_op(b"*/") else {
                 break;
             };
             let right = self.parse_factor()?;

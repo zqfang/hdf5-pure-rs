@@ -44,7 +44,8 @@ impl ReadConversion {
             ));
         }
         let requested = T::type_size();
-        let stored = datatype.size as usize;
+        let stored = usize::try_from(datatype.size)
+            .map_err(|_| Error::InvalidFormat("datatype size does not fit in usize".into()))?;
         let byte_order = datatype.byte_order();
 
         // Dispatch on source class — each per-class helper picks the
@@ -214,8 +215,11 @@ pub(crate) fn convert_between_datatypes(
     source: &DatatypeMessage,
     destination: &DatatypeMessage,
 ) -> Result<Vec<u8>> {
-    let src_size = source.size as usize;
-    let dst_size = destination.size as usize;
+    let src_size = usize::try_from(source.size)
+        .map_err(|_| Error::InvalidFormat("source datatype size does not fit in usize".into()))?;
+    let dst_size = usize::try_from(destination.size).map_err(|_| {
+        Error::InvalidFormat("destination datatype size does not fit in usize".into())
+    })?;
     match (source.class, destination.class) {
         (
             DatatypeClass::FixedPoint | DatatypeClass::Enum | DatatypeClass::BitField,

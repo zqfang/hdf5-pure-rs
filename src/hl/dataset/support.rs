@@ -9,7 +9,7 @@ pub(super) fn read_le_uint(bytes: &[u8], size: usize) -> Result<u64> {
 
     let mut value = 0u64;
     for (idx, byte) in bytes[..size].iter().enumerate() {
-        value |= (*byte as u64) << (idx * 8);
+        value |= u64::from(*byte) << (idx * 8);
     }
     Ok(value)
 }
@@ -17,6 +17,10 @@ pub(super) fn read_le_uint(bytes: &[u8], size: usize) -> Result<u64> {
 pub(super) fn usize_from_u64(value: u64, context: &str) -> Result<usize> {
     usize::try_from(value)
         .map_err(|_| Error::InvalidFormat(format!("{context} does not fit in usize")))
+}
+
+pub(super) fn u64_from_usize(value: usize, context: &str) -> Result<u64> {
+    u64::try_from(value).map_err(|_| Error::InvalidFormat(format!("{context} does not fit in u64")))
 }
 
 pub(super) fn read_u8_at(bytes: &[u8], pos: &mut usize) -> Result<u8> {

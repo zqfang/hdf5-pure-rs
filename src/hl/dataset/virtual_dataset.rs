@@ -70,7 +70,7 @@ impl Dataset {
                 object_index: heap_index,
             },
         )?;
-        let sizeof_size = guard.reader.sizeof_size() as usize;
+        let sizeof_size = usize::from(guard.reader.sizeof_size());
         drop(guard);
 
         let mappings = Self::decode_virtual_mappings(&heap_data, sizeof_size)?;
@@ -131,7 +131,7 @@ impl Dataset {
                 object_index: heap_index,
             },
         )?;
-        let sizeof_size = guard.reader.sizeof_size() as usize;
+        let sizeof_size = usize::from(guard.reader.sizeof_size());
         drop(guard);
 
         let mappings = Self::decode_virtual_mappings(&heap_data, sizeof_size)?;
@@ -146,7 +146,7 @@ impl Dataset {
         access: &DatasetAccess,
     ) -> Result<Vec<u8>> {
         let mappings = Self::decode_virtual_mappings(heap_data, sizeof_size)?;
-        let element_size = info.datatype.size as usize;
+        let element_size = usize_from_u64(u64::from(info.datatype.size), "datatype size")?;
 
         let output_dims = Self::virtual_output_dims(&mappings, file_path, info, access)?;
         let total_elements = usize_from_u64(

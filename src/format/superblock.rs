@@ -124,8 +124,12 @@ impl Superblock {
             )));
         }
 
-        // Reserved byte
-        reader.skip(1)?;
+        let reserved = reader.read_u8()?;
+        if reserved != 0 {
+            return Err(Error::InvalidFormat(
+                "nonzero superblock reserved byte".into(),
+            ));
+        }
 
         // Shared header version (must be 0)
         let shared_ver = reader.read_u8()?;
@@ -144,8 +148,12 @@ impl Superblock {
         reader.set_sizeof_addr(sizeof_addr);
         reader.set_sizeof_size(sizeof_size);
 
-        // Reserved byte
-        reader.skip(1)?;
+        let reserved = reader.read_u8()?;
+        if reserved != 0 {
+            return Err(Error::InvalidFormat(
+                "nonzero superblock reserved byte".into(),
+            ));
+        }
 
         // B-tree K values
         let sym_leaf_k = reader.read_u16()?;
@@ -158,8 +166,12 @@ impl Superblock {
         let chunk_btree_k = if version > 0 {
             let k = reader.read_u16()?;
             if version == 1 {
-                // Reserved 2 bytes in v1
-                reader.skip(2)?;
+                let reserved = reader.read_u16()?;
+                if reserved != 0 {
+                    return Err(Error::InvalidFormat(
+                        "nonzero superblock v1 reserved bytes".into(),
+                    ));
+                }
             }
             k
         } else {
@@ -177,21 +189,41 @@ impl Superblock {
         let root_entry_name_offset = reader.read_length()?;
         let root_entry_obj_header_addr = reader.read_addr()?;
         let root_entry_cache_type = reader.read_u32()?;
-        reader.skip(4)?; // reserved
+        let root_entry_reserved = reader.read_u32()?;
+        if root_entry_reserved != 0 {
+            return Err(Error::InvalidFormat(
+                "nonzero root symbol table entry reserved bytes".into(),
+            ));
+        }
 
         // Scratch-pad space (16 bytes) -- for cache_type == 1, contains btree + heap addr
-        let (root_entry_btree_addr, root_entry_name_heap_addr) = if root_entry_cache_type == 1 {
-            let btree = reader.read_addr()?;
-            let heap = reader.read_addr()?;
-            // Skip remaining scratch-pad bytes
-            let used = sizeof_addr as u64 * 2;
-            if used < 16 {
-                reader.skip(16 - used)?;
+        let (root_entry_btree_addr, root_entry_name_heap_addr) = match root_entry_cache_type {
+            0 | 2 => {
+                reader.skip(16)?;
+                (UNDEF_ADDR, UNDEF_ADDR)
             }
-            (btree, heap)
-        } else {
-            reader.skip(16)?;
-            (UNDEF_ADDR, UNDEF_ADDR)
+            1 => {
+                let btree = reader.read_addr()?;
+                let heap = reader.read_addr()?;
+                // Skip remaining scratch-pad bytes
+                let used = u64::from(sizeof_addr).checked_mul(2).ok_or_else(|| {
+                    Error::InvalidFormat("root symbol table scratch-pad size overflow".into())
+                })?;
+                if used > 16 {
+                    return Err(Error::InvalidFormat(
+                        "root symbol table scratch-pad exceeds fixed size".into(),
+                    ));
+                }
+                if used < 16 {
+                    reader.skip(16 - used)?;
+                }
+                (btree, heap)
+            }
+            other => {
+                return Err(Error::InvalidFormat(format!(
+                    "invalid root symbol table cache type {other}"
+                )));
+            }
         };
 
         Ok(Superblock {
@@ -281,7 +313,8 @@ impl Superblock {
     }
 
     /// Write a v2 superblock to a writer.
-    pub fn write_v2(&self, buf: &mut Vec<u8>) {
+    pub fn write_v2(&self, buf: &mut Vec<u8>) -> Result<()> {
+        Self::validate_sizes(self.sizeof_addr, self.sizeof_size)?;
         // Signature
         buf.extend_from_slice(&HDF5_SIGNATURE);
         // Version
@@ -293,14 +326,35 @@ impl Superblock {
         buf.push(self.status_flags);
 
         // Addresses (little-endian, sizeof_addr bytes each)
-        write_addr(buf, self.base_addr, self.sizeof_addr);
-        write_addr(buf, self.ext_addr, self.sizeof_addr);
-        write_addr(buf, self.eof_addr, self.sizeof_addr);
-        write_addr(buf, self.root_addr, self.sizeof_addr);
+        write_addr(
+            buf,
+            self.base_addr,
+            self.sizeof_addr,
+            "superblock base address",
+        )?;
+        write_addr(
+            buf,
+            self.ext_addr,
+            self.sizeof_addr,
+            "superblock extension address",
+        )?;
+        write_addr(
+            buf,
+            self.eof_addr,
+            self.sizeof_addr,
+            "superblock EOF address",
+        )?;
+        write_addr(
+            buf,
+            self.root_addr,
+            self.sizeof_addr,
+            "superblock root address",
+        )?;
 
         // Checksum (over everything before this point)
         let checksum = checksum_metadata(buf);
         buf.extend_from_slice(&checksum.to_le_bytes());
+        Ok(())
     }
 
     /// Compute the total size of the superblock in bytes.
@@ -318,13 +372,13 @@ impl Superblock {
             // Fixed: sig(8) + version(1) = 9
             // Variable v0: 16 + 4*sizeof_addr + H5G_SIZEOF_ENTRY
             // H5G_SIZEOF_ENTRY = sizeof_size + sizeof_addr + 4 + 4 + 16
-            let entry_size = (self.sizeof_size as usize)
-                .checked_add(self.sizeof_addr as usize)
+            let entry_size = usize::from(self.sizeof_size)
+                .checked_add(usize::from(self.sizeof_addr))
                 .and_then(|value| value.checked_add(24))
                 .ok_or_else(|| Error::InvalidFormat("superblock size overflow".into()))?;
             let common = 16; // freespace(1) + rootgrp(1) + reserved(1) + shared(1) + sizes(2) + reserved(1) + btree_k(4) + flags(4) + 1 extra reserved
             let addrs = 4usize
-                .checked_mul(self.sizeof_addr as usize)
+                .checked_mul(usize::from(self.sizeof_addr))
                 .ok_or_else(|| Error::InvalidFormat("superblock size overflow".into()))?;
             let v1_extra = if self.version > 0 {
                 2 + if self.version == 1 { 2 } else { 0 }
@@ -348,7 +402,7 @@ impl Superblock {
 
     fn v2_checksum_span(sizeof_addr: u8) -> Result<usize> {
         4usize
-            .checked_mul(sizeof_addr as usize)
+            .checked_mul(usize::from(sizeof_addr))
             .and_then(|addr_bytes| 12usize.checked_add(addr_bytes))
             .ok_or_else(|| Error::InvalidFormat("superblock checksum span overflow".into()))
     }
@@ -380,9 +434,27 @@ impl Superblock {
 }
 
 /// Write an address as little-endian bytes of the given width.
-fn write_addr(buf: &mut Vec<u8>, addr: u64, size: u8) {
-    let bytes = addr.to_le_bytes();
-    buf.extend_from_slice(&bytes[..size as usize]);
+fn write_addr(buf: &mut Vec<u8>, addr: u64, size: u8, context: &str) -> Result<()> {
+    let size = usize::from(size);
+    if !(1..=8).contains(&size) {
+        return Err(Error::InvalidFormat(format!("{context} width is invalid")));
+    }
+    if addr == UNDEF_ADDR {
+        buf.extend(std::iter::repeat_n(0xff, size));
+        return Ok(());
+    }
+    if size < 8 {
+        let bits = size
+            .checked_mul(8)
+            .ok_or_else(|| Error::InvalidFormat(format!("{context} width overflow")))?;
+        if addr >= (1u64 << bits) {
+            return Err(Error::InvalidFormat(format!(
+                "{context} does not fit in {size} bytes"
+            )));
+        }
+    }
+    buf.extend_from_slice(&addr.to_le_bytes()[..size]);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -406,7 +478,7 @@ mod tests {
 
         // Write
         let mut buf = Vec::new();
-        sb.write_v2(&mut buf);
+        sb.write_v2(&mut buf).unwrap();
 
         // Expected size: 8 + 1 + 1 + 1 + 1 + 4*8 + 4 = 48
         assert_eq!(buf.len(), 48);
@@ -435,6 +507,24 @@ mod tests {
             Superblock::validate_sizes(8, 16),
             Err(Error::Unsupported(_))
         ));
+    }
+
+    #[test]
+    fn write_v2_rejects_unrepresentable_address_width() {
+        let sb = Superblock {
+            version: 2,
+            sizeof_addr: 2,
+            sizeof_size: 8,
+            eof_addr: 0x1_0000,
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        let err = sb.write_v2(&mut buf).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("superblock EOF address does not fit in 2 bytes"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

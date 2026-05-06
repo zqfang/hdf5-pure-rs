@@ -14,7 +14,7 @@ pub fn decompress(data: &[u8], expected_size: usize) -> Result<Vec<u8>> {
     let mut ip = 0; // input position
 
     while ip < data.len() {
-        let ctrl = data[ip] as usize;
+        let ctrl = usize::from(data[ip]);
         ip += 1;
 
         if ctrl < 32 {
@@ -41,8 +41,8 @@ pub fn decompress(data: &[u8], expected_size: usize) -> Result<Vec<u8>> {
             ip = literal_end;
         } else {
             // Back-reference
-            let mut length = (ctrl >> 5) as usize;
-            let mut offset = ((ctrl & 0x1f) as usize) << 8;
+            let mut length = ctrl >> 5;
+            let mut offset = (ctrl & 0x1f) << 8;
 
             if length == 7 {
                 // Long match: read additional length byte
@@ -51,7 +51,7 @@ pub fn decompress(data: &[u8], expected_size: usize) -> Result<Vec<u8>> {
                         "lzf: unexpected end in long match".into(),
                     ));
                 }
-                length += data[ip] as usize;
+                length += usize::from(data[ip]);
                 ip += 1;
             }
             length += 2; // minimum match length is 2
@@ -61,7 +61,7 @@ pub fn decompress(data: &[u8], expected_size: usize) -> Result<Vec<u8>> {
                     "lzf: unexpected end reading offset".into(),
                 ));
             }
-            offset += data[ip] as usize + 1;
+            offset += usize::from(data[ip]) + 1;
             ip += 1;
 
             if offset > output.len() {

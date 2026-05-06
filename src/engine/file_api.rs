@@ -305,11 +305,16 @@ pub fn H5F__cache_superblock_get_final_load_size(image: &[u8]) -> usize {
 }
 
 pub fn H5F__cache_superblock_verify_chksum(_image: &[u8]) -> bool {
-    true
+    H5F__is_hdf5(_image)
 }
 
-pub fn H5F__cache_superblock_deserialize(image: &[u8]) -> Vec<u8> {
-    image.to_vec()
+pub fn H5F__cache_superblock_deserialize(image: &[u8]) -> Result<Vec<u8>> {
+    if !H5F__is_hdf5(image) {
+        return Err(Error::InvalidFormat(
+            "cached superblock image has invalid HDF5 signature".into(),
+        ));
+    }
+    Ok(image.to_vec())
 }
 
 pub fn H5F__cache_superblock_image_len(image: &[u8]) -> usize {
@@ -342,11 +347,14 @@ pub fn H5F__cache_drvrinfo_free_icr(_image: Vec<u8>) {}
 
 pub fn H5F__close_cb(_file: FileApiState) {}
 
-pub fn H5F__parse_file_lock_env_var(value: Option<&str>) -> Option<bool> {
+pub fn H5F__parse_file_lock_env_var(value: Option<&str>) -> Result<Option<bool>> {
     match value.map(str::to_ascii_uppercase).as_deref() {
-        Some("FALSE") | Some("0") => Some(false),
-        Some("TRUE") | Some("1") | Some("BEST_EFFORT") => Some(true),
-        _ => None,
+        None => Ok(None),
+        Some("FALSE") | Some("0") => Ok(Some(false)),
+        Some("TRUE") | Some("1") | Some("BEST_EFFORT") => Ok(Some(true)),
+        Some(other) => Err(Error::InvalidFormat(format!(
+            "invalid HDF5 file locking environment value '{other}'"
+        ))),
     }
 }
 
@@ -564,7 +572,8 @@ pub fn H5F_block_write(file: &mut FileApiState, offset: usize, data: &[u8]) -> R
         file.image.resize(end, 0);
     }
     file.image[offset..end].copy_from_slice(data);
-    file.eof = file.eof.max(end as u64);
+    let end_u64 = usize_to_u64(end, "H5F EOF")?;
+    file.eof = file.eof.max(end_u64);
     Ok(())
 }
 
@@ -598,7 +607,7 @@ pub fn H5F_flush_tagged_metadata(file: &mut FileApiState) {
 pub fn H5F_get_checksums(file: &FileApiState) -> u32 {
     file.image
         .iter()
-        .fold(0u32, |acc, byte| acc.wrapping_add(*byte as u32))
+        .fold(0u32, |acc, byte| acc.wrapping_add(u32::from(*byte)))
 }
 
 pub fn H5F_debug(file: &FileApiState) -> String {
@@ -685,8 +694,11 @@ pub fn H5F__efc_open_file(cache: &mut ExternalFileCache, name: &str, intent: u32
         .files
         .len()
         .checked_add(1)
-        .ok_or_else(|| Error::InvalidFormat("external file cache id overflow".into()))?
-        as u64;
+        .ok_or_else(|| Error::InvalidFormat("external file cache id overflow".into()))
+        .and_then(|id| {
+            u64::try_from(id)
+                .map_err(|_| Error::InvalidFormat("external file cache id exceeds u64".into()))
+        })?;
     let file = FileApiState {
         id,
         name: name.to_string(),
@@ -797,9 +809,18 @@ pub fn H5F__accum_free(file: &mut FileApiState) {
 
 pub fn H5F__accum_flush(file: &mut FileApiState) -> Result<()> {
     let data = file.accum.clone();
-    H5F_block_write(file, file.eof as usize, &data)?;
+    let eof = u64_to_usize(file.eof, "H5F accumulator EOF")?;
+    H5F_block_write(file, eof, &data)?;
     file.accum.clear();
     Ok(())
+}
+
+fn usize_to_u64(value: usize, context: &str) -> Result<u64> {
+    u64::try_from(value).map_err(|_| Error::InvalidFormat(format!("{context} exceeds u64")))
+}
+
+fn u64_to_usize(value: u64, context: &str) -> Result<usize> {
+    usize::try_from(value).map_err(|_| Error::InvalidFormat(format!("{context} exceeds usize")))
 }
 
 pub fn H5F__accum_reset(file: &mut FileApiState) {
@@ -1093,5 +1114,30 @@ mod tests {
         assert_eq!(cache.close_attempts, 2);
         H5F__efc_destroy(&mut cache);
         assert!(cache.files.is_empty());
+    }
+
+    #[test]
+    fn superblock_cache_deserialize_validates_signature() {
+        let image = b"\x89HDF\r\n\x1a\nrest".to_vec();
+        assert!(H5F__cache_superblock_verify_chksum(&image));
+        assert_eq!(H5F__cache_superblock_deserialize(&image).unwrap(), image);
+
+        let bad = b"not-hdf5";
+        assert!(!H5F__cache_superblock_verify_chksum(bad));
+        assert!(H5F__cache_superblock_deserialize(bad).is_err());
+    }
+
+    #[test]
+    fn file_lock_env_parser_rejects_invalid_values() {
+        assert_eq!(H5F__parse_file_lock_env_var(None).unwrap(), None);
+        assert_eq!(
+            H5F__parse_file_lock_env_var(Some("0")).unwrap(),
+            Some(false)
+        );
+        assert_eq!(
+            H5F__parse_file_lock_env_var(Some("BEST_EFFORT")).unwrap(),
+            Some(true)
+        );
+        assert!(H5F__parse_file_lock_env_var(Some("maybe")).is_err());
     }
 }

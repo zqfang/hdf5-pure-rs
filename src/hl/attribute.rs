@@ -78,8 +78,12 @@ impl AttributeTable {
     }
 }
 
-fn default_attribute_message(name: &str, data: Vec<u8>) -> AttributeMessage {
-    AttributeMessage {
+fn default_attribute_message(name: &str, data: Vec<u8>) -> Result<AttributeMessage> {
+    let data_len_u32 = u32::try_from(data.len().max(1))
+        .map_err(|_| Error::InvalidFormat("attribute data length exceeds u32".into()))?;
+    let data_len_u64 = u64::try_from(data.len())
+        .map_err(|_| Error::InvalidFormat("attribute data length exceeds u64".into()))?;
+    Ok(AttributeMessage {
         version: 3,
         name: name.to_string(),
         char_encoding: 0,
@@ -87,7 +91,7 @@ fn default_attribute_message(name: &str, data: Vec<u8>) -> AttributeMessage {
             version: 1,
             class: DatatypeClass::FixedPoint,
             class_bits: [0, 0, 0],
-            size: data.len().max(1) as u32,
+            size: data_len_u32,
             properties: vec![0, 0, 0, 0],
         },
         dataspace: DataspaceMessage {
@@ -101,12 +105,12 @@ fn default_attribute_message(name: &str, data: Vec<u8>) -> AttributeMessage {
             dims: if data.is_empty() {
                 Vec::new()
             } else {
-                vec![data.len() as u64]
+                vec![data_len_u64]
             },
             max_dims: None,
         },
         data,
-    }
+    })
 }
 
 #[allow(non_snake_case)]
@@ -145,7 +149,7 @@ pub fn H5A__create(table: &mut AttributeTable, attr: AttributeMessage) -> Result
 
 #[allow(non_snake_case)]
 pub fn H5A__create_by_name(table: &mut AttributeTable, name: &str, data: Vec<u8>) -> Result<()> {
-    H5A__create(table, default_attribute_message(name, data))
+    H5A__create(table, default_attribute_message(name, data)?)
 }
 
 #[allow(non_snake_case)]
@@ -688,7 +692,10 @@ impl Attribute {
 
     /// Get the datatype size in bytes.
     pub fn element_size(&self) -> usize {
-        self.msg.datatype.size as usize
+        match usize::try_from(self.msg.datatype.size) {
+            Ok(size) => size,
+            Err(_) => usize::MAX,
+        }
     }
 
     /// Get the shape of the attribute.
@@ -718,19 +725,16 @@ impl Attribute {
 
     /// Try to read the attribute as a single f64 scalar.
     pub fn read_scalar_f64(&self) -> Option<f64> {
-        if self.msg.data.len() >= 8 {
-            Some(f64::from_le_bytes(self.msg.data[..8].try_into().ok()?))
-        } else {
-            None
-        }
+        let bytes = checked_window(&self.msg.data, 0, 8, "attribute f64 scalar").ok()?;
+        Some(f64::from_le_bytes(bytes.try_into().ok()?))
     }
 
     /// Try to read the attribute as a single i64 scalar.
     pub fn read_scalar_i64(&self) -> Option<i64> {
-        if self.msg.data.len() >= 8 {
-            Some(i64::from_le_bytes(self.msg.data[..8].try_into().ok()?))
-        } else if self.msg.data.len() >= 4 {
-            Some(i32::from_le_bytes(self.msg.data[..4].try_into().ok()?) as i64)
+        if let Ok(bytes) = checked_window(&self.msg.data, 0, 8, "attribute i64 scalar") {
+            Some(i64::from_le_bytes(bytes.try_into().ok()?))
+        } else if let Ok(bytes) = checked_window(&self.msg.data, 0, 4, "attribute i32 scalar") {
+            Some(i64::from(i32::from_le_bytes(bytes.try_into().ok()?)))
         } else {
             None
         }
@@ -766,7 +770,7 @@ impl Attribute {
                 .unwrap_or_default();
         }
         let padding = self.msg.datatype.string_padding().unwrap_or(1);
-        decode_fixed_string_with_padding(&self.msg.data, padding)
+        decode_fixed_string_with_padding(&self.msg.data, padding).unwrap_or_default()
     }
 
     /// Read the attribute as string elements.
@@ -799,12 +803,11 @@ impl Attribute {
         }
 
         let padding = self.msg.datatype.string_padding().unwrap_or(1);
-        Ok(self
-            .msg
+        self.msg
             .data
             .chunks_exact(elem_size)
             .map(|chunk| decode_fixed_string_with_padding(chunk, padding))
-            .collect())
+            .collect()
     }
 
     fn read_vlen_strings(&self) -> Result<Vec<String>> {
@@ -815,7 +818,7 @@ impl Attribute {
             ))
         })?;
         let mut guard = inner.lock();
-        let sizeof_addr = guard.superblock.sizeof_addr as usize;
+        let sizeof_addr = usize::from(guard.superblock.sizeof_addr);
         if sizeof_addr > 8 {
             return Err(Error::Unsupported(format!(
                 "attribute '{}' variable-length descriptor address width {sizeof_addr} exceeds 64-bit support",
@@ -859,11 +862,7 @@ impl Attribute {
                 )));
             }
             let bytes = &data[..seq_len];
-            strings.push(
-                String::from_utf8_lossy(bytes)
-                    .trim_end_matches('\0')
-                    .to_string(),
-            );
+            strings.push(decode_utf8_string(bytes, "attribute vlen string payload")?);
         }
         Ok(strings)
     }
@@ -883,13 +882,15 @@ fn decode_vlen_string_ref(chunk: &[u8], sizeof_addr: usize) -> Result<(usize, u6
         ));
     }
 
-    let seq_len = read_u32_le_at(chunk, 0, "vlen string sequence length")? as usize;
+    let seq_len_u32 = read_u32_le_at(chunk, 0, "vlen string sequence length")?;
+    let seq_len = usize::try_from(seq_len_u32)
+        .map_err(|_| Error::InvalidFormat("vlen string sequence length exceeds usize".into()))?;
     let mut addr = 0u64;
     for (i, byte) in checked_window(chunk, addr_start, sizeof_addr, "vlen string address")?
         .iter()
         .enumerate()
     {
-        addr |= (*byte as u64) << (i * 8);
+        addr |= u64::from(*byte) << (i * 8);
     }
     let index = read_u32_le_at(chunk, addr_end, "vlen string heap index")?;
 
@@ -912,15 +913,23 @@ fn read_u32_le_at(data: &[u8], pos: usize, context: &str) -> Result<u32> {
     Ok(u32::from_le_bytes(bytes))
 }
 
-fn decode_fixed_string_with_padding(bytes: &[u8], padding: u8) -> String {
+fn decode_fixed_string_with_padding(bytes: &[u8], padding: u8) -> Result<String> {
     let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
     let bytes = &bytes[..end];
-    let s = String::from_utf8_lossy(bytes);
-    if padding == 2 {
+    let s = std::str::from_utf8(bytes)
+        .map_err(|_| Error::InvalidFormat("attribute fixed string payload is not UTF-8".into()))?;
+    Ok(if padding == 2 {
         s.trim_end().to_string()
     } else {
         s.to_string()
-    }
+    })
+}
+
+fn decode_utf8_string(bytes: &[u8], context: &str) -> Result<String> {
+    Ok(std::str::from_utf8(bytes)
+        .map_err(|_| Error::InvalidFormat(format!("{context} is not UTF-8")))?
+        .trim_end_matches('\0')
+        .to_string())
 }
 
 /// Collect all attributes from an object header at the given address.
@@ -952,7 +961,7 @@ pub(crate) fn collect_attributes(
                     FractalHeapHeader::read_at(&mut guard.reader, attr_info.fractal_heap_addr)?;
                 let records =
                     btree_v2::collect_all_records(&mut guard.reader, attr_info.name_btree_addr)?;
-                let heap_id_len = heap.heap_id_len as usize;
+                let heap_id_len = usize::from(heap.heap_id_len);
 
                 for record in &records {
                     if record.len() < heap_id_len {
@@ -982,9 +991,8 @@ pub(crate) fn collect_attributes(
 
 fn dense_attribute_record_creation_order(record: &[u8], heap_id_len: usize) -> Option<u64> {
     let start = heap_id_len.checked_add(1)?;
-    let end = start.checked_add(4)?;
-    let bytes = record.get(start..end)?;
-    Some(u32::from_le_bytes(bytes.try_into().ok()?) as u64)
+    let bytes = checked_window(record, start, 4, "dense attribute creation order").ok()?;
+    Some(u64::from(u32::from_le_bytes(bytes.try_into().ok()?)))
 }
 
 /// Collect attributes sorted by tracked creation order.
@@ -1036,7 +1044,10 @@ pub(crate) fn get_attr(
 
 #[cfg(test)]
 mod tests {
-    use super::{checked_window, decode_vlen_string_ref};
+    use super::{
+        checked_window, decode_fixed_string_with_padding, decode_vlen_string_ref,
+        default_attribute_message,
+    };
 
     #[test]
     fn decode_vlen_string_ref_rejects_truncated_descriptor() {
@@ -1061,11 +1072,35 @@ mod tests {
     }
 
     #[test]
+    fn default_attribute_message_uses_checked_lengths() {
+        let msg = default_attribute_message("a", vec![1, 2, 3]).unwrap();
+        assert_eq!(msg.datatype.size, 3);
+        assert_eq!(msg.dataspace.dims, vec![3]);
+
+        let scalar = default_attribute_message("empty", Vec::new()).unwrap();
+        assert_eq!(scalar.datatype.size, 1);
+        assert!(scalar.dataspace.dims.is_empty());
+    }
+
+    #[test]
     fn checked_window_rejects_offset_overflow() {
         let err = checked_window(&[], usize::MAX, 1, "vlen string test").unwrap_err();
         assert!(
             err.to_string().contains("vlen string test offset overflow"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn attribute_string_decoder_rejects_invalid_utf8() {
+        assert_eq!(
+            decode_fixed_string_with_padding(b"alpha\0tail", 1).unwrap(),
+            "alpha"
+        );
+        assert_eq!(
+            decode_fixed_string_with_padding(b"alpha   ", 2).unwrap(),
+            "alpha"
+        );
+        assert!(decode_fixed_string_with_padding(&[0xff, 0], 1).is_err());
     }
 }

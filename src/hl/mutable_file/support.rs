@@ -20,8 +20,9 @@ impl MutableFile {
 
         let checksum = checksum_metadata(&oh_data);
 
+        let check_len_u64 = Self::usize_to_u64(check_len, "object-header checksum length")?;
         let checksum_pos = oh_start
-            .checked_add(check_len as u64)
+            .checked_add(check_len_u64)
             .ok_or_else(|| Error::InvalidFormat("object-header checksum offset overflow".into()))?;
         self.write_handle.seek(SeekFrom::Start(checksum_pos))?;
         self.write_handle.write_all(&checksum.to_le_bytes())?;
@@ -96,19 +97,73 @@ impl MutableFile {
         sizeof_size: u8,
     ) -> usize {
         if layout_version > 4 {
-            return sizeof_size as usize;
+            return usize::from(sizeof_size);
         }
         let bits = if unfiltered_chunk_bytes == 0 {
             0
         } else {
-            usize::BITS as usize - unfiltered_chunk_bytes.leading_zeros() as usize
+            usize::try_from(usize::BITS - unfiltered_chunk_bytes.leading_zeros())
+                .unwrap_or(usize::MAX)
         };
         (1 + ((bits + 8) / 8)).min(8)
     }
 
     pub(super) fn write_uint_le(&mut self, value: u64, size: usize) -> Result<()> {
-        self.write_handle.write_all(&value.to_le_bytes()[..size])?;
+        let bytes = Self::encode_uint_le(value, size, "mutable metadata integer")?;
+        self.write_handle.write_all(&bytes)?;
         Ok(())
+    }
+
+    pub(super) fn encode_uint_le(value: u64, size: usize, context: &str) -> Result<Vec<u8>> {
+        if !(1..=8).contains(&size) {
+            return Err(Error::InvalidFormat(format!(
+                "{context} integer width is invalid"
+            )));
+        }
+        if size < 8 {
+            let bits = size
+                .checked_mul(8)
+                .ok_or_else(|| Error::InvalidFormat(format!("{context} integer width overflow")))?;
+            if value >= (1u64 << bits) {
+                return Err(Error::InvalidFormat(format!(
+                    "{context} value does not fit in {size} bytes"
+                )));
+            }
+        }
+        Ok(value.to_le_bytes()[..size].to_vec())
+    }
+
+    pub(super) fn undefined_addr_bytes(size: usize, context: &str) -> Result<Vec<u8>> {
+        if !(1..=8).contains(&size) {
+            return Err(Error::InvalidFormat(format!(
+                "{context} address width is invalid"
+            )));
+        }
+        Ok(vec![0xff; size])
+    }
+
+    pub(super) fn usize_to_u8(value: usize, context: &str) -> Result<u8> {
+        u8::try_from(value).map_err(|_| Error::InvalidFormat(format!("{context} exceeds u8")))
+    }
+
+    pub(super) fn usize_to_u16(value: usize, context: &str) -> Result<u16> {
+        u16::try_from(value).map_err(|_| Error::InvalidFormat(format!("{context} exceeds u16")))
+    }
+
+    pub(super) fn usize_to_u32(value: usize, context: &str) -> Result<u32> {
+        u32::try_from(value).map_err(|_| Error::InvalidFormat(format!("{context} exceeds u32")))
+    }
+
+    pub(super) fn usize_to_u64(value: usize, context: &str) -> Result<u64> {
+        u64::try_from(value).map_err(|_| Error::InvalidFormat(format!("{context} exceeds u64")))
+    }
+
+    pub(super) fn u64_to_usize(value: u64, context: &str) -> Result<usize> {
+        usize::try_from(value).map_err(|_| Error::InvalidFormat(format!("{context} exceeds usize")))
+    }
+
+    pub(super) fn u64_to_u32(value: u64, context: &str) -> Result<u32> {
+        u32::try_from(value).map_err(|_| Error::InvalidFormat(format!("{context} exceeds u32")))
     }
 
     pub(super) fn read_fresh_bytes(&self, offset: u64, len: usize) -> Result<Vec<u8>> {
@@ -129,8 +184,9 @@ impl MutableFile {
             let padding = usize::try_from(padding)
                 .map_err(|_| Error::InvalidFormat("alignment padding overflow".into()))?;
             self.write_handle.write_all(&vec![0u8; padding])?;
+            let padding_u64 = Self::usize_to_u64(padding, "alignment padding")?;
             pos = pos
-                .checked_add(padding as u64)
+                .checked_add(padding_u64)
                 .ok_or_else(|| Error::InvalidFormat("aligned append offset overflow".into()))?;
         }
         self.write_handle.write_all(&vec![0u8; size])?;
@@ -162,8 +218,10 @@ mod tests {
 
     #[test]
     fn checksum_offset_addition_rejects_overflow() {
+        let max_usize_as_u64 =
+            u64::try_from(usize::MAX).expect("usize::MAX should fit in u64 on supported targets");
         let err = u64::MAX
-            .checked_add(usize::MAX as u64)
+            .checked_add(max_usize_as_u64)
             .ok_or_else(|| Error::InvalidFormat("object-header checksum offset overflow".into()))
             .unwrap_err();
         assert!(err.to_string().contains("checksum offset overflow"));
@@ -183,6 +241,22 @@ mod tests {
         assert!(
             err.to_string().contains("alignment cannot be zero"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn mutable_file_integer_helpers_reject_narrowing() {
+        assert!(MutableFile::usize_to_u8(usize::from(u8::MAX) + 1, "rank").is_err());
+        assert!(MutableFile::usize_to_u16(usize::from(u16::MAX) + 1, "record count").is_err());
+        if let Ok(value) = usize::try_from(u64::from(u32::MAX) + 1) {
+            assert!(MutableFile::usize_to_u32(value, "element size").is_err());
+        }
+        assert!(MutableFile::u64_to_u32(u64::from(u32::MAX) + 1, "chunk size").is_err());
+        assert!(MutableFile::encode_uint_le(256, 1, "test integer").is_err());
+        assert!(MutableFile::encode_uint_le(0, 9, "test integer").is_err());
+        assert_eq!(
+            MutableFile::undefined_addr_bytes(2, "test address").unwrap(),
+            vec![0xff, 0xff]
         );
     }
 }

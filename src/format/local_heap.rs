@@ -99,25 +99,37 @@ impl LocalHeap {
         Self::decode_prefix(reader, addr)
     }
 
-    pub fn fl_deserialize(data: &[u8]) -> Vec<(u64, u64)> {
+    pub fn fl_deserialize(data: &[u8]) -> Result<Vec<(u64, u64)>> {
+        if data.len() % 16 != 0 {
+            return Err(Error::InvalidFormat(
+                "local heap free-list image has a partial trailing record".into(),
+            ));
+        }
         let mut entries = Vec::new();
         let mut pos = 0usize;
-        while pos + 16 <= data.len() {
-            let offset = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
-            let size = u64::from_le_bytes(data[pos + 8..pos + 16].try_into().unwrap());
+        while let Some(record) = checked_window(data, pos, 16) {
+            let offset = read_le_u64_from_record(record, 0).ok_or_else(|| {
+                Error::InvalidFormat("local heap free-list offset is truncated".into())
+            })?;
+            let size = read_le_u64_from_record(record, 8).ok_or_else(|| {
+                Error::InvalidFormat("local heap free-list size is truncated".into())
+            })?;
             entries.push((offset, size));
             pos += 16;
         }
-        entries
+        Ok(entries)
     }
 
-    pub fn fl_serialize(entries: &[(u64, u64)]) -> Vec<u8> {
-        let mut out = Vec::with_capacity(entries.len() * 16);
+    pub fn fl_serialize(entries: &[(u64, u64)]) -> Result<Vec<u8>> {
+        let capacity = entries.len().checked_mul(16).ok_or_else(|| {
+            Error::InvalidFormat("local heap free-list image length overflow".into())
+        })?;
+        let mut out = Vec::with_capacity(capacity);
         for &(offset, size) in entries {
             out.extend_from_slice(&offset.to_le_bytes());
             out.extend_from_slice(&size.to_le_bytes());
         }
-        out
+        Ok(out)
     }
 
     pub fn cache_prefix_get_initial_load_size() -> usize {
@@ -224,7 +236,6 @@ impl LocalHeap {
             return Err(Error::Unsupported(format!("local heap version {version}")));
         }
 
-        // Reserved
         reader.skip(3)?;
 
         // Data segment size
@@ -232,9 +243,21 @@ impl LocalHeap {
 
         // Free list head offset
         let free_list_offset = reader.read_length()?;
+        let free_list_null = undefined_length(reader.sizeof_size())?;
+        if free_list_offset != free_list_null && free_list_offset >= data_size {
+            return Err(Error::InvalidFormat(
+                "local heap free-list offset is out of bounds".into(),
+            ));
+        }
 
         // Data segment address
         let data_addr = reader.read_addr()?;
+        let undef_addr = undefined_address(reader.sizeof_addr())?;
+        if data_size > 0 && data_addr == undef_addr {
+            return Err(Error::InvalidFormat(
+                "local heap data address is undefined".into(),
+            ));
+        }
 
         Ok(LocalHeapPrefix {
             data_size,
@@ -248,6 +271,9 @@ impl LocalHeap {
         reader: &mut HdfReader<R>,
         prefix: &LocalHeapPrefix,
     ) -> Result<Self> {
+        if prefix.data_size == 0 {
+            return Ok(Self { data: Vec::new() });
+        }
         reader.seek(prefix.data_addr)?;
         let data = reader.read_bytes(heap_len(prefix.data_size, "local heap data size")?)?;
         Ok(Self { data })
@@ -269,7 +295,9 @@ impl LocalHeap {
                 Error::InvalidFormat("local heap string is not null-terminated".into())
             })?;
 
-        Ok(String::from_utf8_lossy(&self.data[offset..end]).to_string())
+        std::str::from_utf8(&self.data[offset..end])
+            .map(str::to_string)
+            .map_err(|_| Error::InvalidFormat("local heap string is not UTF-8".into()))
     }
 
     fn string_end(&self, offset: usize) -> Result<usize> {
@@ -308,6 +336,49 @@ fn encode_var(out: &mut Vec<u8>, value: u64, size: usize) -> Result<()> {
     Ok(())
 }
 
+fn undefined_length(width: u8) -> Result<u64> {
+    if width == 0 || width > 8 {
+        return Err(Error::Unsupported(format!(
+            "local heap length width {width} exceeds u64"
+        )));
+    }
+    Ok(if width == 8 {
+        u64::MAX
+    } else {
+        let bits = u32::from(width)
+            .checked_mul(8)
+            .ok_or_else(|| Error::InvalidFormat("local heap length width overflow".into()))?;
+        (1u64 << bits) - 1
+    })
+}
+
+fn undefined_address(width: u8) -> Result<u64> {
+    if width == 0 || width > 8 {
+        return Err(Error::Unsupported(format!(
+            "local heap address width {width} exceeds u64"
+        )));
+    }
+    Ok(if width == 8 {
+        u64::MAX
+    } else {
+        let bits = u32::from(width)
+            .checked_mul(8)
+            .ok_or_else(|| Error::InvalidFormat("local heap address width overflow".into()))?;
+        (1u64 << bits) - 1
+    })
+}
+
+fn checked_window(data: &[u8], pos: usize, len: usize) -> Option<&[u8]> {
+    let end = pos.checked_add(len)?;
+    data.get(pos..end)
+}
+
+fn read_le_u64_from_record(record: &[u8], offset: usize) -> Option<u64> {
+    let end = offset.checked_add(8)?;
+    let bytes: [u8; 8] = record.get(offset..end)?.try_into().ok()?;
+    Some(u64::from_le_bytes(bytes))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -327,5 +398,74 @@ mod tests {
         let encoded = LocalHeap::cache_prefix_serialize(&prefix, 8, 8).unwrap();
         assert_eq!(&encoded[..4], b"HEAP");
         assert_eq!(encoded[4], 0);
+    }
+
+    #[test]
+    fn local_heap_prefix_rejects_out_of_bounds_free_list_offset() {
+        let mut image = b"HEAP".to_vec();
+        image.push(0);
+        image.extend_from_slice(&[0; 3]);
+        image.extend_from_slice(&16u64.to_le_bytes());
+        image.extend_from_slice(&16u64.to_le_bytes());
+        image.extend_from_slice(&128u64.to_le_bytes());
+
+        let mut reader = HdfReader::new(std::io::Cursor::new(image));
+        let err = LocalHeap::decode_prefix(&mut reader, 0)
+            .expect_err("free-list offset equal to heap size should fail");
+        assert!(
+            err.to_string().contains("free-list offset"),
+            "unexpected error: {err}"
+        );
+
+        let prefix = LocalHeap::prfx_new(0, u64::MAX, 128);
+        let image = LocalHeap::cache_prefix_serialize(&prefix, 8, 8).unwrap();
+        let mut reader = HdfReader::new(std::io::Cursor::new(image));
+        LocalHeap::decode_prefix(&mut reader, 0)
+            .expect("undefined free-list offset should be accepted");
+    }
+
+    #[test]
+    fn local_heap_prefix_rejects_nonempty_undefined_data_address() {
+        let prefix = LocalHeap::prfx_new(16, u64::MAX, u64::MAX);
+        let image = LocalHeap::cache_prefix_serialize(&prefix, 8, 8).unwrap();
+        let mut reader = HdfReader::new(std::io::Cursor::new(image));
+        let err = LocalHeap::decode_prefix(&mut reader, 0)
+            .expect_err("nonempty heap with undefined data address should fail");
+        assert!(
+            err.to_string().contains("data address"),
+            "unexpected error: {err}"
+        );
+
+        let prefix = LocalHeap::prfx_new(0, u64::MAX, u64::MAX);
+        let image = LocalHeap::cache_prefix_serialize(&prefix, 8, 8).unwrap();
+        let mut reader = HdfReader::new(std::io::Cursor::new(image));
+        LocalHeap::decode_prefix(&mut reader, 0)
+            .expect("empty heap with undefined data address should be accepted");
+    }
+
+    #[test]
+    fn empty_local_heap_does_not_seek_to_undefined_data_address() {
+        let prefix = LocalHeap::prfx_new(0, u64::MAX, u64::MAX);
+        let mut reader = HdfReader::new(std::io::Cursor::new(Vec::<u8>::new()));
+        let heap = LocalHeap::load_data_segment(&mut reader, &prefix)
+            .expect("empty heap should not read undefined data address");
+        assert!(heap.data.is_empty());
+    }
+
+    #[test]
+    fn free_list_deserialize_rejects_partial_trailing_record_without_panicking() {
+        let mut image = Vec::new();
+        image.extend_from_slice(&3u64.to_le_bytes());
+        image.extend_from_slice(&5u64.to_le_bytes());
+        image.extend_from_slice(&7u64.to_le_bytes());
+
+        let err = LocalHeap::fl_deserialize(&image).unwrap_err();
+        assert!(err.to_string().contains("partial trailing record"));
+
+        let mut complete = Vec::new();
+        complete.extend_from_slice(&3u64.to_le_bytes());
+        complete.extend_from_slice(&5u64.to_le_bytes());
+        assert_eq!(LocalHeap::fl_deserialize(&complete).unwrap(), vec![(3, 5)]);
+        assert_eq!(LocalHeap::fl_serialize(&[(3, 5)]).unwrap(), complete);
     }
 }

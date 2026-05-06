@@ -818,7 +818,7 @@ pub fn H5C__make_space_in_cache(cache: &mut MetadataCache, needed: usize) -> Res
 #[allow(non_snake_case)]
 pub fn H5C__serialize_cache(cache: &mut MetadataCache) -> Result<Vec<u8>> {
     cache.flush_entries()?;
-    Ok(H5C__construct_cache_image_buffer(cache))
+    H5C__construct_cache_image_buffer(cache)
 }
 
 #[allow(non_snake_case)]
@@ -827,7 +827,9 @@ pub fn H5C__serialize_ring(cache: &mut MetadataCache, ring: u8) -> Result<Vec<u8
     let mut out = Vec::new();
     for entry in cache.entries.values().filter(|entry| entry.ring == ring) {
         out.extend_from_slice(&entry.addr.to_le_bytes());
-        out.extend_from_slice(&(entry.image.len() as u64).to_le_bytes());
+        out.extend_from_slice(
+            &usize_to_u64(entry.image.len(), "metadata cache entry image length")?.to_le_bytes(),
+        );
         out.extend_from_slice(&entry.image);
     }
     Ok(out)
@@ -849,14 +851,16 @@ pub fn H5C_cache_image_status(cache: &MetadataCache) -> (bool, usize) {
 }
 
 #[allow(non_snake_case)]
-pub fn H5C__construct_cache_image_buffer(cache: &MetadataCache) -> Vec<u8> {
+pub fn H5C__construct_cache_image_buffer(cache: &MetadataCache) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     for entry in cache.entries.values() {
         out.extend_from_slice(&entry.addr.to_le_bytes());
-        out.extend_from_slice(&(entry.image.len() as u64).to_le_bytes());
+        out.extend_from_slice(
+            &usize_to_u64(entry.image.len(), "metadata cache entry image length")?.to_le_bytes(),
+        );
         out.extend_from_slice(&entry.image);
     }
-    out
+    Ok(out)
 }
 
 #[allow(non_snake_case)]
@@ -893,12 +897,20 @@ pub fn H5C_validate_cache_image_config(config: &MetadataCacheResizeConfig) -> bo
 }
 
 #[allow(non_snake_case)]
-pub fn H5C__encode_cache_image_header(cache: &MetadataCache) -> Vec<u8> {
+pub fn H5C__encode_cache_image_header(cache: &MetadataCache) -> Result<Vec<u8>> {
     let stats = cache.stats();
     let mut out = b"H5CIMG\0\0".to_vec();
-    out.extend_from_slice(&(stats.entries as u64).to_le_bytes());
-    out.extend_from_slice(&(stats.total_image_bytes as u64).to_le_bytes());
-    out
+    out.extend_from_slice(
+        &usize_to_u64(stats.entries, "metadata cache image entry count")?.to_le_bytes(),
+    );
+    out.extend_from_slice(
+        &usize_to_u64(
+            stats.total_image_bytes,
+            "metadata cache image total byte count",
+        )?
+        .to_le_bytes(),
+    );
+    Ok(out)
 }
 
 #[allow(non_snake_case)]
@@ -946,7 +958,7 @@ pub fn H5C__reconstruct_cache_entry(
 }
 
 #[allow(non_snake_case)]
-pub fn H5C__write_cache_image_superblock_msg(cache: &MetadataCache) -> Vec<u8> {
+pub fn H5C__write_cache_image_superblock_msg(cache: &MetadataCache) -> Result<Vec<u8>> {
     H5C__encode_cache_image_header(cache)
 }
 
@@ -1020,10 +1032,16 @@ pub fn H5C__discard_single_entry(
 
 #[allow(non_snake_case)]
 pub fn H5C__verify_len_eoa(cache: &MetadataCache, addr: u64, len: usize, eoa: u64) -> bool {
-    cache
-        .entries
-        .get(&addr)
-        .is_some_and(|entry| entry.image.len() == len && addr.saturating_add(len as u64) <= eoa)
+    let Ok(len_u64) = u64::try_from(len) else {
+        return false;
+    };
+    cache.entries.get(&addr).is_some_and(|entry| {
+        entry.image.len() == len && addr.checked_add(len_u64).is_some_and(|end| end <= eoa)
+    })
+}
+
+fn usize_to_u64(value: usize, context: &str) -> Result<u64> {
+    u64::try_from(value).map_err(|_| Error::InvalidFormat(format!("{context} exceeds u64")))
 }
 
 #[allow(non_snake_case)]

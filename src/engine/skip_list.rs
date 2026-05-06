@@ -118,9 +118,117 @@ impl<K: Ord + Clone, V> SkipList<K, V> {
     pub fn close(self) {}
 }
 
+#[allow(non_snake_case)]
+pub fn H5SL__init_package<K: Ord + Clone, V>() -> bool {
+    SkipList::<K, V>::init_package()
+}
+
+#[allow(non_snake_case)]
+pub fn H5SL_term_package<K: Ord + Clone, V>() {
+    SkipList::<K, V>::term_package()
+}
+
+#[allow(non_snake_case)]
+pub fn H5SL__new_node<K: Ord + Clone, V>(key: K, value: V) -> (K, V) {
+    SkipList::<K, V>::new_node(key, value)
+}
+
+#[allow(non_snake_case)]
+pub fn H5SL__insert_common<K: Ord + Clone, V>(
+    list: &mut SkipList<K, V>,
+    key: K,
+    value: V,
+) -> Option<V> {
+    list.insert_common(key, value)
+}
+
+#[allow(non_snake_case)]
+pub fn H5SL__close_common<K: Ord + Clone, V>(list: SkipList<K, V>) {
+    list.close_common()
+}
+
+#[allow(non_snake_case)]
+pub fn H5SL_create<K: Ord + Clone, V>() -> SkipList<K, V> {
+    SkipList::create()
+}
+
+#[allow(non_snake_case)]
+pub fn H5SL_count<K: Ord + Clone, V>(list: &SkipList<K, V>) -> usize {
+    list.count()
+}
+
+#[allow(non_snake_case)]
+pub fn H5SL_insert<K: Ord + Clone, V>(list: &mut SkipList<K, V>, key: K, value: V) -> Option<V> {
+    list.insert(key, value)
+}
+
+#[allow(non_snake_case)]
+pub fn H5SL_add<K: Ord + Clone, V>(list: &mut SkipList<K, V>, key: K, value: V) -> Option<V> {
+    list.add(key, value)
+}
+
+#[allow(non_snake_case)]
+pub fn H5SL_remove<K: Ord + Clone, V>(list: &mut SkipList<K, V>, key: &K) -> Option<V> {
+    list.remove(key)
+}
+
+#[allow(non_snake_case)]
+pub fn H5SL_next<'a, K: Ord + Clone, V>(
+    list: &'a SkipList<K, V>,
+    key: Option<&K>,
+) -> Option<(&'a K, &'a V)> {
+    list.next(key)
+}
+
+#[allow(non_snake_case)]
+pub fn H5SL_prev<'a, K: Ord + Clone, V>(
+    list: &'a SkipList<K, V>,
+    key: Option<&K>,
+) -> Option<(&'a K, &'a V)> {
+    list.prev(key)
+}
+
+#[allow(non_snake_case)]
+pub fn H5SL_last<K: Ord + Clone, V>(list: &SkipList<K, V>) -> Option<(&K, &V)> {
+    list.last()
+}
+
+#[allow(non_snake_case)]
+pub fn H5SL_item<'a, K: Ord + Clone, V>(list: &'a SkipList<K, V>, key: &K) -> Option<&'a V> {
+    list.item(key)
+}
+
+#[allow(non_snake_case)]
+pub fn H5SL_iterate<K: Ord + Clone, V, F>(list: &SkipList<K, V>, callback: F)
+where
+    F: FnMut(&K, &V),
+{
+    list.iterate(callback)
+}
+
+#[allow(non_snake_case)]
+pub fn H5SL_release<K: Ord + Clone, V>(list: &mut SkipList<K, V>) {
+    list.release()
+}
+
+#[allow(non_snake_case)]
+pub fn H5SL_free<K: Ord + Clone, V>(list: &mut SkipList<K, V>) {
+    list.free()
+}
+
+#[allow(non_snake_case)]
+pub fn H5SL_destroy<K: Ord + Clone, V>(list: SkipList<K, V>) {
+    list.destroy()
+}
+
+#[allow(non_snake_case)]
+pub fn H5SL_close<K: Ord + Clone, V>(list: SkipList<K, V>) {
+    list.close()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::SkipList;
+    use super::*;
 
     #[test]
     fn skip_list_aliases_preserve_sorted_order() {
@@ -149,5 +257,34 @@ mod tests {
 
         SkipList::<i32, &str>::create().destroy();
         SkipList::<i32, &str>::create().close();
+    }
+
+    #[test]
+    fn h5sl_aliases_preserve_sorted_order() {
+        assert!(H5SL__init_package::<i32, &str>());
+        H5SL_term_package::<i32, &str>();
+        assert_eq!(H5SL__new_node(3, "c"), (3, "c"));
+
+        let mut list = H5SL_create();
+        assert_eq!(H5SL_insert(&mut list, 2, "b"), None);
+        assert_eq!(H5SL_add(&mut list, 1, "a"), None);
+        assert_eq!(H5SL__insert_common(&mut list, 3, "c"), None);
+        assert_eq!(H5SL_count(&list), 3);
+        assert_eq!(H5SL_item(&list, &2), Some(&"b"));
+        assert_eq!(H5SL_next(&list, Some(&1)), Some((&2, &"b")));
+        assert_eq!(H5SL_prev(&list, Some(&3)), Some((&2, &"b")));
+        assert_eq!(H5SL_last(&list), Some((&3, &"c")));
+
+        let mut seen = Vec::new();
+        H5SL_iterate(&list, |key, value| seen.push((*key, *value)));
+        assert_eq!(seen, vec![(1, "a"), (2, "b"), (3, "c")]);
+        assert_eq!(H5SL_remove(&mut list, &2), Some("b"));
+        H5SL_release(&mut list);
+        H5SL_free(&mut list);
+        assert_eq!(H5SL_count(&list), 0);
+        H5SL__close_common(list);
+
+        H5SL_destroy(H5SL_create::<i32, &str>());
+        H5SL_close(H5SL_create::<i32, &str>());
     }
 }

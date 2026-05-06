@@ -242,7 +242,12 @@ pub(crate) fn read_header_core<R: Read + Seek>(
     }
 
     let class_id = reader.read_u8()?;
-    let raw_element_size = reader.read_u8()? as usize;
+    let raw_element_size = usize::from(reader.read_u8()?);
+    if raw_element_size == 0 {
+        return Err(Error::InvalidFormat(
+            "extensible array element size must be nonzero".into(),
+        ));
+    }
     let max_elements_bits = reader.read_u8()?;
     let index_block_elements = reader.read_u8()?;
     let data_block_min_elements = reader.read_u8()?;
@@ -283,20 +288,20 @@ pub(crate) fn read_header_core<R: Read + Seek>(
 
     let array_offset_size = max_elements_bits.div_ceil(8);
     let data_block_page_elements = 1usize
-        .checked_shl(max_data_block_page_elements_bits as u32)
+        .checked_shl(u32::from(max_data_block_page_elements_bits))
         .ok_or_else(|| {
             Error::InvalidFormat("extensible array page element count overflow".into())
         })?;
-    let derived_super_block_count = (max_elements_bits as usize)
-        .checked_sub(super::log2_power2(data_block_min_elements as u64)?)
+    let derived_super_block_count = usize::from(max_elements_bits)
+        .checked_sub(super::log2_power2(u64::from(data_block_min_elements))?)
         .and_then(|value| value.checked_add(1))
         .ok_or_else(|| Error::InvalidFormat("invalid extensible array block parameters".into()))?;
-    let index_block_super_blocks = super::log2_power2(super_block_min_data_ptrs as u64)?
+    let index_block_super_blocks = super::log2_power2(u64::from(super_block_min_data_ptrs))?
         .checked_mul(2)
         .ok_or_else(|| {
             Error::InvalidFormat("extensible array index block sizing overflow".into())
         })?;
-    let index_block_data_block_addrs = (super_block_min_data_ptrs as usize)
+    let index_block_data_block_addrs = usize::from(super_block_min_data_ptrs)
         .checked_sub(1)
         .and_then(|value| value.checked_mul(2))
         .ok_or_else(|| {
@@ -307,14 +312,16 @@ pub(crate) fn read_header_core<R: Read + Seek>(
         .ok_or_else(|| {
             Error::InvalidFormat("invalid extensible array super block layout".into())
         })?;
-    let super_block_info =
-        build_super_block_info(derived_super_block_count, data_block_min_elements as usize)?;
+    let super_block_info = build_super_block_info(
+        derived_super_block_count,
+        usize::from(data_block_min_elements),
+    )?;
 
     Ok(ParsedExtensibleArrayHeader {
         class_id,
         raw_element_size,
         index_block_elements,
-        data_block_min_elements: data_block_min_elements as usize,
+        data_block_min_elements: usize::from(data_block_min_elements),
         super_block_count: stored_super_block_count,
         super_block_size,
         data_block_count,
@@ -370,13 +377,21 @@ fn build_super_block_info(
     let mut start_index = 0u64;
     let mut start_data_block = 0u64;
     for index in 0..count {
-        let data_blocks = 1usize.checked_shl((index / 2) as u32).ok_or_else(|| {
-            Error::InvalidFormat("extensible array data block count overflow".into())
-        })?;
+        let data_blocks = 1usize
+            .checked_shl(u32::try_from(index / 2).map_err(|_| {
+                Error::InvalidFormat("extensible array data block shift overflow".into())
+            })?)
+            .ok_or_else(|| {
+                Error::InvalidFormat("extensible array data block count overflow".into())
+            })?;
         let data_block_elements = min_data_block_elements
             .checked_mul(
                 1usize
-                    .checked_shl(index.div_ceil(2) as u32)
+                    .checked_shl(u32::try_from(index.div_ceil(2)).map_err(|_| {
+                        Error::InvalidFormat(
+                            "extensible array data block element shift overflow".into(),
+                        )
+                    })?)
                     .ok_or_else(|| {
                         Error::InvalidFormat(
                             "extensible array data block element count overflow".into(),
@@ -391,14 +406,20 @@ fn build_super_block_info(
             data_block_elements,
             start_data_block,
         });
-        let index_span = (data_blocks as u64)
-            .checked_mul(data_block_elements as u64)
+        let index_span = super::u64_from_usize(data_blocks, "extensible array data block count")?
+            .checked_mul(super::u64_from_usize(
+                data_block_elements,
+                "extensible array data block elements",
+            )?)
             .ok_or_else(|| Error::InvalidFormat("extensible array start index overflow".into()))?;
         start_index = start_index
             .checked_add(index_span)
             .ok_or_else(|| Error::InvalidFormat("extensible array start index overflow".into()))?;
         start_data_block = start_data_block
-            .checked_add(data_blocks as u64)
+            .checked_add(super::u64_from_usize(
+                data_blocks,
+                "extensible array data block count",
+            )?)
             .ok_or_else(|| {
                 Error::InvalidFormat("extensible array data block index overflow".into())
             })?;
@@ -419,11 +440,43 @@ fn encode_var(out: &mut Vec<u8>, value: u64, size: usize) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::build_super_block_info;
+    use std::io::Cursor;
+
+    use crate::io::HdfReader;
+
+    use super::{build_super_block_info, read_header_core};
 
     #[test]
     fn build_super_block_info_rejects_start_index_product_overflow() {
         let err = build_super_block_info(3, usize::MAX / 4 + 1).unwrap_err();
         assert!(err.to_string().contains("start index overflow"));
+    }
+
+    #[test]
+    fn extensible_array_header_rejects_zero_element_size() {
+        let mut bytes = b"EAHD".to_vec();
+        bytes.push(0);
+        bytes.push(1);
+        bytes.push(0);
+        bytes.push(4);
+        bytes.push(1);
+        bytes.push(1);
+        bytes.push(1);
+        bytes.push(1);
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // super block count
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // super block size
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // data block count
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // data block size
+        bytes.extend_from_slice(&1u64.to_le_bytes()); // max index set
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // realized elements
+        bytes.extend_from_slice(&crate::io::reader::UNDEF_ADDR.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+
+        let mut reader = HdfReader::new(Cursor::new(bytes));
+        let err = read_header_core(&mut reader, 0).expect_err("zero element size should fail");
+        assert!(
+            err.to_string().contains("element size"),
+            "unexpected error: {err}"
+        );
     }
 }

@@ -14,8 +14,14 @@ const MAX_CHUNK_BTREE_V1_RECURSION: usize = 64;
 /// child-pointer addresses. Mirrors the structural distinction libhdf5
 /// makes via the `H5B_t` `level == 0` test.
 enum ChunkBTreeNode {
-    Leaf(Vec<ChunkBTreeRecord>),
-    Internal(Vec<u64>),
+    Leaf {
+        level: u8,
+        records: Vec<ChunkBTreeRecord>,
+    },
+    Internal {
+        level: u8,
+        child_addrs: Vec<u64>,
+    },
 }
 
 impl Dataset {
@@ -27,7 +33,9 @@ impl Dataset {
         let ndims = chunk_ctx.data_dims.len();
         let chunk_records = Self::collect_btree_v1_chunks(reader, chunk_ctx.idx_addr, ndims)?;
         let mut output = if Self::has_full_chunk_coverage_1d(&chunk_records, chunk_ctx)? {
-            Self::uninitialized_output(chunk_ctx.total_bytes)
+            // Optimization opportunity: this path should fully overwrite the buffer, but proving
+            // every fallback/error edge is safe needs a deeper audit before using uninitialized memory.
+            Self::scratch_output(chunk_ctx.total_bytes)
         } else {
             Self::filled_data(
                 chunk_ctx.total_bytes / chunk_ctx.element_size,
@@ -87,7 +95,7 @@ impl Dataset {
         } else {
             nbytes
         });
-        th.output_u64(filter_mask as u64);
+        th.output_u64(u64::from(filter_mask));
         th.finish();
     }
 
@@ -149,7 +157,7 @@ impl Dataset {
         }
 
         let level = reader.read_u8()?;
-        let entries_used = reader.read_u16()? as usize;
+        let entries_used = usize::from(reader.read_u16()?);
         let _left_sibling = reader.read_addr()?;
         let _right_sibling = reader.read_addr()?;
 
@@ -159,14 +167,14 @@ impl Dataset {
                 records.push(Self::decode_chunk_btree_leaf_record(reader, ndims)?);
             }
             Self::skip_chunk_btree_final_key(reader, ndims)?;
-            Ok(ChunkBTreeNode::Leaf(records))
+            Ok(ChunkBTreeNode::Leaf { level, records })
         } else {
             let mut child_addrs = Vec::with_capacity(entries_used);
             for _ in 0..entries_used {
                 child_addrs.push(Self::decode_chunk_btree_child_addr(reader, ndims)?);
             }
             Self::skip_chunk_btree_final_key(reader, ndims)?;
-            Ok(ChunkBTreeNode::Internal(child_addrs))
+            Ok(ChunkBTreeNode::Internal { level, child_addrs })
         }
     }
 
@@ -179,7 +187,7 @@ impl Dataset {
         ndims: usize,
     ) -> Result<Vec<ChunkBTreeRecord>> {
         let mut visited = Vec::new();
-        Self::collect_btree_v1_chunks_inner(reader, addr, ndims, 0, &mut visited)
+        Self::collect_btree_v1_chunks_inner(reader, addr, ndims, 0, None, &mut visited)
     }
 
     fn collect_btree_v1_chunks_inner<R: Read + Seek>(
@@ -187,6 +195,7 @@ impl Dataset {
         addr: u64,
         ndims: usize,
         depth: usize,
+        expected_level: Option<u8>,
         visited: &mut Vec<u64>,
     ) -> Result<Vec<ChunkBTreeRecord>> {
         if depth > MAX_CHUNK_BTREE_V1_RECURSION {
@@ -207,9 +216,20 @@ impl Dataset {
         visited.push(addr);
 
         let node = Self::decode_chunk_btree_node(reader, addr, ndims)?;
+        let node_level = match &node {
+            ChunkBTreeNode::Leaf { level, .. } | ChunkBTreeNode::Internal { level, .. } => *level,
+        };
+        if let Some(expected_level) = expected_level {
+            if node_level != expected_level {
+                visited.pop();
+                return Err(Error::InvalidFormat(format!(
+                    "v1 chunk B-tree child level {node_level} does not match expected {expected_level}"
+                )));
+            }
+        }
         let result = match node {
-            ChunkBTreeNode::Leaf(records) => Ok(records),
-            ChunkBTreeNode::Internal(child_addrs) => {
+            ChunkBTreeNode::Leaf { records, .. } => Ok(records),
+            ChunkBTreeNode::Internal { level, child_addrs } => {
                 let mut all_chunks = Vec::new();
                 for child_addr in child_addrs {
                     let mut child_chunks = Self::collect_btree_v1_chunks_inner(
@@ -219,6 +239,7 @@ impl Dataset {
                         depth.checked_add(1).ok_or_else(|| {
                             Error::InvalidFormat("v1 chunk B-tree recursion depth overflow".into())
                         })?,
+                        Some(level - 1),
                         visited,
                     )?;
                     all_chunks.append(&mut child_chunks);
@@ -235,7 +256,7 @@ impl Dataset {
         reader: &mut HdfReader<R>,
         ndims: usize,
     ) -> Result<ChunkBTreeRecord> {
-        let chunk_size = reader.read_u32()? as u64;
+        let chunk_size = u64::from(reader.read_u32()?);
         let filter_mask = reader.read_u32()?;
         let mut coords = Vec::with_capacity(ndims);
         for _ in 0..ndims {

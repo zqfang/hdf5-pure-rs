@@ -1,6 +1,7 @@
-use std::io::{Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 
-use crate::error::Result;
+use crate::error::{Error, Result};
+use crate::format::checksum::checksum_metadata;
 
 use super::MutableFile;
 
@@ -33,23 +34,56 @@ impl MutableFile {
         };
 
         let mut guard = self.inner.lock();
-        let element_pos = crate::format::fixed_array::locate_fixed_array_element(
-            &mut guard.reader,
-            index_addr,
-            filtered,
-            chunk_size_len,
-            element_index,
-        )?;
+        let element_location =
+            crate::format::fixed_array::locate_fixed_array_element_with_checksum(
+                &mut guard.reader,
+                index_addr,
+                filtered,
+                chunk_size_len,
+                element_index,
+            )?;
         drop(guard);
 
-        let sa = self.superblock.sizeof_addr as usize;
-        self.write_handle.seek(SeekFrom::Start(element_pos))?;
+        let sa = usize::from(self.superblock.sizeof_addr);
         self.write_handle
-            .write_all(&chunk_addr.to_le_bytes()[..sa])?;
+            .seek(SeekFrom::Start(element_location.element_addr))?;
+        let chunk_addr = Self::encode_uint_le(chunk_addr, sa, "fixed array chunk address")?;
+        self.write_handle.write_all(&chunk_addr)?;
         if filtered {
             self.write_uint_le(chunk_size, chunk_size_len)?;
             self.write_handle.write_all(&0u32.to_le_bytes())?;
         }
+        self.rewrite_fixed_array_element_checksum(
+            element_location.checksum_start,
+            element_location.checksum_len,
+            element_location.checksum_addr,
+        )?;
+        Ok(())
+    }
+
+    fn rewrite_fixed_array_element_checksum(
+        &mut self,
+        checksum_start: u64,
+        checksum_len: usize,
+        checksum_addr: u64,
+    ) -> Result<()> {
+        self.write_handle.flush()?;
+        let mut reader = std::fs::File::open(&self.path)?;
+        reader.seek(SeekFrom::Start(checksum_start))?;
+        let mut bytes = vec![0; checksum_len];
+        reader.read_exact(&mut bytes)?;
+        let checksum = checksum_metadata(&bytes);
+        let checksum_end = checksum_addr
+            .checked_add(4)
+            .ok_or_else(|| Error::InvalidFormat("fixed array checksum address overflow".into()))?;
+        let file_len = reader.metadata()?.len();
+        if checksum_end > file_len {
+            return Err(Error::InvalidFormat(
+                "fixed array checksum address exceeds file size".into(),
+            ));
+        }
+        self.write_handle.seek(SeekFrom::Start(checksum_addr))?;
+        self.write_handle.write_all(&checksum.to_le_bytes())?;
         Ok(())
     }
 }

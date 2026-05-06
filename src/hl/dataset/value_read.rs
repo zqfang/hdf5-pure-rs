@@ -5,47 +5,54 @@ use crate::format::messages::datatype::DatatypeMessage;
 use crate::hl::value::H5Value;
 use crate::io::reader::HdfReader;
 
-use super::Dataset;
+use super::{usize_from_u64, Dataset};
 
 impl Dataset {
     /// Read fixed-length strings from the dataset.
     /// Each element is `element_size` bytes, null-padded or space-padded.
     pub fn read_strings(&self) -> Result<Vec<String>> {
         let info = self.info()?;
-        let elem_size = info.datatype.size as usize;
+        let elem_size = usize_from_u64(u64::from(info.datatype.size), "datatype size")?;
         let raw = self.read_raw()?;
 
         if info.datatype.is_variable_length() {
             // Variable-length data: each element is stored as:
             // sequence_length(4) + global_heap_collection_addr(sizeof_addr) + heap_object_index(4)
             let mut guard = self.inner.lock();
-            let sizeof_addr = guard.superblock.sizeof_addr as usize;
+            let sizeof_addr = usize::from(guard.superblock.sizeof_addr);
             let ref_size = vlen_descriptor_size(sizeof_addr)?;
             validate_record_aligned(raw.len(), ref_size, "variable-length string descriptors")?;
             let mut strings = Vec::new();
 
             for chunk in raw.chunks_exact(ref_size) {
-                let (_seq_len, addr, index) = decode_vlen_descriptor(chunk, sizeof_addr)?;
+                let (seq_len, addr, index) = decode_vlen_descriptor(chunk, sizeof_addr)?;
 
-                if addr == 0 || crate::io::reader::is_undef_addr(addr) {
+                if seq_len == 0 && (addr == 0 || crate::io::reader::is_undef_addr(addr)) {
                     strings.push(String::new());
                 } else {
+                    if addr == 0 || crate::io::reader::is_undef_addr(addr) {
+                        return Err(Error::InvalidFormat(
+                            "variable-length string descriptor has length but no heap address"
+                                .into(),
+                        ));
+                    }
                     let gh_ref = crate::format::global_heap::GlobalHeapRef {
                         collection_addr: addr,
                         object_index: index,
                     };
-                    match crate::format::global_heap::read_global_heap_object(
+                    let data = crate::format::global_heap::read_global_heap_object(
                         &mut guard.reader,
                         &gh_ref,
-                    ) {
-                        Ok(data) => {
-                            trace_vlen_read(data.len() as u64, &data);
-                            let s = String::from_utf8_lossy(&data).to_string();
-                            // Trim trailing nulls
-                            strings.push(s.trim_end_matches('\0').to_string());
-                        }
-                        Err(_) => strings.push(String::new()),
+                    )?;
+                    if data.len() < seq_len {
+                        return Err(Error::InvalidFormat(format!(
+                            "variable-length string payload too short: expected {seq_len} bytes, got {}",
+                            data.len()
+                        )));
                     }
+                    let data = &data[..seq_len];
+                    trace_vlen_read(seq_len, data);
+                    strings.push(decode_utf8_string(data, "variable-length string payload")?);
                 }
             }
             return Ok(strings);
@@ -56,7 +63,7 @@ impl Dataset {
         let padding = info.datatype.string_padding().unwrap_or(1);
         let mut strings = Vec::new();
         for chunk in raw.chunks_exact(elem_size) {
-            strings.push(decode_fixed_string_with_padding(chunk, padding));
+            strings.push(decode_fixed_string_with_padding(chunk, padding)?);
         }
         Ok(strings)
     }
@@ -98,7 +105,7 @@ impl Dataset {
         self.maybe_byte_swap_field(&mut raw, field)?;
 
         let info = self.info()?;
-        let record_size = info.datatype.size as usize;
+        let record_size = usize_from_u64(u64::from(info.datatype.size), "datatype size")?;
         let offset = field.byte_offset;
         let elem_size = field.size;
         let n_records = raw.len() / record_size;
@@ -145,7 +152,7 @@ impl Dataset {
 
         let raw = self.read_raw()?;
         let info = self.info()?;
-        let record_size = info.datatype.size as usize;
+        let record_size = usize_from_u64(u64::from(info.datatype.size), "datatype size")?;
         let offset = field.byte_offset;
         let elem_size = field.size;
         let n_records = raw.len() / record_size;
@@ -185,7 +192,7 @@ impl Dataset {
 
         let raw = self.read_raw()?;
         let info = self.info()?;
-        let record_size = info.datatype.size as usize;
+        let record_size = usize_from_u64(u64::from(info.datatype.size), "datatype size")?;
         let field_end = compound_field_end(field.byte_offset, field.size)?;
         if record_size == 0 || field_end > record_size {
             return Err(Error::InvalidFormat(format!(
@@ -194,7 +201,7 @@ impl Dataset {
         }
 
         let mut guard = self.inner.lock();
-        let sizeof_addr = guard.superblock.sizeof_addr as usize;
+        let sizeof_addr = usize::from(guard.superblock.sizeof_addr);
         let n_records = raw.len() / record_size;
         let mut result = Vec::with_capacity(n_records);
 
@@ -239,7 +246,7 @@ impl Dataset {
                 }
                 _ => Ok(H5Value::Raw(bytes.to_vec())),
             },
-            DatatypeClass::String => Ok(H5Value::String(decode_fixed_string(bytes))),
+            DatatypeClass::String => Ok(H5Value::String(decode_fixed_string(bytes)?)),
             DatatypeClass::Compound => {
                 let fields = dtype.compound_fields()?;
                 let mut values = Vec::with_capacity(fields.len());
@@ -268,10 +275,10 @@ impl Dataset {
             DatatypeClass::Array => {
                 let (dims, base) = dtype.array_dims_base()?;
                 let count = dims.iter().try_fold(1usize, |acc, &dim| {
-                    acc.checked_mul(dim as usize)
+                    acc.checked_mul(usize_from_u64(dim, "array dimension")?)
                         .ok_or_else(|| Error::InvalidFormat("array element count overflow".into()))
                 })?;
-                let elem_size = base.size as usize;
+                let elem_size = usize_from_u64(u64::from(base.size), "array base datatype size")?;
                 let byte_len = count.checked_mul(elem_size).ok_or_else(|| {
                     Error::InvalidFormat("array field payload size overflow".into())
                 })?;
@@ -292,7 +299,7 @@ impl Dataset {
                 let n = bytes.len().min(sizeof_addr).min(8);
                 let mut addr = 0u64;
                 for (i, byte) in bytes.iter().take(n).enumerate() {
-                    addr |= (*byte as u64) << (i * 8);
+                    addr |= u64::from(*byte) << (i * 8);
                 }
                 Ok(H5Value::Reference(addr))
             }
@@ -308,8 +315,7 @@ impl Dataset {
         sizeof_addr: usize,
         reader: &mut HdfReader<R>,
     ) -> Result<H5Value> {
-        let (seq_len_u32, addr, index) = decode_vlen_descriptor(bytes, sizeof_addr)?;
-        let seq_len = seq_len_u32 as usize;
+        let (seq_len, addr, index) = decode_vlen_descriptor(bytes, sizeof_addr)?;
 
         if seq_len == 0 || addr == 0 || crate::io::reader::is_undef_addr(addr) {
             return Ok(H5Value::VarLen(Vec::new()));
@@ -323,7 +329,7 @@ impl Dataset {
             },
         )?;
         let Some(base) = base else {
-            trace_vlen_read(seq_len as u64, &data[..data.len().min(seq_len)]);
+            trace_vlen_read(seq_len, &data[..data.len().min(seq_len)]);
             return Ok(H5Value::Raw(data[..data.len().min(seq_len)].to_vec()));
         };
 
@@ -335,18 +341,17 @@ impl Dataset {
                 )));
             }
             let data = &data[..seq_len];
-            trace_vlen_read(seq_len as u64, data);
-            return Ok(H5Value::String(
-                String::from_utf8_lossy(data)
-                    .trim_end_matches('\0')
-                    .to_string(),
-            ));
+            trace_vlen_read(seq_len, data);
+            return Ok(H5Value::String(decode_utf8_string(
+                data,
+                "variable-length string payload",
+            )?));
         }
 
-        let elem_size = base.size as usize;
+        let elem_size = usize_from_u64(u64::from(base.size), "vlen base datatype size")?;
         if elem_size == 0 {
             let data = &data[..data.len().min(seq_len)];
-            trace_vlen_read(seq_len as u64, data);
+            trace_vlen_read(seq_len, data);
             return Ok(H5Value::Raw(data.to_vec()));
         }
         let expected_len = seq_len
@@ -359,7 +364,7 @@ impl Dataset {
             )));
         }
         let data = &data[..expected_len];
-        trace_vlen_read(expected_len as u64, data);
+        trace_vlen_read(expected_len, data);
 
         let mut values = Vec::with_capacity(seq_len);
         for chunk in data.chunks_exact(elem_size) {
@@ -397,7 +402,7 @@ impl Dataset {
         }
 
         let info = self.info()?;
-        let record_size = info.datatype.size as usize;
+        let record_size = usize_from_u64(u64::from(info.datatype.size), "datatype size")?;
         let field_end = compound_field_end(field.byte_offset, field.size)?;
         if record_size == 0 || field_end > record_size {
             return Err(Error::InvalidFormat(format!(
@@ -444,7 +449,7 @@ fn validate_record_aligned(total_len: usize, record_size: usize, context: &str) 
     Ok(())
 }
 
-fn decode_vlen_descriptor(bytes: &[u8], sizeof_addr: usize) -> Result<(u32, u64, u32)> {
+fn decode_vlen_descriptor(bytes: &[u8], sizeof_addr: usize) -> Result<(usize, u64, u32)> {
     let descriptor_size = vlen_descriptor_size(sizeof_addr)?;
     if bytes.len() < descriptor_size {
         return Err(Error::InvalidFormat(
@@ -452,7 +457,10 @@ fn decode_vlen_descriptor(bytes: &[u8], sizeof_addr: usize) -> Result<(u32, u64,
         ));
     }
 
-    let seq_len = read_u32_le_at(bytes, 0, "variable-length sequence length")?;
+    let seq_len_u32 = read_u32_le_at(bytes, 0, "variable-length sequence length")?;
+    let seq_len = usize::try_from(seq_len_u32).map_err(|_| {
+        Error::InvalidFormat("variable-length sequence length exceeds usize".into())
+    })?;
     let mut addr = 0u64;
     let addr_start = 4usize;
     let addr_end = addr_start
@@ -462,7 +470,7 @@ fn decode_vlen_descriptor(bytes: &[u8], sizeof_addr: usize) -> Result<(u32, u64,
         .iter()
         .enumerate()
     {
-        addr |= (*byte as u64) << (i * 8);
+        addr |= u64::from(*byte) << (i * 8);
     }
     let index_pos = addr_end;
     let index = read_u32_le_at(bytes, index_pos, "variable-length heap index")?;
@@ -487,16 +495,16 @@ fn read_u32_le_at(data: &[u8], pos: usize, context: &str) -> Result<u32> {
 }
 
 #[cfg(feature = "tracehash")]
-fn trace_vlen_read(len: u64, data: &[u8]) {
+fn trace_vlen_read(len: usize, data: &[u8]) {
     let mut th = tracehash::th_call!("hdf5.vlen.read");
-    th.input_u64(len);
+    th.input_u64(u64::try_from(len).unwrap_or(u64::MAX));
     th.output_value(&(true));
     th.output_value(data);
     th.finish();
 }
 
 #[cfg(not(feature = "tracehash"))]
-fn trace_vlen_read(_len: u64, _data: &[u8]) {}
+fn trace_vlen_read(_len: usize, _data: &[u8]) {}
 
 fn read_unsigned_int(bytes: &[u8], little_endian: bool) -> u128 {
     let mut value = 0u128;
@@ -569,6 +577,32 @@ mod tests {
             "unexpected error: {err}"
         );
     }
+
+    #[test]
+    fn decode_vlen_descriptor_checks_sequence_length_conversion() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&3u32.to_le_bytes());
+        bytes.extend_from_slice(&0x1234u64.to_le_bytes());
+        bytes.extend_from_slice(&7u32.to_le_bytes());
+        let (seq_len, addr, index) = decode_vlen_descriptor(&bytes, 8).unwrap();
+        assert_eq!(seq_len, 3);
+        assert_eq!(addr, 0x1234);
+        assert_eq!(index, 7);
+    }
+
+    #[test]
+    fn string_decoders_reject_invalid_utf8() {
+        assert_eq!(
+            decode_fixed_string_with_padding(b"alpha\0tail", 1).unwrap(),
+            "alpha"
+        );
+        assert_eq!(
+            decode_fixed_string_with_padding(b"alpha   ", 2).unwrap(),
+            "alpha"
+        );
+        assert!(decode_fixed_string_with_padding(&[0xff, 0], 1).is_err());
+        assert!(decode_utf8_string(&[0xff, 0], "vlen test").is_err());
+    }
 }
 
 fn endian_array<const N: usize>(
@@ -597,17 +631,25 @@ fn endian_array<const N: usize>(
     Ok(arr)
 }
 
-fn decode_fixed_string(bytes: &[u8]) -> String {
+fn decode_fixed_string(bytes: &[u8]) -> Result<String> {
     decode_fixed_string_with_padding(bytes, 1)
 }
 
-fn decode_fixed_string_with_padding(bytes: &[u8], padding: u8) -> String {
+fn decode_fixed_string_with_padding(bytes: &[u8], padding: u8) -> Result<String> {
     let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
     let bytes = &bytes[..end];
-    let s = String::from_utf8_lossy(bytes);
-    if padding == 2 {
+    let s = std::str::from_utf8(bytes)
+        .map_err(|_| Error::InvalidFormat("fixed-length string payload is not UTF-8".into()))?;
+    Ok(if padding == 2 {
         s.trim_end().to_string()
     } else {
         s.to_string()
-    }
+    })
+}
+
+fn decode_utf8_string(bytes: &[u8], context: &str) -> Result<String> {
+    Ok(std::str::from_utf8(bytes)
+        .map_err(|_| Error::InvalidFormat(format!("{context} is not UTF-8")))?
+        .trim_end_matches('\0')
+        .to_string())
 }

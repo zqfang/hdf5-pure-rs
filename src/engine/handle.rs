@@ -541,6 +541,386 @@ pub fn global_registry() -> &'static parking_lot::Mutex<Option<HandleRegistry>> 
     &REGISTRY
 }
 
+#[allow(non_snake_case)]
+pub fn H5I_INVALID_HID() -> Hid {
+    invalid_hid()
+}
+
+#[allow(non_snake_case)]
+pub fn H5I_init_interface() -> HandleRegistry {
+    HandleRegistry::new()
+}
+
+#[allow(non_snake_case)]
+pub fn H5I_term_package(registry: &HandleRegistry) {
+    registry.term_package()
+}
+
+#[allow(non_snake_case)]
+pub fn H5I__register_type_common(registry: &HandleRegistry, handle_type: HandleType) -> HandleType {
+    registry.register_type_common(handle_type)
+}
+
+#[allow(non_snake_case)]
+pub fn H5I_register_type(registry: &HandleRegistry, handle_type: HandleType) -> HandleType {
+    registry.register_type(handle_type)
+}
+
+#[allow(non_snake_case)]
+pub fn H5Iregister_type1(registry: &HandleRegistry, handle_type: HandleType) -> HandleType {
+    registry.register_type_v1(handle_type)
+}
+
+#[allow(non_snake_case)]
+pub fn H5Iregister_type2(registry: &HandleRegistry, handle_type: HandleType) -> HandleType {
+    registry.register_type_v2(handle_type)
+}
+
+#[allow(non_snake_case)]
+pub fn H5Itype_exists(registry: &HandleRegistry, handle_type: HandleType) -> bool {
+    registry.type_exists(handle_type)
+}
+
+#[allow(non_snake_case)]
+pub fn H5I__register<T: Send + Sync + 'static>(
+    registry: &HandleRegistry,
+    handle_type: HandleType,
+    data: T,
+) -> Hid {
+    registry.register_internal(handle_type, data)
+}
+
+#[allow(non_snake_case)]
+pub fn H5I_register<T: Send + Sync + 'static>(
+    registry: &HandleRegistry,
+    handle_type: HandleType,
+    data: T,
+) -> Hid {
+    registry.register(handle_type, data)
+}
+
+#[allow(non_snake_case)]
+pub fn H5Iregister<T: Send + Sync + 'static>(
+    registry: &HandleRegistry,
+    handle_type: HandleType,
+    data: T,
+) -> Hid {
+    registry.register_api(handle_type, data)
+}
+
+#[allow(non_snake_case)]
+pub fn H5Iregister_future<T: Send + Sync + 'static>(
+    registry: &HandleRegistry,
+    handle_type: HandleType,
+    data: T,
+) -> Hid {
+    registry.register_future(handle_type, data)
+}
+
+#[allow(non_snake_case)]
+pub fn H5I_register_using_existing_id<T: Send + Sync + 'static>(
+    registry: &HandleRegistry,
+    id: Hid,
+    handle_type: HandleType,
+    data: T,
+) -> Option<Hid> {
+    registry.register_using_existing_id_api(id, handle_type, data)
+}
+
+#[allow(non_snake_case)]
+pub fn H5I_subst<T: Send + Sync + 'static>(registry: &HandleRegistry, id: Hid, data: T) -> bool {
+    registry.subst(id, data)
+}
+
+#[allow(non_snake_case)]
+pub fn H5I_is_file_object(registry: &HandleRegistry, id: Hid) -> bool {
+    registry.is_file_object(id)
+}
+
+#[allow(non_snake_case)]
+pub fn H5I__unwrap(registry: &HandleRegistry, id: Hid) -> Option<Hid> {
+    registry.unwrap_id(id)
+}
+
+#[allow(non_snake_case)]
+pub fn H5I__mark_node(registry: &HandleRegistry, id: Hid) -> bool {
+    registry.mark_node(id)
+}
+
+#[allow(non_snake_case)]
+pub fn H5I_inc_ref(registry: &HandleRegistry, id: Hid) -> Option<i32> {
+    registry.inc_ref(id)
+}
+
+#[allow(non_snake_case)]
+pub fn H5Iinc_ref(registry: &HandleRegistry, id: Hid) -> Option<i32> {
+    registry.inc_ref(id)
+}
+
+#[allow(non_snake_case)]
+pub fn H5I__dec_ref(registry: &HandleRegistry, id: Hid) -> Option<i32> {
+    registry.dec_ref_internal(id)
+}
+
+#[allow(non_snake_case)]
+pub fn H5I_dec_ref(registry: &HandleRegistry, id: Hid) -> Option<i32> {
+    registry.dec_ref(id)
+}
+
+#[allow(non_snake_case)]
+pub fn H5Idec_ref(registry: &HandleRegistry, id: Hid) -> Option<i32> {
+    registry.dec_ref(id)
+}
+
+#[allow(non_snake_case)]
+pub fn H5I__dec_app_ref(registry: &HandleRegistry, id: Hid) -> Option<i32> {
+    registry.dec_app_ref_internal(id)
+}
+
+#[allow(non_snake_case)]
+pub fn H5I_dec_app_ref(registry: &HandleRegistry, id: Hid) -> Option<i32> {
+    registry.dec_app_ref(id)
+}
+
+#[allow(non_snake_case)]
+pub fn H5I_dec_app_ref_async(registry: &HandleRegistry, id: Hid) -> Option<i32> {
+    registry.dec_app_ref_async(id)
+}
+
+#[allow(non_snake_case)]
+pub fn H5I__dec_app_ref_always_close(registry: &HandleRegistry, id: Hid) -> Option<i32> {
+    registry.dec_app_ref_always_close_internal(id)
+}
+
+#[allow(non_snake_case)]
+pub fn H5I_dec_app_ref_always_close(registry: &HandleRegistry, id: Hid) -> Option<i32> {
+    registry.dec_app_ref_always_close(id)
+}
+
+#[allow(non_snake_case)]
+pub fn H5I_dec_app_ref_always_close_async(registry: &HandleRegistry, id: Hid) -> Option<i32> {
+    registry.dec_app_ref_always_close_async(id)
+}
+
+#[allow(non_snake_case)]
+pub fn H5I_get_ref(registry: &HandleRegistry, id: Hid) -> Option<i32> {
+    registry.get_ref(id)
+}
+
+#[allow(non_snake_case)]
+pub fn H5Iget_ref(registry: &HandleRegistry, id: Hid) -> Option<i32> {
+    registry.get_ref(id)
+}
+
+#[allow(non_snake_case)]
+pub fn H5I_get_type(registry: &HandleRegistry, id: Hid) -> Option<HandleType> {
+    registry.get_type(id)
+}
+
+#[allow(non_snake_case)]
+pub fn H5Iget_type(registry: &HandleRegistry, id: Hid) -> Option<HandleType> {
+    registry.get_type(id)
+}
+
+#[allow(non_snake_case)]
+pub fn H5Iobject_verify(registry: &HandleRegistry, id: Hid, expected: HandleType) -> bool {
+    registry.object_verify(id, expected)
+}
+
+#[allow(non_snake_case)]
+pub fn H5I_is_valid(registry: &HandleRegistry, id: Hid) -> bool {
+    registry.is_valid_api(id)
+}
+
+#[allow(non_snake_case)]
+pub fn H5Iis_valid(registry: &HandleRegistry, id: Hid) -> bool {
+    registry.is_valid_api(id)
+}
+
+#[allow(non_snake_case)]
+pub fn H5I_object<T: Send + Sync + 'static>(registry: &HandleRegistry, id: Hid) -> Option<Arc<T>> {
+    registry.get(id)
+}
+
+#[allow(non_snake_case)]
+pub fn H5I_remove(registry: &HandleRegistry, id: Hid) -> bool {
+    registry.remove(id)
+}
+
+#[allow(non_snake_case)]
+pub fn H5I__remove_common(registry: &HandleRegistry, id: Hid) -> bool {
+    registry.remove_common(id)
+}
+
+#[allow(non_snake_case)]
+pub fn H5I__remove_verify(registry: &HandleRegistry, id: Hid, expected: HandleType) -> bool {
+    registry.remove_verify_internal(id, expected)
+}
+
+#[allow(non_snake_case)]
+pub fn H5I_remove_verify(registry: &HandleRegistry, id: Hid, expected: HandleType) -> bool {
+    registry.remove_verify(id, expected)
+}
+
+#[allow(non_snake_case)]
+pub fn H5Iremove_verify(registry: &HandleRegistry, id: Hid, expected: HandleType) -> bool {
+    registry.remove_verify(id, expected)
+}
+
+#[allow(non_snake_case)]
+pub fn H5I_clear_type(registry: &HandleRegistry, handle_type: HandleType) -> usize {
+    registry.clear_type(handle_type)
+}
+
+#[allow(non_snake_case)]
+pub fn H5Iclear_type(registry: &HandleRegistry, handle_type: HandleType) -> usize {
+    registry.clear_type_api(handle_type)
+}
+
+#[allow(non_snake_case)]
+pub fn H5I__destroy_type(registry: &HandleRegistry, handle_type: HandleType) -> usize {
+    registry.destroy_type_internal(handle_type)
+}
+
+#[allow(non_snake_case)]
+pub fn H5Idestroy_type(registry: &HandleRegistry, handle_type: HandleType) -> usize {
+    registry.destroy_type_api(handle_type)
+}
+
+#[allow(non_snake_case)]
+pub fn H5I_nmembers(registry: &HandleRegistry, handle_type: HandleType) -> usize {
+    registry.nmembers(handle_type)
+}
+
+#[allow(non_snake_case)]
+pub fn H5Inmembers(registry: &HandleRegistry, handle_type: HandleType) -> usize {
+    registry.nmembers_api(handle_type)
+}
+
+#[allow(non_snake_case)]
+pub fn H5I__inc_type_ref(registry: &HandleRegistry, handle_type: HandleType) -> i32 {
+    registry.inc_type_ref_internal(handle_type)
+}
+
+#[allow(non_snake_case)]
+pub fn H5Iinc_type_ref(registry: &HandleRegistry, handle_type: HandleType) -> i32 {
+    registry.inc_type_ref(handle_type)
+}
+
+#[allow(non_snake_case)]
+pub fn H5I_dec_type_ref(registry: &HandleRegistry, handle_type: HandleType) -> Option<i32> {
+    registry.dec_type_ref(handle_type)
+}
+
+#[allow(non_snake_case)]
+pub fn H5Idec_type_ref(registry: &HandleRegistry, handle_type: HandleType) -> Option<i32> {
+    registry.dec_type_ref_api(handle_type)
+}
+
+#[allow(non_snake_case)]
+pub fn H5I__get_type_ref(registry: &HandleRegistry, handle_type: HandleType) -> i32 {
+    registry.get_type_ref_internal(handle_type)
+}
+
+#[allow(non_snake_case)]
+pub fn H5I_get_type_ref(registry: &HandleRegistry, handle_type: HandleType) -> i32 {
+    registry.get_type_ref(handle_type)
+}
+
+#[allow(non_snake_case)]
+pub fn H5Iget_type_ref(registry: &HandleRegistry, handle_type: HandleType) -> i32 {
+    registry.get_type_ref(handle_type)
+}
+
+#[allow(non_snake_case)]
+pub fn H5I__iterate_cb<F>(registry: &HandleRegistry, handle_type: HandleType, callback: F)
+where
+    F: FnMut(Hid),
+{
+    registry.iterate_cb(handle_type, callback)
+}
+
+#[allow(non_snake_case)]
+pub fn H5I__iterate_pub_cb<F>(registry: &HandleRegistry, handle_type: HandleType, callback: F)
+where
+    F: FnMut(Hid),
+{
+    registry.iterate_pub_cb(handle_type, callback)
+}
+
+#[allow(non_snake_case)]
+pub fn H5I_iterate<F>(registry: &HandleRegistry, handle_type: HandleType, callback: F)
+where
+    F: FnMut(Hid),
+{
+    registry.iterate_api(handle_type, callback)
+}
+
+#[allow(non_snake_case)]
+pub fn H5Iiterate<F>(registry: &HandleRegistry, handle_type: HandleType, callback: F)
+where
+    F: FnMut(Hid),
+{
+    registry.iterate(handle_type, callback)
+}
+
+#[allow(non_snake_case)]
+pub fn H5I_find_id<F>(
+    registry: &HandleRegistry,
+    handle_type: HandleType,
+    predicate: F,
+) -> Option<Hid>
+where
+    F: FnMut(Hid) -> bool,
+{
+    registry.find_id(handle_type, predicate)
+}
+
+#[allow(non_snake_case)]
+pub fn H5I__search_cb<F>(
+    registry: &HandleRegistry,
+    handle_type: HandleType,
+    predicate: F,
+) -> Option<Hid>
+where
+    F: FnMut(Hid) -> bool,
+{
+    registry.search_cb(handle_type, predicate)
+}
+
+#[allow(non_snake_case)]
+pub fn H5Isearch<F>(registry: &HandleRegistry, handle_type: HandleType, predicate: F) -> Option<Hid>
+where
+    F: FnMut(Hid) -> bool,
+{
+    registry.search(handle_type, predicate)
+}
+
+#[allow(non_snake_case)]
+pub fn H5Iget_file_id(registry: &HandleRegistry, id: Hid) -> Option<Hid> {
+    registry.get_file_id(id)
+}
+
+#[allow(non_snake_case)]
+pub fn H5Iget_name(registry: &HandleRegistry, id: Hid) -> Option<String> {
+    registry.get_name(id)
+}
+
+#[allow(non_snake_case)]
+pub fn H5I__get_name_test(registry: &HandleRegistry, id: Hid) -> Option<String> {
+    registry.get_name_test(id)
+}
+
+#[allow(non_snake_case)]
+pub fn H5I_dump_ids_for_type(registry: &HandleRegistry, handle_type: HandleType) -> Vec<Hid> {
+    registry.dump_ids_for_type(handle_type)
+}
+
+#[allow(non_snake_case)]
+pub fn H5I__id_dump_cb(registry: &HandleRegistry, handle_type: HandleType) -> Vec<Hid> {
+    registry.id_dump_cb(handle_type)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -633,5 +1013,123 @@ mod tests {
         assert_eq!(reg.dec_app_ref(44), Some(1));
         assert_eq!(reg.dec_app_ref_always_close(44), Some(0));
         assert!(!reg.is_valid_api(44));
+    }
+
+    #[test]
+    fn h5i_aliases_cover_registry_surface() {
+        let reg = H5I_init_interface();
+        assert_eq!(H5I_INVALID_HID(), INVALID_HID);
+        assert_eq!(
+            H5I__register_type_common(&reg, HandleType::Dataset),
+            HandleType::Dataset
+        );
+        assert_eq!(
+            H5I_register_type(&reg, HandleType::Group),
+            HandleType::Group
+        );
+        assert_eq!(
+            H5Iregister_type1(&reg, HandleType::Attribute),
+            HandleType::Attribute
+        );
+        assert_eq!(
+            H5Iregister_type2(&reg, HandleType::Datatype),
+            HandleType::Datatype
+        );
+        assert!(H5Itype_exists(&reg, HandleType::Dataset));
+        assert_eq!(H5I__inc_type_ref(&reg, HandleType::Dataset), 2);
+        assert_eq!(H5Iinc_type_ref(&reg, HandleType::Dataset), 3);
+        assert_eq!(H5I__get_type_ref(&reg, HandleType::Dataset), 3);
+        assert_eq!(H5I_get_type_ref(&reg, HandleType::Dataset), 3);
+        assert_eq!(H5Iget_type_ref(&reg, HandleType::Dataset), 3);
+        assert_eq!(H5I_dec_type_ref(&reg, HandleType::Dataset), Some(2));
+        assert_eq!(H5Idec_type_ref(&reg, HandleType::Dataset), Some(1));
+
+        let file = H5I_register(&reg, HandleType::File, "file");
+        let group = H5Iregister(&reg, HandleType::Group, "group");
+        let dset = H5Iregister_future(&reg, HandleType::Dataset, "future");
+        let attr = H5I__register(&reg, HandleType::Attribute, "attr");
+        assert_eq!(
+            H5I_register_using_existing_id(&reg, 44, HandleType::File, "existing"),
+            Some(44)
+        );
+        assert!(H5I_subst(&reg, dset, "replacement"));
+        assert_eq!(&*H5I_object::<&str>(&reg, dset).unwrap(), &"replacement");
+
+        assert!(H5I_is_file_object(&reg, file));
+        assert_eq!(H5I__unwrap(&reg, file), Some(file));
+        assert!(H5I__mark_node(&reg, file));
+        assert_eq!(H5Iget_file_id(&reg, file), Some(file));
+        assert_eq!(H5I_get_type(&reg, group), Some(HandleType::Group));
+        assert_eq!(H5Iget_type(&reg, group), Some(HandleType::Group));
+        assert!(H5Iobject_verify(&reg, attr, HandleType::Attribute));
+        assert!(H5I_is_valid(&reg, attr));
+        assert!(H5Iis_valid(&reg, attr));
+
+        assert_eq!(H5I_inc_ref(&reg, file), Some(2));
+        assert_eq!(H5Iinc_ref(&reg, file), Some(3));
+        assert_eq!(H5I_get_ref(&reg, file), Some(3));
+        assert_eq!(H5Iget_ref(&reg, file), Some(3));
+        assert_eq!(H5I__dec_ref(&reg, file), Some(2));
+        assert_eq!(H5I_dec_ref(&reg, file), Some(1));
+
+        let close_async = H5I_register(&reg, HandleType::File, "close_async");
+        assert_eq!(H5I_dec_app_ref_async(&reg, close_async), Some(0));
+        let close = H5I_register(&reg, HandleType::File, "close");
+        assert_eq!(H5I__dec_app_ref(&reg, close), Some(0));
+        let close_always = H5I_register(&reg, HandleType::File, "close_always");
+        assert_eq!(H5I_dec_app_ref_always_close(&reg, close_always), Some(0));
+        let close_always_internal = H5I_register(&reg, HandleType::File, "close_always_internal");
+        assert_eq!(
+            H5I__dec_app_ref_always_close(&reg, close_always_internal),
+            Some(0)
+        );
+        let close_always_async = H5I_register(&reg, HandleType::File, "close_always_async");
+        assert_eq!(
+            H5I_dec_app_ref_always_close_async(&reg, close_always_async),
+            Some(0)
+        );
+
+        assert_eq!(H5I_nmembers(&reg, HandleType::Group), 1);
+        assert_eq!(H5Inmembers(&reg, HandleType::Group), 1);
+        assert_eq!(
+            H5I_find_id(&reg, HandleType::Group, |id| id == group),
+            Some(group)
+        );
+        assert_eq!(
+            H5I__search_cb(&reg, HandleType::Group, |id| id == group),
+            Some(group)
+        );
+        assert_eq!(
+            H5Isearch(&reg, HandleType::Group, |id| id == group),
+            Some(group)
+        );
+
+        let mut iterated = Vec::new();
+        H5I__iterate_cb(&reg, HandleType::Group, |id| iterated.push(id));
+        H5I__iterate_pub_cb(&reg, HandleType::Group, |id| iterated.push(id));
+        H5I_iterate(&reg, HandleType::Group, |id| iterated.push(id));
+        H5Iiterate(&reg, HandleType::Group, |id| iterated.push(id));
+        assert_eq!(iterated, vec![group, group, group, group]);
+        assert_eq!(H5I_dump_ids_for_type(&reg, HandleType::Group), vec![group]);
+        assert_eq!(H5I__id_dump_cb(&reg, HandleType::Group), vec![group]);
+        assert_eq!(H5Iget_name(&reg, group), Some(format!("Group:{group}")));
+        assert_eq!(
+            H5I__get_name_test(&reg, group),
+            Some(format!("Group:{group}"))
+        );
+
+        assert!(H5I__remove_verify(&reg, attr, HandleType::Attribute));
+        assert!(H5I_remove_verify(&reg, dset, HandleType::Dataset));
+        assert!(H5Iremove_verify(&reg, 44, HandleType::File));
+        let common = H5I_register(&reg, HandleType::Datatype, "common");
+        assert!(H5I__remove_common(&reg, common));
+        let removed = H5I_register(&reg, HandleType::Datatype, "removed");
+        assert!(H5I_remove(&reg, removed));
+        assert_eq!(H5I_clear_type(&reg, HandleType::File), 1);
+        assert_eq!(H5Iclear_type(&reg, HandleType::Group), 1);
+        assert_eq!(H5I__destroy_type(&reg, HandleType::Datatype), 0);
+        assert_eq!(H5Idestroy_type(&reg, HandleType::Dataset), 0);
+        H5I_term_package(&reg);
+        assert!(reg.is_empty());
     }
 }

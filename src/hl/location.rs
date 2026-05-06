@@ -123,6 +123,12 @@ impl Location for crate::hl::dataset::Dataset {
 
 /// Check if a named member exists in a group.
 pub fn link_exists(group: &crate::hl::group::Group, name: &str) -> crate::Result<bool> {
-    let members = group.member_names()?;
-    Ok(members.iter().any(|n| n == name))
+    match group.find_link_by_name(name) {
+        Ok(_) => Ok(true),
+        Err(crate::Error::InvalidFormat(msg)) if msg.contains("not found") => {
+            let members = group.members()?;
+            Ok(members.iter().any(|(member_name, _)| member_name == name))
+        }
+        Err(err) => Err(err),
+    }
 }

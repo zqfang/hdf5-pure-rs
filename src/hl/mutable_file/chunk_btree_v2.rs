@@ -32,7 +32,7 @@ impl MutableFile {
         } else {
             0
         };
-        let sa = self.superblock.sizeof_addr as usize;
+        let sa = usize::from(self.superblock.sizeof_addr);
         let expected_record_size =
             Self::btree_v2_chunk_record_size(sa, filtered, chunk_size_len, scaled_coords.len())?;
 
@@ -48,7 +48,7 @@ impl MutableFile {
         let mut guard = self.inner.lock();
         let reader = &mut guard.reader;
         let header = BTreeV2Header::read_at(reader, index_addr)?;
-        if header.record_size as usize != expected_record_size {
+        if usize::from(header.record_size) != expected_record_size {
             return Err(Error::InvalidFormat(format!(
                 "v2 B-tree chunk record size {} does not match expected {expected_record_size}",
                 header.record_size
@@ -101,13 +101,14 @@ impl MutableFile {
         let leaf_capacity = Self::btree_v2_leaf_capacity(header)?;
         if records.len() <= leaf_capacity {
             let root_addr = self.append_btree_v2_leaf(header, records)?;
+            let root_nrecords = Self::usize_to_u16(records.len(), "v2 B-tree root record count")?;
             self.rewrite_btree_v2_header_root(
                 header_addr,
                 header,
                 0,
                 root_addr,
-                records.len() as u16,
-                records.len() as u64,
+                root_nrecords,
+                Self::usize_to_u64(records.len(), "v2 B-tree total record count")?,
             )?;
             return Ok(());
         }
@@ -154,7 +155,10 @@ impl MutableFile {
                 Error::InvalidFormat("invalid v2 B-tree chunk leaf distribution".into())
             })?;
             let leaf_addr = self.append_btree_v2_leaf(header, leaf_records)?;
-            children.push((leaf_addr, take as u16));
+            children.push((
+                leaf_addr,
+                Self::usize_to_u16(take, "v2 B-tree child record count")?,
+            ));
             record_pos = leaf_end;
             remaining_leaf_records = remaining_leaf_records.checked_sub(take).ok_or_else(|| {
                 Error::InvalidFormat("invalid v2 B-tree chunk leaf distribution".into())
@@ -181,8 +185,8 @@ impl MutableFile {
             header,
             1,
             root_addr,
-            separators.len() as u16,
-            records.len() as u64,
+            Self::usize_to_u16(separators.len(), "v2 B-tree root record count")?,
+            Self::usize_to_u64(records.len(), "v2 B-tree total record count")?,
         )
     }
 
@@ -190,14 +194,15 @@ impl MutableFile {
     /// checksum). Mirrors the serialize half of libhdf5's
     /// `H5B2__cache_leaf_serialize`.
     fn encode_btree_v2_leaf(header: &BTreeV2Header, records: &[Vec<u8>]) -> Result<Vec<u8>> {
-        if records.len() > u16::MAX as usize {
+        if records.len() > usize::from(u16::MAX) {
             return Err(Error::Unsupported(
                 "v2 B-tree leaf record count exceeds u16".into(),
             ));
         }
+        let record_size = usize::from(header.record_size);
         let records_bytes = records
             .len()
-            .checked_mul(header.record_size as usize)
+            .checked_mul(record_size)
             .ok_or_else(|| Error::InvalidFormat("v2 B-tree leaf size overflow".into()))?;
         let leaf_capacity = 6usize
             .checked_add(records_bytes)
@@ -208,7 +213,7 @@ impl MutableFile {
         leaf.push(0);
         leaf.push(header.tree_type);
         for record in records {
-            if record.len() != header.record_size as usize {
+            if record.len() != record_size {
                 return Err(Error::InvalidFormat(
                     "v2 B-tree leaf record has wrong size".into(),
                 ));
@@ -243,21 +248,25 @@ impl MutableFile {
                 "v2 B-tree internal child/record count mismatch".into(),
             ));
         }
-        if separators.len() > u16::MAX as usize {
+        if separators.len() > usize::from(u16::MAX) {
             return Err(Error::Unsupported(
                 "v2 B-tree internal record count exceeds u16".into(),
             ));
         }
         let leaf_capacity = Self::btree_v2_leaf_capacity(header)?;
-        let child_nrecords_size = Self::bytes_needed(leaf_capacity as u64);
-        let sa = self.superblock.sizeof_addr as usize;
+        let child_nrecords_size = Self::bytes_needed(Self::usize_to_u64(
+            leaf_capacity,
+            "v2 B-tree leaf record capacity",
+        )?);
+        let sa = usize::from(self.superblock.sizeof_addr);
+        let record_size = usize::from(header.record_size);
 
         let mut node = Vec::new();
         node.extend_from_slice(b"BTIN");
         node.push(0);
         node.push(header.tree_type);
         for record in separators {
-            if record.len() != header.record_size as usize {
+            if record.len() != record_size {
                 return Err(Error::InvalidFormat(
                     "v2 B-tree internal separator has wrong size".into(),
                 ));
@@ -265,8 +274,16 @@ impl MutableFile {
             node.extend_from_slice(record);
         }
         for &(child_addr, child_nrecords) in children {
-            node.extend_from_slice(&child_addr.to_le_bytes()[..sa]);
-            node.extend_from_slice(&(child_nrecords as u64).to_le_bytes()[..child_nrecords_size]);
+            node.extend_from_slice(&Self::encode_uint_le(
+                child_addr,
+                sa,
+                "v2 B-tree child address",
+            )?);
+            node.extend_from_slice(&Self::encode_uint_le(
+                u64::from(child_nrecords),
+                child_nrecords_size,
+                "v2 B-tree child record count",
+            )?);
         }
         let checksum = checksum_metadata(&node);
         node.extend_from_slice(&checksum.to_le_bytes());
@@ -288,11 +305,15 @@ impl MutableFile {
     }
 
     fn btree_v2_depth1_internal_capacity(&self, header: &BTreeV2Header) -> Result<usize> {
-        let node_size = header.node_size as usize;
-        let record_size = header.record_size as usize;
+        let node_size = usize::try_from(header.node_size)
+            .map_err(|_| Error::InvalidFormat("v2 B-tree node size is too large".into()))?;
+        let record_size = usize::from(header.record_size);
         let leaf_capacity = Self::btree_v2_leaf_capacity(header)?;
-        let max_nrec_size = Self::bytes_needed(leaf_capacity as u64);
-        let pointer_size = (self.superblock.sizeof_addr as usize)
+        let max_nrec_size = Self::bytes_needed(Self::usize_to_u64(
+            leaf_capacity,
+            "v2 B-tree leaf record capacity",
+        )?);
+        let pointer_size = usize::from(self.superblock.sizeof_addr)
             .checked_add(max_nrec_size)
             .ok_or_else(|| Error::InvalidFormat("v2 B-tree pointer size overflow".into()))?;
         let metadata_and_pointer = 10usize
@@ -327,25 +348,38 @@ impl MutableFile {
     fn rewrite_btree_v2_header_root(
         &mut self,
         header_addr: u64,
-        header: &BTreeV2Header,
+        _header: &BTreeV2Header,
         new_depth: u16,
         new_root_addr: u64,
         new_root_nrecords: u16,
         new_total_records: u64,
     ) -> Result<()> {
-        let sa = self.superblock.sizeof_addr as usize;
-        let ss = self.superblock.sizeof_size as usize;
-        let depth_pos = header_addr + (4 + 1 + 1 + 4 + 2) as u64;
-        let root_addr_pos = header_addr + (4 + 1 + 1 + 4 + 2 + 2 + 1 + 1) as u64;
-        let root_nrecords_pos = root_addr_pos + sa as u64;
-        let total_records_pos = root_nrecords_pos + 2;
-        let checksum_pos = total_records_pos + ss as u64;
+        let sa = usize::from(self.superblock.sizeof_addr);
+        let ss = usize::from(self.superblock.sizeof_size);
+        let depth_pos = header_addr
+            .checked_add(u64::from(4u8 + 1 + 1 + 4 + 2))
+            .ok_or_else(|| Error::InvalidFormat("v2 B-tree header offset overflow".into()))?;
+        let root_addr_pos = header_addr
+            .checked_add(u64::from(4u8 + 1 + 1 + 4 + 2 + 2 + 1 + 1))
+            .ok_or_else(|| Error::InvalidFormat("v2 B-tree header offset overflow".into()))?;
+        let root_nrecords_pos = root_addr_pos
+            .checked_add(Self::usize_to_u64(sa, "v2 B-tree address width")?)
+            .ok_or_else(|| Error::InvalidFormat("v2 B-tree header offset overflow".into()))?;
+        let total_records_pos = root_nrecords_pos
+            .checked_add(2)
+            .ok_or_else(|| Error::InvalidFormat("v2 B-tree header offset overflow".into()))?;
+        let checksum_pos = total_records_pos
+            .checked_add(Self::usize_to_u64(ss, "v2 B-tree length width")?)
+            .ok_or_else(|| Error::InvalidFormat("v2 B-tree header offset overflow".into()))?;
 
         self.write_handle.seek(SeekFrom::Start(depth_pos))?;
         self.write_handle.write_all(&new_depth.to_le_bytes())?;
         self.write_handle.seek(SeekFrom::Start(root_addr_pos))?;
-        self.write_handle
-            .write_all(&new_root_addr.to_le_bytes()[..sa])?;
+        self.write_handle.write_all(&Self::encode_uint_le(
+            new_root_addr,
+            sa,
+            "v2 B-tree root address",
+        )?)?;
         self.write_handle.seek(SeekFrom::Start(root_nrecords_pos))?;
         self.write_handle
             .write_all(&new_root_nrecords.to_le_bytes())?;
@@ -366,23 +400,24 @@ impl MutableFile {
         let total_offset = Self::checked_header_relative_offset(total_records_pos, header_addr)?;
         Self::header_window_mut(&mut header_bytes, depth_offset, 2)?
             .copy_from_slice(&new_depth.to_le_bytes());
-        Self::header_window_mut(&mut header_bytes, root_addr_offset, sa)?
-            .copy_from_slice(&new_root_addr.to_le_bytes()[..sa]);
+        Self::header_window_mut(&mut header_bytes, root_addr_offset, sa)?.copy_from_slice(
+            &Self::encode_uint_le(new_root_addr, sa, "v2 B-tree root address")?,
+        );
         Self::header_window_mut(&mut header_bytes, root_nrecords_offset, 2)?
             .copy_from_slice(&new_root_nrecords.to_le_bytes());
-        Self::header_window_mut(&mut header_bytes, total_offset, ss)?
-            .copy_from_slice(&new_total_records.to_le_bytes()[..ss]);
+        Self::header_window_mut(&mut header_bytes, total_offset, ss)?.copy_from_slice(
+            &Self::encode_uint_le(new_total_records, ss, "v2 B-tree total record count")?,
+        );
         let checksum = checksum_metadata(&header_bytes);
         self.write_handle.seek(SeekFrom::Start(checksum_pos))?;
         self.write_handle.write_all(&checksum.to_le_bytes())?;
-
-        let _ = header;
         Ok(())
     }
 
     fn btree_v2_leaf_capacity(header: &BTreeV2Header) -> Result<usize> {
-        let node_size = header.node_size as usize;
-        let record_size = header.record_size as usize;
+        let node_size = usize::try_from(header.node_size)
+            .map_err(|_| Error::InvalidFormat("v2 B-tree node size is too large".into()))?;
+        let record_size = usize::from(header.record_size);
         if node_size <= 10 || record_size == 0 {
             return Err(Error::InvalidFormat("invalid v2 B-tree node sizing".into()));
         }
@@ -426,14 +461,17 @@ impl MutableFile {
         sizeof_addr: usize,
     ) -> Result<Vec<u8>> {
         let mut record = Vec::new();
-        record.extend_from_slice(&addr.to_le_bytes()[..sizeof_addr]);
+        record.extend_from_slice(&Self::encode_uint_le(
+            addr,
+            sizeof_addr,
+            "v2 B-tree chunk address",
+        )?);
         if filtered {
-            if chunk_size_len == 0 || chunk_size_len > 8 {
-                return Err(Error::InvalidFormat(format!(
-                    "invalid v2 B-tree chunk size length {chunk_size_len}"
-                )));
-            }
-            record.extend_from_slice(&chunk_size.to_le_bytes()[..chunk_size_len]);
+            record.extend_from_slice(&Self::encode_uint_le(
+                chunk_size,
+                chunk_size_len,
+                "v2 B-tree chunk size",
+            )?);
             record.extend_from_slice(&0u32.to_le_bytes());
         }
         for &coord in scaled_coords {
@@ -516,7 +554,7 @@ impl MutableFile {
         }
         let mut value = 0u64;
         for (idx, byte) in bytes.iter().enumerate() {
-            value |= (*byte as u64) << (idx * 8);
+            value |= u64::from(*byte) << (idx * 8);
         }
         Ok(value)
     }

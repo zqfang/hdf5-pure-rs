@@ -1,3 +1,5 @@
+use crate::error::{Error, Result};
+
 /// Pure Rust object/region reference token.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reference {
@@ -87,11 +89,11 @@ impl Reference {
     }
 
     /// Encode a reference.
-    pub fn encode(&self) -> Vec<u8> {
+    pub fn encode(&self) -> Result<Vec<u8>> {
         let mut out = Vec::new();
         Self::encode_obj_token_into(self.object_token, &mut out);
-        Self::encode_region_into(self.region.as_deref(), &mut out);
-        out
+        Self::encode_region_into(self.region.as_deref(), &mut out)?;
+        Ok(out)
     }
 
     /// Encode an object token.
@@ -102,23 +104,35 @@ impl Reference {
     }
 
     /// Encode a region payload.
-    pub fn encode_region(&self) -> Vec<u8> {
+    pub fn encode_region(&self) -> Result<Vec<u8>> {
         let mut out = Vec::new();
-        Self::encode_region_into(self.region.as_deref(), &mut out);
-        out
+        Self::encode_region_into(self.region.as_deref(), &mut out)?;
+        Ok(out)
     }
 
     /// Decode a region payload.
-    pub fn decode_region(bytes: &[u8]) -> Option<Vec<u8>> {
+    pub fn decode_region(bytes: &[u8]) -> Result<Option<Vec<u8>>> {
         if bytes.is_empty() {
-            None
+            return Ok(None);
         } else {
-            Some(bytes.to_vec())
+            let len_u64 = read_u64_le_at(bytes, 0, "reference region length")?;
+            let len = usize::try_from(len_u64).map_err(|_| {
+                Error::InvalidFormat("reference region length exceeds usize".into())
+            })?;
+            let end = 8usize
+                .checked_add(len)
+                .ok_or_else(|| Error::InvalidFormat("reference region length overflow".into()))?;
+            if bytes.len() != end {
+                return Err(Error::InvalidFormat(
+                    "reference region payload has invalid length".into(),
+                ));
+            }
+            Ok(Some(bytes[8..end].to_vec()))
         }
     }
 
     /// Encode a heap reference payload.
-    pub fn encode_heap(&self) -> Vec<u8> {
+    pub fn encode_heap(&self) -> Result<Vec<u8>> {
         self.encode()
     }
 
@@ -128,17 +142,19 @@ impl Reference {
     }
 
     /// Decode an object-token compatibility payload.
-    pub fn decode_token_obj_compat(bytes: &[u8]) -> Option<u64> {
-        let word = bytes.get(..8)?;
-        Some(u64::from_le_bytes(word.try_into().ok()?))
+    pub fn decode_token_obj_compat(bytes: &[u8]) -> Result<u64> {
+        if bytes.len() != 8 {
+            return Err(Error::InvalidFormat(
+                "object reference token payload has invalid length".into(),
+            ));
+        }
+        read_u64_le_at(bytes, 0, "object reference token")
     }
 
     /// Decode a region-token compatibility payload.
-    pub fn decode_token_region_compat(bytes: &[u8]) -> Option<Vec<u8>> {
-        let len_word = bytes.get(..8)?;
-        let len = u64::from_le_bytes(len_word.try_into().ok()?) as usize;
-        let end = 8usize.checked_add(len)?;
-        Some(bytes.get(8..end)?.to_vec())
+    pub fn decode_token_region_compat(bytes: &[u8]) -> Result<Vec<u8>> {
+        Self::decode_region(bytes)?
+            .ok_or_else(|| Error::InvalidFormat("region reference token payload is empty".into()))
     }
 
     /// Public object-reference constructor alias.
@@ -161,7 +177,7 @@ impl Reference {
     }
 
     /// Encode a region-token compatibility payload.
-    pub fn encode_token_region_compat(&self) -> Vec<u8> {
+    pub fn encode_token_region_compat(&self) -> Result<Vec<u8>> {
         self.encode_region()
     }
 
@@ -174,13 +190,32 @@ impl Reference {
         out.extend_from_slice(&token.to_le_bytes());
     }
 
-    fn encode_region_into(region: Option<&[u8]>, out: &mut Vec<u8>) {
-        let len = region.map_or(0, <[u8]>::len) as u64;
+    fn encode_region_into(region: Option<&[u8]>, out: &mut Vec<u8>) -> Result<()> {
+        let len = region.map_or(Ok(0u64), |region| {
+            u64::try_from(region.len())
+                .map_err(|_| Error::InvalidFormat("reference region length exceeds u64".into()))
+        })?;
         out.extend_from_slice(&len.to_le_bytes());
         if let Some(region) = region {
             out.extend_from_slice(region);
         }
+        Ok(())
     }
+}
+
+fn checked_window<'a>(data: &'a [u8], pos: usize, len: usize, context: &str) -> Result<&'a [u8]> {
+    let end = pos
+        .checked_add(len)
+        .ok_or_else(|| Error::InvalidFormat(format!("{context} offset overflow")))?;
+    data.get(pos..end)
+        .ok_or_else(|| Error::InvalidFormat(format!("{context} is truncated")))
+}
+
+fn read_u64_le_at(data: &[u8], pos: usize, context: &str) -> Result<u64> {
+    let bytes: [u8; 8] = checked_window(data, pos, 8, context)?
+        .try_into()
+        .map_err(|_| Error::InvalidFormat(format!("{context} is truncated")))?;
+    Ok(u64::from_le_bytes(bytes))
 }
 
 #[cfg(test)]
@@ -201,13 +236,21 @@ mod tests {
         assert_eq!(r.get_region(), Some([1, 2, 3].as_slice()));
         assert!(r.equal(&r.copy()));
         assert_eq!(
-            Reference::decode_token_obj_compat(&r.encode_obj_token()),
-            Some(8)
+            Reference::decode_token_obj_compat(&r.encode_obj_token()).unwrap(),
+            8
         );
         assert_eq!(
-            Reference::decode_token_region_compat(&r.encode_token_region_compat()),
+            Reference::decode_token_region_compat(&r.encode_token_region_compat().unwrap())
+                .unwrap(),
+            vec![1, 2, 3]
+        );
+        assert_eq!(
+            Reference::decode_region(&r.encode_region().unwrap()).unwrap(),
             Some(vec![1, 2, 3])
         );
+        assert!(Reference::decode_token_obj_compat(&[0; 7]).is_err());
+        assert!(Reference::decode_token_region_compat(&[2, 0, 0, 0, 0, 0, 0, 0, 1]).is_err());
+        assert!(Reference::decode_region(&u64::MAX.to_le_bytes()).is_err());
         assert_eq!(r.open_attr_api_common(), 8);
         assert_eq!(r.get_region_api(), Some([1, 2, 3].as_slice()));
         Reference::create_object_api(1, None).destroy();

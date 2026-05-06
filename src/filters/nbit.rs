@@ -26,7 +26,7 @@ pub fn decompress(data: &[u8], client_data: &[u32]) -> Result<Vec<u8>> {
         ));
     }
 
-    let nparams = client_data[0] as usize;
+    let nparams = nbit_usize(client_data[0], "nbit parameter count")?;
     if nparams != client_data.len() {
         return Err(Error::InvalidFormat(format!(
             "nbit parameter count mismatch: header says {nparams}, got {}",
@@ -38,8 +38,8 @@ pub fn decompress(data: &[u8], client_data: &[u32]) -> Result<Vec<u8>> {
         return Ok(data.to_vec());
     }
 
-    let nelmts = client_data[2] as usize;
-    let dtype_size = client_data[4] as usize;
+    let nelmts = nbit_usize(client_data[2], "nbit element count")?;
+    let dtype_size = nbit_usize(client_data[4], "nbit datatype size")?;
     if dtype_size == 0 {
         return Err(Error::InvalidFormat("nbit datatype size is zero".into()));
     }
@@ -59,14 +59,20 @@ pub fn decompress(data: &[u8], client_data: &[u32]) -> Result<Vec<u8>> {
                 order: *client_data
                     .get(5)
                     .ok_or_else(|| Error::InvalidFormat("nbit missing byte order".into()))?,
-                precision: *client_data
-                    .get(6)
-                    .ok_or_else(|| Error::InvalidFormat("nbit missing precision".into()))?
-                    as usize,
-                offset: *client_data
-                    .get(7)
-                    .ok_or_else(|| Error::InvalidFormat("nbit missing bit offset".into()))?
-                    as usize,
+                precision: nbit_usize(
+                    client_data
+                        .get(6)
+                        .copied()
+                        .ok_or_else(|| Error::InvalidFormat("nbit missing precision".into()))?,
+                    "nbit precision",
+                )?,
+                offset: nbit_usize(
+                    client_data
+                        .get(7)
+                        .copied()
+                        .ok_or_else(|| Error::InvalidFormat("nbit missing bit offset".into()))?,
+                    "nbit bit offset",
+                )?,
             };
             validate_atomic(parms)?;
             for idx in 0..nelmts {
@@ -108,8 +114,8 @@ pub fn nbit_compress(data: &[u8], client_data: &[u32]) -> Result<Vec<u8>> {
         return Ok(data.to_vec());
     }
 
-    let nelmts = client_data[2] as usize;
-    let dtype_size = client_data[4] as usize;
+    let nelmts = nbit_usize(client_data[2], "nbit element count")?;
+    let dtype_size = nbit_usize(client_data[4], "nbit datatype size")?;
     let expected = nelmts
         .checked_mul(dtype_size)
         .ok_or_else(|| Error::InvalidFormat("nbit input size overflow".into()))?;
@@ -125,14 +131,20 @@ pub fn nbit_compress(data: &[u8], client_data: &[u32]) -> Result<Vec<u8>> {
                 order: *client_data
                     .get(5)
                     .ok_or_else(|| Error::InvalidFormat("nbit missing byte order".into()))?,
-                precision: *client_data
-                    .get(6)
-                    .ok_or_else(|| Error::InvalidFormat("nbit missing precision".into()))?
-                    as usize,
-                offset: *client_data
-                    .get(7)
-                    .ok_or_else(|| Error::InvalidFormat("nbit missing bit offset".into()))?
-                    as usize,
+                precision: nbit_usize(
+                    client_data
+                        .get(6)
+                        .copied()
+                        .ok_or_else(|| Error::InvalidFormat("nbit missing precision".into()))?,
+                    "nbit precision",
+                )?,
+                offset: nbit_usize(
+                    client_data
+                        .get(7)
+                        .copied()
+                        .ok_or_else(|| Error::InvalidFormat("nbit missing bit offset".into()))?,
+                    "nbit bit offset",
+                )?,
             };
             validate_atomic(parms)?;
             for idx in 0..nelmts {
@@ -169,7 +181,7 @@ pub fn can_apply_nbit(client_data: &[u32]) -> Result<()> {
             "nbit filter missing datatype parameters".into(),
         ));
     }
-    let nparams = client_data[0] as usize;
+    let nparams = nbit_usize(client_data[0], "nbit parameter count")?;
     if nparams != client_data.len() {
         return Err(Error::InvalidFormat(format!(
             "nbit parameter count mismatch: header says {nparams}, got {}",
@@ -205,8 +217,8 @@ fn nbit_get_parms_atomic(parms: &[u32], pidx: &mut usize, size: usize) -> Result
     let parsed = AtomicParms {
         size,
         order: take(parms, pidx)?,
-        precision: take(parms, pidx)? as usize,
-        offset: take(parms, pidx)? as usize,
+        precision: take_usize(parms, pidx, "nbit precision")?,
+        offset: take_usize(parms, pidx, "nbit bit offset")?,
     };
     validate_atomic(parsed)?;
     Ok(parsed)
@@ -219,16 +231,16 @@ fn compress_array(
     parms: &[u32],
     pidx: &mut usize,
 ) -> Result<()> {
-    let total_size = take(parms, pidx)? as usize;
+    let total_size = take_usize(parms, pidx, "nbit array total size")?;
     let base_class = take(parms, pidx)?;
 
     match base_class {
         NBIT_ATOMIC => {
             let p = AtomicParms {
-                size: take(parms, pidx)? as usize,
+                size: take_usize(parms, pidx, "nbit atomic size")?,
                 order: take(parms, pidx)?,
-                precision: take(parms, pidx)? as usize,
-                offset: take(parms, pidx)? as usize,
+                precision: take_usize(parms, pidx, "nbit precision")?,
+                offset: take_usize(parms, pidx, "nbit bit offset")?,
             };
             validate_atomic(p)?;
             if total_size % p.size != 0 {
@@ -242,10 +254,13 @@ fn compress_array(
             }
         }
         NBIT_ARRAY | NBIT_COMPOUND => {
-            let base_size = *parms
-                .get(*pidx)
-                .ok_or_else(|| Error::InvalidFormat("nbit missing nested size".into()))?
-                as usize;
+            let base_size = nbit_usize(
+                parms
+                    .get(*pidx)
+                    .copied()
+                    .ok_or_else(|| Error::InvalidFormat("nbit missing nested size".into()))?,
+                "nbit nested size",
+            )?;
             if base_size == 0 || total_size % base_size != 0 {
                 return Err(Error::InvalidFormat(
                     "nbit array element size is not a multiple of nested size".into(),
@@ -282,15 +297,18 @@ fn compress_compound(
     parms: &[u32],
     pidx: &mut usize,
 ) -> Result<()> {
-    let size = take(parms, pidx)? as usize;
-    let nmembers = take(parms, pidx)? as usize;
+    let size = take_usize(parms, pidx, "nbit compound size")?;
+    let nmembers = take_usize(parms, pidx, "nbit compound member count")?;
     for _ in 0..nmembers {
-        let member_offset = take(parms, pidx)? as usize;
+        let member_offset = take_usize(parms, pidx, "nbit compound member offset")?;
         let member_class = take(parms, pidx)?;
-        let member_size = *parms
-            .get(*pidx)
-            .ok_or_else(|| Error::InvalidFormat("nbit missing compound member size".into()))?
-            as usize;
+        let member_size = nbit_usize(
+            parms
+                .get(*pidx)
+                .copied()
+                .ok_or_else(|| Error::InvalidFormat("nbit missing compound member size".into()))?,
+            "nbit compound member size",
+        )?;
         if member_offset
             .checked_add(member_size)
             .ok_or_else(|| Error::InvalidFormat("nbit compound member bounds overflow".into()))?
@@ -306,10 +324,10 @@ fn compress_compound(
         match member_class {
             NBIT_ATOMIC => {
                 let p = AtomicParms {
-                    size: take(parms, pidx)? as usize,
+                    size: take_usize(parms, pidx, "nbit atomic size")?,
                     order: take(parms, pidx)?,
-                    precision: take(parms, pidx)? as usize,
-                    offset: take(parms, pidx)? as usize,
+                    precision: take_usize(parms, pidx, "nbit precision")?,
+                    offset: take_usize(parms, pidx, "nbit bit offset")?,
                 };
                 validate_atomic(p)?;
                 compress_atomic(input, offset, writer, p)?;
@@ -343,7 +361,7 @@ fn compress_one_nooptype(
         .get(offset..end)
         .ok_or_else(|| Error::InvalidFormat("nbit input offset out of range".into()))?;
     for &byte in window {
-        writer.write_bits(byte as u16, 8)?;
+        writer.write_bits(u16::from(byte), 8)?;
     }
     Ok(())
 }
@@ -355,16 +373,16 @@ fn decompress_array(
     parms: &[u32],
     pidx: &mut usize,
 ) -> Result<()> {
-    let total_size = take(parms, pidx)? as usize;
+    let total_size = take_usize(parms, pidx, "nbit array total size")?;
     let base_class = take(parms, pidx)?;
 
     match base_class {
         NBIT_ATOMIC => {
             let p = AtomicParms {
-                size: take(parms, pidx)? as usize,
+                size: take_usize(parms, pidx, "nbit atomic size")?,
                 order: take(parms, pidx)?,
-                precision: take(parms, pidx)? as usize,
-                offset: take(parms, pidx)? as usize,
+                precision: take_usize(parms, pidx, "nbit precision")?,
+                offset: take_usize(parms, pidx, "nbit bit offset")?,
             };
             validate_atomic(p)?;
             if total_size % p.size != 0 {
@@ -379,10 +397,13 @@ fn decompress_array(
             }
         }
         NBIT_ARRAY | NBIT_COMPOUND => {
-            let base_size = *parms
-                .get(*pidx)
-                .ok_or_else(|| Error::InvalidFormat("nbit missing nested size".into()))?
-                as usize;
+            let base_size = nbit_usize(
+                parms
+                    .get(*pidx)
+                    .copied()
+                    .ok_or_else(|| Error::InvalidFormat("nbit missing nested size".into()))?,
+                "nbit nested size",
+            )?;
             if base_size == 0 {
                 return Err(Error::InvalidFormat(
                     "nbit nested datatype size is zero".into(),
@@ -426,17 +447,20 @@ fn decompress_compound(
     parms: &[u32],
     pidx: &mut usize,
 ) -> Result<()> {
-    let size = take(parms, pidx)? as usize;
-    let nmembers = take(parms, pidx)? as usize;
+    let size = take_usize(parms, pidx, "nbit compound size")?;
+    let nmembers = take_usize(parms, pidx, "nbit compound member count")?;
     let mut used_size = 0usize;
 
     for _ in 0..nmembers {
-        let member_offset = take(parms, pidx)? as usize;
+        let member_offset = take_usize(parms, pidx, "nbit compound member offset")?;
         let member_class = take(parms, pidx)?;
-        let member_size = *parms
-            .get(*pidx)
-            .ok_or_else(|| Error::InvalidFormat("nbit missing compound member size".into()))?
-            as usize;
+        let member_size = nbit_usize(
+            parms
+                .get(*pidx)
+                .copied()
+                .ok_or_else(|| Error::InvalidFormat("nbit missing compound member size".into()))?,
+            "nbit compound member size",
+        )?;
 
         used_size = used_size
             .checked_add(member_size)
@@ -453,10 +477,10 @@ fn decompress_compound(
         match member_class {
             NBIT_ATOMIC => {
                 let p = AtomicParms {
-                    size: take(parms, pidx)? as usize,
+                    size: take_usize(parms, pidx, "nbit atomic size")?,
                     order: take(parms, pidx)?,
-                    precision: take(parms, pidx)? as usize,
-                    offset: take(parms, pidx)? as usize,
+                    precision: take_usize(parms, pidx, "nbit precision")?,
+                    offset: take_usize(parms, pidx, "nbit bit offset")?,
                 };
                 validate_atomic(p)?;
                 let offset = data_offset.checked_add(member_offset).ok_or_else(|| {
@@ -644,7 +668,7 @@ fn compress_atomic_byte(
     } else {
         ((1u16 << dat_len) - 1) as u8
     };
-    writer.write_bits(((byte >> dat_offset) & mask) as u16, dat_len)
+    writer.write_bits(u16::from((byte >> dat_offset) & mask), dat_len)
 }
 
 fn validate_atomic(parms: AtomicParms) -> Result<()> {
@@ -677,12 +701,12 @@ fn validate_atomic(parms: AtomicParms) -> Result<()> {
 fn validate_nbit_type(parms: &[u32], pidx: &mut usize, class: u32) -> Result<usize> {
     match class {
         NBIT_ATOMIC => {
-            let size = take(parms, pidx)? as usize;
+            let size = take_usize(parms, pidx, "nbit atomic size")?;
             let p = nbit_get_parms_atomic(parms, pidx, size)?;
             Ok(p.size)
         }
         NBIT_ARRAY => {
-            let total_size = take(parms, pidx)? as usize;
+            let total_size = take_usize(parms, pidx, "nbit array total size")?;
             let base_class = take(parms, pidx)?;
             if matches!(
                 base_class,
@@ -704,7 +728,7 @@ fn validate_nbit_type(parms: &[u32], pidx: &mut usize, class: u32) -> Result<usi
             Ok(total_size)
         }
         NBIT_COMPOUND => validate_nbit_compound(parms, pidx),
-        NBIT_NOOPTYPE => Ok(take(parms, pidx)? as usize),
+        NBIT_NOOPTYPE => take_usize(parms, pidx, "nbit noop size"),
         other => Err(Error::InvalidFormat(format!(
             "invalid nbit datatype class {other}"
         ))),
@@ -712,10 +736,10 @@ fn validate_nbit_type(parms: &[u32], pidx: &mut usize, class: u32) -> Result<usi
 }
 
 fn validate_nbit_compound(parms: &[u32], pidx: &mut usize) -> Result<usize> {
-    let size = take(parms, pidx)? as usize;
-    let nmembers = take(parms, pidx)? as usize;
+    let size = take_usize(parms, pidx, "nbit compound size")?;
+    let nmembers = take_usize(parms, pidx, "nbit compound member count")?;
     for _ in 0..nmembers {
-        let member_offset = take(parms, pidx)? as usize;
+        let member_offset = take_usize(parms, pidx, "nbit compound member offset")?;
         let member_class = take(parms, pidx)?;
         let member_size = validate_nbit_type(parms, pidx, member_class)?;
         let member_end = member_offset
@@ -736,6 +760,15 @@ fn take(parms: &[u32], pidx: &mut usize) -> Result<u32> {
         .ok_or_else(|| Error::InvalidFormat("truncated nbit parameters".into()))?;
     *pidx += 1;
     Ok(value)
+}
+
+fn take_usize(parms: &[u32], pidx: &mut usize, context: &'static str) -> Result<usize> {
+    nbit_usize(take(parms, pidx)?, context)
+}
+
+fn nbit_usize(value: u32, context: &'static str) -> Result<usize> {
+    usize::try_from(value)
+        .map_err(|_| Error::InvalidFormat(format!("{context} does not fit in usize")))
 }
 
 struct BitStream<'a> {
@@ -771,7 +804,7 @@ impl<'a> BitStream<'a> {
             } else {
                 ((1u16 << take) - 1) as u8
             };
-            value = (value << take) | (((byte >> shift) & mask) as u16);
+            value = (value << take) | u16::from((byte >> shift) & mask);
             self.bits_left -= take;
             nbits -= take;
             if self.bits_left == 0 {
@@ -830,7 +863,8 @@ impl BitWriter {
             } else {
                 (1u16 << take) - 1
             };
-            let bits = ((value >> shift) & mask) as u8;
+            let bits = u8::try_from((value >> shift) & mask)
+                .map_err(|_| Error::InvalidFormat("nbit bit run exceeds byte".into()))?;
             self.current |= bits << (free - take);
             self.bits_used += take;
             nbits -= take;

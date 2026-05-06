@@ -22,7 +22,7 @@ impl Dataset {
             Self::filtered_chunk_size_len(
                 info,
                 chunk_ctx.chunk_bytes,
-                reader.sizeof_size() as usize,
+                usize::from(reader.sizeof_size()),
             )?
         } else {
             0
@@ -40,7 +40,7 @@ impl Dataset {
                 &record,
                 filtered,
                 chunk_size_len,
-                reader.sizeof_addr() as usize,
+                usize::from(reader.sizeof_addr()),
                 chunk_ctx.data_dims.len(),
                 chunk_ctx.chunk_bytes,
             )?;
@@ -128,7 +128,7 @@ impl Dataset {
         } else {
             nbytes
         });
-        th.output_u64(filter_mask as u64);
+        th.output_u64(u64::from(filter_mask));
         th.finish();
     }
 
@@ -155,8 +155,11 @@ impl Dataset {
         th.output_value(&(true));
         th.output_u64(addr);
         th.output_u64(nbytes);
-        th.output_u64(filter_mask as u64);
-        th.output_u64(scaled.len() as u64);
+        let Ok(scaled_len) = u64::try_from(scaled.len()) else {
+            return;
+        };
+        th.output_u64(u64::from(filter_mask));
+        th.output_u64(scaled_len);
         for coord in scaled {
             th.output_u64(*coord);
         }

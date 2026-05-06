@@ -58,14 +58,14 @@ fn apply_pipeline_reverse_with_mask_and_expected(
     filter_mask: u32,
     expected_len: Option<usize>,
 ) -> Result<Vec<u8>> {
-    if pipeline.filters.len() > u32::BITS as usize {
+    if pipeline.filters.len() > 32 {
         return Err(Error::InvalidFormat(format!(
             "filter pipeline length {} exceeds 32-bit chunk filter mask",
             pipeline.filters.len()
         )));
     }
 
-    let valid_mask = if pipeline.filters.len() >= u32::BITS as usize {
+    let valid_mask = if pipeline.filters.len() >= 32 {
         u32::MAX
     } else {
         (1u32 << pipeline.filters.len()) - 1
@@ -80,10 +80,13 @@ fn apply_pipeline_reverse_with_mask_and_expected(
     #[cfg(feature = "tracehash")]
     let mut th = {
         let mut th = tracehash::th_call!("hdf5.filter_pipeline.apply");
-        th.input_u64(pipeline.filters.len() as u64);
+        th.input_u64(usize_to_u64(
+            pipeline.filters.len(),
+            "filter pipeline length",
+        )?);
         th.input_u64(0x0100);
-        th.input_u64(filter_mask as u64);
-        th.input_u64(data.len() as u64);
+        th.input_u64(u64::from(filter_mask));
+        th.input_u64(usize_to_u64(data.len(), "filter input length")?);
         th
     };
 
@@ -111,7 +114,7 @@ fn apply_pipeline_reverse_with_mask_and_expected(
     {
         th.output_value(&(true));
         th.output_u64(0);
-        th.output_u64(buf.len() as u64);
+        th.output_u64(usize_to_u64(buf.len(), "filter output length")?);
         th.finish();
     }
 
@@ -148,18 +151,26 @@ fn apply_filter_reverse(
         32000 => {
             // LZF filter -- need the uncompressed size
             // LZF stores the original size in the first client_data parameter
-            let expected = filter
-                .client_data
-                .first()
-                .copied()
-                .unwrap_or(data.len() as u32 * 2);
-            lzf::decompress(data, expected as usize)
+            let expected = if let Some(&encoded) = filter.client_data.first() {
+                usize::try_from(encoded)
+                    .map_err(|_| Error::InvalidFormat("lzf expected size exceeds usize".into()))?
+            } else {
+                data.len()
+                    .checked_mul(2)
+                    .ok_or_else(|| Error::InvalidFormat("lzf expected size hint overflow".into()))?
+            };
+            lzf::decompress(data, expected)
         }
         _ => Err(Error::Unsupported(format!(
             "filter {} not implemented",
             filter.id
         ))),
     }
+}
+
+#[cfg(feature = "tracehash")]
+fn usize_to_u64(value: usize, context: &str) -> Result<u64> {
+    u64::try_from(value).map_err(|_| Error::InvalidFormat(format!("{context} exceeds u64")))
 }
 
 fn shuffle_element_size(filter: &FilterDesc, dataset_element_size: usize) -> Option<usize> {

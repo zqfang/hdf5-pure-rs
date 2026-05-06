@@ -363,7 +363,7 @@ impl FractalHeapHeader {
     }
 
     pub fn get_iblock_max_drows_test(&self) -> usize {
-        self.current_root_rows as usize
+        usize::from(self.current_root_rows)
     }
 
     pub fn get_dblock_size_test(&self, row: usize) -> Result<u64> {
@@ -379,7 +379,7 @@ impl FractalHeapHeader {
     }
 
     pub fn get_id_off_test(&self, heap_id: &[u8]) -> Result<u64> {
-        let offset_bytes = ((self.max_heap_size as usize) + 7) / 8;
+        let offset_bytes = (usize::from(self.max_heap_size) + 7) / 8;
         heap_id
             .get(1..1 + offset_bytes)
             .map(read_le_uint)
@@ -392,7 +392,7 @@ impl FractalHeapHeader {
     }
 
     pub fn get_huge_info_test(&self) -> (u64, u64) {
-        (self.huge_btree_addr, self.max_managed_obj_size as u64)
+        (self.huge_btree_addr, u64::from(self.max_managed_obj_size))
     }
 
     pub fn dtable_encode(&self) -> Vec<u8> {
@@ -425,7 +425,7 @@ impl FractalHeapHeader {
 
     pub fn dtable_lookup(&self, offset: u64) -> Result<(usize, u64)> {
         let mut row = 0usize;
-        let width = self.table_width as u64;
+        let width = u64::from(self.table_width);
         let mut base = 0u64;
         loop {
             let row_span = self
@@ -468,7 +468,7 @@ impl FractalHeapHeader {
             span = span
                 .checked_add(
                     self.checked_row_block_size(row)?
-                        .checked_mul(self.table_width as u64)
+                        .checked_mul(u64::from(self.table_width))
                         .ok_or_else(|| {
                             Error::InvalidFormat("fractal heap dtable span overflow".into())
                         })?,
@@ -496,7 +496,7 @@ impl FractalHeapHeader {
         if heap_id.is_empty() {
             return Err(Error::InvalidFormat("empty tiny heap ID".into()));
         }
-        Ok((heap_id[0] & 0x0f) as usize + 1)
+        Ok(usize::from(heap_id[0] & 0x0f) + 1)
     }
 
     pub fn tiny_op(&self, heap_id: &[u8]) -> Result<Vec<u8>> {
@@ -595,6 +595,12 @@ impl FractalHeapHeader {
             )));
         }
         let id_type = (heap_id[0] >> 4) & 0x03;
+        if id_type != 2 && heap_id[0] & 0x0f != 0 {
+            return Err(Error::InvalidFormat(format!(
+                "fractal heap ID reserved bits are nonzero: {:#04x}",
+                heap_id[0] & 0x0f
+            )));
+        }
 
         match id_type {
             0 => self.read_managed(reader, heap_id),
@@ -635,8 +641,11 @@ impl FractalHeap {
 
     pub fn insert(&mut self, data: Vec<u8>) -> Result<Vec<u8>> {
         self.ensure_open()?;
-        let id = self.objects.len() as u64;
-        if data.len() as u64 > self.header.max_managed_obj_size as u64 {
+        let id = u64::try_from(self.objects.len())
+            .map_err(|_| Error::InvalidFormat("fractal heap object id overflow".into()))?;
+        let data_len = u64::try_from(data.len())
+            .map_err(|_| Error::InvalidFormat("fractal heap object length overflow".into()))?;
+        if data_len > u64::from(self.header.max_managed_obj_size) {
             return Err(Error::InvalidFormat(
                 "fractal heap object exceeds managed limit".into(),
             ));
@@ -696,7 +705,11 @@ impl FractalHeap {
     }
 
     pub fn size(&self) -> u64 {
-        self.objects.iter().map(|o| o.len() as u64).sum()
+        self.objects
+            .iter()
+            .map(|o| u64::try_from(o.len()).unwrap_or(u64::MAX))
+            .try_fold(0u64, |acc, len| acc.checked_add(len))
+            .unwrap_or(u64::MAX)
     }
 
     pub fn id_print(heap_id: &[u8]) -> String {
@@ -708,7 +721,7 @@ impl FractalHeap {
     }
 
     fn encode_managed_id(&self, offset: u64) -> Vec<u8> {
-        let mut id = vec![0; self.header.heap_id_len as usize];
+        let mut id = vec![0; usize::from(self.header.heap_id_len)];
         if !id.is_empty() {
             id[0] = 0;
             let end = id.len().min(9);
@@ -812,25 +825,38 @@ impl FractalHeapIndirectBlock {
         verify_image_checksum(image, "fractal heap indirect block")
     }
 
-    pub fn cache_iblock_image_len(&self) -> usize {
-        4 + 1 + 8 + self.child_addrs.len() * 8 + 4
+    pub fn cache_iblock_image_len(&self) -> Result<usize> {
+        let child_bytes = self.child_addrs.len().checked_mul(8).ok_or_else(|| {
+            Error::InvalidFormat("fractal heap indirect block image length overflow".into())
+        })?;
+        4usize
+            .checked_add(1)
+            .and_then(|len| len.checked_add(8))
+            .and_then(|len| len.checked_add(child_bytes))
+            .and_then(|len| len.checked_add(4))
+            .ok_or_else(|| {
+                Error::InvalidFormat("fractal heap indirect block image length overflow".into())
+            })
     }
 
-    pub fn cache_iblock_pre_serialize(&self) -> Vec<u8> {
+    pub fn cache_iblock_pre_serialize(&self) -> Result<Vec<u8>> {
         self.cache_iblock_serialize()
     }
 
-    pub fn cache_iblock_serialize(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(self.cache_iblock_image_len());
+    pub fn cache_iblock_serialize(&self) -> Result<Vec<u8>> {
+        let nrows = u64::try_from(self.nrows).map_err(|_| {
+            Error::InvalidFormat("fractal heap indirect block row count is too large".into())
+        })?;
+        let mut out = Vec::with_capacity(self.cache_iblock_image_len()?);
         out.extend_from_slice(&FHIB_MAGIC);
         out.push(0);
-        out.extend_from_slice(&(self.nrows as u64).to_le_bytes());
+        out.extend_from_slice(&nrows.to_le_bytes());
         for addr in &self.child_addrs {
             out.extend_from_slice(&addr.to_le_bytes());
         }
         let checksum = checksum_metadata(&out);
         out.extend_from_slice(&checksum.to_le_bytes());
-        out
+        Ok(out)
     }
 
     pub fn cache_iblock_notify(&mut self) {
@@ -888,23 +914,30 @@ impl FractalHeapDirectBlock {
         4
     }
 
-    pub fn cache_dblock_image_len(&self) -> usize {
-        4 + 1 + 8 + self.data.len() + 4
+    pub fn cache_dblock_image_len(&self) -> Result<usize> {
+        4usize
+            .checked_add(1)
+            .and_then(|len| len.checked_add(8))
+            .and_then(|len| len.checked_add(self.data.len()))
+            .and_then(|len| len.checked_add(4))
+            .ok_or_else(|| {
+                Error::InvalidFormat("fractal heap direct block image length overflow".into())
+            })
     }
 
-    pub fn cache_dblock_pre_serialize(&self) -> Vec<u8> {
+    pub fn cache_dblock_pre_serialize(&self) -> Result<Vec<u8>> {
         self.cache_dblock_serialize()
     }
 
-    pub fn cache_dblock_serialize(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(self.cache_dblock_image_len());
+    pub fn cache_dblock_serialize(&self) -> Result<Vec<u8>> {
+        let mut out = Vec::with_capacity(self.cache_dblock_image_len()?);
         out.extend_from_slice(&FHDB_MAGIC);
         out.push(0);
         out.extend_from_slice(&self.addr.to_le_bytes());
         out.extend_from_slice(&self.data);
         let checksum = checksum_metadata(&out);
         out.extend_from_slice(&checksum.to_le_bytes());
-        out
+        Ok(out)
     }
 
     pub fn cache_dblock_notify(&mut self) {
@@ -1192,11 +1225,16 @@ impl FractalHeapSection {
 
     pub fn sect_row_term_cls() {}
 
-    pub fn sect_row_serialize(&self) -> Vec<u8> {
-        let mut out = Vec::new();
-        out.extend_from_slice(&section_offset(self).unwrap_or(0).to_le_bytes());
-        out.extend_from_slice(&section_size(self).unwrap_or(0).to_le_bytes());
-        out
+    pub fn sect_row_serialize(&self) -> Result<Vec<u8>> {
+        let Self::Row { offset, size, .. } = self else {
+            return Err(Error::InvalidFormat(
+                "fractal heap row section serializer received non-row section".into(),
+            ));
+        };
+        let mut out = Vec::with_capacity(16);
+        out.extend_from_slice(&offset.to_le_bytes());
+        out.extend_from_slice(&size.to_le_bytes());
+        Ok(out)
     }
 
     pub fn sect_row_deserialize(row: usize, offset: u64, size: u64) -> Self {
@@ -1314,8 +1352,16 @@ impl FractalHeapSection {
         self.sect_indirect_reduce(amount);
     }
 
-    pub fn sect_indirect_serialize(&self) -> Vec<u8> {
-        self.sect_row_serialize()
+    pub fn sect_indirect_serialize(&self) -> Result<Vec<u8>> {
+        let Self::Indirect { offset, size, .. } = self else {
+            return Err(Error::InvalidFormat(
+                "fractal heap indirect section serializer received non-indirect section".into(),
+            ));
+        };
+        let mut out = Vec::with_capacity(16);
+        out.extend_from_slice(&offset.to_le_bytes());
+        out.extend_from_slice(&size.to_le_bytes());
+        Ok(out)
     }
 
     pub fn sect_indirect_free(self) {}
@@ -1461,7 +1507,7 @@ impl FractalHeapHeader {
         th.output_u64(addr);
         th.output_u64(stored_len);
         th.output_u64(object_len);
-        th.output_u64(filter_mask as u64);
+        th.output_u64(u64::from(filter_mask));
         th.output_value(&(filtered));
         th.finish();
     }
@@ -1499,7 +1545,7 @@ impl FractalHeapHeader {
 pub(super) fn read_le_uint(bytes: &[u8]) -> u64 {
     let mut value = 0u64;
     for (idx, byte) in bytes.iter().take(8).enumerate() {
-        value |= (*byte as u64) << (idx * 8);
+        value |= u64::from(*byte) << (idx * 8);
     }
     value
 }
@@ -1532,10 +1578,10 @@ pub(super) fn verify_direct_block_checksum<R: Read + Seek>(
     block_size: u64,
 ) -> Result<()> {
     let restore = reader.position()?;
-    let block_offset_bytes = ((max_heap_size as usize) + 7) / 8;
+    let block_offset_bytes = (usize::from(max_heap_size) + 7) / 8;
     let check_len = 4usize
         .checked_add(1)
-        .and_then(|n| n.checked_add(reader.sizeof_addr() as usize))
+        .and_then(|n| n.checked_add(usize::from(reader.sizeof_addr())))
         .and_then(|n| n.checked_add(block_offset_bytes))
         .ok_or_else(|| {
             Error::InvalidFormat("fractal heap direct block checksum span overflow".into())
@@ -1663,4 +1709,50 @@ pub(super) fn log2_power2(value: u64) -> u32 {
 
 pub(super) fn log2_floor(value: u64) -> u32 {
     63 - value.leading_zeros()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cache_block_serializers_validate_lengths_and_checksums() {
+        let iblock = FractalHeapIndirectBlock {
+            nrows: 2,
+            child_addrs: vec![10, u64::MAX, 30],
+            ref_count: 1,
+            dirty: true,
+        };
+        let image = iblock.cache_iblock_serialize().unwrap();
+        assert_eq!(image.len(), iblock.cache_iblock_image_len().unwrap());
+        assert_eq!(&image[..4], &FHIB_MAGIC);
+        assert_eq!(u64::from_le_bytes(image[5..13].try_into().unwrap()), 2);
+        FractalHeapIndirectBlock::cache_iblock_verify_chksum(&image).unwrap();
+        assert_eq!(iblock.cache_iblock_pre_serialize().unwrap(), image);
+
+        let dblock = FractalHeapDirectBlock::man_dblock_new(64, vec![1, 2, 3, 4]);
+        let image = dblock.cache_dblock_serialize().unwrap();
+        assert_eq!(image.len(), dblock.cache_dblock_image_len().unwrap());
+        assert_eq!(&image[..4], &FHDB_MAGIC);
+        assert_eq!(u64::from_le_bytes(image[5..13].try_into().unwrap()), 64);
+        verify_image_checksum(&image, "fractal heap direct block").unwrap();
+        assert_eq!(dblock.cache_dblock_pre_serialize().unwrap(), image);
+    }
+
+    #[test]
+    fn section_class_serializers_reject_wrong_section_variants() {
+        let row = FractalHeapSection::sect_row_deserialize(3, 10, 20);
+        let image = row.sect_row_serialize().unwrap();
+        assert_eq!(u64::from_le_bytes(image[..8].try_into().unwrap()), 10);
+        assert_eq!(u64::from_le_bytes(image[8..16].try_into().unwrap()), 20);
+
+        let indirect = FractalHeapSection::sect_indirect_new(30, 2, 40);
+        let image = indirect.sect_indirect_serialize().unwrap();
+        assert_eq!(u64::from_le_bytes(image[..8].try_into().unwrap()), 30);
+        assert_eq!(u64::from_le_bytes(image[8..16].try_into().unwrap()), 40);
+
+        let single = FractalHeapSection::sect_single_new(1, 2);
+        assert!(single.sect_row_serialize().is_err());
+        assert!(single.sect_indirect_serialize().is_err());
+    }
 }

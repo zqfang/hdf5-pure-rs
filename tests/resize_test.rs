@@ -277,15 +277,14 @@ fn test_mutable_file_renames_compact_attributes_same_length() {
         mf.rename_group_attr("metadata", "g_old", "g_new").unwrap();
         mf.rename_dataset_attr("metadata/values", "dsold", "dsnew")
             .unwrap();
-        mf.rename_root_attr("omega", "om").unwrap();
 
         let err = mf
-            .rename_root_attr("om", "longer")
-            .expect_err("growing compact rename should be rejected");
+            .rename_root_attr("omega", "om")
+            .expect_err("shrinking compact rename should be rejected");
         assert!(err.to_string().contains("cannot grow"));
 
         let err = mf
-            .rename_root_attr("om", "taken")
+            .rename_root_attr("omega", "taken")
             .expect_err("duplicate compact rename target should be rejected");
         assert!(err.to_string().contains("already exists"));
     }
@@ -293,9 +292,8 @@ fn test_mutable_file_renames_compact_attributes_same_length() {
     {
         let f = File::open(&path).unwrap();
         assert!(!f.attr_exists("alpha").unwrap());
-        assert!(!f.attr_exists("omega").unwrap());
-        assert!(f.attr_exists("om").unwrap());
-        assert_eq!(f.attr("om").unwrap().read_scalar::<i32>().unwrap(), 11);
+        assert!(f.attr_exists("omega").unwrap());
+        assert_eq!(f.attr("omega").unwrap().read_scalar::<i32>().unwrap(), 11);
         assert!(f.attr_exists("taken").unwrap());
 
         let group = f.group("metadata").unwrap();

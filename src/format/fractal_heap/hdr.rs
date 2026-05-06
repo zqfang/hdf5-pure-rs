@@ -7,7 +7,7 @@ use crate::error::{Error, Result};
 use crate::format::messages::filter_pipeline::FilterPipelineMessage;
 use crate::io::reader::HdfReader;
 
-use super::{FractalHeapHeader, FRHP_MAGIC};
+use super::{verify_metadata_checksum, FractalHeapHeader, FRHP_MAGIC};
 
 impl FractalHeapHeader {
     pub fn read_at<R: Read + Seek>(reader: &mut HdfReader<R>, addr: u64) -> Result<Self> {
@@ -66,12 +66,15 @@ impl FractalHeapHeader {
         if io_filter_len > 0 {
             root_direct_filtered_size = Some(reader.read_length()?);
             root_direct_filter_mask = reader.read_u32()?;
-            let pipeline_bytes = reader.read_bytes(io_filter_len as usize)?;
+            let pipeline_bytes = reader.read_bytes(usize::from(io_filter_len))?;
             filter_pipeline = Some(FilterPipelineMessage::decode(&pipeline_bytes)?);
         }
 
-        // Checksum
-        let _checksum = reader.read_u32()?;
+        let checksum_span = reader
+            .position()?
+            .checked_sub(addr)
+            .ok_or_else(|| Error::InvalidFormat("fractal heap checksum span underflow".into()))?;
+        verify_metadata_checksum(reader, addr, checksum_span, "fractal heap header")?;
 
         validate_doubling_table_geometry(
             table_width,
@@ -141,7 +144,40 @@ fn validate_doubling_table_geometry(
 
 #[cfg(test)]
 mod tests {
+    use std::io::Cursor;
+
+    use crate::format::checksum::checksum_metadata;
+    use crate::io::HdfReader;
+
     use super::validate_doubling_table_geometry;
+    use super::*;
+
+    fn minimal_fractal_heap_header() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"FRHP");
+        bytes.push(0); // version
+        bytes.extend_from_slice(&8u16.to_le_bytes()); // heap id length
+        bytes.extend_from_slice(&0u16.to_le_bytes()); // filter length
+        bytes.push(0); // flags
+        bytes.extend_from_slice(&64u32.to_le_bytes()); // max managed object size
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // next huge id
+        bytes.extend_from_slice(&crate::io::reader::UNDEF_ADDR.to_le_bytes()); // huge btree
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // managed free space
+        bytes.extend_from_slice(&crate::io::reader::UNDEF_ADDR.to_le_bytes()); // free-space manager
+        for _ in 0..8 {
+            bytes.extend_from_slice(&0u64.to_le_bytes());
+        }
+        bytes.extend_from_slice(&4u16.to_le_bytes()); // table width
+        bytes.extend_from_slice(&8u64.to_le_bytes()); // start block size
+        bytes.extend_from_slice(&64u64.to_le_bytes()); // max direct block size
+        bytes.extend_from_slice(&32u16.to_le_bytes()); // max heap size bits
+        bytes.extend_from_slice(&0u16.to_le_bytes()); // starting root rows
+        bytes.extend_from_slice(&crate::io::reader::UNDEF_ADDR.to_le_bytes()); // root block
+        bytes.extend_from_slice(&0u16.to_le_bytes()); // current root rows
+        let checksum = checksum_metadata(&bytes);
+        bytes.extend_from_slice(&checksum.to_le_bytes());
+        bytes
+    }
 
     #[test]
     fn rejects_invalid_doubling_table_geometry() {
@@ -155,5 +191,16 @@ mod tests {
     #[test]
     fn accepts_valid_doubling_table_geometry() {
         validate_doubling_table_geometry(4, 8, 64, 32).unwrap();
+    }
+
+    #[test]
+    fn rejects_bad_header_checksum() {
+        let mut bytes = minimal_fractal_heap_header();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xff;
+        let mut reader = HdfReader::new(Cursor::new(bytes));
+        let err = FractalHeapHeader::read_at(&mut reader, 0)
+            .expect_err("bad fractal heap header checksum should fail");
+        assert!(err.to_string().contains("checksum"));
     }
 }

@@ -5,7 +5,7 @@ use crate::filters;
 use crate::format::messages::data_layout::ChunkIndexType;
 use crate::io::reader::HdfReader;
 
-use super::{usize_from_u64, Dataset, DatasetInfo};
+use super::{u64_from_usize, usize_from_u64, Dataset, DatasetInfo};
 
 #[derive(Debug, Clone)]
 pub(super) struct ChunkBTreeRecord {
@@ -30,7 +30,7 @@ impl Dataset {
         info: &DatasetInfo,
         total_bytes: usize,
     ) -> Result<Vec<u8>> {
-        let element_size = info.datatype.size as usize;
+        let element_size = usize_from_u64(u64::from(info.datatype.size), "datatype size")?;
         let data_dims = &info.dataspace.dims;
         let chunk_dims = info
             .layout
@@ -146,7 +146,7 @@ impl Dataset {
         let read_size = usize_from_u64(
             info.layout
                 .single_chunk_filtered_size
-                .unwrap_or(chunk_bytes as u64),
+                .unwrap_or(u64_from_usize(chunk_bytes, "single-chunk size")?),
             "single-chunk size",
         )?;
         let mut raw = reader.read_bytes(read_size)?;
@@ -192,7 +192,9 @@ impl Dataset {
             .ok_or_else(|| Error::InvalidFormat("chunk count overflow".into()))?;
 
         let mut output = if Self::can_skip_chunk_prefill_for_implicit_1d(chunk_ctx)? {
-            Self::uninitialized_output(chunk_ctx.total_bytes)
+            // Optimization opportunity: this path should fully overwrite the buffer, but proving
+            // every fallback/error edge is safe needs a deeper audit before using uninitialized memory.
+            Self::scratch_output(chunk_ctx.total_bytes)
         } else {
             Self::filled_data(
                 chunk_ctx.total_bytes / chunk_ctx.element_size,
@@ -204,8 +206,11 @@ impl Dataset {
         for chunk_index in 0..total_chunks {
             let coords =
                 Self::implicit_chunk_coords(chunk_index, chunk_ctx.chunk_dims, &chunks_per_dim)?;
-            let offset = (chunk_index as u64)
-                .checked_mul(chunk_ctx.chunk_bytes as u64)
+            let chunk_index_u64 = u64_from_usize(chunk_index, "implicit chunk index")?;
+            let chunk_bytes_u64 =
+                u64_from_usize(chunk_ctx.chunk_bytes, "implicit chunk byte size")?;
+            let offset = chunk_index_u64
+                .checked_mul(chunk_bytes_u64)
                 .and_then(|off| chunk_ctx.idx_addr.checked_add(off))
                 .ok_or_else(|| Error::InvalidFormat("implicit chunk address overflow".into()))?;
             if Self::try_read_full_chunk_1d_into_output(
@@ -291,14 +296,11 @@ impl Dataset {
         Ok(Some(data_size.div_ceil(chunk_size)))
     }
 
-    pub(super) fn uninitialized_output(total_bytes: usize) -> Vec<u8> {
-        let mut out = Vec::with_capacity(total_bytes);
-        // Safe because callers only use this helper when they can prove that
-        // every byte in the buffer is written before the Vec is observed.
-        unsafe {
-            out.set_len(total_bytes);
-        }
-        out
+    pub(super) fn scratch_output(total_bytes: usize) -> Vec<u8> {
+        // This intentionally avoids the fill-value prefill cost, not allocation initialization.
+        // Replacing it with uninitialized memory is an optimization opportunity that needs a
+        // full proof that every selected chunk path writes all bytes before observation.
+        vec![0; total_bytes]
     }
 
     pub(super) fn filtered_chunk_size_len(
@@ -313,7 +315,8 @@ impl Dataset {
         let bits = if chunk_bytes == 0 {
             0
         } else {
-            usize::BITS as usize - chunk_bytes.leading_zeros() as usize
+            usize::try_from(usize::BITS - chunk_bytes.leading_zeros())
+                .map_err(|_| Error::InvalidFormat("chunk size bit count overflow".into()))?
         };
         Ok((1 + ((bits + 8) / 8)).min(8))
     }
@@ -362,7 +365,7 @@ impl Dataset {
             }
             let chunk_coord = remaining % chunks_per_dim[dim];
             remaining /= chunks_per_dim[dim];
-            coords[dim] = (chunk_coord as u64)
+            coords[dim] = u64_from_usize(chunk_coord, "implicit chunk coordinate")?
                 .checked_mul(chunk_dims[dim])
                 .ok_or_else(|| Error::InvalidFormat("implicit chunk coordinate overflow".into()))?;
         }

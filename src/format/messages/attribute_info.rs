@@ -20,7 +20,7 @@ impl AttributeInfoMessage {
             ));
         }
 
-        let sa = sizeof_addr as usize;
+        let sa = usize::from(sizeof_addr);
         let mut pos = 0;
 
         let version = read_u8(data, &mut pos, "attribute info message version")?;
@@ -31,6 +31,11 @@ impl AttributeInfoMessage {
         }
 
         let flags = read_u8(data, &mut pos, "attribute info message flags")?;
+        if flags & !0x03 != 0 {
+            return Err(Error::InvalidFormat(format!(
+                "attribute info message flags {flags:#x} are invalid"
+            )));
+        }
 
         let has_max_crt_order = flags & 0x01 != 0;
         let has_corder_btree = flags & 0x02 != 0;
@@ -116,7 +121,7 @@ fn read_le_u64(data: &[u8], pos: &mut usize, size: usize, context: &str) -> Resu
     let end = checked_add_pos(*pos, size, context)?;
     let mut val = 0u64;
     for (i, byte) in data[*pos..end].iter().enumerate() {
-        val |= (*byte as u64) << (i * 8);
+        val |= u64::from(*byte) << (i * 8);
     }
     advance_pos(pos, size, context)?;
     Ok(val)

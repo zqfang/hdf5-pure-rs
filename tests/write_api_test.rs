@@ -376,6 +376,42 @@ fn test_writable_fixed_string_attrs() {
 }
 
 #[test]
+#[cfg(target_pointer_width = "64")]
+fn test_writable_rejects_unrepresentable_fixed_string_lengths() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("api_write_string_len_overflow.h5");
+    let too_long = u32::MAX as usize + 1;
+
+    let mut wf = WritableFile::create(&path).unwrap();
+    let err = wf
+        .add_fixed_ascii_attr("root", "x", too_long)
+        .expect_err("root fixed string length should fit encoded u32");
+    assert!(err.to_string().contains("fixed string length"));
+
+    let err = wf
+        .create_group("metadata")
+        .unwrap()
+        .add_fixed_utf8_attr("group", "x", too_long)
+        .expect_err("group fixed string length should fit encoded u32");
+    assert!(err.to_string().contains("fixed string length"));
+
+    let err = match wf
+        .new_dataset_builder("values")
+        .fixed_ascii_attr("units", "x", too_long)
+    {
+        Ok(_) => panic!("dataset attribute fixed string length should fit encoded u32"),
+        Err(err) => err,
+    };
+    assert!(err.to_string().contains("fixed string length"));
+
+    let err = wf
+        .new_dataset_builder("names")
+        .write_fixed_ascii_strings(&["x"], too_long)
+        .expect_err("dataset fixed string length should fit encoded u32");
+    assert!(err.to_string().contains("fixed string length"));
+}
+
+#[test]
 fn test_writable_rejects_oversized_object_header_message() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("api_write_oversized_oh_message.h5");
@@ -1077,6 +1113,25 @@ fn test_writable_file_vlen_utf8_strings() {
             "h5dump failed on vlen string writer fixture: {}",
             String::from_utf8_lossy(&out.stderr)
         );
+    }
+
+    let out = std::process::Command::new("timeout")
+        .arg("10")
+        .arg("h5dump")
+        .arg("-d")
+        .arg("names")
+        .arg(&path)
+        .output();
+    if let Ok(out) = out {
+        assert!(
+            out.status.success(),
+            "h5dump -d failed or timed out on vlen string writer fixture: status={:?}, stderr={}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.contains("alpha"));
+        assert!(stdout.contains("STRSIZE H5T_VARIABLE"));
     }
 }
 

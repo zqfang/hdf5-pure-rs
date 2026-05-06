@@ -14,6 +14,15 @@ pub enum FileDriverKind {
     Direct,
 }
 
+fn file_driver_kind_id(kind: FileDriverKind) -> u64 {
+    match kind {
+        FileDriverKind::Sec2 => 0,
+        FileDriverKind::Stdio => 1,
+        FileDriverKind::Core => 2,
+        FileDriverKind::Direct => 3,
+    }
+}
+
 #[derive(Debug)]
 pub struct LocalFileDriver {
     kind: FileDriverKind,
@@ -243,10 +252,13 @@ impl LocalFileDriver {
     }
 
     pub fn direct_check_alignment_reqs(addr: u64, size: usize, config: &DirectFileConfig) -> bool {
+        let Ok(size) = u64::try_from(size) else {
+            return false;
+        };
         config.memory_alignment != 0
             && config.block_size != 0
             && addr % config.memory_alignment == 0
-            && (size as u64) % config.block_size == 0
+            && size % config.block_size == 0
     }
 
     pub fn direct_close(self) {}
@@ -331,7 +343,7 @@ impl LocalFileDriver {
     }
 
     pub fn core_get_eof(&self) -> u64 {
-        self.core_image.len() as u64
+        u64::try_from(self.core_image.len()).unwrap_or(u64::MAX)
     }
 
     pub fn core_get_handle(&self) -> Option<&[u8]> {
@@ -477,8 +489,10 @@ impl LocalFileDriver {
     }
 
     fn driver_write(&mut self, addr: u64, data: &[u8]) -> Result<()> {
+        let data_len = u64::try_from(data.len())
+            .map_err(|_| Error::InvalidFormat("VFD write length exceeds u64".into()))?;
         let end = addr
-            .checked_add(data.len() as u64)
+            .checked_add(data_len)
             .ok_or_else(|| Error::InvalidFormat("VFD write span overflow".into()))?;
         if self.kind == FileDriverKind::Core {
             let start = usize::try_from(addr)
@@ -569,10 +583,26 @@ pub fn H5FD_init() -> VfdRegistry {
 #[allow(non_snake_case)]
 pub fn H5FD__init_package() -> VfdRegistry {
     let mut registry = VfdRegistry::default();
-    H5FD_register_driver_by_name(&mut registry, "sec2", FileDriverKind::Sec2 as u64);
-    H5FD_register_driver_by_name(&mut registry, "stdio", FileDriverKind::Stdio as u64);
-    H5FD_register_driver_by_name(&mut registry, "core", FileDriverKind::Core as u64);
-    H5FD_register_driver_by_name(&mut registry, "direct", FileDriverKind::Direct as u64);
+    H5FD_register_driver_by_name(
+        &mut registry,
+        "sec2",
+        file_driver_kind_id(FileDriverKind::Sec2),
+    );
+    H5FD_register_driver_by_name(
+        &mut registry,
+        "stdio",
+        file_driver_kind_id(FileDriverKind::Stdio),
+    );
+    H5FD_register_driver_by_name(
+        &mut registry,
+        "core",
+        file_driver_kind_id(FileDriverKind::Core),
+    );
+    H5FD_register_driver_by_name(
+        &mut registry,
+        "direct",
+        file_driver_kind_id(FileDriverKind::Direct),
+    );
     registry
 }
 
@@ -793,8 +823,8 @@ pub fn H5FD_locate_signature(image: &[u8]) -> Option<u64> {
     const SIG: &[u8; 8] = b"\x89HDF\r\n\x1a\n";
     let mut offset = 0usize;
     while offset.checked_add(SIG.len())? <= image.len() {
-        if &image[offset..offset + SIG.len()] == SIG {
-            return Some(offset as u64);
+        if image.get(offset..offset.checked_add(SIG.len())?) == Some(SIG.as_slice()) {
+            return u64::try_from(offset).ok();
         }
         offset = if offset == 0 {
             512
@@ -1096,6 +1126,35 @@ fn unsupported_vfd_driver(driver: &str) -> Error {
     ))
 }
 
+fn read_le_u32_at(data: &[u8], offset: usize, context: &str) -> Result<u32> {
+    let end = offset
+        .checked_add(4)
+        .ok_or_else(|| Error::InvalidFormat(format!("{context} offset overflow")))?;
+    let bytes: [u8; 4] = data
+        .get(offset..end)
+        .ok_or_else(|| Error::InvalidFormat(format!("{context} is truncated")))?
+        .try_into()
+        .map_err(|_| Error::InvalidFormat(format!("{context} is truncated")))?;
+    Ok(u32::from_le_bytes(bytes))
+}
+
+fn read_le_u32_len_at(data: &[u8], offset: usize, context: &'static str) -> Result<usize> {
+    usize::try_from(read_le_u32_at(data, offset, context)?)
+        .map_err(|_| Error::InvalidFormat(format!("{context} does not fit in usize")))
+}
+
+fn read_le_u64_at(data: &[u8], offset: usize, context: &str) -> Result<u64> {
+    let end = offset
+        .checked_add(8)
+        .ok_or_else(|| Error::InvalidFormat(format!("{context} offset overflow")))?;
+    let bytes: [u8; 8] = data
+        .get(offset..end)
+        .ok_or_else(|| Error::InvalidFormat(format!("{context} is truncated")))?
+        .try_into()
+        .map_err(|_| Error::InvalidFormat(format!("{context} is truncated")))?;
+    Ok(u64::from_le_bytes(bytes))
+}
+
 #[allow(non_snake_case)]
 pub fn H5FD__hdfs_register() -> Result<()> {
     Err(unsupported_vfd_driver("HDFS"))
@@ -1304,44 +1363,65 @@ pub fn H5FD__mirror_register() -> Result<()> {
 pub fn H5FD__mirror_unregister() {}
 
 #[allow(non_snake_case)]
-pub fn H5FD__mirror_xmit_decode_uint64(bytes: &[u8]) -> Option<u64> {
-    let raw: [u8; 8] = bytes.get(..8)?.try_into().ok()?;
-    Some(u64::from_le_bytes(raw))
-}
-
-#[allow(non_snake_case)]
-pub fn H5FD_mirror_xmit_decode_lock(_bytes: &[u8]) -> MirrorXmit {
-    MirrorXmit::Lock
-}
-
-#[allow(non_snake_case)]
-pub fn H5FD_mirror_xmit_decode_open(bytes: &[u8]) -> MirrorXmit {
-    MirrorXmit::Open {
-        path: String::from_utf8_lossy(bytes).to_string(),
+pub fn H5FD__mirror_xmit_decode_uint64(bytes: &[u8]) -> Result<u64> {
+    if bytes.len() != 8 {
+        return Err(Error::InvalidFormat(
+            "mirror transmit uint64 payload has invalid length".into(),
+        ));
     }
+    read_le_u64_at(bytes, 0, "mirror transmit uint64")
 }
 
 #[allow(non_snake_case)]
-pub fn H5FD_mirror_xmit_decode_reply(bytes: &[u8]) -> MirrorXmit {
-    let status = bytes
-        .get(..4)
-        .and_then(|raw| raw.try_into().ok())
-        .map(i32::from_le_bytes)
-        .unwrap_or(-1);
-    MirrorXmit::Reply { status }
+pub fn H5FD_mirror_xmit_decode_lock(bytes: &[u8]) -> Result<MirrorXmit> {
+    if !bytes.is_empty() {
+        return Err(Error::InvalidFormat(
+            "mirror transmit lock payload has invalid length".into(),
+        ));
+    }
+    Ok(MirrorXmit::Lock)
 }
 
 #[allow(non_snake_case)]
-pub fn H5FD_mirror_xmit_decode_set_eoa(bytes: &[u8]) -> Option<MirrorXmit> {
+pub fn H5FD_mirror_xmit_decode_open(bytes: &[u8]) -> Result<MirrorXmit> {
+    let path = std::str::from_utf8(bytes)
+        .map_err(|_| Error::InvalidFormat("mirror transmit open path is not UTF-8".into()))?;
+    Ok(MirrorXmit::Open {
+        path: path.to_string(),
+    })
+}
+
+#[allow(non_snake_case)]
+pub fn H5FD_mirror_xmit_decode_reply(bytes: &[u8]) -> Result<MirrorXmit> {
+    if bytes.len() != 4 {
+        return Err(Error::InvalidFormat(
+            "mirror transmit reply payload has invalid length".into(),
+        ));
+    }
+    let status = i32::from_le_bytes(
+        bytes
+            .try_into()
+            .map_err(|_| Error::InvalidFormat("mirror transmit reply is truncated".into()))?,
+    );
+    Ok(MirrorXmit::Reply { status })
+}
+
+#[allow(non_snake_case)]
+pub fn H5FD_mirror_xmit_decode_set_eoa(bytes: &[u8]) -> Result<MirrorXmit> {
     H5FD__mirror_xmit_decode_uint64(bytes).map(|eoa| MirrorXmit::SetEoa { eoa })
 }
 
 #[allow(non_snake_case)]
-pub fn H5FD_mirror_xmit_decode_write(bytes: &[u8]) -> Option<MirrorXmit> {
-    let addr = H5FD__mirror_xmit_decode_uint64(bytes)?;
-    Some(MirrorXmit::Write {
+pub fn H5FD_mirror_xmit_decode_write(bytes: &[u8]) -> Result<MirrorXmit> {
+    if bytes.len() < 8 {
+        return Err(Error::InvalidFormat(
+            "mirror transmit write payload is truncated".into(),
+        ));
+    }
+    let addr = read_le_u64_at(bytes, 0, "mirror transmit write address")?;
+    Ok(MirrorXmit::Write {
         addr,
-        data: bytes.get(8..)?.to_vec(),
+        data: bytes[8..].to_vec(),
     })
 }
 
@@ -1520,32 +1600,54 @@ pub fn H5FD__family_validate_config(config: &FamilyFileConfig) -> bool {
 }
 
 #[allow(non_snake_case)]
-pub fn H5FD__family_sb_size(config: &FamilyFileConfig) -> usize {
-    8 + 4 + config.printf_filename.len()
+pub fn H5FD__family_sb_size(config: &FamilyFileConfig) -> Result<usize> {
+    12usize
+        .checked_add(config.printf_filename.len())
+        .ok_or_else(|| Error::InvalidFormat("family VFD config image length overflow".into()))
 }
 
 #[allow(non_snake_case)]
-pub fn H5FD__family_sb_encode(config: &FamilyFileConfig) -> Vec<u8> {
+pub fn H5FD__family_sb_encode(config: &FamilyFileConfig) -> Result<Vec<u8>> {
+    if !H5FD__family_validate_config(config) {
+        return Err(Error::InvalidFormat("invalid family VFD config".into()));
+    }
     let filename = config.printf_filename.as_bytes();
-    let mut out = Vec::with_capacity(H5FD__family_sb_size(config));
+    let filename_len = u32::try_from(filename.len())
+        .map_err(|_| Error::InvalidFormat("family VFD filename length exceeds u32".into()))?;
+    let mut out = Vec::with_capacity(H5FD__family_sb_size(config)?);
     out.extend_from_slice(&config.member_size.to_le_bytes());
-    out.extend_from_slice(&(filename.len() as u32).to_le_bytes());
+    out.extend_from_slice(&filename_len.to_le_bytes());
     out.extend_from_slice(filename);
-    out
+    Ok(out)
 }
 
 #[allow(non_snake_case)]
-pub fn H5FD__family_sb_decode(bytes: &[u8]) -> Option<FamilyFileConfig> {
-    let member_size = u64::from_le_bytes(bytes.get(0..8)?.try_into().ok()?);
-    let filename_len = u32::from_le_bytes(bytes.get(8..12)?.try_into().ok()?) as usize;
-    let filename = std::str::from_utf8(bytes.get(12..12usize.checked_add(filename_len)?)?)
-        .ok()?
+pub fn H5FD__family_sb_decode(bytes: &[u8]) -> Result<FamilyFileConfig> {
+    let member_size = read_le_u64_at(bytes, 0, "family VFD member size")?;
+    let filename_len = read_le_u32_len_at(bytes, 8, "family VFD filename length")?;
+    let filename_start = 12usize;
+    let filename_end = filename_start
+        .checked_add(filename_len)
+        .ok_or_else(|| Error::InvalidFormat("family VFD filename length overflow".into()))?;
+    let filename_bytes = bytes
+        .get(filename_start..filename_end)
+        .ok_or_else(|| Error::InvalidFormat("family VFD filename is truncated".into()))?;
+    if bytes.len() != filename_end {
+        return Err(Error::InvalidFormat(
+            "family VFD config has trailing bytes".into(),
+        ));
+    }
+    let filename = std::str::from_utf8(filename_bytes)
+        .map_err(|_| Error::InvalidFormat("family VFD filename is not UTF-8".into()))?
         .to_string();
     let config = FamilyFileConfig {
         member_size,
         printf_filename: filename,
     };
-    H5FD__family_validate_config(&config).then_some(config)
+    if !H5FD__family_validate_config(&config) {
+        return Err(Error::InvalidFormat("invalid family VFD config".into()));
+    }
+    Ok(config)
 }
 
 #[allow(non_snake_case)]
@@ -1682,37 +1784,58 @@ pub fn H5FD_multi_validate_config(config: &MultiFileConfig) -> bool {
 }
 
 #[allow(non_snake_case)]
-pub fn H5FD_multi_sb_size(config: &MultiFileConfig) -> usize {
-    4 + config.memb_map.len() * 2
+pub fn H5FD_multi_sb_size(config: &MultiFileConfig) -> Result<usize> {
+    config
+        .memb_map
+        .len()
+        .checked_mul(2)
+        .and_then(|payload| payload.checked_add(4))
+        .ok_or_else(|| Error::InvalidFormat("multi VFD member map length overflow".into()))
 }
 
 #[allow(non_snake_case)]
-pub fn H5FD_multi_sb_encode(config: &MultiFileConfig) -> Vec<u8> {
-    let mut out = Vec::with_capacity(H5FD_multi_sb_size(config));
-    out.extend_from_slice(&(config.memb_map.len() as u32).to_le_bytes());
+pub fn H5FD_multi_sb_encode(config: &MultiFileConfig) -> Result<Vec<u8>> {
+    if !H5FD_multi_validate_config(config) {
+        return Err(Error::InvalidFormat("invalid multi VFD config".into()));
+    }
+    let count = u32::try_from(config.memb_map.len())
+        .map_err(|_| Error::InvalidFormat("multi VFD member count exceeds u32".into()))?;
+    let mut out = Vec::with_capacity(H5FD_multi_sb_size(config)?);
+    out.extend_from_slice(&count.to_le_bytes());
     let mut entries: Vec<_> = config.memb_map.iter().collect();
     entries.sort_by_key(|(mem_type, _)| vfd_mem_type_code(**mem_type));
     for (mem_type, driver) in entries {
         out.push(vfd_mem_type_code(*mem_type));
         out.push(file_driver_kind_code(*driver));
     }
-    out
+    Ok(out)
 }
 
 #[allow(non_snake_case)]
-pub fn H5FD_multi_sb_decode(bytes: &[u8]) -> Option<MultiFileConfig> {
-    let count = u32::from_le_bytes(bytes.get(0..4)?.try_into().ok()?) as usize;
-    if bytes.len() != 4usize.checked_add(count.checked_mul(2)?)? {
-        return None;
+pub fn H5FD_multi_sb_decode(bytes: &[u8]) -> Result<MultiFileConfig> {
+    let count = read_le_u32_len_at(bytes, 0, "multi VFD member count")?;
+    let payload_len = count
+        .checked_mul(2)
+        .and_then(|len| 4usize.checked_add(len))
+        .ok_or_else(|| Error::InvalidFormat("multi VFD member map length overflow".into()))?;
+    if bytes.len() != payload_len {
+        return Err(Error::InvalidFormat(
+            "multi VFD member map has invalid length".into(),
+        ));
     }
     let mut memb_map = HashMap::new();
     for entry in bytes[4..].chunks_exact(2) {
-        let mem_type = vfd_mem_type_from_code(entry[0])?;
-        let driver = file_driver_kind_from_code(entry[1])?;
+        let mem_type = vfd_mem_type_from_code(entry[0])
+            .ok_or_else(|| Error::InvalidFormat("invalid multi VFD memory type".into()))?;
+        let driver = file_driver_kind_from_code(entry[1])
+            .ok_or_else(|| Error::InvalidFormat("invalid multi VFD driver kind".into()))?;
         memb_map.insert(mem_type, driver);
     }
     let config = MultiFileConfig { memb_map };
-    H5FD_multi_validate_config(&config).then_some(config)
+    if !H5FD_multi_validate_config(&config) {
+        return Err(Error::InvalidFormat("invalid multi VFD config".into()));
+    }
+    Ok(config)
 }
 
 #[allow(non_snake_case)]
@@ -1935,47 +2058,70 @@ pub fn H5FD__splitter_truncate() -> Result<()> {
 }
 
 #[allow(non_snake_case)]
-pub fn H5FD__splitter_sb_size(config: &SplitterFileConfig) -> usize {
-    1 + 4
-        + config
-            .write_only_path
-            .as_ref()
-            .map(|path| path.as_os_str().as_encoded_bytes().len())
-            .unwrap_or(0)
+pub fn H5FD__splitter_sb_size(config: &SplitterFileConfig) -> Result<usize> {
+    5usize
+        .checked_add(
+            config
+                .write_only_path
+                .as_ref()
+                .map(|path| path.as_os_str().as_encoded_bytes().len())
+                .unwrap_or(0),
+        )
+        .ok_or_else(|| Error::InvalidFormat("splitter VFD config image length overflow".into()))
 }
 
 #[allow(non_snake_case)]
-pub fn H5FD__splitter_sb_encode(config: &SplitterFileConfig) -> Vec<u8> {
+pub fn H5FD__splitter_sb_encode(config: &SplitterFileConfig) -> Result<Vec<u8>> {
+    if !H5FD__splitter_validate_config(config) {
+        return Err(Error::InvalidFormat("invalid splitter VFD config".into()));
+    }
     let path = config
         .write_only_path
         .as_ref()
         .map(|path| path.as_os_str().as_encoded_bytes())
         .unwrap_or(&[]);
-    let mut out = Vec::with_capacity(H5FD__splitter_sb_size(config));
+    let path_len = u32::try_from(path.len())
+        .map_err(|_| Error::InvalidFormat("splitter VFD path length exceeds u32".into()))?;
+    let mut out = Vec::with_capacity(H5FD__splitter_sb_size(config)?);
     out.push(u8::from(config.ignore_wo_errors));
-    out.extend_from_slice(&(path.len() as u32).to_le_bytes());
+    out.extend_from_slice(&path_len.to_le_bytes());
     out.extend_from_slice(path);
-    out
+    Ok(out)
 }
 
 #[allow(non_snake_case)]
-pub fn H5FD__splitter_sb_decode(bytes: &[u8]) -> Option<SplitterFileConfig> {
-    let ignore_wo_errors = *bytes.first()? != 0;
-    let path_len = u32::from_le_bytes(bytes.get(1..5)?.try_into().ok()?) as usize;
-    let path_bytes = bytes.get(5..5usize.checked_add(path_len)?)?;
-    if bytes.len() != 5usize.checked_add(path_len)? {
-        return None;
+pub fn H5FD__splitter_sb_decode(bytes: &[u8]) -> Result<SplitterFileConfig> {
+    let ignore_wo_errors = *bytes
+        .first()
+        .ok_or_else(|| Error::InvalidFormat("splitter VFD flags are truncated".into()))?
+        != 0;
+    let path_len = read_le_u32_len_at(bytes, 1, "splitter VFD path length")?;
+    let path_end = 5usize
+        .checked_add(path_len)
+        .ok_or_else(|| Error::InvalidFormat("splitter VFD path length overflow".into()))?;
+    let path_bytes = bytes
+        .get(5..path_end)
+        .ok_or_else(|| Error::InvalidFormat("splitter VFD path is truncated".into()))?;
+    if bytes.len() != path_end {
+        return Err(Error::InvalidFormat(
+            "splitter VFD config has trailing bytes".into(),
+        ));
     }
     let write_only_path = if path_bytes.is_empty() {
         None
     } else {
-        Some(PathBuf::from(std::str::from_utf8(path_bytes).ok()?))
+        Some(PathBuf::from(std::str::from_utf8(path_bytes).map_err(
+            |_| Error::InvalidFormat("splitter VFD path is not UTF-8".into()),
+        )?))
     };
     let config = SplitterFileConfig {
         write_only_path,
         ignore_wo_errors,
     };
-    H5FD__splitter_validate_config(&config).then_some(config)
+    if !H5FD__splitter_validate_config(&config) {
+        return Err(Error::InvalidFormat("invalid splitter VFD config".into()));
+    }
+    Ok(config)
 }
 
 #[allow(non_snake_case)]
@@ -2072,51 +2218,73 @@ pub fn H5FD__log_validate_config(config: &LogFileConfig) -> bool {
 }
 
 #[allow(non_snake_case)]
-pub fn H5FD__log_sb_size(config: &LogFileConfig) -> usize {
-    8 + 8
-        + 4
-        + config
-            .log_path
-            .as_ref()
-            .map(|path| path.as_os_str().as_encoded_bytes().len())
-            .unwrap_or(0)
+pub fn H5FD__log_sb_size(config: &LogFileConfig) -> Result<usize> {
+    20usize
+        .checked_add(
+            config
+                .log_path
+                .as_ref()
+                .map(|path| path.as_os_str().as_encoded_bytes().len())
+                .unwrap_or(0),
+        )
+        .ok_or_else(|| Error::InvalidFormat("log VFD config image length overflow".into()))
 }
 
 #[allow(non_snake_case)]
-pub fn H5FD__log_sb_encode(config: &LogFileConfig) -> Vec<u8> {
+pub fn H5FD__log_sb_encode(config: &LogFileConfig) -> Result<Vec<u8>> {
+    if !H5FD__log_validate_config(config) {
+        return Err(Error::InvalidFormat("invalid log VFD config".into()));
+    }
     let path = config
         .log_path
         .as_ref()
         .map(|path| path.as_os_str().as_encoded_bytes())
         .unwrap_or(&[]);
-    let mut out = Vec::with_capacity(H5FD__log_sb_size(config));
+    let buffer_size = u64::try_from(config.buffer_size)
+        .map_err(|_| Error::InvalidFormat("log VFD buffer size exceeds u64".into()))?;
+    let path_len = u32::try_from(path.len())
+        .map_err(|_| Error::InvalidFormat("log VFD path length exceeds u32".into()))?;
+    let mut out = Vec::with_capacity(H5FD__log_sb_size(config)?);
     out.extend_from_slice(&config.flags.to_le_bytes());
-    out.extend_from_slice(&(config.buffer_size as u64).to_le_bytes());
-    out.extend_from_slice(&(path.len() as u32).to_le_bytes());
+    out.extend_from_slice(&buffer_size.to_le_bytes());
+    out.extend_from_slice(&path_len.to_le_bytes());
     out.extend_from_slice(path);
-    out
+    Ok(out)
 }
 
 #[allow(non_snake_case)]
-pub fn H5FD__log_sb_decode(bytes: &[u8]) -> Option<LogFileConfig> {
-    let flags = u64::from_le_bytes(bytes.get(0..8)?.try_into().ok()?);
-    let buffer_size = u64::from_le_bytes(bytes.get(8..16)?.try_into().ok()?) as usize;
-    let path_len = u32::from_le_bytes(bytes.get(16..20)?.try_into().ok()?) as usize;
-    let path_bytes = bytes.get(20..20usize.checked_add(path_len)?)?;
-    if bytes.len() != 20usize.checked_add(path_len)? {
-        return None;
+pub fn H5FD__log_sb_decode(bytes: &[u8]) -> Result<LogFileConfig> {
+    let flags = read_le_u64_at(bytes, 0, "log VFD flags")?;
+    let buffer_size = usize::try_from(read_le_u64_at(bytes, 8, "log VFD buffer size")?)
+        .map_err(|_| Error::InvalidFormat("log VFD buffer size does not fit usize".into()))?;
+    let path_len = read_le_u32_len_at(bytes, 16, "log VFD path length")?;
+    let path_end = 20usize
+        .checked_add(path_len)
+        .ok_or_else(|| Error::InvalidFormat("log VFD path length overflow".into()))?;
+    let path_bytes = bytes
+        .get(20..path_end)
+        .ok_or_else(|| Error::InvalidFormat("log VFD path is truncated".into()))?;
+    if bytes.len() != path_end {
+        return Err(Error::InvalidFormat(
+            "log VFD config has trailing bytes".into(),
+        ));
     }
     let log_path = if path_bytes.is_empty() {
         None
     } else {
-        Some(PathBuf::from(std::str::from_utf8(path_bytes).ok()?))
+        Some(PathBuf::from(std::str::from_utf8(path_bytes).map_err(
+            |_| Error::InvalidFormat("log VFD path is not UTF-8".into()),
+        )?))
     };
     let config = LogFileConfig {
         log_path,
         flags,
         buffer_size,
     };
-    H5FD__log_validate_config(&config).then_some(config)
+    if !H5FD__log_validate_config(&config) {
+        return Err(Error::InvalidFormat("invalid log VFD config".into()));
+    }
+    Ok(config)
 }
 
 #[allow(non_snake_case)]
@@ -2374,11 +2542,16 @@ pub fn H5FD__onion_revision_index_insert(
 }
 
 #[allow(non_snake_case)]
-pub fn H5FD__onion_revision_record_decode(bytes: &[u8]) -> Option<OnionRevisionRecord> {
-    let revision = u64::from_le_bytes(bytes.get(0..8)?.try_into().ok()?);
-    let address = u64::from_le_bytes(bytes.get(8..16)?.try_into().ok()?);
-    let size = u64::from_le_bytes(bytes.get(16..24)?.try_into().ok()?);
-    Some(OnionRevisionRecord {
+pub fn H5FD__onion_revision_record_decode(bytes: &[u8]) -> Result<OnionRevisionRecord> {
+    if bytes.len() != 24 {
+        return Err(Error::InvalidFormat(
+            "onion revision record image has invalid length".into(),
+        ));
+    }
+    let revision = read_le_u64_at(bytes, 0, "onion revision record revision")?;
+    let address = read_le_u64_at(bytes, 8, "onion revision record address")?;
+    let size = read_le_u64_at(bytes, 16, "onion revision record size")?;
+    Ok(OnionRevisionRecord {
         revision,
         address,
         size,
@@ -2417,7 +2590,7 @@ pub fn H5FD__onion_merge_revision_index_into_archival_index(
 }
 
 #[allow(non_snake_case)]
-pub fn H5FD__onion_ingest_header(bytes: &[u8]) -> Option<OnionHeader> {
+pub fn H5FD__onion_ingest_header(bytes: &[u8]) -> Result<OnionHeader> {
     H5FD__onion_sb_decode(bytes)
 }
 
@@ -2454,11 +2627,20 @@ pub fn H5FD__onion_sb_encode(header: &OnionHeader) -> Vec<u8> {
 }
 
 #[allow(non_snake_case)]
-pub fn H5FD__onion_sb_decode(bytes: &[u8]) -> Option<OnionHeader> {
-    Some(OnionHeader {
-        version: *bytes.first()?,
-        flags: *bytes.get(1)?,
-        revision_count: u64::from_le_bytes(bytes.get(2..10)?.try_into().ok()?),
+pub fn H5FD__onion_sb_decode(bytes: &[u8]) -> Result<OnionHeader> {
+    if bytes.len() != H5FD__onion_sb_size(&OnionHeader::default()) {
+        return Err(Error::InvalidFormat(
+            "onion VFD header image has invalid length".into(),
+        ));
+    }
+    Ok(OnionHeader {
+        version: *bytes
+            .first()
+            .ok_or_else(|| Error::InvalidFormat("onion VFD version is truncated".into()))?,
+        flags: *bytes
+            .get(1)
+            .ok_or_else(|| Error::InvalidFormat("onion VFD flags are truncated".into()))?,
+        revision_count: read_le_u64_at(bytes, 2, "onion VFD revision count")?,
     })
 }
 
@@ -2556,33 +2738,42 @@ pub fn H5FD__get_onion_revision_count(header: &OnionHeader) -> u64 {
 }
 
 #[allow(non_snake_case)]
-pub fn H5FD__onion_write_final_history(index: &OnionRevisionIndex) -> Vec<u8> {
+pub fn H5FD__onion_write_final_history(index: &OnionRevisionIndex) -> Result<Vec<u8>> {
     H5FD__onion_history_encode(index)
 }
 
 #[allow(non_snake_case)]
-pub fn H5FD__onion_ingest_history(bytes: &[u8]) -> OnionRevisionIndex {
+pub fn H5FD__onion_ingest_history(bytes: &[u8]) -> Result<OnionRevisionIndex> {
+    if bytes.len() % 24 != 0 {
+        return Err(Error::InvalidFormat(
+            "onion revision history has a partial trailing record".into(),
+        ));
+    }
     let mut index = OnionRevisionIndex::default();
     for chunk in bytes.chunks_exact(24) {
-        if let Some(record) = H5FD__onion_revision_record_decode(chunk) {
-            H5FD__onion_revision_index_insert(&mut index, record);
-        }
+        let record = H5FD__onion_revision_record_decode(chunk)?;
+        H5FD__onion_revision_index_insert(&mut index, record);
     }
-    index
+    Ok(index)
 }
 
 #[allow(non_snake_case)]
-pub fn H5FD__onion_write_history(index: &OnionRevisionIndex) -> Vec<u8> {
+pub fn H5FD__onion_write_history(index: &OnionRevisionIndex) -> Result<Vec<u8>> {
     H5FD__onion_history_encode(index)
 }
 
 #[allow(non_snake_case)]
-pub fn H5FD__onion_history_encode(index: &OnionRevisionIndex) -> Vec<u8> {
-    let mut out = Vec::with_capacity(index.records.len() * 24);
+pub fn H5FD__onion_history_encode(index: &OnionRevisionIndex) -> Result<Vec<u8>> {
+    let len = index
+        .records
+        .len()
+        .checked_mul(24)
+        .ok_or_else(|| Error::InvalidFormat("onion revision history length overflow".into()))?;
+    let mut out = Vec::with_capacity(len);
     for record in &index.records {
         out.extend_from_slice(&H5FD__onion_revision_record_encode(record));
     }
-    out
+    Ok(out)
 }
 
 #[allow(non_snake_case)]
@@ -2627,7 +2818,7 @@ pub fn H5FD__multi_unregister() {}
 pub fn H5FD__ioc_calculate_target_ioc(addr: u64, config: &SubfilingConfig) -> u32 {
     let count = config.ioc_count.max(1);
     let stripe = config.stripe_size.max(1);
-    ((addr / stripe) % u64::from(count)) as u32
+    u32::try_from((addr / stripe) % u64::from(count)).unwrap_or(0)
 }
 
 #[allow(non_snake_case)]
@@ -2811,19 +3002,41 @@ pub fn H5FD__ioc_sb_size(_config: &IocConfig) -> usize {
 }
 
 #[allow(non_snake_case)]
-pub fn H5FD__ioc_sb_encode(config: &IocConfig) -> Vec<u8> {
+pub fn H5FD__ioc_sb_encode(config: &IocConfig) -> Result<Vec<u8>> {
+    if !H5FD__ioc_validate_config(config) {
+        return Err(Error::InvalidFormat("invalid subfiling IOC config".into()));
+    }
+    let thread_pool_size = u64::try_from(config.thread_pool_size)
+        .map_err(|_| Error::InvalidFormat("subfiling IOC thread pool size exceeds u64".into()))?;
+    let queue_depth = u64::try_from(config.queue_depth)
+        .map_err(|_| Error::InvalidFormat("subfiling IOC queue depth exceeds u64".into()))?;
     let mut out = Vec::with_capacity(16);
-    out.extend_from_slice(&(config.thread_pool_size as u64).to_le_bytes());
-    out.extend_from_slice(&(config.queue_depth as u64).to_le_bytes());
-    out
+    out.extend_from_slice(&thread_pool_size.to_le_bytes());
+    out.extend_from_slice(&queue_depth.to_le_bytes());
+    Ok(out)
 }
 
 #[allow(non_snake_case)]
-pub fn H5FD__ioc_sb_decode(bytes: &[u8]) -> Option<IocConfig> {
-    Some(IocConfig {
-        thread_pool_size: u64::from_le_bytes(bytes.get(0..8)?.try_into().ok()?) as usize,
-        queue_depth: u64::from_le_bytes(bytes.get(8..16)?.try_into().ok()?) as usize,
-    })
+pub fn H5FD__ioc_sb_decode(bytes: &[u8]) -> Result<IocConfig> {
+    if bytes.len() != H5FD__ioc_sb_size(&IocConfig::default()) {
+        return Err(Error::InvalidFormat(
+            "subfiling IOC config image has invalid length".into(),
+        ));
+    }
+    let thread_pool_size =
+        usize::try_from(read_le_u64_at(bytes, 0, "subfiling IOC thread pool size")?).map_err(
+            |_| Error::InvalidFormat("subfiling IOC thread pool size does not fit usize".into()),
+        )?;
+    let queue_depth = usize::try_from(read_le_u64_at(bytes, 8, "subfiling IOC queue depth")?)
+        .map_err(|_| Error::InvalidFormat("subfiling IOC queue depth does not fit usize".into()))?;
+    let config = IocConfig {
+        thread_pool_size,
+        queue_depth,
+    };
+    if !H5FD__ioc_validate_config(&config) {
+        return Err(Error::InvalidFormat("invalid subfiling IOC config".into()));
+    }
+    Ok(config)
 }
 
 #[allow(non_snake_case)]
@@ -3044,21 +3257,33 @@ pub fn H5FD__subfiling_sb_size(_config: &SubfilingConfig) -> usize {
 }
 
 #[allow(non_snake_case)]
-pub fn H5FD__subfiling_sb_encode(config: &SubfilingConfig) -> Vec<u8> {
+pub fn H5FD__subfiling_sb_encode(config: &SubfilingConfig) -> Result<Vec<u8>> {
+    if config.stripe_size == 0 || config.ioc_count == 0 || config.stripe_count == 0 {
+        return Err(Error::InvalidFormat("invalid subfiling VFD config".into()));
+    }
     let mut out = Vec::with_capacity(16);
     out.extend_from_slice(&config.stripe_size.to_le_bytes());
     out.extend_from_slice(&config.ioc_count.to_le_bytes());
     out.extend_from_slice(&config.stripe_count.to_le_bytes());
-    out
+    Ok(out)
 }
 
 #[allow(non_snake_case)]
-pub fn H5FD__subfiling_sb_decode(bytes: &[u8]) -> Option<SubfilingConfig> {
-    Some(SubfilingConfig {
-        stripe_size: u64::from_le_bytes(bytes.get(0..8)?.try_into().ok()?),
-        ioc_count: u32::from_le_bytes(bytes.get(8..12)?.try_into().ok()?),
-        stripe_count: u32::from_le_bytes(bytes.get(12..16)?.try_into().ok()?),
-    })
+pub fn H5FD__subfiling_sb_decode(bytes: &[u8]) -> Result<SubfilingConfig> {
+    if bytes.len() != H5FD__subfiling_sb_size(&SubfilingConfig::default()) {
+        return Err(Error::InvalidFormat(
+            "subfiling VFD config image has invalid length".into(),
+        ));
+    }
+    let config = SubfilingConfig {
+        stripe_size: read_le_u64_at(bytes, 0, "subfiling VFD stripe size")?,
+        ioc_count: read_le_u32_at(bytes, 8, "subfiling VFD IOC count")?,
+        stripe_count: read_le_u32_at(bytes, 12, "subfiling VFD stripe count")?,
+    };
+    if config.stripe_size == 0 || config.ioc_count == 0 || config.stripe_count == 0 {
+        return Err(Error::InvalidFormat("invalid subfiling VFD config".into()));
+    }
+    Ok(config)
 }
 
 #[allow(non_snake_case)]
@@ -3204,8 +3429,9 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        FamilyFileConfig, FileDriverKind, LocalFileDriver, LogFileConfig, MultiFileConfig,
-        SplitterFileConfig, VfdMemType,
+        Error, FamilyFileConfig, FileDriverKind, IocConfig, LocalFileDriver, LogFileConfig,
+        MirrorXmit, MultiFileConfig, OnionHeader, OnionRevisionIndex, OnionRevisionRecord,
+        SplitterFileConfig, SubfilingConfig, VfdMemType,
     };
 
     #[test]
@@ -3232,9 +3458,20 @@ mod tests {
             member_size: 4096,
             printf_filename: "member-%03d.h5".into(),
         };
-        let family_bytes = super::H5FD__family_sb_encode(&family);
-        assert_eq!(super::H5FD__family_sb_size(&family), family_bytes.len());
-        assert_eq!(super::H5FD__family_sb_decode(&family_bytes), Some(family));
+        let family_bytes = super::H5FD__family_sb_encode(&family).unwrap();
+        assert_eq!(
+            super::H5FD__family_sb_size(&family).unwrap(),
+            family_bytes.len()
+        );
+        assert_eq!(
+            super::H5FD__family_sb_decode(&family_bytes).unwrap(),
+            family
+        );
+        assert!(super::H5FD__family_sb_encode(&FamilyFileConfig {
+            member_size: 0,
+            printf_filename: "member-%03d.h5".into(),
+        })
+        .is_err());
 
         let mut multi = MultiFileConfig::default();
         multi
@@ -3243,39 +3480,208 @@ mod tests {
         multi
             .memb_map
             .insert(VfdMemType::RawData, FileDriverKind::Core);
-        let multi_bytes = super::H5FD_multi_sb_encode(&multi);
-        assert_eq!(super::H5FD_multi_sb_size(&multi), multi_bytes.len());
-        assert_eq!(super::H5FD_multi_sb_decode(&multi_bytes), Some(multi));
+        let multi_bytes = super::H5FD_multi_sb_encode(&multi).unwrap();
+        assert_eq!(
+            super::H5FD_multi_sb_size(&multi).unwrap(),
+            multi_bytes.len()
+        );
+        assert_eq!(super::H5FD_multi_sb_decode(&multi_bytes).unwrap(), multi);
+        assert!(super::H5FD_multi_sb_encode(&MultiFileConfig::default()).is_err());
 
         let splitter = SplitterFileConfig {
             write_only_path: Some(PathBuf::from("mirror.h5")),
             ignore_wo_errors: true,
         };
-        let splitter_bytes = super::H5FD__splitter_sb_encode(&splitter);
+        let splitter_bytes = super::H5FD__splitter_sb_encode(&splitter).unwrap();
         assert_eq!(
-            super::H5FD__splitter_sb_size(&splitter),
+            super::H5FD__splitter_sb_size(&splitter).unwrap(),
             splitter_bytes.len()
         );
         assert_eq!(
-            super::H5FD__splitter_sb_decode(&splitter_bytes),
-            Some(splitter)
+            super::H5FD__splitter_sb_decode(&splitter_bytes).unwrap(),
+            splitter
         );
+        assert!(super::H5FD__splitter_sb_encode(&SplitterFileConfig {
+            write_only_path: Some(PathBuf::from("")),
+            ignore_wo_errors: true,
+        })
+        .is_err());
 
         let log = LogFileConfig {
             log_path: Some(PathBuf::from("driver.log")),
             flags: 0x55,
             buffer_size: 8192,
         };
-        let log_bytes = super::H5FD__log_sb_encode(&log);
-        assert_eq!(super::H5FD__log_sb_size(&log), log_bytes.len());
-        assert_eq!(super::H5FD__log_sb_decode(&log_bytes), Some(log));
+        let log_bytes = super::H5FD__log_sb_encode(&log).unwrap();
+        assert_eq!(super::H5FD__log_sb_size(&log).unwrap(), log_bytes.len());
+        assert_eq!(super::H5FD__log_sb_decode(&log_bytes).unwrap(), log);
+        assert!(super::H5FD__log_sb_encode(&LogFileConfig {
+            log_path: Some(PathBuf::from("")),
+            flags: 0,
+            buffer_size: 0,
+        })
+        .is_err());
+
+        assert_eq!(
+            super::H5FD_mirror_xmit_decode_lock(&[]).unwrap(),
+            MirrorXmit::Lock
+        );
+        assert_eq!(
+            super::H5FD_mirror_xmit_decode_open(&super::H5FD_mirror_xmit_encode_open("mirror.h5",))
+                .unwrap(),
+            MirrorXmit::Open {
+                path: "mirror.h5".into()
+            }
+        );
+        assert_eq!(
+            super::H5FD_mirror_xmit_decode_reply(&super::H5FD_mirror_xmit_encode_reply(0)).unwrap(),
+            MirrorXmit::Reply { status: 0 }
+        );
+        assert_eq!(
+            super::H5FD_mirror_xmit_decode_set_eoa(&super::H5FD_mirror_xmit_encode_set_eoa(4096))
+                .unwrap(),
+            MirrorXmit::SetEoa { eoa: 4096 }
+        );
+        assert_eq!(
+            super::H5FD_mirror_xmit_decode_write(&super::H5FD_mirror_xmit_encode_write(
+                8192, b"abc",
+            ))
+            .unwrap(),
+            MirrorXmit::Write {
+                addr: 8192,
+                data: b"abc".to_vec()
+            }
+        );
+
+        let onion = OnionHeader {
+            version: 1,
+            flags: 0x2,
+            revision_count: 3,
+        };
+        let onion_bytes = super::H5FD__onion_sb_encode(&onion);
+        assert_eq!(super::H5FD__onion_sb_size(&onion), onion_bytes.len());
+        assert_eq!(super::H5FD__onion_sb_decode(&onion_bytes).unwrap(), onion);
+
+        let ioc = IocConfig {
+            thread_pool_size: 4,
+            queue_depth: 16,
+        };
+        let ioc_bytes = super::H5FD__ioc_sb_encode(&ioc).unwrap();
+        assert_eq!(super::H5FD__ioc_sb_size(&ioc), ioc_bytes.len());
+        assert_eq!(super::H5FD__ioc_sb_decode(&ioc_bytes).unwrap(), ioc);
+        assert!(super::H5FD__ioc_sb_encode(&IocConfig {
+            thread_pool_size: 0,
+            queue_depth: 16,
+        })
+        .is_err());
+
+        let subfiling = SubfilingConfig {
+            ioc_count: 2,
+            stripe_size: 1024,
+            stripe_count: 8,
+        };
+        let subfiling_bytes = super::H5FD__subfiling_sb_encode(&subfiling).unwrap();
+        assert_eq!(
+            super::H5FD__subfiling_sb_size(&subfiling),
+            subfiling_bytes.len()
+        );
+        assert_eq!(
+            super::H5FD__subfiling_sb_decode(&subfiling_bytes).unwrap(),
+            subfiling
+        );
+        assert!(super::H5FD__subfiling_sb_encode(&SubfilingConfig {
+            ioc_count: 0,
+            stripe_size: 1024,
+            stripe_count: 8,
+        })
+        .is_err());
+
+        let history = OnionRevisionIndex {
+            records: vec![
+                OnionRevisionRecord {
+                    revision: 1,
+                    address: 64,
+                    size: 8,
+                },
+                OnionRevisionRecord {
+                    revision: 2,
+                    address: 128,
+                    size: 16,
+                },
+            ],
+        };
+        let history_bytes = super::H5FD__onion_history_encode(&history).unwrap();
+        assert_eq!(
+            super::H5FD__onion_ingest_history(&history_bytes).unwrap(),
+            history
+        );
     }
 
     #[test]
     fn vfd_config_decoders_reject_truncated_or_invalid_payloads() {
-        assert!(super::H5FD__family_sb_decode(&[0; 4]).is_none());
-        assert!(super::H5FD_multi_sb_decode(&[1, 0, 0, 0, 99, 0]).is_none());
-        assert!(super::H5FD__splitter_sb_decode(&[0, 4, 0, 0, 0, b'a']).is_none());
-        assert!(super::H5FD__log_sb_decode(&[0; 7]).is_none());
+        assert!(matches!(
+            super::H5FD__family_sb_decode(&[0; 4]).unwrap_err(),
+            Error::InvalidFormat(_)
+        ));
+        assert!(matches!(
+            super::H5FD_multi_sb_decode(&[1, 0, 0, 0, 99, 0]).unwrap_err(),
+            Error::InvalidFormat(_)
+        ));
+        assert!(matches!(
+            super::H5FD__splitter_sb_decode(&[0, 4, 0, 0, 0, b'a']).unwrap_err(),
+            Error::InvalidFormat(_)
+        ));
+        assert!(matches!(
+            super::H5FD__log_sb_decode(&[0; 7]).unwrap_err(),
+            Error::InvalidFormat(_)
+        ));
+        assert!(matches!(
+            super::H5FD_mirror_xmit_decode_lock(&[0]).unwrap_err(),
+            Error::InvalidFormat(_)
+        ));
+        assert!(matches!(
+            super::H5FD_mirror_xmit_decode_open(&[0xff]).unwrap_err(),
+            Error::InvalidFormat(_)
+        ));
+        assert!(matches!(
+            super::H5FD_mirror_xmit_decode_reply(&[0; 3]).unwrap_err(),
+            Error::InvalidFormat(_)
+        ));
+        assert!(matches!(
+            super::H5FD_mirror_xmit_decode_set_eoa(&[0; 7]).unwrap_err(),
+            Error::InvalidFormat(_)
+        ));
+        assert!(matches!(
+            super::H5FD_mirror_xmit_decode_write(&[0; 7]).unwrap_err(),
+            Error::InvalidFormat(_)
+        ));
+        assert!(matches!(
+            super::H5FD__onion_sb_decode(&[0; 9]).unwrap_err(),
+            Error::InvalidFormat(_)
+        ));
+        assert!(matches!(
+            super::H5FD__onion_revision_record_decode(&[0; 23]).unwrap_err(),
+            Error::InvalidFormat(_)
+        ));
+        assert!(matches!(
+            super::H5FD__onion_ingest_history(&[0; 25]).unwrap_err(),
+            Error::InvalidFormat(_)
+        ));
+        assert!(matches!(
+            super::H5FD__ioc_sb_decode(&[0; 15]).unwrap_err(),
+            Error::InvalidFormat(_)
+        ));
+        assert!(matches!(
+            super::H5FD__ioc_sb_decode(&[0; 16]).unwrap_err(),
+            Error::InvalidFormat(_)
+        ));
+        assert!(matches!(
+            super::H5FD__subfiling_sb_decode(&[0; 15]).unwrap_err(),
+            Error::InvalidFormat(_)
+        ));
+        assert!(matches!(
+            super::H5FD__subfiling_sb_decode(&[0; 16]).unwrap_err(),
+            Error::InvalidFormat(_)
+        ));
     }
 }

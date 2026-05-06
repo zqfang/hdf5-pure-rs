@@ -7,7 +7,25 @@ use crate::format::messages::fill_value::FillValueMessage;
 use crate::format::messages::filter_pipeline::FilterPipelineMessage;
 use crate::format::object_header::{self, ObjectHeader, RawMessage};
 
-use super::{read_le_uint_at, read_u8_at, usize_from_u64, Dataset, DatasetAccess, VdsView};
+use super::{
+    read_le_uint_at, read_u8_at, u64_from_usize, usize_from_u64, Dataset, DatasetAccess, VdsView,
+};
+
+fn is_undefined_external_addr(addr: u64, sizeof_addr: usize) -> Result<bool> {
+    let bits = sizeof_addr
+        .checked_mul(8)
+        .ok_or_else(|| Error::InvalidFormat("external file list address size overflow".into()))?;
+    let undef = if bits == 64 {
+        u64::MAX
+    } else if bits < 64 {
+        (1u64 << bits) - 1
+    } else {
+        return Err(Error::InvalidFormat(
+            "external file list address is wider than u64".into(),
+        ));
+    };
+    Ok(addr == undef)
+}
 
 /// Metadata about a dataset parsed from its object header.
 #[derive(Debug)]
@@ -124,8 +142,8 @@ impl Dataset {
                 object_header::MSG_EXTERNAL_FILE_LIST => {
                     external_file_list = Some(Self::decode_external_file_list(
                         &msg.data,
-                        sizeof_addr as usize,
-                        sizeof_size as usize,
+                        usize::from(sizeof_addr),
+                        usize::from(sizeof_size),
                     )?);
                 }
                 _ => {}
@@ -136,7 +154,7 @@ impl Dataset {
             if let (Some(raw), Some(datatype)) = (old_fill_value_raw, datatype.as_ref()) {
                 fill_value = Some(FillValueMessage::decode_old_with_datatype_size(
                     raw,
-                    Some(datatype.size as usize),
+                    Some(usize_from_u64(u64::from(datatype.size), "datatype size")?),
                 )?);
             }
         }
@@ -154,7 +172,7 @@ impl Dataset {
         })
     }
 
-    fn decode_external_file_list(
+    pub(super) fn decode_external_file_list(
         data: &[u8],
         sizeof_addr: usize,
         sizeof_size: usize,
@@ -166,31 +184,37 @@ impl Dataset {
                 "external file list version {version}"
             )));
         }
-        pos = pos
+        let reserved_end = pos
             .checked_add(3)
             .ok_or_else(|| Error::InvalidFormat("external file list offset overflow".into()))?;
-        if pos > data.len() {
+        pos = reserved_end;
+        let allocated_slots = read_le_uint_at(data, &mut pos, 2)?;
+        if allocated_slots == 0 {
             return Err(Error::InvalidFormat(
-                "truncated external file list reserved bytes".into(),
+                "external file list has no allocated slots".into(),
             ));
         }
-        let allocated_slots = read_le_uint_at(data, &mut pos, 2)?;
         let used_slots = usize_from_u64(
             read_le_uint_at(data, &mut pos, 2)?,
             "external file list slot count",
         )?;
-        if used_slots as u64 > allocated_slots {
+        if u64_from_usize(used_slots, "external file list slot count")? > allocated_slots {
             return Err(Error::InvalidFormat(
                 "external file list uses more slots than allocated".into(),
             ));
         }
         let heap_addr = read_le_uint_at(data, &mut pos, sizeof_addr)?;
+        if is_undefined_external_addr(heap_addr, sizeof_addr)? {
+            return Err(Error::InvalidFormat(
+                "external file list heap address is undefined".into(),
+            ));
+        }
         let mut entries = Vec::with_capacity(used_slots);
         for _ in 0..used_slots {
             entries.push(ExternalFileEntry {
                 name_offset: read_le_uint_at(data, &mut pos, sizeof_size)?,
-                file_offset: read_le_uint_at(data, &mut pos, 8)?,
-                size: read_le_uint_at(data, &mut pos, 8)?,
+                file_offset: read_le_uint_at(data, &mut pos, sizeof_size)?,
+                size: read_le_uint_at(data, &mut pos, sizeof_size)?,
             });
         }
         Ok(ExternalFileList { heap_addr, entries })
@@ -238,7 +262,7 @@ impl Dataset {
     /// Get the element size in bytes.
     pub fn element_size(&self) -> Result<usize> {
         let info = self.info()?;
-        Ok(info.datatype.size as usize)
+        usize_from_u64(u64::from(info.datatype.size), "datatype size")
     }
 
     /// Get the datatype.
@@ -393,16 +417,19 @@ impl Dataset {
             .as_ref()
             .ok_or_else(|| Error::InvalidFormat("chunked dataset missing chunk dims".into()))?;
         let chunk_dims = Self::chunk_data_dims(data_dims, raw_chunk_dims)?;
-        let chunk_bytes =
-            Self::chunk_byte_len(raw_chunk_dims, chunk_dims, info.datatype.size as usize)?;
+        let chunk_bytes = Self::chunk_byte_len(
+            raw_chunk_dims,
+            chunk_dims,
+            usize_from_u64(u64::from(info.datatype.size), "datatype size")?,
+        )?;
         let filtered = info
             .filter_pipeline
             .as_ref()
             .map(|pipeline| !pipeline.filters.is_empty())
             .unwrap_or(false);
         let mut guard = self.inner.lock();
-        let sizeof_addr = guard.reader.sizeof_addr() as usize;
-        let sizeof_size = guard.reader.sizeof_size() as usize;
+        let sizeof_addr = usize::from(guard.reader.sizeof_addr());
+        let sizeof_size = usize::from(guard.reader.sizeof_size());
         let infos = match info
             .layout
             .chunk_index_type
@@ -412,7 +439,7 @@ impl Dataset {
                 let size = info
                     .layout
                     .single_chunk_filtered_size
-                    .unwrap_or(chunk_bytes as u64);
+                    .unwrap_or(u64_from_usize(chunk_bytes, "single-chunk size")?);
                 vec![ChunkInfo {
                     offset: vec![0; data_dims.len()],
                     filter_mask: info.layout.single_chunk_filter_mask.unwrap_or(0),
@@ -547,8 +574,8 @@ impl Dataset {
                 .collect::<Result<Vec<_>>>()?;
             let addr = idx_addr
                 .checked_add(
-                    (chunk_index as u64)
-                        .checked_mul(chunk_bytes as u64)
+                    u64_from_usize(chunk_index, "implicit chunk index")?
+                        .checked_mul(u64_from_usize(chunk_bytes, "implicit chunk byte size")?)
                         .ok_or_else(|| Error::InvalidFormat("chunk address overflow".into()))?,
                 )
                 .ok_or_else(|| Error::InvalidFormat("chunk address overflow".into()))?;
@@ -556,7 +583,7 @@ impl Dataset {
                 offset,
                 filter_mask: 0,
                 addr,
-                size: chunk_bytes as u64,
+                size: u64_from_usize(chunk_bytes, "implicit chunk size")?,
             });
         }
         Ok(infos)
@@ -589,7 +616,9 @@ impl Dataset {
                 offset,
                 filter_mask: element.filter_mask,
                 addr: element.addr,
-                size: element.nbytes.unwrap_or(chunk_bytes as u64),
+                size: element
+                    .nbytes
+                    .unwrap_or(u64_from_usize(chunk_bytes, "linear chunk size")?),
             });
         }
         Ok(chunks)

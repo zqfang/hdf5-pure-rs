@@ -4,7 +4,7 @@ Pure Rust implementation of the HDF5 file format.
 
 Based on HDF5 C library commit [`62701c4`](https://github.com/HDFGroup/hdf5/commit/62701c4c79775d267deedd15ed14d4c09571e792) (2026-04-10, v1.14.x branch). The machine-readable source pin is `hdf5-source.json`.
 
-* 2026-05-02: **Available as early release for testers** -- Features are still missing, and more testing is needed. **Due to the risk of data corruption, be especially vigilant if you use this crate. **
+* 2026-05-06: **Available as early release for testers** -- Features are still missing, and more testing is needed. **Due to the risk of data corruption, be especially vigilant if you use this crate. **
 
 
 ## This is an LLM-mediated faithful (hopefully) translation, not the original code! 

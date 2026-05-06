@@ -494,12 +494,10 @@ pub fn H5Tset_precision(dtype: &mut RuntimeDatatype, precision: u16) {
 
 #[allow(non_snake_case)]
 pub fn H5T__set_precision(dtype: &mut RuntimeDatatype, precision: u16) {
-    let bytes = precision.to_le_bytes();
     if dtype.message.properties.len() < 4 {
         dtype.message.properties.resize(4, 0);
     }
-    dtype.message.properties[2] = bytes[0];
-    dtype.message.properties[3] = bytes[1];
+    write_le_u16_at(&mut dtype.message.properties, 2, precision);
 }
 
 #[allow(non_snake_case)]
@@ -590,12 +588,10 @@ pub fn H5Tset_offset(dtype: &mut RuntimeDatatype, offset: u16) {
 
 #[allow(non_snake_case)]
 pub fn H5T__set_offset(dtype: &mut RuntimeDatatype, offset: u16) {
-    let bytes = offset.to_le_bytes();
     if dtype.message.properties.len() < 2 {
         dtype.message.properties.resize(2, 0);
     }
-    dtype.message.properties[0] = bytes[0];
-    dtype.message.properties[1] = bytes[1];
+    write_le_u16_at(&mut dtype.message.properties, 0, offset);
 }
 
 #[allow(non_snake_case)]
@@ -785,7 +781,19 @@ pub fn H5Tset_ebias(dtype: &mut RuntimeDatatype, ebias: u32) {
     if dtype.message.properties.len() < 12 {
         dtype.message.properties.resize(12, 0);
     }
-    dtype.message.properties[8..12].copy_from_slice(&ebias.to_le_bytes());
+    write_le_u32_at(&mut dtype.message.properties, 8, ebias);
+}
+
+fn write_le_u16_at(bytes: &mut [u8], pos: usize, value: u16) {
+    if let Some(window) = pos.checked_add(2).and_then(|end| bytes.get_mut(pos..end)) {
+        window.copy_from_slice(&value.to_le_bytes());
+    }
+}
+
+fn write_le_u32_at(bytes: &mut [u8], pos: usize, value: u32) {
+    if let Some(window) = pos.checked_add(4).and_then(|end| bytes.get_mut(pos..end)) {
+        window.copy_from_slice(&value.to_le_bytes());
+    }
 }
 #[allow(non_snake_case)]
 pub fn H5Tset_norm(dtype: &mut RuntimeDatatype, norm: u8) {
@@ -821,9 +829,9 @@ pub fn H5T__bit_shift(data: &[u8], shift: i8) -> Vec<u8> {
     data.iter()
         .map(|byte| {
             if shift > 0 {
-                byte.wrapping_shl(shift as u32)
+                byte.wrapping_shl(u32::from(shift.unsigned_abs()))
             } else {
-                byte.wrapping_shr((-shift) as u32)
+                byte.wrapping_shr(u32::from(shift.unsigned_abs()))
             }
         })
         .collect()
@@ -1228,10 +1236,12 @@ pub fn H5T__vlen_mem_str_read(value: &str) -> Vec<u8> {
 }
 
 #[allow(non_snake_case)]
-pub fn H5T__vlen_mem_str_write(value: &mut String, bytes: &[u8]) {
-    *value = String::from_utf8_lossy(bytes)
+pub fn H5T__vlen_mem_str_write(value: &mut String, bytes: &[u8]) -> Result<()> {
+    *value = std::str::from_utf8(bytes)
+        .map_err(|_| Error::InvalidFormat("vlen memory string is not UTF-8".into()))?
         .trim_end_matches('\0')
         .to_string();
+    Ok(())
 }
 
 #[allow(non_snake_case)]
@@ -2408,5 +2418,13 @@ mod tests {
         assert!(H5Tcommitted(&opened));
         assert_eq!(H5T_nameof(&opened), Some("i32"));
         assert!(H5T_is_sensible(&opened));
+    }
+
+    #[test]
+    fn vlen_memory_string_write_rejects_invalid_utf8() {
+        let mut value = String::new();
+        H5T__vlen_mem_str_write(&mut value, b"alpha\0\0").unwrap();
+        assert_eq!(value, "alpha");
+        assert!(H5T__vlen_mem_str_write(&mut value, &[0xff]).is_err());
     }
 }

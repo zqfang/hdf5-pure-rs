@@ -9,6 +9,7 @@
 use std::io::{Read, Seek};
 
 use crate::error::{Error, Result};
+use crate::format::checksum::checksum_metadata;
 use crate::io::reader::HdfReader;
 
 use super::hdr::FixedArrayHeader;
@@ -63,11 +64,15 @@ pub(super) fn cache_dblock_image_len(prefix: &FixedArrayDataBlockPrefix) -> Resu
     }
 }
 
-pub(super) fn cache_dblock_serialize(prefix_and_payload: &[u8]) -> Vec<u8> {
-    let mut out = prefix_and_payload.to_vec();
+pub(super) fn cache_dblock_serialize(prefix_and_payload: &[u8]) -> Result<Vec<u8>> {
+    let image_len = prefix_and_payload.len().checked_add(4).ok_or_else(|| {
+        Error::InvalidFormat("fixed array data block image length overflow".into())
+    })?;
+    let mut out = Vec::with_capacity(image_len);
+    out.extend_from_slice(prefix_and_payload);
     let checksum = crate::format::checksum::checksum_metadata(&out);
     out.extend_from_slice(&checksum.to_le_bytes());
-    out
+    Ok(out)
 }
 
 pub(super) fn cache_dblock_notify(_prefix: &FixedArrayDataBlockPrefix) {}
@@ -198,12 +203,20 @@ pub(super) fn decode_data_block_prefix<R: Read + Seek>(
     }
 
     let page_elements = 1usize
-        .checked_shl(header.max_page_elements_bits as u32)
+        .checked_shl(u32::from(header.max_page_elements_bits))
         .ok_or_else(|| Error::InvalidFormat("fixed array page size overflow".into()))?;
     let expected_element_size = if filtered {
-        reader.sizeof_addr() as usize + chunk_size_len + 4
+        checked_usize_add(
+            checked_usize_add(
+                usize::from(reader.sizeof_addr()),
+                chunk_size_len,
+                "fixed array raw element size",
+            )?,
+            4,
+            "fixed array raw element size",
+        )?
     } else {
-        reader.sizeof_addr() as usize
+        usize::from(reader.sizeof_addr())
     };
     if header.raw_element_size != expected_element_size {
         return Err(Error::InvalidFormat(format!(
@@ -218,10 +231,14 @@ pub(super) fn decode_data_block_prefix<R: Read + Seek>(
         let pages = element_count.div_ceil(page_elements);
         let page_init_size = pages.div_ceil(8);
         let page_init = reader.read_bytes(page_init_size)?;
-        let _checksum = reader.read_u32()?;
+        verify_reader_checksum(
+            reader,
+            header.data_block_addr,
+            "fixed array data block prefix",
+        )?;
         let prefix_size = checked_usize_add(
             4 + 1 + 1,
-            reader.sizeof_addr() as usize,
+            usize::from(reader.sizeof_addr()),
             "fixed array data block prefix size",
         )
         .and_then(|value| {
@@ -315,7 +332,7 @@ pub(super) fn collect_data_block_elements<R: Read + Seek>(
                 for _ in 0..page_count {
                     elements.push(read_element(reader, filtered, chunk_size_len)?);
                 }
-                let _page_checksum = reader.read_u32()?;
+                verify_reader_checksum(reader, page_addr, "fixed array data block page")?;
             } else {
                 super::append_fill_elements(page_count, &mut elements);
             }
@@ -324,9 +341,36 @@ pub(super) fn collect_data_block_elements<R: Read + Seek>(
         for _ in 0..header.elements {
             elements.push(read_element(reader, filtered, chunk_size_len)?);
         }
-        let _checksum = reader.read_u32()?;
+        verify_reader_checksum(reader, header.data_block_addr, "fixed array data block")?;
     }
     Ok(elements)
+}
+
+fn verify_reader_checksum<R: Read + Seek>(
+    reader: &mut HdfReader<R>,
+    start: u64,
+    context: &str,
+) -> Result<()> {
+    let checksum_pos = reader.position()?;
+    let stored = reader.read_u32()?;
+    let check_len = usize::try_from(
+        checksum_pos
+            .checked_sub(start)
+            .ok_or_else(|| Error::InvalidFormat(format!("{context} checksum span underflow")))?,
+    )
+    .map_err(|_| Error::InvalidFormat(format!("{context} checksum span is too large")))?;
+    reader.seek(start)?;
+    let bytes = reader.read_bytes(check_len)?;
+    let computed = checksum_metadata(&bytes);
+    if stored != computed {
+        return Err(Error::InvalidFormat(format!(
+            "{context} checksum mismatch: stored={stored:#010x}, computed={computed:#010x}"
+        )));
+    }
+    reader.seek(checksum_pos.checked_add(4).ok_or_else(|| {
+        Error::InvalidFormat(format!("{context} checksum end offset overflow"))
+    })?)?;
+    Ok(())
 }
 
 /// Drive `decode_data_block_prefix` + `collect_data_block_elements` —
@@ -363,5 +407,77 @@ pub(super) fn read_element<R: Read + Seek>(
             nbytes: None,
             filter_mask: 0,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+
+    use crate::io::HdfReader;
+
+    use super::*;
+
+    fn header(elements: u64, max_page_elements_bits: u8) -> FixedArrayHeader {
+        FixedArrayHeader {
+            class_id: 1,
+            raw_element_size: 8,
+            max_page_elements_bits,
+            elements,
+            data_block_addr: 0,
+        }
+    }
+
+    fn append_checksum(bytes: &mut Vec<u8>) {
+        let checksum = checksum_metadata(bytes);
+        bytes.extend_from_slice(&checksum.to_le_bytes());
+    }
+
+    fn fixed_array_prefix(owner: u64) -> Vec<u8> {
+        let mut bytes = b"FADB".to_vec();
+        bytes.push(0);
+        bytes.push(1);
+        bytes.extend_from_slice(&owner.to_le_bytes());
+        bytes
+    }
+
+    #[test]
+    fn fixed_array_unpaginated_rejects_bad_checksum() {
+        let mut bytes = fixed_array_prefix(100);
+        bytes.extend_from_slice(&55u64.to_le_bytes());
+        append_checksum(&mut bytes);
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xff;
+
+        let mut reader = HdfReader::new(Cursor::new(bytes));
+        let err = read_data_block(&mut reader, 100, &header(1, 4), false, 0)
+            .expect_err("bad fixed array data block checksum should fail");
+        assert!(err.to_string().contains("checksum"));
+    }
+
+    #[test]
+    fn fixed_array_paginated_rejects_bad_prefix_and_page_checksums() {
+        let mut bytes = fixed_array_prefix(100);
+        bytes.push(0x80); // page 0 initialized, page 1 fill-valued.
+        append_checksum(&mut bytes);
+        let page_start = bytes.len();
+        bytes.extend_from_slice(&55u64.to_le_bytes());
+        append_checksum(&mut bytes);
+
+        let mut bad_prefix = bytes.clone();
+        bad_prefix[14] ^= 0x02;
+        let mut reader = HdfReader::new(Cursor::new(bad_prefix));
+        let err = read_data_block(&mut reader, 100, &header(2, 0), false, 0)
+            .expect_err("bad fixed array prefix checksum should fail");
+        assert!(err.to_string().contains("checksum"));
+
+        let mut bad_page = bytes;
+        let last = bad_page.len() - 1;
+        bad_page[last] ^= 0xff;
+        let mut reader = HdfReader::new(Cursor::new(bad_page));
+        let err = read_data_block(&mut reader, 100, &header(2, 0), false, 0)
+            .expect_err("bad fixed array page checksum should fail");
+        assert!(err.to_string().contains("checksum"));
+        assert_eq!(page_start, 19);
     }
 }

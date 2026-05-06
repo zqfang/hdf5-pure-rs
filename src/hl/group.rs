@@ -222,7 +222,7 @@ impl Group {
         let mut links = Vec::new();
 
         for record in &records {
-            let Some(heap_id) = dense_link_heap_id(record, heap.heap_id_len as usize)? else {
+            let Some(heap_id) = dense_link_heap_id(record, usize::from(heap.heap_id_len))? else {
                 continue;
             };
             match heap.read_managed_object(reader, heap_id) {
@@ -515,7 +515,7 @@ impl Group {
     fn object_comment_at(&self, addr: u64) -> Result<Option<String>> {
         let mut guard = self.inner.lock();
         let oh = ObjectHeader::read_at(&mut guard.reader, addr)?;
-        Ok(object_comment_from_header(&oh))
+        object_comment_from_header(&oh)
     }
 }
 
@@ -563,15 +563,16 @@ fn object_info_from_header(addr: u64, oh: &ObjectHeader) -> ObjectInfo {
     }
 }
 
-fn object_comment_from_header(oh: &ObjectHeader) -> Option<String> {
+fn object_comment_from_header(oh: &ObjectHeader) -> Result<Option<String>> {
     oh.messages
         .iter()
         .find(|msg| msg.msg_type == object_header::MSG_OBJ_COMMENT)
         .map(|msg| {
-            String::from_utf8_lossy(&msg.data)
-                .trim_end_matches('\0')
-                .to_string()
+            std::str::from_utf8(&msg.data)
+                .map(|text| text.trim_end_matches('\0').to_string())
+                .map_err(|_| Error::InvalidFormat("object comment is not UTF-8".into()))
         })
+        .transpose()
 }
 
 fn dense_link_heap_id(record: &[u8], heap_id_len: usize) -> Result<Option<&[u8]>> {

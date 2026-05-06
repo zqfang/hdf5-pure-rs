@@ -2,6 +2,7 @@ use crate::error::{Error, Result};
 
 const EXTERNAL_LINK_VERSION: u8 = 0;
 const EXTERNAL_LINK_FLAGS_ALL: u8 = 0;
+const LINK_ALL_FLAGS: u8 = 0x1f;
 
 /// Link type values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,6 +51,11 @@ impl LinkMessage {
 
         // Flags
         let flags = read_u8(data, &mut pos, "link message flags")?;
+        if flags & !LINK_ALL_FLAGS != 0 {
+            return Err(Error::InvalidFormat(format!(
+                "link message flags {flags:#x} are invalid"
+            )));
+        }
 
         let size_of_len_of_link_name = flags & 0x03; // 2 bits
         let has_creation_order = flags & 0x04 != 0;
@@ -63,7 +69,10 @@ impl LinkMessage {
                 0 => LinkType::Hard,
                 1 => LinkType::Soft,
                 64 => LinkType::External,
-                other => LinkType::UserDefined(other),
+                65..=u8::MAX => LinkType::UserDefined(t),
+                other => {
+                    return Err(Error::InvalidFormat(format!("invalid link type {other}")));
+                }
             }
         } else {
             LinkType::Hard // default
@@ -94,11 +103,14 @@ impl LinkMessage {
         let name_len = read_le_u64(data, &mut pos, name_len_size, "link message name length")?
             .try_into()
             .map_err(|_| Error::InvalidFormat("link name length overflows usize".into()))?;
+        if name_len == 0 {
+            return Err(Error::InvalidFormat("invalid link name length".into()));
+        }
 
         // Link name
         ensure_available(data, pos, name_len, "link name")?;
         let name_end = checked_end(pos, name_len, "link name")?;
-        let name = String::from_utf8_lossy(&data[pos..name_end]).to_string();
+        let name = decode_utf8_text(&data[pos..name_end], "link name")?;
         advance_pos(&mut pos, name_len, "link name")?;
 
         // Link value based on type
@@ -111,22 +123,34 @@ impl LinkMessage {
                 hard_link_addr = Some(read_le_u64(
                     data,
                     &mut pos,
-                    sizeof_addr as usize,
+                    usize::from(sizeof_addr),
                     "hard link address",
                 )?);
             }
             LinkType::Soft => {
                 let target_len =
-                    read_le_u64(data, &mut pos, 2, "soft link target length")? as usize;
+                    usize::try_from(read_le_u64(data, &mut pos, 2, "soft link target length")?)
+                        .map_err(|_| {
+                            Error::InvalidFormat("soft link target length overflow".into())
+                        })?;
+                if target_len == 0 {
+                    return Err(Error::InvalidFormat("invalid soft link length".into()));
+                }
                 ensure_available(data, pos, target_len, "soft link target")?;
                 let target_end = checked_end(pos, target_len, "soft link target")?;
-                soft_link_target =
-                    Some(String::from_utf8_lossy(&data[pos..target_end]).to_string());
+                soft_link_target = Some(decode_utf8_text(
+                    &data[pos..target_end],
+                    "soft link target",
+                )?);
+                advance_pos(&mut pos, target_len, "soft link target")?;
             }
             LinkType::External => {
                 let info_len =
-                    read_le_u64(data, &mut pos, 2, "external link info length")? as usize;
-                if info_len < 2 {
+                    usize::try_from(read_le_u64(data, &mut pos, 2, "external link info length")?)
+                        .map_err(|_| {
+                        Error::InvalidFormat("external link info length overflow".into())
+                    })?;
+                if info_len < 3 {
                     return Err(Error::InvalidFormat(
                         "external link info is too short".into(),
                     ));
@@ -137,12 +161,12 @@ impl LinkMessage {
                 trace_external_link_resolve(&filename, &obj_path);
 
                 external_link = Some((filename, obj_path));
+                advance_pos(&mut pos, info_len, "external link info")?;
             }
             LinkType::UserDefined(_) => {
                 // Skip user-defined link data
             }
         }
-
         Ok(LinkMessage {
             name,
             link_type,
@@ -217,6 +241,12 @@ fn advance_pos(pos: &mut usize, len: usize, context: &str) -> Result<()> {
     Ok(())
 }
 
+fn decode_utf8_text(bytes: &[u8], context: &str) -> Result<String> {
+    std::str::from_utf8(bytes)
+        .map(str::to_string)
+        .map_err(|_| Error::InvalidFormat(format!("{context} is not UTF-8")))
+}
+
 fn unpack_external_link_value(data: &[u8]) -> Result<(String, String)> {
     if data.is_empty() {
         return Err(Error::InvalidFormat(
@@ -272,7 +302,7 @@ fn unpack_external_link_value(data: &[u8]) -> Result<(String, String)> {
         ));
     }
 
-    let filename = String::from_utf8_lossy(&payload[..filename_end]).to_string();
-    let obj_path = String::from_utf8_lossy(&obj_payload[..obj_end]).to_string();
+    let filename = decode_utf8_text(&payload[..filename_end], "external link filename")?;
+    let obj_path = decode_utf8_text(&obj_payload[..obj_end], "external link object path")?;
     Ok((filename, obj_path))
 }

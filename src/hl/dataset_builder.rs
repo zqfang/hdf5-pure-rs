@@ -153,7 +153,7 @@ impl<'a> DatasetBuilder<'a> {
         let data = unsafe { std::slice::from_raw_parts(values.as_ptr() as *const u8, byte_len) };
         self.push_attr(OwnedBuilderAttr {
             name: name.to_string(),
-            shape: vec![values.len() as u64],
+            shape: vec![usize_to_u64(values.len(), "attribute element count")?],
             dtype,
             data: data.to_vec(),
         })?;
@@ -194,7 +194,7 @@ impl<'a> DatasetBuilder<'a> {
         let (dtype, data) = fixed_string_attr(values, len, false)?;
         self.push_attr(OwnedBuilderAttr {
             name: name.to_string(),
-            shape: vec![values.len() as u64],
+            shape: vec![usize_to_u64(values.len(), "attribute element count")?],
             dtype,
             data,
         })?;
@@ -211,7 +211,7 @@ impl<'a> DatasetBuilder<'a> {
         let (dtype, data) = fixed_string_attr(values, len, true)?;
         self.push_attr(OwnedBuilderAttr {
             name: name.to_string(),
-            shape: vec![values.len() as u64],
+            shape: vec![usize_to_u64(values.len(), "attribute element count")?],
             dtype,
             data,
         })?;
@@ -228,10 +228,10 @@ impl<'a> DatasetBuilder<'a> {
             self.alloc_time,
             self.fill_time,
         )?;
-        let shape = self
-            .shape
-            .clone()
-            .unwrap_or_else(|| vec![data.len() as u64]);
+        let shape = match self.shape.clone() {
+            Some(shape) => shape,
+            None => vec![usize_to_u64(data.len(), "dataset element count")?],
+        };
         Self::validate_element_count(&shape, data.len())?;
         let max_shape = self.effective_max_shape(&shape)?;
 
@@ -326,10 +326,13 @@ impl<'a> DatasetBuilder<'a> {
             self.alloc_time,
             self.fill_time,
         )?;
-        let shape = self
-            .shape
-            .clone()
-            .unwrap_or_else(|| vec![(data.len() / dtype_size) as u64]);
+        let shape = match self.shape.clone() {
+            Some(shape) => shape,
+            None => vec![usize_to_u64(
+                data.len() / dtype_size,
+                "dataset element count",
+            )?],
+        };
         let max_shape = self.effective_max_shape(&shape)?;
         let expected_count = shape_element_count(&shape)?;
         let expected_bytes = usize::try_from(expected_count)
@@ -486,10 +489,10 @@ impl<'a> DatasetBuilder<'a> {
                 "variable-length string fill values are not supported yet".into(),
             ));
         }
-        let shape = self
-            .shape
-            .clone()
-            .unwrap_or_else(|| vec![data.len() as u64]);
+        let shape = match self.shape.clone() {
+            Some(shape) => shape,
+            None => vec![usize_to_u64(data.len(), "dataset element count")?],
+        };
         let max_shape = self.effective_max_shape(&shape)?;
         let attrs: Vec<_> = self
             .attrs
@@ -508,19 +511,15 @@ impl<'a> DatasetBuilder<'a> {
     }
 
     fn write_fixed_strings(self, data: &[&str], len: usize, utf8: bool) -> Result<()> {
-        if len > u32::MAX as usize {
-            return Err(Error::InvalidFormat(
-                "fixed string length exceeds u32".into(),
-            ));
-        }
+        let len_u32 = usize_to_u32(len, "fixed string length")?;
         let dtype = if utf8 {
             DtypeSpec::FixedUtf8String {
-                len: len as u32,
+                len: len_u32,
                 padding: 1,
             }
         } else {
             DtypeSpec::FixedAsciiString {
-                len: len as u32,
+                len: len_u32,
                 padding: 1,
             }
         };
@@ -531,13 +530,14 @@ impl<'a> DatasetBuilder<'a> {
             self.alloc_time,
             self.fill_time,
         )?;
-        let shape = self
-            .shape
-            .clone()
-            .unwrap_or_else(|| vec![data.len() as u64]);
+        let shape = match self.shape.clone() {
+            Some(shape) => shape,
+            None => vec![usize_to_u64(data.len(), "dataset element count")?],
+        };
         let max_shape = self.effective_max_shape(&shape)?;
         let expected_count = shape_element_count(&shape)?;
-        if expected_count != data.len() as u64 {
+        let actual_count = usize_to_u64(data.len(), "dataset element count")?;
+        if expected_count != actual_count {
             return Err(Error::InvalidFormat(format!(
                 "fixed string data length {} does not match dataset shape element count {expected_count}",
                 data.len()
@@ -780,12 +780,12 @@ pub(crate) fn dtype_for_type<T: H5Type>() -> Result<DtypeSpec> {
             };
             out.push(CompoundFieldSpec {
                 name: field.name,
-                offset: field.offset as u32,
+                offset: usize_to_u32(field.offset, "compound field offset")?,
                 dtype,
             });
         }
         Ok(DtypeSpec::Compound {
-            size: T::type_size() as u32,
+            size: usize_to_u32(T::type_size(), "compound type size")?,
             fields: out,
         })
     } else {
@@ -796,19 +796,15 @@ pub(crate) fn dtype_for_type<T: H5Type>() -> Result<DtypeSpec> {
 }
 
 fn fixed_string_attr(values: &[&str], len: usize, utf8: bool) -> Result<(DtypeSpec, Vec<u8>)> {
-    if len > u32::MAX as usize {
-        return Err(Error::InvalidFormat(
-            "fixed string length exceeds u32".into(),
-        ));
-    }
+    let len_u32 = usize_to_u32(len, "fixed string length")?;
     let dtype = if utf8 {
         DtypeSpec::FixedUtf8String {
-            len: len as u32,
+            len: len_u32,
             padding: 1,
         }
     } else {
         DtypeSpec::FixedAsciiString {
-            len: len as u32,
+            len: len_u32,
             padding: 1,
         }
     };
@@ -828,6 +824,14 @@ fn fixed_string_attr(values: &[&str], len: usize, utf8: bool) -> Result<(DtypeSp
         data.resize(data.len() + (len - bytes.len()), 0);
     }
     Ok((dtype, data))
+}
+
+fn usize_to_u64(value: usize, context: &str) -> Result<u64> {
+    u64::try_from(value).map_err(|_| Error::InvalidFormat(format!("{context} exceeds u64")))
+}
+
+fn usize_to_u32(value: usize, context: &str) -> Result<u32> {
+    u32::try_from(value).map_err(|_| Error::InvalidFormat(format!("{context} exceeds u32")))
 }
 
 fn shape_element_count(shape: &[u64]) -> Result<u64> {

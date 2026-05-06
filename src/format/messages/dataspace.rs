@@ -34,7 +34,8 @@ impl DataspaceMessage {
 
         let version = data[0];
         let ndims = data[1];
-        if ndims as usize > MAX_DATASPACE_RANK {
+        let rank = usize::from(ndims);
+        if rank > MAX_DATASPACE_RANK {
             return Err(Error::InvalidFormat(format!(
                 "dataspace rank {} exceeds supported maximum {MAX_DATASPACE_RANK}",
                 ndims
@@ -53,19 +54,24 @@ impl DataspaceMessage {
     fn decode_v1(data: &[u8], ndims: u8) -> Result<Self> {
         ensure_available(data, 0, 8, "dataspace v1 header")?;
         let flags = data[2];
-        // v1: reserved bytes [3..8], then dimensions
+        if flags & !0x01 != 0 {
+            return Err(Error::Unsupported(format!(
+                "dataspace v1 flags {flags:#x} are not supported"
+            )));
+        }
+        // v1: reserved bytes [3..8], then dimensions. Upstream
+        // `H5O__sdspace_decode` checks availability and skips them.
+        ensure_available(data, 3, 5, "dataspace v1 reserved bytes")?;
         let has_max = flags & 0x01 != 0;
 
         let mut pos = 8; // skip 5 reserved bytes after version(1)+ndims(1)+flags(1)
 
-        let dims = read_dims(data, &mut pos, ndims as usize, "dataspace v1 dimensions")?;
+        let rank = usize::from(ndims);
+        let dims = read_dims(data, &mut pos, rank, "dataspace v1 dimensions")?;
         let max_dims = if has_max {
-            Some(read_dims(
-                data,
-                &mut pos,
-                ndims as usize,
-                "dataspace v1 max dimensions",
-            )?)
+            let max_dims = read_dims(data, &mut pos, rank, "dataspace v1 max dimensions")?;
+            validate_dims_not_greater_than_max(&dims, &max_dims)?;
+            Some(max_dims)
         } else {
             None
         };
@@ -92,6 +98,11 @@ impl DataspaceMessage {
 
     fn decode_v2(data: &[u8], ndims: u8) -> Result<Self> {
         let flags = data[2];
+        if flags & !0x01 != 0 {
+            return Err(Error::InvalidFormat(format!(
+                "dataspace v2 flags {flags:#x} are invalid"
+            )));
+        }
         let space_type_val = data[3];
 
         let space_type = match space_type_val {
@@ -113,18 +124,21 @@ impl DataspaceMessage {
                 "dataspace type {space_type:?} has rank {ndims}, expected 0"
             )));
         }
+        if space_type == DataspaceType::Simple && ndims == 0 {
+            return Err(Error::InvalidFormat(
+                "simple dataspace must have nonzero rank".into(),
+            ));
+        }
 
         let has_max = flags & 0x01 != 0;
         let mut pos = 4;
 
-        let dims = read_dims(data, &mut pos, ndims as usize, "dataspace v2 dimensions")?;
+        let rank = usize::from(ndims);
+        let dims = read_dims(data, &mut pos, rank, "dataspace v2 dimensions")?;
         let max_dims = if has_max {
-            Some(read_dims(
-                data,
-                &mut pos,
-                ndims as usize,
-                "dataspace v2 max dimensions",
-            )?)
+            let max_dims = read_dims(data, &mut pos, rank, "dataspace v2 max dimensions")?;
+            validate_dims_not_greater_than_max(&dims, &max_dims)?;
+            Some(max_dims)
         } else {
             None
         };
@@ -146,21 +160,21 @@ fn trace_dataspace_extent(data: &[u8], flags: u8, message: &DataspaceMessage) {
     let mut th = tracehash::th_call!("hdf5.dataspace.extent");
     th.input_bytes(data);
     th.output_value(&(true));
-    th.output_u64(message.version as u64);
-    th.output_u64(message.ndims as u64);
-    th.output_u64(flags as u64);
+    th.output_u64(u64::from(message.version));
+    th.output_u64(u64::from(message.ndims));
+    th.output_u64(u64::from(flags));
     th.output_u64(match message.space_type {
         DataspaceType::Scalar => 0,
         DataspaceType::Simple => 1,
         DataspaceType::Null => 2,
     });
-    th.output_u64(message.dims.len() as u64);
+    th.output_u64(u64::try_from(message.dims.len()).unwrap_or(u64::MAX));
     for &dim in &message.dims {
         th.output_u64(dim);
     }
     th.output_value(&(message.max_dims.is_some()));
     if let Some(max_dims) = &message.max_dims {
-        th.output_u64(max_dims.len() as u64);
+        th.output_u64(u64::try_from(max_dims.len()).unwrap_or(u64::MAX));
         for &dim in max_dims {
             th.output_u64(dim);
         }
@@ -178,6 +192,17 @@ fn read_dims(data: &[u8], pos: &mut usize, count: usize, context: &str) -> Resul
         dims.push(val);
     }
     Ok(dims)
+}
+
+fn validate_dims_not_greater_than_max(dims: &[u64], max_dims: &[u64]) -> Result<()> {
+    for (idx, (&dim, &max_dim)) in dims.iter().zip(max_dims).enumerate() {
+        if dim > max_dim {
+            return Err(Error::InvalidFormat(format!(
+                "dataspace dimension {idx} size {dim} exceeds maximum {max_dim}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn ensure_available(data: &[u8], pos: usize, len: usize, context: &str) -> Result<()> {

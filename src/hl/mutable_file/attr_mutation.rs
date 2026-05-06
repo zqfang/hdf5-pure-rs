@@ -8,6 +8,7 @@ use crate::format::messages::attribute::AttributeMessage;
 use crate::format::messages::attribute_info::AttributeInfoMessage;
 use crate::format::object_header::{
     self, ObjectHeader, HDR_ATTR_STORE_PHASE_CHANGE, HDR_CHUNK0_SIZE_MASK, HDR_STORE_TIMES,
+    HDR_V2_KNOWN_FLAGS,
 };
 
 use super::MutableFile;
@@ -117,15 +118,16 @@ impl MutableFile {
             Ok(location) => {
                 let (name_offset, name_size) =
                     Self::compact_attribute_name_field(&location.raw_data)?;
-                if new_name.len() >= name_size {
+                if new_name.len() + 1 != name_size {
                     return Err(Error::Unsupported(
-                        "in-place compact attribute rename cannot grow the encoded name field"
+                        "in-place compact attribute rename cannot grow or shrink the encoded name field"
                             .into(),
                     ));
                 }
+                let name_offset_u64 = Self::usize_to_u64(name_offset, "attribute name offset")?;
                 let file_name_offset = location
                     .msg_data_offset
-                    .checked_add(name_offset as u64)
+                    .checked_add(name_offset_u64)
                     .ok_or_else(|| Error::InvalidFormat("attribute name offset overflow".into()))?;
 
                 let mut encoded_name = vec![0u8; name_size];
@@ -154,7 +156,7 @@ impl MutableFile {
             .first()
             .copied()
             .ok_or_else(|| Error::InvalidFormat("attribute message too short".into()))?;
-        let name_size = read_u16_le_at(raw, 2, "attribute name size")? as usize;
+        let name_size = usize::from(read_u16_le_at(raw, 2, "attribute name size")?);
         if name_size == 0 {
             return Err(Error::InvalidFormat(
                 "attribute message name length is zero".into(),
@@ -220,6 +222,11 @@ impl MutableFile {
         }
 
         let flags = reader.read_u8()?;
+        if flags & !HDR_V2_KNOWN_FLAGS != 0 {
+            return Err(Error::InvalidFormat(format!(
+                "object header v2 flags contain reserved bits: {flags:#04x}"
+            )));
+        }
         if flags & HDR_STORE_TIMES != 0 {
             reader.skip(16)?;
         }
@@ -240,20 +247,24 @@ impl MutableFile {
         let mut found = None;
         while reader.position()? < chunk0_data_end {
             let msg_header_pos = reader.position()?;
-            if msg_header_pos + 4 > chunk0_data_end {
+            if msg_header_pos
+                .checked_add(4)
+                .is_none_or(|end| end > chunk0_data_end)
+            {
                 break;
             }
 
-            let msg_type = reader.read_u8()? as u16;
-            let msg_size = reader.read_u16()? as usize;
+            let msg_type = u16::from(reader.read_u8()?);
+            let msg_size = usize::from(reader.read_u16()?);
             let _msg_flags = reader.read_u8()?;
             if flags & object_header::HDR_ATTR_CRT_ORDER_TRACKED != 0 {
                 reader.skip(2)?;
             }
 
             let msg_data_offset = reader.position()?;
+            let msg_size_u64 = Self::usize_to_u64(msg_size, "object-header message size")?;
             if msg_data_offset
-                .checked_add(msg_size as u64)
+                .checked_add(msg_size_u64)
                 .is_none_or(|end| end > chunk0_data_end)
             {
                 return Err(Error::InvalidFormat(
@@ -287,7 +298,7 @@ impl MutableFile {
                 if msg_type == object_header::MSG_ATTR_INFO {
                     has_dense_attrs = true;
                 }
-                reader.skip(msg_size as u64)?;
+                reader.skip(msg_size_u64)?;
             }
         }
 
@@ -346,7 +357,7 @@ impl MutableFile {
             ));
         }
         let records = btree_v2::collect_all_records(&mut guard.reader, attr_info.name_btree_addr)?;
-        let heap_id_len = heap.heap_id_len as usize;
+        let heap_id_len = usize::from(heap.heap_id_len);
         let mut found = None;
         for (idx, record) in records.iter().enumerate() {
             let heap_id = checked_window(record, 0, heap_id_len, "dense attribute heap ID")?;
@@ -386,17 +397,19 @@ impl MutableFile {
         new_name: &str,
     ) -> Result<()> {
         let (name_offset, name_size) = Self::compact_attribute_name_field(&location.raw_data)?;
-        if new_name.len() >= name_size {
+        if new_name.len() + 1 != name_size {
             return Err(Error::Unsupported(
-                "in-place dense attribute rename cannot grow the encoded name field".into(),
+                "in-place dense attribute rename cannot grow or shrink the encoded name field"
+                    .into(),
             ));
         }
 
+        let name_offset_u64 = Self::usize_to_u64(name_offset, "dense attribute name offset")?;
         let file_name_offset = location
             .heap
             .root_block_addr
             .checked_add(location.object_offset)
-            .and_then(|offset| offset.checked_add(name_offset as u64))
+            .and_then(|offset| offset.checked_add(name_offset_u64))
             .ok_or_else(|| Error::InvalidFormat("dense attribute name offset overflow".into()))?;
         let mut encoded_name = vec![0u8; name_size];
         encoded_name[..new_name.len()].copy_from_slice(new_name.as_bytes());
@@ -433,12 +446,11 @@ impl MutableFile {
         &mut self,
         location: &DenseAttributeLocation,
     ) -> Result<()> {
-        if location.records.len() > u16::MAX as usize {
-            return Err(Error::Unsupported(
-                "dense attribute name index has too many records".into(),
-            ));
-        }
-        let record_size = location.btree.record_size as usize;
+        let record_count_u16 =
+            Self::usize_to_u16(location.records.len(), "dense attribute record count")?;
+        let record_count_u64 =
+            Self::usize_to_u64(location.records.len(), "dense attribute record count")?;
+        let record_size = usize::from(location.btree.record_size);
         if location
             .records
             .iter()
@@ -475,8 +487,8 @@ impl MutableFile {
             .seek(SeekFrom::Start(location.btree.root_addr))?;
         self.write_handle.write_all(&leaf)?;
 
-        let sa = self.superblock.sizeof_addr as usize;
-        let ss = self.superblock.sizeof_size as usize;
+        let sa = usize::from(self.superblock.sizeof_addr);
+        let ss = usize::from(self.superblock.sizeof_size);
         let mut header = Vec::new();
         header.extend_from_slice(b"BTHD");
         header.push(0);
@@ -486,9 +498,17 @@ impl MutableFile {
         header.extend_from_slice(&0u16.to_le_bytes());
         header.push(location.btree.split_pct);
         header.push(location.btree.merge_pct);
-        header.extend_from_slice(&location.btree.root_addr.to_le_bytes()[..sa]);
-        header.extend_from_slice(&(location.records.len() as u16).to_le_bytes());
-        header.extend_from_slice(&(location.records.len() as u64).to_le_bytes()[..ss]);
+        header.extend_from_slice(&Self::encode_uint_le(
+            location.btree.root_addr,
+            sa,
+            "dense attribute B-tree root address",
+        )?);
+        header.extend_from_slice(&record_count_u16.to_le_bytes());
+        header.extend_from_slice(&Self::encode_uint_le(
+            record_count_u64,
+            ss,
+            "dense attribute B-tree total record count",
+        )?);
         let checksum = checksum_metadata(&header);
         header.extend_from_slice(&checksum.to_le_bytes());
         self.write_handle
@@ -533,9 +553,10 @@ impl MutableFile {
         })?;
         checksum_window.fill(0);
         let checksum = checksum_metadata(&block);
+        let checksum_pos_u64 = Self::usize_to_u64(checksum_pos, "direct block checksum position")?;
         self.write_handle.seek(SeekFrom::Start(
             heap.root_block_addr
-                .checked_add(checksum_pos as u64)
+                .checked_add(checksum_pos_u64)
                 .ok_or_else(|| {
                     Error::InvalidFormat("direct block checksum address overflow".into())
                 })?,
@@ -570,30 +591,39 @@ fn read_u32_le_at(raw: &[u8], pos: usize, context: &str) -> Result<u32> {
 }
 
 fn managed_heap_object_offset(heap: &FractalHeapHeader, heap_id: &[u8]) -> Result<u64> {
-    let offset_bytes = ((heap.max_heap_size as usize) + 7) / 8;
-    if offset_bytes == 0 || offset_bytes > 8 {
-        return Err(Error::Unsupported(format!(
-            "dense attribute heap offset width {offset_bytes} is unsupported"
-        )));
-    }
+    let offset_bytes = fractal_heap_offset_width(heap)?;
     let offset_bytes = checked_window(heap_id, 1, offset_bytes, "dense attribute heap offset")?;
     let mut offset = 0u64;
     for (idx, byte) in offset_bytes.iter().enumerate() {
-        offset |= (*byte as u64) << (idx * 8);
+        offset |= u64::from(*byte) << (idx * 8);
     }
     Ok(offset)
 }
 
 fn direct_block_checksum_pos(heap: &FractalHeapHeader, sizeof_addr: u8) -> Result<usize> {
-    let offset_bytes = ((heap.max_heap_size as usize) + 7) / 8;
+    let offset_bytes = fractal_heap_offset_width(heap)?;
     5usize
-        .checked_add(sizeof_addr as usize)
+        .checked_add(usize::from(sizeof_addr))
         .and_then(|pos| pos.checked_add(offset_bytes))
         .ok_or_else(|| Error::InvalidFormat("direct block checksum position overflow".into()))
 }
 
+fn fractal_heap_offset_width(heap: &FractalHeapHeader) -> Result<usize> {
+    let max_heap_size = usize::from(heap.max_heap_size);
+    let offset_bytes = max_heap_size
+        .checked_add(7)
+        .ok_or_else(|| Error::InvalidFormat("dense attribute heap offset width overflow".into()))?
+        / 8;
+    if offset_bytes == 0 || offset_bytes > 8 {
+        return Err(Error::Unsupported(format!(
+            "dense attribute heap offset width {offset_bytes} is unsupported"
+        )));
+    }
+    Ok(offset_bytes)
+}
+
 fn dense_attribute_record_hash_pos(heap: &FractalHeapHeader, record: &[u8]) -> Result<usize> {
-    let heap_id_len = heap.heap_id_len as usize;
+    let heap_id_len = usize::from(heap.heap_id_len);
     let hash_pos = heap_id_len
         .checked_add(1)
         .and_then(|pos| pos.checked_add(4))
@@ -618,5 +648,39 @@ mod tests {
                 .contains("attribute mutation test offset overflow"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn fractal_heap_offset_width_rejects_invalid_widths() {
+        let heap = FractalHeapHeader {
+            heap_addr: 0,
+            heap_id_len: 0,
+            io_filter_len: 0,
+            flags: 0,
+            max_managed_obj_size: 0,
+            table_width: 0,
+            start_block_size: 0,
+            max_direct_block_size: 0,
+            max_heap_size: 0,
+            start_root_rows: 0,
+            root_block_addr: 0,
+            current_root_rows: 0,
+            num_managed_objects: 0,
+            has_checksum: false,
+            sizeof_addr: 8,
+            sizeof_size: 8,
+            huge_btree_addr: 0,
+            root_direct_filtered_size: None,
+            root_direct_filter_mask: 0,
+            filter_pipeline: None,
+        };
+        assert!(fractal_heap_offset_width(&heap).is_err());
+
+        let mut heap = heap;
+        heap.max_heap_size = 65;
+        assert!(fractal_heap_offset_width(&heap).is_err());
+
+        heap.max_heap_size = 64;
+        assert_eq!(fractal_heap_offset_width(&heap).unwrap(), 8);
     }
 }

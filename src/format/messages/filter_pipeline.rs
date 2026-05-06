@@ -12,7 +12,7 @@ pub const FILTER_NBIT: u16 = 5;
 pub const FILTER_SCALEOFFSET: u16 = 6;
 
 /// A single filter in the pipeline.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FilterDesc {
     pub id: u16,
     pub name: Option<String>,
@@ -21,7 +21,7 @@ pub struct FilterDesc {
 }
 
 /// Parsed Filter Pipeline message (type 0x000B).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FilterPipelineMessage {
     pub version: u8,
     pub filters: Vec<FilterDesc>,
@@ -36,8 +36,8 @@ impl FilterPipelineMessage {
             let mut th = tracehash::th_call!("hdf5.filter_pipeline.decode");
             th.input_bytes(data);
             th.output_value(&(true));
-            th.output_u64(message.version as u64);
-            th.output_u64(message.filters.len() as u64);
+            th.output_u64(u64::from(message.version));
+            th.output_u64(u64::try_from(message.filters.len()).unwrap_or(u64::MAX));
             th.finish();
         }
 
@@ -52,7 +52,7 @@ impl FilterPipelineMessage {
         }
 
         let version = data[0];
-        let nfilters = data[1] as usize;
+        let nfilters = usize::from(data[1]);
         if nfilters > MAX_FILTERS {
             return Err(Error::InvalidFormat(format!(
                 "filter pipeline has too many filters: {nfilters}"
@@ -78,7 +78,11 @@ impl FilterPipelineMessage {
 
         for _ in 0..nfilters {
             let id = read_u16_le(data, &mut pos, "filter pipeline v1 filter id")?;
-            let name_len = read_u16_le(data, &mut pos, "filter pipeline v1 name length")? as usize;
+            let name_len = usize::from(read_u16_le(
+                data,
+                &mut pos,
+                "filter pipeline v1 name length",
+            )?);
             // The v1 spec requires the name length (including null terminator
             // and 8-byte padding) to itself be a multiple of eight; matches
             // upstream `H5O__pline_decode`.
@@ -88,8 +92,11 @@ impl FilterPipelineMessage {
                 )));
             }
             let flags = read_u16_le(data, &mut pos, "filter pipeline v1 flags")?;
-            let cd_nelmts =
-                read_u16_le(data, &mut pos, "filter pipeline v1 client data count")? as usize;
+            let cd_nelmts = usize::from(read_u16_le(
+                data,
+                &mut pos,
+                "filter pipeline v1 client data count",
+            )?);
             if cd_nelmts > MAX_FILTER_CLIENT_VALUES {
                 return Err(Error::InvalidFormat(format!(
                     "filter pipeline v1 client data count {cd_nelmts} exceeds supported maximum {MAX_FILTER_CLIENT_VALUES}"
@@ -100,14 +107,13 @@ impl FilterPipelineMessage {
             let name = if name_len > 0 {
                 ensure_available(data, pos, name_len, "filter pipeline v1 name")?;
                 let name_bytes = checked_window(data, pos, name_len, "filter pipeline v1 name")?;
-                let null_pos = name_bytes.iter().position(|&b| b == 0).unwrap_or(name_len);
-                let n = String::from_utf8_lossy(checked_window(
-                    name_bytes,
-                    0,
-                    null_pos,
+                let null_pos = name_bytes.iter().position(|&b| b == 0).ok_or_else(|| {
+                    Error::InvalidFormat("filter pipeline v1 name is not null-terminated".into())
+                })?;
+                let n = decode_utf8_name(
+                    checked_window(name_bytes, 0, null_pos, "filter pipeline v1 name text")?,
                     "filter pipeline v1 name text",
-                )?)
-                .to_string();
+                )?;
                 // Pad to 8-byte boundary
                 let padded = align8(name_len, "filter pipeline v1 name")?;
                 ensure_available(data, pos, padded, "filter pipeline v1 padded name")?;
@@ -137,7 +143,6 @@ impl FilterPipelineMessage {
                 client_data,
             });
         }
-
         Ok(Self {
             version: 1,
             filters,
@@ -154,20 +159,24 @@ impl FilterPipelineMessage {
 
             // v2: name_length and name are OMITTED for known filter IDs (< 256)
             let name = if id >= 256 {
-                let name_len =
-                    read_u16_le(data, &mut pos, "filter pipeline v2 name length")? as usize;
+                let name_len = usize::from(read_u16_le(
+                    data,
+                    &mut pos,
+                    "filter pipeline v2 name length",
+                )?);
                 if name_len > 0 {
                     ensure_available(data, pos, name_len, "filter pipeline v2 name")?;
                     let name_bytes =
                         checked_window(data, pos, name_len, "filter pipeline v2 name")?;
-                    let null_pos = name_bytes.iter().position(|&b| b == 0).unwrap_or(name_len);
-                    let n = String::from_utf8_lossy(checked_window(
-                        name_bytes,
-                        0,
-                        null_pos,
+                    let null_pos = name_bytes.iter().position(|&b| b == 0).ok_or_else(|| {
+                        Error::InvalidFormat(
+                            "filter pipeline v2 name is not null-terminated".into(),
+                        )
+                    })?;
+                    let n = decode_utf8_name(
+                        checked_window(name_bytes, 0, null_pos, "filter pipeline v2 name text")?,
                         "filter pipeline v2 name text",
-                    )?)
-                    .to_string();
+                    )?;
                     advance_pos(&mut pos, name_len, "filter pipeline v2 name")?;
                     Some(n)
                 } else {
@@ -178,8 +187,11 @@ impl FilterPipelineMessage {
             };
 
             let flags = read_u16_le(data, &mut pos, "filter pipeline v2 flags")?;
-            let cd_nelmts =
-                read_u16_le(data, &mut pos, "filter pipeline v2 client data count")? as usize;
+            let cd_nelmts = usize::from(read_u16_le(
+                data,
+                &mut pos,
+                "filter pipeline v2 client data count",
+            )?);
             if cd_nelmts > MAX_FILTER_CLIENT_VALUES {
                 return Err(Error::InvalidFormat(format!(
                     "filter pipeline v2 client data count {cd_nelmts} exceeds supported maximum {MAX_FILTER_CLIENT_VALUES}"
@@ -199,7 +211,6 @@ impl FilterPipelineMessage {
                 client_data,
             });
         }
-
         Ok(Self {
             version: 2,
             filters,
@@ -261,6 +272,12 @@ fn checked_add_pos(pos: usize, len: usize, context: &str) -> Result<usize> {
 fn advance_pos(pos: &mut usize, len: usize, context: &str) -> Result<()> {
     *pos = checked_add_pos(*pos, len, context)?;
     Ok(())
+}
+
+fn decode_utf8_name(bytes: &[u8], context: &str) -> Result<String> {
+    std::str::from_utf8(bytes)
+        .map(str::to_string)
+        .map_err(|_| Error::InvalidFormat(format!("{context} is not UTF-8")))
 }
 
 fn align8(len: usize, context: &str) -> Result<usize> {

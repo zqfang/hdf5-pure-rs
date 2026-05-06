@@ -181,6 +181,29 @@ fn test_link_exists() {
 }
 
 #[test]
+fn test_link_exists_sees_soft_and_external_links() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("link_exists_non_hard.h5");
+
+    {
+        let mut wf = WritableFile::create(&path).unwrap();
+        wf.new_dataset_builder("real_data")
+            .write::<i32>(&[1, 2, 3])
+            .unwrap();
+        wf.link_soft("soft_alias", "/real_data").unwrap();
+        wf.link_external("external_alias", "missing.h5", "/data")
+            .unwrap();
+        wf.flush().unwrap();
+    }
+
+    let f = File::open(&path).unwrap();
+    let root = f.root_group().unwrap();
+    assert!(root.link_exists("soft_alias").unwrap());
+    assert!(root.link_exists("external_alias").unwrap());
+    assert!(!root.link_exists("missing_alias").unwrap());
+}
+
+#[test]
 fn test_write_external_link() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("ext_link_test.h5");

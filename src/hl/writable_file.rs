@@ -81,9 +81,10 @@ impl WritableFile {
             .checked_mul(T::type_size())
             .ok_or_else(|| Error::InvalidFormat("attribute byte size overflow".into()))?;
         let data = unsafe { std::slice::from_raw_parts(values.as_ptr() as *const u8, byte_len) };
+        let shape = [usize_to_u64(values.len(), "attribute element count")?];
         self.writer.add_root_attr(&AttrSpec {
             name,
-            shape: &[values.len() as u64],
+            shape: &shape,
             dtype,
             data,
         })
@@ -119,9 +120,10 @@ impl WritableFile {
         len: usize,
     ) -> Result<()> {
         let (dtype, data) = fixed_string_attr(values, len, false)?;
+        let shape = [usize_to_u64(values.len(), "attribute element count")?];
         self.writer.add_root_attr(&AttrSpec {
             name,
-            shape: &[values.len() as u64],
+            shape: &shape,
             dtype,
             data: &data,
         })
@@ -135,9 +137,10 @@ impl WritableFile {
         len: usize,
     ) -> Result<()> {
         let (dtype, data) = fixed_string_attr(values, len, true)?;
+        let shape = [usize_to_u64(values.len(), "attribute element count")?];
         self.writer.add_root_attr(&AttrSpec {
             name,
-            shape: &[values.len() as u64],
+            shape: &shape,
             dtype,
             data: &data,
         })
@@ -217,11 +220,12 @@ impl<'a> WritableGroup<'a> {
             .checked_mul(T::type_size())
             .ok_or_else(|| Error::InvalidFormat("attribute byte size overflow".into()))?;
         let data = unsafe { std::slice::from_raw_parts(values.as_ptr() as *const u8, byte_len) };
+        let shape = [usize_to_u64(values.len(), "attribute element count")?];
         self.writer.add_group_attr(
             &self.path,
             &AttrSpec {
                 name,
-                shape: &[values.len() as u64],
+                shape: &shape,
                 dtype,
                 data,
             },
@@ -264,11 +268,12 @@ impl<'a> WritableGroup<'a> {
         len: usize,
     ) -> Result<()> {
         let (dtype, data) = fixed_string_attr(values, len, false)?;
+        let shape = [usize_to_u64(values.len(), "attribute element count")?];
         self.writer.add_group_attr(
             &self.path,
             &AttrSpec {
                 name,
-                shape: &[values.len() as u64],
+                shape: &shape,
                 dtype,
                 data: &data,
             },
@@ -283,11 +288,12 @@ impl<'a> WritableGroup<'a> {
         len: usize,
     ) -> Result<()> {
         let (dtype, data) = fixed_string_attr(values, len, true)?;
+        let shape = [usize_to_u64(values.len(), "attribute element count")?];
         self.writer.add_group_attr(
             &self.path,
             &AttrSpec {
                 name,
-                shape: &[values.len() as u64],
+                shape: &shape,
                 dtype,
                 data: &data,
             },
@@ -316,19 +322,15 @@ fn fixed_string_attr(
     len: usize,
     utf8: bool,
 ) -> Result<(crate::engine::writer::DtypeSpec, Vec<u8>)> {
-    if len > u32::MAX as usize {
-        return Err(Error::InvalidFormat(
-            "fixed string length exceeds u32".into(),
-        ));
-    }
+    let len_u32 = usize_to_u32(len, "fixed string length")?;
     let dtype = if utf8 {
         crate::engine::writer::DtypeSpec::FixedUtf8String {
-            len: len as u32,
+            len: len_u32,
             padding: 1,
         }
     } else {
         crate::engine::writer::DtypeSpec::FixedAsciiString {
-            len: len as u32,
+            len: len_u32,
             padding: 1,
         }
     };
@@ -348,4 +350,12 @@ fn fixed_string_attr(
         data.resize(data.len() + (len - bytes.len()), 0);
     }
     Ok((dtype, data))
+}
+
+fn usize_to_u64(value: usize, context: &str) -> Result<u64> {
+    u64::try_from(value).map_err(|_| Error::InvalidFormat(format!("{context} exceeds u64")))
+}
+
+fn usize_to_u32(value: usize, context: &str) -> Result<u32> {
+    u32::try_from(value).map_err(|_| Error::InvalidFormat(format!("{context} exceeds u32")))
 }

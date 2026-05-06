@@ -44,7 +44,7 @@ mod tests;
 pub use access::{DatasetAccess, VdsMissingSourcePolicy, VdsView};
 pub use info::{ChunkInfo, DatasetInfo, DatasetSpaceStatus, ExternalFileEntry, ExternalFileList};
 
-use support::{read_le_u32_at, read_le_uint_at, read_u8_at, usize_from_u64};
+use support::{read_le_u32_at, read_le_uint_at, read_u8_at, u64_from_usize, usize_from_u64};
 
 /// An HDF5 dataset.
 pub struct Dataset {

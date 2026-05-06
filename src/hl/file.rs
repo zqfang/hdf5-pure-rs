@@ -809,7 +809,10 @@ pub(crate) fn collect_v1_group_members<R: Read + Seek>(
     for snod_addr in snod_addrs {
         let snod = SymbolTableNode::read_at(reader, snod_addr)?;
         for entry in &snod.entries {
-            let name = heap.get_string(entry.name_offset as usize)?;
+            let name_offset = usize::try_from(entry.name_offset).map_err(|_| {
+                Error::InvalidFormat("symbol-table name offset does not fit in usize".into())
+            })?;
+            let name = heap.get_string(name_offset)?;
             if !name.is_empty() {
                 members.push((name, entry.obj_header_addr));
             }

@@ -446,9 +446,9 @@
     object offset against `2^max_heap_size` and the object length
     against `max_managed_obj_size`. Mirrors `H5HF__man_op_real`.
   - `format/messages/link_info.rs::decode` now rejects
-    `max_creation_index > u32::MAX`, matching upstream
-    `H5O__linfo_decode`'s `H5L_MAX_CRT_IDX_VAL` bound. Covered by two
-    tests in `tests/robustness_test.rs`.
+    `max_creation_index` values whose encoded int64 representation would be
+    negative, matching upstream `H5O__linfo_decode`. Covered by two tests in
+    `tests/robustness_test.rs`.
   - `format/fractal_heap/huge.rs` now decodes direct/filtered huge heap
     IDs and huge-object v2 B-tree records through checked layout
     helpers before slicing. Malformed files now get explicit
@@ -583,7 +583,10 @@ crate's intended scope.
   - Multi/family/splitter/log VFD config serialization: property/config
     encode/decode and validation without real I/O. Implemented deterministic
     round-trip codecs and validation helpers while keeping actual driver I/O
-    explicitly unsupported.
+    explicitly unsupported. Onion, subfiling IOC, and subfiling superblock
+    payloads now use the same fallible structured decode pattern and reject
+    truncated, trailing, or zero-valued invalid config images instead of
+    collapsing malformed payloads to `None`.
   - External file cache bookkeeping: track opened external files in a small
     map, max count, release/close behavior. Implemented bounded cache state
     without arbitrary external-link traversal.
@@ -907,6 +910,17 @@ three items remain:
   `mant_size == 0`, sign bit position outside precision, and
   exp/mantissa location+size overflowing precision. Six tests cover the
   rejection paths plus a canonical IEEE-754 binary32 acceptance test.
+- [x] `format/messages/datatype.rs::DatatypeMessage::decode` now rejects
+  the reserved FloatingPoint mantissa-normalization code `3`, matching
+  upstream `H5O__dtype_decode_helper`.
+- [x] `format/messages/datatype.rs::DatatypeMessage::decode` now validates
+  array datatype byte size against `base.size * product(dims)` and rejects
+  truncated array metadata at decode time. This matches
+  `H5O__dtype_decode_helper`'s array element-count and size checks.
+- [x] `format/messages/datatype.rs` now treats opaque datatype tag length
+  as the padded, 8-byte-aligned length encoded in the class bit field,
+  matching `H5O__dtype_decode_helper`; this fixes embedded opaque datatypes
+  so following compound members are advanced from the right offset.
 - [x] `format/messages/filter_pipeline.rs` v1 decoder now rejects
   filter `name_length` values that are not a multiple of eight, matching
   upstream `H5O__pline_decode`. Covered by one focused test in
@@ -924,10 +938,390 @@ three items remain:
 - [x] `format/messages/attribute.rs` (v1/v2/v3) now rejects messages
   with `name_size == 0`, matching upstream `H5O__attr_decode`. Covered
   by one test.
+- [x] `format/messages/attribute.rs` now rejects unknown v2/v3 attribute
+  flags, `name_size <= 1`, and embedded NULs before the stored name length,
+  matching `H5O__attr_decode`'s flag and corrupted-name checks.
 - [x] `format/messages/data_layout.rs` (v1/v2/v3/v4) now rejects chunk
   layouts with any chunk dimension equal to zero (matches
   `H5O__layout_decode`'s "chunk dimension must be positive"). Covered
   by one focused v3 test.
+- [x] `format/messages/data_layout.rs` now rejects virtual layout messages
+  before version 4, matching `H5O__layout_decode`.
+- [x] `format/messages/data_layout.rs` now rejects v4 B-tree2 chunk-index
+  layout messages with a zero node size, matching the positive creation
+  parameter requirement used alongside the split/merge percentage checks.
+- [x] `format/messages/dataspace.rs` now rejects current dimensions that
+  exceed stored maximum dimensions, matching `H5O__sdspace_decode`.
+- [x] `format/messages/fill_value.rs` now rejects unknown v3 fill-value
+  flags, matching `H5O__fill_new_decode`.
+- [x] `format/messages/fill_value.rs` now decodes nonzero v2 fill-defined
+  states with the following size-prefixed payload, matching `H5O__fill_decode`
+  and older files that encode explicit fill bytes with state `1`.
+- [x] `engine/object_api.rs::H5O__mtime_new_decode` now decodes the new
+  object modification-time message as version/reserved/u32 seconds instead of
+  aliasing the old raw-u64 helper, matching `H5O__mtime_new_decode`.
+- [x] v2 object headers now validate and apply `MSG_OBJ_REF_COUNT` payloads:
+  the decoder requires the four-byte refcount field, tolerates trailing bytes,
+  and reports the decoded value instead of always defaulting v2 refcount to 1.
+- [x] `engine/object_api.rs` now exposes a faithful `H5O__refcount_decode`
+  helper for the four-byte object refcount message image, matching the
+  existing encode/size helpers and the v2 object-header path.
+- [x] `engine/object_api.rs::{H5O__ginfo_decode,H5O__btreek_decode}` now
+  decode structured group-info and B-tree-K message payloads instead of raw
+  byte passthroughs, with version/flag/truncation checks and trailing-byte
+  tolerance after known fields.
+- [x] Real object-header message validation now applies those same group-info
+  and B-tree-K checks during v1/v2 header reads, so malformed fixed-layout
+  payloads fail before high-level code sees the header.
+- [x] `engine/object_api.rs::H5O__fsinfo_decode` now preserves the optional
+  file-space page-size field after the strategy/persist/threshold prefix and
+  sizes/encodes the message accordingly.
+- [x] `engine/object_api.rs::H5O__name_decode` now stops at the first NUL
+  byte and `H5O__name_encode` writes the terminating NUL, matching the
+  C-string object-name message convention.
+- [x] `engine/object_api.rs::{H5O__fill_new_decode,H5O__pline_decode}` now
+  return the existing parsed fill-value and filter-pipeline message structs
+  instead of raw byte passthroughs, with size/reset/copy helpers operating on
+  the decoded message state.
+- [x] Real object-header message validation now dispatches fill-value,
+  old-fill-value, and filter-pipeline payloads through their faithful message
+  decoders during header reads, so malformed payloads fail at the same boundary
+  as group-info, B-tree-K, shared-message, and refcount messages.
+- [x] `engine/object_api.rs::H5O__dtype_decode_helper` now returns the
+  parsed datatype message and its encode/size/copy/share/debug helpers operate
+  on that decoded state while preserving the raw class-property bytes.
+- [x] Real object-header message validation now also dispatches unshared
+  datatype and attribute payloads through their faithful decoders during header
+  reads, while still treating shared messages as shared-message references.
+- [x] Object-header validation now also dispatches unshared dataspace, data
+  layout, link, link-info, attribute-info, and symbol-table payloads through
+  their real decoders while the reader still has the superblock address/size
+  widths needed to interpret those messages faithfully.
+- [x] `engine/object_api.rs::{H5O__shmesg_decode,H5O_SHARED_DECODE}` now
+  expose parsed shared-message table and shared-reference payloads instead of
+  byte passthroughs, with validation matching the object-header shared-message
+  checks and trailing-byte tolerance after the decoded fields.
+- [x] `engine/object_api.rs::H5O__efl_decode` now exposes a parsed external
+  file list message using address/size-width-aware decoding instead of raw
+  byte passthroughs, and object-header validation now applies the same EFL
+  checks while the reader still has the required superblock widths.
+- [x] `engine/object_api.rs::H5O__attr_decode` now exposes the parsed
+  attribute message instead of a raw byte clone while retaining the original
+  raw byte length for size/copy/debug helpers, because the parsed attribute
+  representation intentionally does not preserve all padding bytes needed for
+  exact re-encoding.
+- [x] `engine/object_api.rs::{H5O__link_decode,H5O__linfo_decode,H5O__ainfo_decode}`
+  now expose parsed link, link-info, and attribute-info object-message
+  wrappers instead of raw byte helpers, preserving raw payload length for size
+  callbacks while copy/delete/debug operate on the decoded state.
+- [x] `engine/object_api.rs::H5O__fill_old_decode` now routes old fill-value
+  messages through the existing `FillValueMessage::decode_old` parser, and
+  old-fill encode/size helpers now operate on the parsed fill-value state.
+- [x] `engine/vfd.rs::{H5FD__onion_revision_record_decode,H5FD__onion_sb_decode,H5FD__ioc_sb_decode,H5FD__subfiling_sb_decode}`
+  now return structured `Result` errors for invalid/truncated superblock
+  payloads, and onion revision history ingestion rejects partial trailing
+  records instead of silently dropping them.
+- [x] `engine/vfd.rs` mirror transmit decoders now return structured errors
+  for truncated reply, set-EOA, and write payloads instead of mapping bad
+  messages to sentinel values or `None`.
+- [x] `engine/dataset_api.rs` chunk-index count-image decoders now parse and
+  preserve the declared entry count separately from materialized records and
+  reject malformed count images. They still do not fabricate chunk records
+  because the local helper image only encodes the count.
+- [x] `engine/reference.rs` reference-token compatibility decoders now return
+  `Result` and validate the length-prefixed object/region token payloads
+  instead of reporting truncation as `None`.
+- [x] `engine/shared_message.rs::H5SM__cache_list_deserialize` now parses the
+  shared-message cache-list image back into `SharedMessageStore` entries
+  instead of returning a byte clone, using the existing
+  `SharedMessage::encode` entry layout as its inverse and rejecting truncated
+  cache-list records.
+- [x] `format/local_heap.rs::LocalHeap::fl_deserialize` now returns a
+  `Result` and rejects partial trailing free-list records instead of silently
+  ignoring them, matching the fixed 16-byte free-list entry layout.
+- [x] `engine/property.rs` HDFS/ROS3 FAPL config decoders now return
+  structured `Result` errors for truncated strings, invalid presence flags,
+  invalid UTF-8, and trailing config bytes instead of collapsing malformed
+  stored property bytes to `None`.
+- [x] `engine/group_api.rs` group cache-node and dense-link record decoders
+  now reject invalid UTF-8 and malformed creation-order records instead of
+  lossy-decoding names or accepting trailing bytes in fixed-size records.
+- [x] `engine/vfd.rs` mirror transmit lock/open decoders now return
+  structured errors for unexpected lock payload bytes and invalid UTF-8 open
+  paths, matching the fallible reply/set-EOA/write transmit decoders.
+- [x] Metadata string helpers for object names, local-heap strings, link
+  message text fields, and filter-pipeline names now reject invalid UTF-8
+  instead of lossy-decoding replacement characters. High-level raw value
+  presentation still keeps lossy string display where it is intentionally
+  user-facing rather than metadata validation.
+- [x] Dataset/attribute fallible string reads now reject invalid UTF-8 for
+  fixed-length and variable-length string payloads instead of silently
+  substituting replacement characters. The legacy non-fallible attribute
+  scalar string convenience method keeps its compatibility fallback.
+- [x] File-level helper validation now rejects invalid cached superblock
+  signatures and invalid configured file-locking environment values instead
+  of treating malformed inputs as valid/absent state.
+- [x] Dataset scatter/select wrappers and implicit chunk-index iteration now
+  return `Result` and propagate span/geometry overflow errors instead of
+  collapsing checked failures to empty vectors.
+- [x] Attribute message names, object comments, enum member names, and opaque
+  datatype tags now validate UTF-8 through their existing `Result` decode
+  paths instead of lossy-decoding metadata text.
+- [x] `engine/datatype_api.rs::H5T__vlen_mem_str_write` now returns
+  `Result<()>` and rejects invalid UTF-8 instead of lossy-decoding into a
+  Rust `String`.
+- [x] `format/messages/filter_pipeline.rs` now rejects non-NUL-terminated
+  stored filter names, matching `H5O__pline_decode`.
+- [x] `format/object_header/cache.rs` now rejects reserved v2 object-header
+  flag bits before decoding optional fields, matching the defined
+  `H5O_HDR_*` flag mask. The mutable-file object-header scanners now share
+  the same mask and use checked chunk/message range arithmetic.
+- [x] Compact/dense in-place attribute rename now rejects both growing and
+  shrinking the encoded name field. Shrinking would leave an embedded NUL
+  in the fixed attribute name field, which the faithful `H5O__attr_decode`
+  corrupted-name check now rejects.
+- [x] `format/symbol_table.rs::SymbolTableNode::read_entry` now rejects
+  unknown symbol-table entry cache types instead of silently skipping the
+  scratch pad, matching the fixed `H5G_ent_decode` cache-type union.
+- [x] `format/superblock.rs` now applies the same cache-type validation to
+  the v0/v1 root symbol-table entry embedded in the superblock.
+- [x] `format/fractal_heap/iblock.rs` now validates indirect-block version
+  bytes and verifies checksums for filtered indirect blocks, matching the
+  same metadata checks already applied to unfiltered indirect blocks.
+- [x] `format/messages/{link_info,attribute_info}.rs` no longer rejects a
+  creation-order index flag when creation-order tracking is absent, matching
+  `H5O__linfo_decode` / `H5O__ainfo_decode` which decode the optional B-tree
+  address without enforcing that implication.
+- [x] `format/messages/{link_info,attribute_info}.rs` also no longer rejects
+  trailing payload bytes after the decoded fields; upstream decodes the fields
+  it knows about and returns without an end-of-message equality check. This
+  fixes the big-endian external-link fixture.
+- [x] v1 reserved-byte handling in dataspace, attribute, filter-pipeline, and
+  v1/v2 layout message decoders now follows the upstream decoders: check the
+  buffer is long enough, then skip the reserved bytes rather than requiring
+  them to be zero.
+- [x] Serialized VDS selection headers now skip reserved bytes for all, point,
+  and hyperslab selections, matching `H5S__all_deserialize`,
+  `H5S__point_deserialize`, and `H5S__hyper_deserialize`.
+- [x] Global heap header/object reserved-byte handling now mirrors
+  `H5HG__hdr_deserialize` / `H5HG__cache_heap_deserialize`: check the fields
+  are present, then skip them. Index-0 free objects use their stored size as
+  the movement amount even when it is smaller than a normal object header,
+  while zero-size free entries terminate the walk to guarantee parser progress
+  on patched VDS global-heap fixtures.
+- [x] Link, symbol-table-message, symbol-table-node, local-heap, and
+  external-file-list metadata parsing now follows the same upstream pattern:
+  require the decoded fields to be present, skip reserved fields without
+  zero-validation where libhdf5 does, and ignore trailing payload bytes where
+  the corresponding C decoder has no consumed-all-buffer check. External file
+  list entries also use `sizeof_size` for name offset, file offset, and size,
+  matching `H5F_DECODE_LENGTH`.
+- [x] v1 object-header prefix/message reserved bytes are now skipped rather
+  than zero-validated, matching `H5O__prefix_deserialize` and
+  `H5O__chunk_deserialize`. v2 object-header creation-order indexing no
+  longer requires tracking during prefix decode, and object-header message
+  flags now use libhdf5's full defined flag mask plus the same bad-combination
+  checks.
+- [x] Shared-message table/reference validation now mirrors
+  `H5O__shmesg_decode` and `H5O__shared_decode`: validate the required fields
+  and addresses, but tolerate trailing payload bytes after the decoded shared
+  message reference.
+- [x] Filter-pipeline v1 odd client-data padding is now skipped instead of
+  zero-validated, matching `H5O__pline_decode`.
+- [x] Array datatype decoding now uses libhdf5's version boundary for the
+  compact array layout: version 2 keeps the reserved bytes plus dimension
+  permutation block, while version 3 and later drop both. This matches
+  `H5O__dtype_decode_helper`.
+- [x] String datatype decode now preserves padding and character-set bitfields
+  without range-checking them, matching `H5O__dtype_decode_helper`'s decode
+  path.
+- [x] `engine/object_api.rs::H5O__ginfo_encode` is now fallible and rejects
+  unsupported group-info versions plus half-present paired fields instead of
+  silently encoding missing compact/dense limits or estimates as zero.
+- [x] `engine/object_api.rs::H5O__prefix_deserialize` now validates cached
+  object-header prefix images before returning the raw bytes: v1 images must
+  have a complete declared chunk, and v2 images must have valid version/flags,
+  phase-change ordering, declared chunk length, and checksum.
+- [x] `engine/object_api.rs::{H5O__chunk_deserialize,H5O__cache_chk_deserialize,H5O__cache_chk_serialize}`
+  now validate v2 `OCHK` continuation-chunk checksums before returning raw
+  bytes, while leaving v1 continuation chunks as raw message streams because
+  they require object-header context to parse faithfully.
+- [x] `engine/object_api.rs::H5O__layout_decode` now rejects impossible data
+  layout message versions even though it still preserves the raw payload; full
+  layout parsing remains in `format/messages/data_layout.rs` where
+  address/size widths are available.
+- [x] `engine/free_space.rs::FreeSpaceManager::cache_hdr_deserialize` now
+  parses free-space header images as alignment/threshold/checksum records
+  instead of routing them through the section-info decoder, rejects zero
+  alignment, and verifies section-info checksums even for empty section lists.
+- [x] `engine/group_api.rs::H5G__cache_node_deserialize` now enforces the
+  serializer's NUL-terminated UTF-8 name stream instead of accepting an
+  unterminated trailing name.
+- [x] `engine/shared_message.rs` shared-message cache/table/list encoders now
+  return `Result` and reject payload lengths that cannot be represented in
+  the encoded u32 length field instead of narrowing silently.
+- [x] `format/fractal_heap/mod.rs` indirect/direct block cache serializers
+  now return `Result` and use checked image-length arithmetic before building
+  checksum-protected metadata images; indirect-block serialization also
+  rejects row counts that cannot be represented in the encoded u64 field.
+- [x] Fixed-array and extensible-array data/index block cache serializers now
+  return `Result` and use checked image-length arithmetic before appending
+  checksum bytes, matching the checked image-length helpers used by their
+  cache deserializers.
+- [x] Local-heap free-list serialization and free-space section-info cache
+  serialization now return `Result` and use checked image-length arithmetic
+  instead of relying on unchecked `usize` multiplication/summing.
+- [x] Group cache-node and fractal-heap row/indirect section serializers now
+  return `Result`; cache-node serialization checks encoded name-stream length,
+  and section serializers reject the wrong section class instead of encoding
+  zeroed offset/size fields.
+- [x] Object-header message/cache serializers now return `Result` and use
+  checked encoded-image sizing, and free-space header serialization now
+  rejects zero alignment to match the decoder's validated contract.
+- [x] Additional object-message encoders (`layout`, `fsinfo`, new mtime,
+  shared-message table info, B-tree K, external-file-list, and object name)
+  now return `Result` and reject invalid versions, narrowing/truncation, bad
+  slot counts, undefined addresses, or encoded-size overflow where applicable;
+  the EFL size helper now reflects the full 16-byte fixed header.
+- [x] Dataset chunk-index count-image encoders now return `Result` across the
+  earray/farray/btree2/btree wrapper surfaces and validate that the entry
+  count can be represented in the exact 8-byte image accepted by the decoders.
+- [x] VFD family, multi, splitter, log, IOC, and subfiling superblock/config
+  encoders now return `Result`, reuse decode-side validity rules, and reject
+  string-length/count/usize narrowing before writing binary images.
+- [x] Onion revision history encoding now returns `Result` and checks record
+  count image length overflow; old-fill and datatype object-message encoders
+  now return `Result` and reject old-fill length narrowing plus datatype image
+  length overflow before emitting bytes.
+- [x] Writer datatype encoding now returns `Result` and rejects compound/enum
+  member-count narrowing, array rank/dimension/byte-size overflow, NUL-bearing
+  metadata names, and opaque tag padded-length narrowing before writing bytes.
+  HDFS/ROS3 property-list config encoders now likewise return `Result` and
+  reject optional-string lengths that cannot be represented in the u32 image.
+- [x] Writer metadata helpers for dataspaces, link messages, contiguous and
+  chunked layouts, filter pipelines, fill-value messages, chunk B-tree nodes,
+  dense B-tree headers, and managed-heap IDs now use fallible width/count
+  checks instead of relying on unchecked `as` narrowing at the emit point.
+- [x] Reference region/token encoding and aggregate property-list chunk
+  encoding now return `Result` and check their u64 length prefixes before
+  writing images; `H5P__encode_size_t` also rejects values wider than u64.
+- [x] High-level writable-file and dataset-builder paths now reject
+  unrepresentable attribute element counts, fixed-string lengths, compound
+  field offsets, and compound type sizes before constructing writer specs.
+- [x] Mutable-file resize/write-chunk paths now check dataspace rank,
+  max-shape rank, chunk element counts, filtered chunk sizes, datatype sizes,
+  and v2 B-tree root/child record counts before rewriting on-disk metadata.
+- [x] Mutable fixed-array and extensible-array chunk-index updates now encode
+  address, offset, chunk-size, and aggregate count/byte-size fields through
+  checked width helpers instead of slicing little-endian integers directly.
+- [x] Mutable v1/v2 chunk B-tree rebuilds now encode sibling/root/child
+  addresses, node entry counts, child record counts, total record counts, and
+  filtered chunk sizes through checked width helpers before writing metadata.
+- [x] Object-header message and continuation readers now check chunk-local
+  `u64 -> usize` spans before allocating message/padding/checksum buffers.
+- [x] Dense attribute mutation now emits B-tree root/count fields through
+  checked width helpers and validates fractal-heap ID offset widths; shared
+  message and reference decode paths now check length-prefix conversion before
+  allocating or slicing payloads.
+- [x] Selection point/hyperslab serialization now checks rank/count conversion
+  and validates decoded image lengths before allocating vectors; high-level
+  attribute convenience creation and vlen string-reference decode now check
+  length-prefix conversion explicitly.
+- [x] File API EOF/accumulator offsets, metadata-cache image headers/entries,
+  object-header checksum spans, and v2 superblock address emission now use
+  explicit checked conversions instead of direct truncating casts or dynamic
+  little-endian slices.
+- [x] Dataset variable-length value/string descriptor decoding now converts
+  sequence-length fields through checked helpers before slicing, allocating,
+  or computing payload byte counts.
+- [x] Dataset contiguous/chunked read paths and chunk-info enumeration now
+  convert fallback byte sizes, implicit chunk indexes, and chunk coordinates
+  with checked helpers; fixed/extensible array test-image helpers now reject
+  unrepresentable usize fields instead of truncating them into u64 images.
+- [x] V1 symbol-table group member collection now checks local-heap name
+  offsets before converting them for heap-string lookup.
+- [x] Typed conversion and dataset value-read paths now convert decoded
+  datatype sizes and array dimensions through checked helpers before using
+  them as record sizes, strides, or payload byte counts.
+- [x] Global-heap trace/test helpers no longer truncate object data lengths or
+  synthetic collection sizes when crossing usize/u64 boundaries.
+- [x] Object-header v1 cache validation, external-file-list slot decoding,
+  symbol-table node counts, and v1 B-tree child/key loops now use explicit
+  checked or lossless conversions instead of direct integer casts.
+- [x] Variable-length dataset trace instrumentation now accepts native usize
+  lengths and performs a saturating trace-only conversion to u64 internally.
+- [x] N-bit filter parameter parsing now routes decoded counts, datatype
+  sizes, precisions, offsets, array sizes, and compound member metadata
+  through checked `u32 -> usize` conversions before allocating or iterating.
+- [x] Scale-offset filter parameter parsing now checks decoded element
+  counts, datatype sizes, and minimum-bit-count fields before using them as
+  host sizes or serialized header values.
+- [x] Fill-value, compact data-layout, and attribute message decoding now
+  checks length/datatype-size fields before slicing payload windows or
+  computing expected attribute byte counts.
+- [x] Datatype compound/enum/array decoding now checks encoded datatype sizes
+  before computing member offsets, record bounds, enum value widths, and array
+  byte counts; remaining small-width message decoder counts now use lossless
+  `usize::from` conversions.
+- [x] VFD superblock and property-list config decoders now check serialized
+  `u32` string/count fields before using them as host lengths.
+- [x] Dataspace, link-info, symbol-table, attribute-info, and object-header
+  shared/external-message decoders now use lossless address/rank width
+  conversions instead of direct casts.
+- [x] Fractal heap tiny/managed/huge/header helpers now use lossless or
+  checked conversions for heap-ID lengths, table widths, root row counts,
+  filtered payload sizes, and in-memory object IDs.
+- [x] V2 B-tree header/node parsing and cache image sizing now checks node
+  and record sizes, depth/count indexes, child record counts, and
+  record/image byte totals before indexing, allocating, or serializing.
+- [x] Mutable and high-level chunk-index B-tree paths now use lossless or
+  checked conversions for address/size widths, entry counts, root/child
+  record counts, chunk sizes, filter masks, and header patch offsets.
+- [x] Fixed-array and extensible-array chunk-index decoders and mutable
+  patch paths now use lossless or checked conversions for raw element sizes,
+  address widths, array-offset widths, page/block shifts, decoded element
+  counts, and checksum/address byte spans.
+- [x] High-level dataset, attribute, virtual-dataset, and dense-group read
+  paths now use lossless or checked conversions for datatype sizes,
+  address/length widths, external-file-list slot counts, vlen descriptors,
+  dense heap-ID lengths, reference addresses, and ndarray dimensions.
+- [x] Object-header and superblock parsing now uses lossless or checked
+  conversions for message sizes/types, continuation widths, chunk data sizes,
+  checksum spans, trace metadata lengths, and superblock address/size widths.
+- [x] Mutable-file resize and attribute mutation paths now use lossless or
+  checked conversions for v2 object-header message scanners, compact/dense
+  attribute name offsets, dense heap IDs/record sizes, address/size widths,
+  direct-block checksum positions, and append/checksum seek offsets.
+- [x] Fractal-heap indirect-block, local-heap undefined value, symbol-table
+  scratch-pad, and v2 B-tree validation paths now use lossless or checked
+  conversions for heap offset widths, checksum spans, entry/address widths,
+  undefined address/length bit counts, and metadata prefix comparisons.
+- [x] LZF, Fletcher32, and filter-pipeline paths now use lossless byte and
+  mask conversions, checked trace length widening, and checked LZF fallback
+  expected-size arithmetic instead of truncating through `u32`.
+- [x] N-bit and scale-offset bitstream paths now use explicit widening and
+  checked bit-count conversions for packed byte runs, parameter byte widths,
+  integer min-bit calculations, and low-bit float reconstruction helpers.
+- [x] Filter-pipeline, dataspace, fill-value, attribute-info, data-layout,
+  and link-info message helpers now use lossless or checked conversions for
+  trace metadata lengths, enum trace values, address/size byte folds, chunk
+  element sizes, and signed max-creation-index bounds.
+- [x] Datatype message decoding and related high-level accessors now use
+  lossless or checked conversions for trace fields, bit precision/offset
+  metadata, compound/enum member counts, inline array dimensions, variable
+  offset byte folds, legacy array sizes, dataspace ranks, chunk size bit
+  counts, scalar i32 widening, and VDS selection encoded widths.
+- [x] Engine file/dataset/group/shared-message/VFD/object helpers and global
+  heap parsing now use lossless or checked conversions for byte checksums,
+  cache IDs, chunk table addresses, bit shifts, group cache indexes, driver
+  IDs, write spans, signature offsets, refcount deltas, message creation
+  indexes, address/size widths, and global heap object indexes.
+- [x] Writer datatype, object-header, layout, dense-storage, global-heap,
+  fractal-heap, chunk-index, and allocation paths now use explicit lossless
+  widening or checked narrowing for enum base sizes, fixed-point precision,
+  name length classes, address/size slices, message sizes, heap object/free
+  sizes, dataset payload lengths, chunk coordinates, B-tree node sizes,
+  managed heap IDs, and dense B-tree record counts.
 
 Cleared on inspection (recorded so a future scan doesn't re-flag them):
 

@@ -266,7 +266,7 @@ fn is_phantom_data(ty: &Type) -> bool {
             .segments
             .iter()
             .last()
-            .map_or(false, |x| x.ident == "PhantomData"),
+            .is_some_and(|x| x.ident == "PhantomData"),
         _ => false,
     }
 }

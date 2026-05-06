@@ -1,9 +1,13 @@
 use crate::error::{Error, Result};
 
 pub const FILL_TIME_NEVER: u8 = 1;
+const FILL_V3_FLAGS_ALL: u8 = 0x3f;
+const FILL_ALLOC_TIME_MAX: u8 = 3;
+const FILL_WRITE_TIME_MAX: u8 = 2;
+const FILL_DEFINED_MAX: u8 = 2;
 
 /// Parsed Fill Value message (types 0x0004 old and 0x0005 new).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FillValueMessage {
     pub version: u8,
     /// Allocation-time policy encoded by the fill-value message.
@@ -45,14 +49,23 @@ impl FillValueMessage {
 
         let alloc_time = data[1];
         let fill_time = data[2];
-        let defined = data[3] != 0;
+        validate_alloc_time(alloc_time, "fill value v2 allocation time")?;
+        validate_fill_time(fill_time, "fill value v2 write time")?;
+        let defined_state = data[3];
+        if defined_state > FILL_DEFINED_MAX {
+            return Err(Error::InvalidFormat(format!(
+                "fill value v2 defined state {} is invalid",
+                defined_state
+            )));
+        }
+        let defined = defined_state != 0;
         let value = if defined {
             if data.len() < 8 {
                 return Err(Error::InvalidFormat(
                     "fill value v2 missing value size".into(),
                 ));
             }
-            let size = read_u32_le_at(data, 4, "fill value v2 value size")? as usize;
+            let size = read_u32_len_at(data, 4, "fill value v2 value size")?;
             if size > 0 {
                 Some(checked_window(data, 8, size, "fill value v2 value")?.to_vec())
             } else {
@@ -87,8 +100,15 @@ impl FillValueMessage {
         }
 
         let flags = data[1];
+        if flags & !FILL_V3_FLAGS_ALL != 0 {
+            return Err(Error::InvalidFormat(format!(
+                "fill value v3 flags {flags:#x} are invalid"
+            )));
+        }
         let alloc_time = flags & 0x03;
         let fill_time = (flags >> 2) & 0x03;
+        validate_alloc_time(alloc_time, "fill value v3 allocation time")?;
+        validate_fill_time(fill_time, "fill value v3 write time")?;
         let undefined = flags & 0x10 != 0;
         let have_value = flags & 0x20 != 0;
         if undefined && have_value {
@@ -104,7 +124,7 @@ impl FillValueMessage {
                     "fill value v3 missing value size".into(),
                 ));
             }
-            let size = read_u32_le_at(data, 2, "fill value v3 value size")? as usize;
+            let size = read_u32_len_at(data, 2, "fill value v3 value size")?;
             if size > 0 {
                 Some(checked_window(data, 6, size, "fill value v3 value")?.to_vec())
             } else {
@@ -147,7 +167,7 @@ impl FillValueMessage {
             return Err(Error::InvalidFormat("old fill value too short".into()));
         }
 
-        let size = read_u32_le_at(data, 0, "old fill value size")? as usize;
+        let size = read_u32_len_at(data, 0, "old fill value size")?;
         let value = if size > 0 {
             Some(checked_window(data, 4, size, "old fill value")?.to_vec())
         } else {
@@ -174,6 +194,24 @@ impl FillValueMessage {
     }
 }
 
+fn validate_alloc_time(value: u8, context: &str) -> Result<()> {
+    if value > FILL_ALLOC_TIME_MAX {
+        return Err(Error::InvalidFormat(format!(
+            "{context} {value} is invalid"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_fill_time(value: u8, context: &str) -> Result<()> {
+    if value > FILL_WRITE_TIME_MAX {
+        return Err(Error::InvalidFormat(format!(
+            "{context} {value} is invalid"
+        )));
+    }
+    Ok(())
+}
+
 fn checked_end(pos: usize, len: usize, context: &str) -> Result<usize> {
     pos.checked_add(len)
         .ok_or_else(|| Error::InvalidFormat(format!("{context} offset overflow")))
@@ -191,6 +229,11 @@ fn read_u32_le_at(data: &[u8], pos: usize, context: &str) -> Result<u32> {
         .try_into()
         .map_err(|_| Error::InvalidFormat(format!("{context} is truncated")))?;
     Ok(u32::from_le_bytes(bytes))
+}
+
+fn read_u32_len_at(data: &[u8], pos: usize, context: &'static str) -> Result<usize> {
+    usize::try_from(read_u32_le_at(data, pos, context)?)
+        .map_err(|_| Error::InvalidFormat(format!("{context} does not fit in usize")))
 }
 
 #[cfg(test)]
@@ -220,13 +263,13 @@ fn trace_fill_value(
     let mut th = tracehash::th_call!("hdf5.fill_value.decode");
     th.input_bytes(data);
     th.output_value(&(true));
-    th.output_u64(version as u64);
-    th.output_u64(alloc_time as u64);
-    th.output_u64(fill_time as u64);
+    th.output_u64(u64::from(version));
+    th.output_u64(u64::from(alloc_time));
+    th.output_u64(u64::from(fill_time));
     th.output_value(&(defined));
     if let Some(value) = value {
         th.output_value(&(true));
-        th.output_u64(value.len() as u64);
+        th.output_u64(u64::try_from(value.len()).unwrap_or(u64::MAX));
         th.output_value(value);
     } else {
         th.output_value(&(false));

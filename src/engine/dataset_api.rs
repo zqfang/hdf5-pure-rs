@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use crate::error::{Error, Result};
+use crate::hl::selection::{Selection, SelectionType};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct VirtualMapping {
@@ -15,6 +16,32 @@ pub struct VirtualMapping {
 pub struct VirtualLayout {
     pub mappings: Vec<VirtualMapping>,
     pub unlimited: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VirtualSpaceStatus {
+    Valid,
+    Invalid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VirtualMappingValidation<'a> {
+    pub virtual_selection: &'a Selection,
+    pub virtual_shape: &'a [u64],
+    pub virtual_max_dims: &'a [u64],
+    pub source_selection: &'a Selection,
+    pub source_shape: &'a [u64],
+    pub source_max_dims: &'a [u64],
+    pub source_file_printf_substitutions: usize,
+    pub source_dataset_printf_substitutions: usize,
+    pub source_space_status: VirtualSpaceStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VirtualParsedName {
+    pub segments: Vec<String>,
+    pub static_strlen: usize,
+    pub substitutions: usize,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -41,12 +68,241 @@ pub struct DatasetApi {
 }
 
 #[allow(non_snake_case)]
+pub fn H5D_virtual_check_mapping_pre(args: &VirtualMappingValidation<'_>) -> Result<()> {
+    if args.virtual_selection.selection_type() == SelectionType::Points
+        || args.source_selection.selection_type() == SelectionType::Points
+    {
+        return Err(Error::Unsupported(
+            "point selections are not supported by libhdf5 VDS mapping creation checks".into(),
+        ));
+    }
+
+    let virtual_unlimited = args
+        .virtual_selection
+        .select_unlim_dim(args.virtual_max_dims)
+        .is_some();
+    let source_unlimited = args
+        .source_selection
+        .select_unlim_dim(args.source_max_dims)
+        .is_some();
+
+    if virtual_unlimited {
+        if source_unlimited {
+            let virtual_non_unlim = args
+                .virtual_selection
+                .select_num_elem_non_unlim(args.virtual_shape, args.virtual_max_dims)?;
+            let source_non_unlim = args
+                .source_selection
+                .select_num_elem_non_unlim(args.source_shape, args.source_max_dims)?;
+            if virtual_non_unlim != source_non_unlim {
+                return Err(Error::InvalidFormat(
+                    "VDS virtual/source non-unlimited element counts differ".into(),
+                ));
+            }
+        }
+    } else if args.source_space_status != VirtualSpaceStatus::Invalid {
+        let virtual_count = args
+            .virtual_selection
+            .selected_count(args.virtual_shape)
+            .ok_or_else(|| Error::InvalidFormat("VDS virtual selection count overflow".into()))?;
+        let source_count = args
+            .source_selection
+            .selected_count(args.source_shape)
+            .ok_or_else(|| Error::InvalidFormat("VDS source selection count overflow".into()))?;
+        if virtual_count != source_count {
+            return Err(Error::InvalidFormat(
+                "VDS virtual/source selected element counts differ".into(),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+#[allow(non_snake_case)]
+pub fn H5D_virtual_check_mapping_post(args: &VirtualMappingValidation<'_>) -> Result<()> {
+    let virtual_unlimited = args
+        .virtual_selection
+        .select_unlim_dim(args.virtual_max_dims)
+        .is_some();
+    let source_unlimited = args
+        .source_selection
+        .select_unlim_dim(args.source_max_dims)
+        .is_some();
+    let printf_subs =
+        args.source_file_printf_substitutions + args.source_dataset_printf_substitutions;
+
+    if virtual_unlimited && !source_unlimited {
+        if printf_subs == 0 {
+            return Err(Error::InvalidFormat(
+                "VDS unlimited virtual selection with limited source needs printf substitutions"
+                    .into(),
+            ));
+        }
+        if args.virtual_selection.selection_type() != SelectionType::Hyperslab {
+            return Err(Error::InvalidFormat(
+                "VDS printf mapping virtual selection must be hyperslab".into(),
+            ));
+        }
+        if args.source_space_status != VirtualSpaceStatus::Invalid {
+            let virtual_block_count = virtual_first_block_element_count(args.virtual_selection)?;
+            let source_count = args
+                .source_selection
+                .selected_count(args.source_shape)
+                .ok_or_else(|| {
+                    Error::InvalidFormat("VDS source selection count overflow".into())
+                })?;
+            if virtual_block_count != source_count {
+                return Err(Error::InvalidFormat(
+                    "VDS virtual single-block/source selected element counts differ".into(),
+                ));
+            }
+        }
+    } else if printf_subs > 0 {
+        return Err(Error::InvalidFormat(
+            "VDS printf substitutions require unlimited virtual selection and limited source selection"
+                .into(),
+        ));
+    }
+
+    Ok(())
+}
+
+#[allow(non_snake_case)]
 pub fn H5D_virtual_check_min_dims(mapping: &VirtualMapping, dims: &[u64]) -> bool {
+    H5D_virtual_check_min_dims_checked(mapping, dims).is_ok()
+}
+
+#[allow(non_snake_case)]
+pub fn H5D_virtual_check_min_dims_checked(mapping: &VirtualMapping, dims: &[u64]) -> Result<()> {
+    if dims.len() != mapping.min_dims.len() {
+        return Err(Error::InvalidFormat(format!(
+            "VDS rank {} does not match min-dims rank {}",
+            dims.len(),
+            mapping.min_dims.len()
+        )));
+    }
     mapping
         .min_dims
         .iter()
         .zip(dims)
-        .all(|(minimum, actual)| actual >= minimum)
+        .enumerate()
+        .try_for_each(|(idx, (minimum, actual))| {
+            if actual < minimum {
+                Err(Error::InvalidFormat(format!(
+                    "VDS dimension {idx} is smaller than required minimum"
+                )))
+            } else {
+                Ok(())
+            }
+        })
+}
+
+#[allow(non_snake_case)]
+pub fn H5D_virtual_parse_source_name(source_name: &str) -> Result<Option<VirtualParsedName>> {
+    let bytes = source_name.as_bytes();
+    let mut pos = 0usize;
+    let mut segment = String::new();
+    let mut segments = Vec::new();
+    let mut substitutions = 0usize;
+    let mut static_strlen = source_name.len();
+
+    while let Some(relative_pct) = bytes[pos..].iter().position(|&byte| byte == b'%') {
+        let pct = pos
+            .checked_add(relative_pct)
+            .ok_or_else(|| Error::InvalidFormat("VDS source-name offset overflow".into()))?;
+        let spec = bytes.get(pct + 1).copied().ok_or_else(|| {
+            Error::InvalidFormat("VDS source name has truncated format specifier".into())
+        })?;
+        if !source_name.is_char_boundary(pct) || !source_name.is_char_boundary(pct + 2) {
+            return Err(Error::InvalidFormat(
+                "VDS source name format specifier is not UTF-8 aligned".into(),
+            ));
+        }
+
+        match spec {
+            b'b' => {
+                segment.push_str(&source_name[pos..pct]);
+                segments.push(std::mem::take(&mut segment));
+                substitutions = substitutions.checked_add(1).ok_or_else(|| {
+                    Error::InvalidFormat("VDS source-name substitution count overflow".into())
+                })?;
+                static_strlen = static_strlen.checked_sub(2).ok_or_else(|| {
+                    Error::InvalidFormat("VDS source-name static length underflow".into())
+                })?;
+            }
+            b'%' => {
+                segment.push_str(&source_name[pos..pct]);
+                segment.push('%');
+                static_strlen = static_strlen.checked_sub(1).ok_or_else(|| {
+                    Error::InvalidFormat("VDS source-name static length underflow".into())
+                })?;
+            }
+            other => {
+                return Err(Error::InvalidFormat(format!(
+                    "invalid VDS source-name format specifier %{specifier}",
+                    specifier = other as char
+                )));
+            }
+        }
+        pos = pct
+            .checked_add(2)
+            .ok_or_else(|| Error::InvalidFormat("VDS source-name offset overflow".into()))?;
+    }
+
+    if substitutions == 0 && segment.is_empty() {
+        return Ok(None);
+    }
+    segment.push_str(&source_name[pos..]);
+    segments.push(segment);
+    Ok(Some(VirtualParsedName {
+        segments,
+        static_strlen,
+        substitutions,
+    }))
+}
+
+#[allow(non_snake_case)]
+pub fn H5D_virtual_free_parsed_name(_parsed_name: Option<VirtualParsedName>) {}
+
+#[allow(non_snake_case)]
+pub fn H5D__virtual_build_source_name(
+    source_name: &str,
+    parsed_name: Option<&VirtualParsedName>,
+    blockno: u64,
+) -> Result<String> {
+    let Some(parsed_name) = parsed_name else {
+        return Ok(source_name.to_string());
+    };
+    if parsed_name.substitutions == 0 {
+        return Ok(parsed_name
+            .segments
+            .first()
+            .cloned()
+            .unwrap_or_else(|| source_name.to_string()));
+    }
+    if parsed_name.segments.len() != parsed_name.substitutions + 1 {
+        return Err(Error::InvalidFormat(
+            "VDS parsed source-name segment count does not match substitutions".into(),
+        ));
+    }
+    let block = blockno.to_string();
+    let substitution_bytes = parsed_name
+        .substitutions
+        .checked_mul(block.len())
+        .ok_or_else(|| Error::InvalidFormat("VDS built source-name size overflow".into()))?;
+    let capacity = parsed_name
+        .static_strlen
+        .checked_add(substitution_bytes)
+        .ok_or_else(|| Error::InvalidFormat("VDS built source-name size overflow".into()))?;
+    let mut out = String::with_capacity(capacity);
+    for (idx, segment) in parsed_name.segments.iter().enumerate() {
+        out.push_str(segment);
+        if idx < parsed_name.substitutions {
+            out.push_str(&block);
+        }
+    }
+    Ok(out)
 }
 
 #[allow(non_snake_case)]
@@ -534,7 +790,7 @@ pub fn H5D__chunk_read(table: &mut ChunkTable, coord: &[u64]) -> Result<Vec<u8>>
 pub fn H5D__chunk_write(table: &mut ChunkTable, coord: Vec<u64>, data: Vec<u8>) {
     let info = ChunkInfo {
         coord: coord.clone(),
-        addr: table.chunks.len() as u64,
+        addr: u64::try_from(table.chunks.len()).unwrap_or(u64::MAX),
         size: data.len(),
         filter_mask: 0,
     };
@@ -710,7 +966,7 @@ pub fn H5D__nonexistent_readvv(len: usize) -> Vec<u8> {
 
 #[allow(non_snake_case)]
 pub fn H5D__chunk_file_alloc(table: &mut ChunkTable, coord: Vec<u64>, size: usize) -> u64 {
-    let addr = table.chunks.len() as u64;
+    let addr = u64::try_from(table.chunks.len()).unwrap_or(u64::MAX);
     let info = ChunkInfo {
         coord: coord.clone(),
         addr,
@@ -787,6 +1043,10 @@ pub struct ChunkIndexState {
     pub space_allocated: bool,
     pub entries: HashMap<Vec<u64>, ChunkInfo>,
     pub metadata_loaded: bool,
+    pub declared_entry_count: u64,
+    pub none_base_addr: Option<u64>,
+    pub none_chunk_size: usize,
+    pub none_chunks_per_dim: Vec<u64>,
 }
 
 fn chunk_index_insert(index: &mut ChunkIndexState, coord: Vec<u64>, addr: u64, size: usize) {
@@ -815,11 +1075,123 @@ fn chunk_index_remove(index: &mut ChunkIndexState, coord: &[u64]) -> Option<Chun
 
 fn chunk_index_dump(kind: &str, index: &ChunkIndexState) -> String {
     format!(
-        "{kind}(open={}, allocated={}, entries={})",
+        "{kind}(open={}, allocated={}, entries={}, declared={})",
         index.open,
         index.space_allocated,
-        index.entries.len()
+        index.entries.len(),
+        index.declared_entry_count
     )
+}
+
+fn chunk_index_encode_count(index: &ChunkIndexState) -> Result<Vec<u8>> {
+    let count = u64::try_from(index.entries.len()).map_err(|_| {
+        Error::InvalidFormat("chunk-index entry count cannot be represented as u64".into())
+    })?;
+    Ok(count.to_le_bytes().to_vec())
+}
+
+fn chunk_index_decode_count_image(bytes: &[u8], context: &str) -> Result<ChunkIndexState> {
+    if bytes.len() != 8 {
+        return Err(Error::InvalidFormat(format!(
+            "{context} chunk-index count image has invalid length"
+        )));
+    }
+    let raw: [u8; 8] = bytes
+        .try_into()
+        .map_err(|_| Error::InvalidFormat(format!("{context} chunk-index count is truncated")))?;
+    let declared_entry_count = u64::from_le_bytes(raw);
+    Ok(ChunkIndexState {
+        metadata_loaded: true,
+        space_allocated: declared_entry_count != 0,
+        declared_entry_count,
+        ..ChunkIndexState::default()
+    })
+}
+
+fn none_total_chunks(chunks_per_dim: &[u64]) -> Result<u64> {
+    if chunks_per_dim.is_empty() {
+        return Err(Error::InvalidFormat("none chunk index rank is zero".into()));
+    }
+    chunks_per_dim.iter().try_fold(1u64, |acc, &dim| {
+        if dim == 0 {
+            return Err(Error::InvalidFormat(
+                "none chunk index dimension is zero".into(),
+            ));
+        }
+        acc.checked_mul(dim)
+            .ok_or_else(|| Error::InvalidFormat("none chunk count overflow".into()))
+    })
+}
+
+fn none_array_offset_pre(chunks_per_dim: &[u64], coord: &[u64]) -> Result<u64> {
+    if chunks_per_dim.len() != coord.len() {
+        return Err(Error::InvalidFormat(
+            "none chunk rank does not match coordinate rank".into(),
+        ));
+    }
+    let mut stride = 1u64;
+    let mut index = 0u64;
+    for (&dim, &coord) in chunks_per_dim.iter().zip(coord).rev() {
+        if dim == 0 {
+            return Err(Error::InvalidFormat(
+                "none chunk index dimension is zero".into(),
+            ));
+        }
+        if coord >= dim {
+            return Err(Error::InvalidFormat(
+                "none chunk coordinate is outside chunk grid".into(),
+            ));
+        }
+        index = index
+            .checked_add(coord.checked_mul(stride).ok_or_else(|| {
+                Error::InvalidFormat("none chunk coordinate offset overflow".into())
+            })?)
+            .ok_or_else(|| Error::InvalidFormat("none chunk coordinate offset overflow".into()))?;
+        stride = stride
+            .checked_mul(dim)
+            .ok_or_else(|| Error::InvalidFormat("none chunk stride overflow".into()))?;
+    }
+    Ok(index)
+}
+
+fn none_increment_scaled_coord(coord: &mut [u64], chunks_per_dim: &[u64]) {
+    for dim in (0..coord.len()).rev() {
+        coord[dim] += 1;
+        if coord[dim] >= chunks_per_dim[dim] {
+            coord[dim] = 0;
+        } else {
+            break;
+        }
+    }
+}
+
+fn virtual_first_block_element_count(selection: &Selection) -> Result<u64> {
+    match selection {
+        Selection::Hyperslab(dims) => {
+            if dims.is_empty() {
+                return Ok(1);
+            }
+            dims.iter().try_fold(1u64, |acc, dim| {
+                acc.checked_mul(dim.block).ok_or_else(|| {
+                    Error::InvalidFormat("VDS virtual block element count overflow".into())
+                })
+            })
+        }
+        Selection::Slice(slices) => {
+            if slices.is_empty() {
+                return Ok(1);
+            }
+            slices.iter().try_fold(1u64, |acc, slice| {
+                let block = if slice.count() == 0 { 0 } else { 1 };
+                acc.checked_mul(block).ok_or_else(|| {
+                    Error::InvalidFormat("VDS virtual block element count overflow".into())
+                })
+            })
+        }
+        _ => Err(Error::InvalidFormat(
+            "VDS printf mapping virtual selection must be hyperslab".into(),
+        )),
+    }
 }
 
 macro_rules! chunk_index_family {
@@ -868,15 +1240,13 @@ macro_rules! chunk_index_family {
         }
 
         #[allow(non_snake_case)]
-        pub fn $encode(index: &ChunkIndexState) -> Vec<u8> {
-            (index.entries.len() as u64).to_le_bytes().to_vec()
+        pub fn $encode(index: &ChunkIndexState) -> Result<Vec<u8>> {
+            chunk_index_encode_count(index)
         }
 
         #[allow(non_snake_case)]
-        pub fn $decode(bytes: &[u8]) -> ChunkIndexState {
-            let mut index = ChunkIndexState::default();
-            index.metadata_loaded = bytes.len() >= 8;
-            index
+        pub fn $decode(bytes: &[u8]) -> Result<ChunkIndexState> {
+            chunk_index_decode_count_image(bytes, $kind)
         }
 
         #[allow(non_snake_case)]
@@ -1025,7 +1395,7 @@ pub fn H5D__earray_filt_fill(size: usize) -> Vec<u8> {
 }
 
 #[allow(non_snake_case)]
-pub fn H5D__earray_filt_encode(index: &ChunkIndexState) -> Vec<u8> {
+pub fn H5D__earray_filt_encode(index: &ChunkIndexState) -> Result<Vec<u8>> {
     H5D__earray_encode(index)
 }
 
@@ -1095,12 +1465,12 @@ pub fn H5D__farray_filt_fill(size: usize) -> Vec<u8> {
 }
 
 #[allow(non_snake_case)]
-pub fn H5D__farray_filt_encode(index: &ChunkIndexState) -> Vec<u8> {
+pub fn H5D__farray_filt_encode(index: &ChunkIndexState) -> Result<Vec<u8>> {
     H5D__farray_encode(index)
 }
 
 #[allow(non_snake_case)]
-pub fn H5D__farray_filt_decode(bytes: &[u8]) -> ChunkIndexState {
+pub fn H5D__farray_filt_decode(bytes: &[u8]) -> Result<ChunkIndexState> {
     H5D__farray_decode(bytes)
 }
 
@@ -1150,12 +1520,12 @@ pub fn H5D__bt2_compare(left: &ChunkInfo, right: &ChunkInfo) -> std::cmp::Orderi
 }
 
 #[allow(non_snake_case)]
-pub fn H5D__bt2_filt_encode(index: &ChunkIndexState) -> Vec<u8> {
+pub fn H5D__bt2_filt_encode(index: &ChunkIndexState) -> Result<Vec<u8>> {
     H5D__bt2_unfilt_encode(index)
 }
 
 #[allow(non_snake_case)]
-pub fn H5D__bt2_filt_decode(bytes: &[u8]) -> ChunkIndexState {
+pub fn H5D__bt2_filt_decode(bytes: &[u8]) -> Result<ChunkIndexState> {
     H5D__bt2_unfilt_decode(bytes)
 }
 
@@ -1458,12 +1828,22 @@ pub fn H5D__mpio_dump_collective_filtered_chunk_list(chunks: &[ChunkInfo]) -> St
 }
 
 #[allow(non_snake_case)]
-pub fn H5D__scatter_file(src: &[u8], spans: &[(usize, usize)]) -> Vec<Vec<u8>> {
+pub fn H5D__scatter_file(src: &[u8], spans: &[(usize, usize)]) -> Result<Vec<Vec<u8>>> {
+    H5D__scatter_file_checked(src, spans)
+}
+
+#[allow(non_snake_case)]
+pub fn H5D__scatter_file_checked(src: &[u8], spans: &[(usize, usize)]) -> Result<Vec<Vec<u8>>> {
     spans
         .iter()
-        .filter_map(|&(offset, len)| {
-            src.get(offset..offset.saturating_add(len))
-                .map(<[u8]>::to_vec)
+        .map(|&(offset, len)| {
+            let end = offset
+                .checked_add(len)
+                .ok_or_else(|| Error::InvalidFormat("dataset scatter span overflow".into()))?;
+            Ok(src
+                .get(offset..end)
+                .ok_or_else(|| Error::InvalidFormat("dataset scatter span out of bounds".into()))?
+                .to_vec())
         })
         .collect()
 }
@@ -1474,7 +1854,7 @@ pub fn H5D__gather_file(parts: &[Vec<u8>]) -> Vec<u8> {
 }
 
 #[allow(non_snake_case)]
-pub fn H5D__scatter_mem(src: &[u8], spans: &[(usize, usize)]) -> Vec<Vec<u8>> {
+pub fn H5D__scatter_mem(src: &[u8], spans: &[(usize, usize)]) -> Result<Vec<Vec<u8>>> {
     H5D__scatter_file(src, spans)
 }
 
@@ -1484,7 +1864,7 @@ pub fn H5D__gather_mem(parts: &[Vec<u8>]) -> Vec<u8> {
 }
 
 #[allow(non_snake_case)]
-pub fn H5D__scatgath_read_select(src: &[u8], spans: &[(usize, usize)]) -> Vec<Vec<u8>> {
+pub fn H5D__scatgath_read_select(src: &[u8], spans: &[(usize, usize)]) -> Result<Vec<Vec<u8>>> {
     H5D__scatter_file(src, spans)
 }
 
@@ -1588,6 +1968,32 @@ pub fn H5D__none_idx_create() -> ChunkIndexState {
 }
 
 #[allow(non_snake_case)]
+pub fn H5D__none_idx_configure(
+    index: &mut ChunkIndexState,
+    base_addr: u64,
+    chunk_size: usize,
+    chunks_per_dim: Vec<u64>,
+) -> Result<()> {
+    if chunk_size == 0 {
+        return Err(Error::InvalidFormat(
+            "none chunk index chunk size is zero".into(),
+        ));
+    }
+    if chunks_per_dim.is_empty() || chunks_per_dim.iter().any(|&dim| dim == 0) {
+        return Err(Error::InvalidFormat(
+            "none chunk index dimensions must be nonzero".into(),
+        ));
+    }
+    let _ = none_total_chunks(&chunks_per_dim)?;
+    index.open = true;
+    index.space_allocated = true;
+    index.none_base_addr = Some(base_addr);
+    index.none_chunk_size = chunk_size;
+    index.none_chunks_per_dim = chunks_per_dim;
+    Ok(())
+}
+
+#[allow(non_snake_case)]
 pub fn H5D__none_idx_close(_index: &mut ChunkIndexState) {}
 
 #[allow(non_snake_case)]
@@ -1597,20 +2003,73 @@ pub fn H5D__none_idx_is_open(_index: &ChunkIndexState) -> bool {
 
 #[allow(non_snake_case)]
 pub fn H5D__none_idx_is_space_alloc(_index: &ChunkIndexState) -> bool {
-    false
+    _index.none_base_addr.is_some()
 }
 
 #[allow(non_snake_case)]
-pub fn H5D__none_idx_get_addr(_index: &ChunkIndexState, _coord: &[u64]) -> Option<u64> {
-    None
+pub fn H5D__none_idx_get_addr(index: &ChunkIndexState, coord: &[u64]) -> Option<u64> {
+    H5D__none_idx_get_addr_checked(index, coord).ok()
+}
+
+#[allow(non_snake_case)]
+pub fn H5D__none_idx_get_addr_checked(index: &ChunkIndexState, coord: &[u64]) -> Result<u64> {
+    let base_addr = index
+        .none_base_addr
+        .ok_or_else(|| Error::InvalidFormat("none chunk index base address is undefined".into()))?;
+    let chunk_size = u64::try_from(index.none_chunk_size)
+        .map_err(|_| Error::InvalidFormat("none chunk size exceeds u64".into()))?;
+    if coord.len() != index.none_chunks_per_dim.len() {
+        return Err(Error::InvalidFormat(format!(
+            "none chunk coordinate rank {} does not match chunk rank {}",
+            coord.len(),
+            index.none_chunks_per_dim.len()
+        )));
+    }
+    if coord
+        .iter()
+        .zip(&index.none_chunks_per_dim)
+        .any(|(&coord, &dim)| coord >= dim)
+    {
+        return Err(Error::InvalidFormat(
+            "none chunk coordinate is outside chunk grid".into(),
+        ));
+    }
+    let chunk_idx = none_array_offset_pre(&index.none_chunks_per_dim, coord)?;
+    base_addr
+        .checked_add(
+            chunk_idx
+                .checked_mul(chunk_size)
+                .ok_or_else(|| Error::InvalidFormat("none chunk byte offset overflow".into()))?,
+        )
+        .ok_or_else(|| Error::InvalidFormat("none chunk address overflow".into()))
 }
 
 #[allow(non_snake_case)]
 pub fn H5D__none_idx_load_metadata(_index: &mut ChunkIndexState) {}
 
 #[allow(non_snake_case)]
-pub fn H5D__none_idx_iterate(_index: &ChunkIndexState) -> Vec<ChunkInfo> {
-    Vec::new()
+pub fn H5D__none_idx_iterate(index: &ChunkIndexState) -> Result<Vec<ChunkInfo>> {
+    H5D__none_idx_iterate_checked(index)
+}
+
+#[allow(non_snake_case)]
+pub fn H5D__none_idx_iterate_checked(index: &ChunkIndexState) -> Result<Vec<ChunkInfo>> {
+    let total = none_total_chunks(&index.none_chunks_per_dim)?;
+    let total_usize = usize::try_from(total)
+        .map_err(|_| Error::InvalidFormat("none chunk count exceeds usize".into()))?;
+    let mut out = Vec::with_capacity(total_usize);
+    let mut coord = vec![0u64; index.none_chunks_per_dim.len()];
+    for _ in 0..total {
+        let addr = H5D__none_idx_get_addr_checked(index, &coord)?;
+        out.push(ChunkInfo {
+            coord: coord.clone(),
+            addr,
+            size: index.none_chunk_size,
+            filter_mask: 0,
+        });
+        none_increment_scaled_coord(&mut coord, &index.none_chunks_per_dim);
+    }
+    Ok(out)
 }
 
 #[allow(non_snake_case)]
@@ -1627,11 +2086,20 @@ pub fn H5D__none_idx_copy_setup(index: &ChunkIndexState) -> ChunkIndexState {
 }
 
 #[allow(non_snake_case)]
-pub fn H5D__none_idx_reset(_index: &mut ChunkIndexState) {}
+pub fn H5D__none_idx_reset(index: &mut ChunkIndexState) {
+    *index = ChunkIndexState::default();
+}
 
 #[allow(non_snake_case)]
-pub fn H5D__none_idx_dump(_index: &ChunkIndexState) -> String {
-    "none_idx".into()
+pub fn H5D__none_idx_dump(index: &ChunkIndexState) -> String {
+    format!(
+        "none_idx(open={}, allocated={}, base={:?}, chunk_size={}, chunks_per_dim={:?})",
+        index.open,
+        H5D__none_idx_is_space_alloc(index),
+        index.none_base_addr,
+        index.none_chunk_size,
+        index.none_chunks_per_dim
+    )
 }
 
 #[allow(non_snake_case)]
@@ -1924,16 +2392,7 @@ pub fn H5D__contig_readvv(
     storage: &ContiguousStorage,
     spans: &[(usize, usize)],
 ) -> Result<Vec<Vec<u8>>> {
-    Ok(spans
-        .iter()
-        .map(|&(offset, len)| {
-            storage
-                .data
-                .get(offset..offset.saturating_add(len))
-                .unwrap_or(&[])
-                .to_vec()
-        })
-        .collect())
+    H5D__scatter_file_checked(&storage.data, spans)
 }
 
 #[allow(non_snake_case)]
@@ -2057,8 +2516,8 @@ pub mod explicit_index_wrappers {
     }
 
     #[allow(non_snake_case)]
-    pub fn H5D__earray_encode(index: &ChunkIndexState) -> Vec<u8> {
-        (index.entries.len() as u64).to_le_bytes().to_vec()
+    pub fn H5D__earray_encode(index: &ChunkIndexState) -> Result<Vec<u8>> {
+        chunk_index_encode_count(index)
     }
 
     #[allow(non_snake_case)]
@@ -2067,8 +2526,8 @@ pub mod explicit_index_wrappers {
     }
 
     #[allow(non_snake_case)]
-    pub fn H5D__earray_filt_decode(_bytes: &[u8]) -> ChunkIndexState {
-        ChunkIndexState::default()
+    pub fn H5D__earray_filt_decode(bytes: &[u8]) -> Result<ChunkIndexState> {
+        chunk_index_decode_count_image(bytes, "earray")
     }
 
     #[allow(non_snake_case)]
@@ -2184,18 +2643,18 @@ pub mod explicit_index_wrappers {
     }
 
     #[allow(non_snake_case)]
-    pub fn H5D__bt2_store(index: &ChunkIndexState) -> Vec<u8> {
-        (index.entries.len() as u64).to_le_bytes().to_vec()
+    pub fn H5D__bt2_store(index: &ChunkIndexState) -> Result<Vec<u8>> {
+        chunk_index_encode_count(index)
     }
 
     #[allow(non_snake_case)]
-    pub fn H5D__bt2_unfilt_encode(index: &ChunkIndexState) -> Vec<u8> {
+    pub fn H5D__bt2_unfilt_encode(index: &ChunkIndexState) -> Result<Vec<u8>> {
         H5D__bt2_store(index)
     }
 
     #[allow(non_snake_case)]
-    pub fn H5D__bt2_unfilt_decode(_bytes: &[u8]) -> ChunkIndexState {
-        ChunkIndexState::default()
+    pub fn H5D__bt2_unfilt_decode(bytes: &[u8]) -> Result<ChunkIndexState> {
+        chunk_index_decode_count_image(bytes, "bt2")
     }
 
     #[allow(non_snake_case)]
@@ -2326,13 +2785,13 @@ pub mod explicit_index_wrappers {
     }
 
     #[allow(non_snake_case)]
-    pub fn H5D__farray_encode(index: &ChunkIndexState) -> Vec<u8> {
-        (index.entries.len() as u64).to_le_bytes().to_vec()
+    pub fn H5D__farray_encode(index: &ChunkIndexState) -> Result<Vec<u8>> {
+        chunk_index_encode_count(index)
     }
 
     #[allow(non_snake_case)]
-    pub fn H5D__farray_decode(_bytes: &[u8]) -> ChunkIndexState {
-        ChunkIndexState::default()
+    pub fn H5D__farray_decode(bytes: &[u8]) -> Result<ChunkIndexState> {
+        chunk_index_decode_count_image(bytes, "farray")
     }
 
     #[allow(non_snake_case)]
@@ -2468,13 +2927,13 @@ pub mod explicit_index_wrappers {
     }
 
     #[allow(non_snake_case)]
-    pub fn H5D__btree_decode_key(_bytes: &[u8]) -> ChunkIndexState {
-        ChunkIndexState::default()
+    pub fn H5D__btree_decode_key(bytes: &[u8]) -> Result<ChunkIndexState> {
+        chunk_index_decode_count_image(bytes, "btree")
     }
 
     #[allow(non_snake_case)]
-    pub fn H5D__btree_encode_key(index: &ChunkIndexState) -> Vec<u8> {
-        (index.entries.len() as u64).to_le_bytes().to_vec()
+    pub fn H5D__btree_encode_key(index: &ChunkIndexState) -> Result<Vec<u8>> {
+        chunk_index_encode_count(index)
     }
 
     #[allow(non_snake_case)]
@@ -2586,12 +3045,12 @@ pub fn H5D_btree_debug(index: &ChunkIndexState) -> String {
 }
 
 #[allow(non_snake_case)]
-pub fn H5D__select_io(dataset: &DatasetApi, spans: &[(usize, usize)]) -> Vec<Vec<u8>> {
+pub fn H5D__select_io(dataset: &DatasetApi, spans: &[(usize, usize)]) -> Result<Vec<Vec<u8>>> {
     H5D__scatter_file(&dataset.raw, spans)
 }
 
 #[allow(non_snake_case)]
-pub fn H5D_select_io_mem(src: &[u8], spans: &[(usize, usize)]) -> Vec<Vec<u8>> {
+pub fn H5D_select_io_mem(src: &[u8], spans: &[(usize, usize)]) -> Result<Vec<Vec<u8>>> {
     H5D__scatter_mem(src, spans)
 }
 
@@ -2607,5 +3066,265 @@ mod tests {
         assert!(storage.dirty);
         H5D__compact_flush(&mut storage);
         assert!(!storage.dirty);
+    }
+
+    #[test]
+    fn none_chunk_index_computes_implicit_addresses() {
+        let mut index = H5D__none_idx_create();
+        H5D__none_idx_configure(&mut index, 1000, 16, vec![2, 3]).unwrap();
+
+        assert!(H5D__none_idx_is_open(&index));
+        assert!(H5D__none_idx_is_space_alloc(&index));
+        assert_eq!(
+            H5D__none_idx_get_addr_checked(&index, &[0, 0]).unwrap(),
+            1000
+        );
+        assert_eq!(
+            H5D__none_idx_get_addr_checked(&index, &[0, 2]).unwrap(),
+            1032
+        );
+        assert_eq!(
+            H5D__none_idx_get_addr_checked(&index, &[1, 0]).unwrap(),
+            1048
+        );
+
+        let chunks = H5D__none_idx_iterate(&index).unwrap();
+        assert_eq!(chunks.len(), 6);
+        assert_eq!(chunks[0].coord, vec![0, 0]);
+        assert_eq!(chunks[0].addr, 1000);
+        assert_eq!(chunks[5].coord, vec![1, 2]);
+        assert_eq!(chunks[5].addr, 1080);
+        assert!(chunks.iter().all(|chunk| chunk.filter_mask == 0));
+    }
+
+    #[test]
+    fn none_chunk_index_rejects_malformed_geometry() {
+        let mut index = H5D__none_idx_create();
+        assert!(H5D__none_idx_configure(&mut index, 0, 0, vec![1]).is_err());
+        assert!(H5D__none_idx_configure(&mut index, 0, 1, vec![0]).is_err());
+
+        H5D__none_idx_configure(&mut index, u64::MAX - 7, 8, vec![2]).unwrap();
+        assert!(H5D__none_idx_get_addr_checked(&index, &[1]).is_err());
+        assert!(H5D__none_idx_get_addr_checked(&index, &[2]).is_err());
+        assert!(H5D__none_idx_get_addr_checked(&index, &[0, 0]).is_err());
+    }
+
+    #[test]
+    fn chunk_index_count_images_roundtrip_and_reject_bad_lengths() {
+        let mut index = ChunkIndexState::default();
+        H5D__farray_idx_insert(&mut index, vec![0], 64, 8);
+        H5D__farray_idx_insert(&mut index, vec![1], 72, 8);
+
+        let farray_image = H5D__farray_encode(&index).unwrap();
+        let farray = H5D__farray_decode(&farray_image).unwrap();
+        assert!(farray.metadata_loaded);
+        assert!(farray.space_allocated);
+        assert_eq!(farray.declared_entry_count, 2);
+        assert!(farray.entries.is_empty());
+        assert_eq!(
+            H5D__farray_filt_decode(&farray_image)
+                .unwrap()
+                .declared_entry_count,
+            2
+        );
+
+        let earray = H5D__earray_filt_decode(&H5D__earray_encode(&index).unwrap()).unwrap();
+        assert_eq!(earray.declared_entry_count, 2);
+
+        let bt2 = H5D__bt2_filt_decode(&H5D__bt2_filt_encode(&index).unwrap()).unwrap();
+        assert_eq!(bt2.declared_entry_count, 2);
+
+        let explicit = explicit_index_wrappers::H5D__bt2_unfilt_decode(
+            &explicit_index_wrappers::H5D__bt2_unfilt_encode(&index).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(explicit.declared_entry_count, 2);
+
+        let btree = explicit_index_wrappers::H5D__btree_decode_key(
+            &explicit_index_wrappers::H5D__btree_encode_key(&index).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(btree.declared_entry_count, 2);
+
+        assert!(H5D__farray_decode(&[0; 7]).is_err());
+        assert!(H5D__bt2_filt_decode(&[0; 9]).is_err());
+        assert!(explicit_index_wrappers::H5D__earray_filt_decode(&[0; 7]).is_err());
+        assert!(explicit_index_wrappers::H5D__btree_decode_key(&[0; 9]).is_err());
+    }
+
+    #[test]
+    fn virtual_mapping_pre_rejects_points_and_mismatched_limited_counts() {
+        let point = Selection::Points(vec![vec![0]]);
+        let all = Selection::All;
+        let args = VirtualMappingValidation {
+            virtual_selection: &point,
+            virtual_shape: &[1],
+            virtual_max_dims: &[1],
+            source_selection: &all,
+            source_shape: &[1],
+            source_max_dims: &[1],
+            source_file_printf_substitutions: 0,
+            source_dataset_printf_substitutions: 0,
+            source_space_status: VirtualSpaceStatus::Valid,
+        };
+        assert!(matches!(
+            H5D_virtual_check_mapping_pre(&args),
+            Err(Error::Unsupported(_))
+        ));
+
+        let virtual_selection = Selection::All;
+        let source_selection = Selection::All;
+        let args = VirtualMappingValidation {
+            virtual_selection: &virtual_selection,
+            virtual_shape: &[2],
+            virtual_max_dims: &[2],
+            source_selection: &source_selection,
+            source_shape: &[3],
+            source_max_dims: &[3],
+            source_file_printf_substitutions: 0,
+            source_dataset_printf_substitutions: 0,
+            source_space_status: VirtualSpaceStatus::Valid,
+        };
+        assert!(matches!(
+            H5D_virtual_check_mapping_pre(&args),
+            Err(Error::InvalidFormat(_))
+        ));
+    }
+
+    #[test]
+    fn virtual_mapping_post_enforces_printf_rules() {
+        let virtual_selection = Selection::Hyperslab(vec![crate::hl::selection::HyperslabDim {
+            start: 0,
+            stride: 10,
+            count: 2,
+            block: 3,
+        }]);
+        let source_selection = Selection::All;
+        let ok = VirtualMappingValidation {
+            virtual_selection: &virtual_selection,
+            virtual_shape: &[20],
+            virtual_max_dims: &[u64::MAX],
+            source_selection: &source_selection,
+            source_shape: &[3],
+            source_max_dims: &[3],
+            source_file_printf_substitutions: 1,
+            source_dataset_printf_substitutions: 0,
+            source_space_status: VirtualSpaceStatus::Valid,
+        };
+        H5D_virtual_check_mapping_post(&ok).unwrap();
+
+        let missing_printf = VirtualMappingValidation {
+            source_file_printf_substitutions: 0,
+            ..ok.clone()
+        };
+        assert!(matches!(
+            H5D_virtual_check_mapping_post(&missing_printf),
+            Err(Error::InvalidFormat(_))
+        ));
+
+        let limited_with_printf = VirtualMappingValidation {
+            virtual_max_dims: &[20],
+            source_file_printf_substitutions: 1,
+            ..ok
+        };
+        assert!(matches!(
+            H5D_virtual_check_mapping_post(&limited_with_printf),
+            Err(Error::InvalidFormat(_))
+        ));
+    }
+
+    #[test]
+    fn virtual_min_dims_check_rejects_rank_and_extent_mismatch() {
+        let mapping = VirtualMapping {
+            min_dims: vec![2, 3],
+            ..VirtualMapping::default()
+        };
+
+        H5D_virtual_check_min_dims_checked(&mapping, &[2, 3]).unwrap();
+        assert!(H5D_virtual_check_min_dims(&mapping, &[4, 5]));
+        assert!(matches!(
+            H5D_virtual_check_min_dims_checked(&mapping, &[2]),
+            Err(Error::InvalidFormat(_))
+        ));
+        assert!(matches!(
+            H5D_virtual_check_min_dims_checked(&mapping, &[2, 2]),
+            Err(Error::InvalidFormat(_))
+        ));
+        assert!(!H5D_virtual_check_min_dims(&mapping, &[2, 2]));
+    }
+
+    #[test]
+    fn virtual_source_name_parser_and_builder_follow_printf_rules() {
+        assert!(H5D_virtual_parse_source_name("plain.h5").unwrap().is_none());
+
+        let parsed = H5D_virtual_parse_source_name("run_%b/part_%%_%b.h5")
+            .unwrap()
+            .expect("printf source name should parse");
+        assert_eq!(parsed.substitutions, 2);
+        assert_eq!(parsed.static_strlen, "run_/part_%_.h5".len());
+        assert_eq!(
+            H5D__virtual_build_source_name("ignored", Some(&parsed), 42).unwrap(),
+            "run_42/part_%_42.h5"
+        );
+
+        let escaped = H5D_virtual_parse_source_name("literal_%%.h5")
+            .unwrap()
+            .expect("escaped percent should allocate parsed name");
+        assert_eq!(escaped.substitutions, 0);
+        assert_eq!(
+            H5D__virtual_build_source_name("literal_%%.h5", Some(&escaped), 7).unwrap(),
+            "literal_%.h5"
+        );
+        H5D_virtual_free_parsed_name(Some(escaped));
+    }
+
+    #[test]
+    fn virtual_source_name_parser_rejects_bad_format_specifiers() {
+        assert!(matches!(
+            H5D_virtual_parse_source_name("bad_%x.h5"),
+            Err(Error::InvalidFormat(_))
+        ));
+        assert!(matches!(
+            H5D_virtual_parse_source_name("bad_%"),
+            Err(Error::InvalidFormat(_))
+        ));
+
+        let malformed = VirtualParsedName {
+            segments: vec!["a".to_string()],
+            static_strlen: 1,
+            substitutions: 1,
+        };
+        assert!(matches!(
+            H5D__virtual_build_source_name("ignored", Some(&malformed), 0),
+            Err(Error::InvalidFormat(_))
+        ));
+    }
+
+    #[test]
+    fn scatter_and_contiguous_reads_reject_bad_spans() {
+        assert_eq!(
+            H5D__scatter_file_checked(b"abcdef", &[(1, 2), (4, 2)]).unwrap(),
+            vec![b"bc".to_vec(), b"ef".to_vec()]
+        );
+        assert_eq!(
+            H5D__scatter_file(b"abcdef", &[(1, 2), (4, 2)]).unwrap(),
+            vec![b"bc".to_vec(), b"ef".to_vec()]
+        );
+        assert!(H5D__scatter_file_checked(b"abc", &[(usize::MAX, 1)]).is_err());
+        assert!(H5D__scatter_file_checked(b"abc", &[(2, 2)]).is_err());
+        assert!(H5D__scatter_file(b"abc", &[(usize::MAX, 1)]).is_err());
+        assert!(H5D__scatgath_read_select(b"abc", &[(2, 2)]).is_err());
+
+        let storage = ContiguousStorage {
+            addr: Some(0),
+            data: b"abcdef".to_vec(),
+            cached: false,
+            allocated: true,
+        };
+        assert_eq!(
+            H5D__contig_readvv(&storage, &[(0, 3)]).unwrap(),
+            vec![b"abc".to_vec()]
+        );
+        assert!(H5D__contig_readvv(&storage, &[(5, 2)]).is_err());
     }
 }

@@ -1,4 +1,5 @@
 use crate::error::{Error, Result};
+use crate::io::reader::UNDEF_ADDR;
 
 /// Parsed Symbol Table message (type 0x0011).
 /// Points to a v1 B-tree and local heap for group membership.
@@ -13,7 +14,12 @@ pub struct SymbolTableMessage {
 impl SymbolTableMessage {
     /// Decode from raw message bytes. `sizeof_addr` determines address width.
     pub fn decode(data: &[u8], sizeof_addr: u8) -> Result<Self> {
-        let sa = sizeof_addr as usize;
+        let sa = usize::from(sizeof_addr);
+        if !(1..=8).contains(&sa) {
+            return Err(Error::InvalidFormat(format!(
+                "symbol table address size {sa} is invalid"
+            )));
+        }
         let expected_len = sa.checked_mul(2).ok_or_else(|| {
             Error::InvalidFormat("symbol table message address size overflow".into())
         })?;
@@ -22,9 +28,18 @@ impl SymbolTableMessage {
                 "symbol table message too short".into(),
             ));
         }
-
         let btree_addr = read_addr(data, 0, sa)?;
         let name_heap_addr = read_addr(data, sa, sa)?;
+        if is_undefined_addr(btree_addr, sa) {
+            return Err(Error::InvalidFormat(
+                "symbol table B-tree address is undefined".into(),
+            ));
+        }
+        if is_undefined_addr(name_heap_addr, sa) {
+            return Err(Error::InvalidFormat(
+                "symbol table local heap address is undefined".into(),
+            ));
+        }
 
         Ok(Self {
             btree_addr,
@@ -45,6 +60,15 @@ fn read_addr(data: &[u8], offset: usize, size: usize) -> Result<u64> {
         val |= u64::from(*byte) << (i * 8);
     }
     Ok(val)
+}
+
+fn is_undefined_addr(addr: u64, size: usize) -> bool {
+    if size >= 8 {
+        addr == UNDEF_ADDR
+    } else {
+        let mask = (1u64 << (size * 8)) - 1;
+        addr == mask
+    }
 }
 
 fn checked_window<'a>(

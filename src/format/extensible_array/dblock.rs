@@ -8,6 +8,7 @@
 use std::io::{Read, Seek};
 
 use crate::error::{Error, Result};
+use crate::format::checksum::checksum_metadata;
 use crate::io::reader::{is_undef_addr, HdfReader};
 
 use super::fixed_array::FixedArrayElement;
@@ -48,13 +49,20 @@ pub(super) fn cache_dblock_image_len(
         })
 }
 
-pub(super) fn cache_dblock_serialize(prefix: &[u8], payload: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(prefix.len() + payload.len() + 4);
+pub(super) fn cache_dblock_serialize(prefix: &[u8], payload: &[u8]) -> Result<Vec<u8>> {
+    let image_len = prefix
+        .len()
+        .checked_add(payload.len())
+        .and_then(|value| value.checked_add(4))
+        .ok_or_else(|| {
+            Error::InvalidFormat("extensible array data block image length overflow".into())
+        })?;
+    let mut out = Vec::with_capacity(image_len);
     out.extend_from_slice(prefix);
     out.extend_from_slice(payload);
     let checksum = crate::format::checksum::checksum_metadata(&out);
     out.extend_from_slice(&checksum.to_le_bytes());
-    out
+    Ok(out)
 }
 
 pub(super) fn cache_dblock_notify(_prefix: &ExtArrayDataBlockPrefix) {}
@@ -184,15 +192,22 @@ pub(super) fn decode_data_block_prefix<R: Read + Seek>(
 
     let _block_offset = reader.read_uint(header.array_offset_size)?;
     let pages = super::data_block_pages(header, data_block_elements);
+    if pages > 0 {
+        verify_reader_checksum(
+            reader,
+            data_block_addr,
+            "extensible array data block prefix",
+        )?;
+    }
     let prefix_size = super::checked_usize_add(
         4 + 1 + 1,
-        reader.sizeof_addr() as usize,
+        usize::from(reader.sizeof_addr()),
         "extensible array data block prefix size",
     )
     .and_then(|value| {
         super::checked_usize_add(
             value,
-            header.array_offset_size as usize,
+            usize::from(header.array_offset_size),
             "extensible array data block prefix size",
         )
     })
@@ -272,7 +287,7 @@ pub(super) fn append_data_block_elements<R: Read + Seek>(
                 "extensible array unread data block span",
             )?)?;
         }
-        let _checksum = reader.read_u32()?;
+        verify_reader_checksum(reader, data_block_addr, "extensible array data block")?;
     } else {
         let page_payload = super::checked_usize_mul(
             header.data_block_page_elements,
@@ -315,6 +330,7 @@ pub(super) fn append_data_block_elements<R: Read + Seek>(
                 for _ in 0..page_elements {
                     elements.push(read_element(reader, filtered, chunk_size_len)?);
                 }
+                verify_reader_checksum(reader, page_addr, "extensible array data block page")?;
             } else {
                 super::append_fill_elements(header, page_elements, elements)?;
             }
@@ -322,6 +338,33 @@ pub(super) fn append_data_block_elements<R: Read + Seek>(
         }
     }
 
+    Ok(())
+}
+
+fn verify_reader_checksum<R: Read + Seek>(
+    reader: &mut HdfReader<R>,
+    start: u64,
+    context: &str,
+) -> Result<()> {
+    let checksum_pos = reader.position()?;
+    let stored = reader.read_u32()?;
+    let check_len = usize::try_from(
+        checksum_pos
+            .checked_sub(start)
+            .ok_or_else(|| Error::InvalidFormat(format!("{context} checksum span underflow")))?,
+    )
+    .map_err(|_| Error::InvalidFormat(format!("{context} checksum span is too large")))?;
+    reader.seek(start)?;
+    let bytes = reader.read_bytes(check_len)?;
+    let computed = checksum_metadata(&bytes);
+    if stored != computed {
+        return Err(Error::InvalidFormat(format!(
+            "{context} checksum mismatch: stored={stored:#010x}, computed={computed:#010x}"
+        )));
+    }
+    reader.seek(checksum_pos.checked_add(4).ok_or_else(|| {
+        Error::InvalidFormat(format!("{context} checksum end offset overflow"))
+    })?)?;
     Ok(())
 }
 
@@ -345,5 +388,117 @@ pub(super) fn read_element<R: Read + Seek>(
             nbytes: None,
             filter_mask: 0,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+
+    use crate::io::HdfReader;
+
+    use super::*;
+
+    fn header(data_block_page_elements: usize) -> ExtensibleArrayHeader {
+        ExtensibleArrayHeader {
+            class_id: 1,
+            raw_element_size: 8,
+            index_block_elements: 0,
+            max_index_set: 0,
+            index_block_addr: 0,
+            array_offset_size: 1,
+            data_block_page_elements,
+            index_block_super_blocks: 0,
+            index_block_data_block_addrs: 0,
+            index_block_super_block_addrs: 0,
+            super_block_info: Vec::new(),
+        }
+    }
+
+    fn append_checksum(bytes: &mut Vec<u8>) {
+        let checksum = checksum_metadata(bytes);
+        bytes.extend_from_slice(&checksum.to_le_bytes());
+    }
+
+    fn extensible_array_prefix(owner: u64) -> Vec<u8> {
+        let mut bytes = b"EADB".to_vec();
+        bytes.push(0);
+        bytes.push(1);
+        bytes.extend_from_slice(&owner.to_le_bytes());
+        bytes.push(0); // block offset, array_offset_size = 1
+        bytes
+    }
+
+    #[test]
+    fn extensible_array_unpaginated_rejects_bad_checksum() {
+        let mut bytes = extensible_array_prefix(100);
+        bytes.extend_from_slice(&55u64.to_le_bytes());
+        append_checksum(&mut bytes);
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xff;
+
+        let mut elements = Vec::new();
+        let mut reader = HdfReader::new(Cursor::new(bytes));
+        let err = append_data_block_elements(
+            &mut reader,
+            100,
+            &header(4),
+            false,
+            0,
+            0,
+            1,
+            None,
+            1,
+            &mut elements,
+        )
+        .expect_err("bad extensible array data block checksum should fail");
+        assert!(err.to_string().contains("checksum"));
+    }
+
+    #[test]
+    fn extensible_array_paginated_rejects_bad_prefix_and_page_checksums() {
+        let mut bytes = extensible_array_prefix(100);
+        append_checksum(&mut bytes);
+        bytes.extend_from_slice(&55u64.to_le_bytes());
+        append_checksum(&mut bytes);
+
+        let mut bad_prefix = bytes.clone();
+        bad_prefix[14] ^= 0xff;
+        let mut elements = Vec::new();
+        let mut reader = HdfReader::new(Cursor::new(bad_prefix));
+        let err = append_data_block_elements(
+            &mut reader,
+            100,
+            &header(1),
+            false,
+            0,
+            0,
+            2,
+            Some(&[0x80]),
+            1,
+            &mut elements,
+        )
+        .expect_err("bad extensible array data block prefix checksum should fail");
+        assert!(err.to_string().contains("checksum"));
+
+        let mut bad_page = bytes;
+        let last = bad_page.len() - 1;
+        bad_page[last] ^= 0xff;
+        let mut elements = Vec::new();
+        let mut reader = HdfReader::new(Cursor::new(bad_page));
+        let err = append_data_block_elements(
+            &mut reader,
+            100,
+            &header(1),
+            false,
+            0,
+            0,
+            2,
+            Some(&[0x80]),
+            1,
+            &mut elements,
+        )
+        .expect_err("bad extensible array data block page checksum should fail");
+        assert!(err.to_string().contains("checksum"));
     }
 }

@@ -36,9 +36,9 @@ pub fn decompress(data: &[u8], client_data: &[u32]) -> Result<Vec<u8>> {
     }
 
     let scale_type = client_data[PARM_SCALETYPE];
-    let nelmts = client_data[PARM_NELMTS] as usize;
+    let nelmts = scaleoffset_usize(client_data[PARM_NELMTS], "scaleoffset element count")?;
     let class = client_data[PARM_CLASS];
-    let size = client_data[PARM_SIZE] as usize;
+    let size = scaleoffset_usize(client_data[PARM_SIZE], "scaleoffset datatype size")?;
     let sign = client_data[PARM_SIGN];
     let order = client_data[PARM_ORDER];
 
@@ -62,9 +62,12 @@ pub fn decompress(data: &[u8], client_data: &[u32]) -> Result<Vec<u8>> {
         return Err(Error::InvalidFormat("scaleoffset data too short".into()));
     }
 
-    let minbits = read_u32_le_at(data, 0, "scaleoffset minimum bit count")? as usize;
+    let minbits = scaleoffset_usize(
+        read_u32_le_at(data, 0, "scaleoffset minimum bit count")?,
+        "scaleoffset minimum bit count",
+    )?;
     validate_scaleoffset_parameters(class, sign, size, minbits)?;
-    let minval_size = data[4] as usize;
+    let minval_size = usize::from(data[4]);
     if minval_size > 16 {
         return Err(Error::InvalidFormat(
             "invalid scaleoffset minimum value header".into(),
@@ -140,7 +143,7 @@ pub fn can_apply_scaleoffset(client_data: &[u32]) -> Result<()> {
     }
     let scale_type = client_data[PARM_SCALETYPE];
     let class = client_data[PARM_CLASS];
-    let size = client_data[PARM_SIZE] as usize;
+    let size = scaleoffset_usize(client_data[PARM_SIZE], "scaleoffset datatype size")?;
     let sign = client_data[PARM_SIGN];
     let order = client_data[PARM_ORDER];
     if size == 0 {
@@ -205,9 +208,9 @@ pub fn filter_scaleoffset(data: &[u8], client_data: &[u32], reverse: bool) -> Re
 pub fn scaleoffset_compress(data: &[u8], client_data: &[u32]) -> Result<Vec<u8>> {
     can_apply_scaleoffset(client_data)?;
     let scale_type = client_data[PARM_SCALETYPE];
-    let nelmts = client_data[PARM_NELMTS] as usize;
+    let nelmts = scaleoffset_usize(client_data[PARM_NELMTS], "scaleoffset element count")?;
     let class = client_data[PARM_CLASS];
-    let size = client_data[PARM_SIZE] as usize;
+    let size = scaleoffset_usize(client_data[PARM_SIZE], "scaleoffset datatype size")?;
     let sign = client_data[PARM_SIGN];
     let order = client_data[PARM_ORDER];
     let expected = nelmts
@@ -237,9 +240,16 @@ pub fn scaleoffset_compress(data: &[u8], client_data: &[u32]) -> Result<Vec<u8>>
     };
 
     let mut out = vec![0u8; HEADER_LEN];
-    out[..4].copy_from_slice(&(minbits as u32).to_le_bytes());
+    let minbits_u32 = u32::try_from(minbits).map_err(|_| {
+        Error::InvalidFormat("scaleoffset minimum bit count does not fit in u32".into())
+    })?;
+    out[..4].copy_from_slice(&minbits_u32.to_le_bytes());
     out[4] = size as u8;
-    write_uint(&mut out[5..5 + size], ORDER_LE, minval);
+    write_uint(
+        checked_window_mut(&mut out, 5, size, "scaleoffset minimum value header")?,
+        ORDER_LE,
+        minval,
+    );
 
     if minbits == size * 8 {
         out.extend_from_slice(&data[..expected]);
@@ -289,8 +299,11 @@ pub fn scaleoffset_precompress_i(
     let minbits = if max_delta == 0 {
         0
     } else {
-        scaleoffset_log2(max_delta as u64)
-            .map(|bits| bits as usize + 1)
+        u64::try_from(max_delta)
+            .ok()
+            .and_then(scaleoffset_log2)
+            .and_then(|bits| usize::try_from(bits).ok())
+            .and_then(|bits| bits.checked_add(1))
             .unwrap_or(size * 8)
             .min(size * 8)
     };
@@ -300,7 +313,12 @@ pub fn scaleoffset_precompress_i(
             .checked_mul(size)
             .ok_or_else(|| Error::InvalidFormat("scaleoffset packed offset overflow".into()))?;
         write_uint(
-            &mut packed[offset..offset + size],
+            checked_window_mut(
+                &mut packed,
+                offset,
+                size,
+                "scaleoffset packed integer value",
+            )?,
             order,
             value.wrapping_sub(minval),
         );
@@ -326,7 +344,8 @@ pub fn scaleoffset_precompress_fd(
         .get(1)
         .copied()
         .ok_or_else(|| Error::InvalidFormat("scaleoffset missing scale factor".into()))?
-        as i32;
+        .to_ne_bytes();
+    let scale = i32::from_ne_bytes(scale);
     let multiplier = 10f64.powi(scale);
     let values: Vec<f64> = data
         .chunks_exact(size)
@@ -359,7 +378,8 @@ pub fn scaleoffset_precompress_fd(
     let minbits = if max_delta == 0 {
         0
     } else {
-        (u128::BITS - max_delta.leading_zeros()) as usize
+        usize::try_from(u128::BITS - max_delta.leading_zeros())
+            .map_err(|_| Error::InvalidFormat("scaleoffset bit count overflow".into()))?
     }
     .min(size * 8);
     let mut packed = vec![0u8; data.len()];
@@ -368,7 +388,11 @@ pub fn scaleoffset_precompress_fd(
         let offset = idx
             .checked_mul(size)
             .ok_or_else(|| Error::InvalidFormat("scaleoffset packed offset overflow".into()))?;
-        write_uint(&mut packed[offset..offset + size], order, delta);
+        write_uint(
+            checked_window_mut(&mut packed, offset, size, "scaleoffset packed float value")?,
+            order,
+            delta,
+        );
     }
     let minval = if size == 4 {
         (min as f32).to_bits() as u128
@@ -537,7 +561,7 @@ fn scaleoffset_compress_one_byte(
     } else {
         ((1u16 << bits_to_copy) - 1) as u8
     };
-    writer.write_bits((byte & mask) as u16, bits_to_copy)
+    writer.write_bits(u16::from(byte & mask), bits_to_copy)
 }
 
 fn postprocess_integer(
@@ -589,7 +613,8 @@ fn postprocess_float(
         .get(1)
         .copied()
         .ok_or_else(|| Error::InvalidFormat("scaleoffset missing scale factor".into()))?
-        as i32;
+        .to_ne_bytes();
+    let scale = i32::from_ne_bytes(scale);
     let divisor = 10f64.powi(scale);
     let marker = if minbits > 0 && minbits < 128 {
         Some((1u128 << minbits) - 1)
@@ -604,35 +629,35 @@ fn postprocess_float(
 
     match size {
         4 => {
-            let min = f32::from_le_bytes((minval as u32).to_le_bytes()) as f64;
-            let fill = fill.map(|v| f32::from_le_bytes((v as u32).to_le_bytes()));
+            let min = f64::from(f32::from_le_bytes(low_u32(minval).to_le_bytes()));
+            let fill = fill.map(|v| f32::from_le_bytes(low_u32(v).to_le_bytes()));
             for chunk in out.chunks_exact_mut(size) {
                 let packed = read_uint(chunk, order);
                 let value = if let (Some(marker), Some(fill)) = (marker, fill) {
                     if packed == marker {
                         fill
                     } else {
-                        (packed as i64 as f64 / divisor + min) as f32
+                        (signed_low_i64(packed) as f64 / divisor + min) as f32
                     }
                 } else {
-                    (packed as i64 as f64 / divisor + min) as f32
+                    (signed_low_i64(packed) as f64 / divisor + min) as f32
                 };
                 write_float32(chunk, order, value);
             }
         }
         8 => {
-            let min = f64::from_le_bytes((minval as u64).to_le_bytes());
-            let fill = fill.map(|v| f64::from_le_bytes((v as u64).to_le_bytes()));
+            let min = f64::from_le_bytes(low_u64(minval).to_le_bytes());
+            let fill = fill.map(|v| f64::from_le_bytes(low_u64(v).to_le_bytes()));
             for chunk in out.chunks_exact_mut(size) {
                 let packed = read_uint(chunk, order);
                 let value = if let (Some(marker), Some(fill)) = (marker, fill) {
                     if packed == marker {
                         fill
                     } else {
-                        packed as i64 as f64 / divisor + min
+                        signed_low_i64(packed) as f64 / divisor + min
                     }
                 } else {
-                    packed as i64 as f64 / divisor + min
+                    signed_low_i64(packed) as f64 / divisor + min
                 };
                 write_float64(chunk, order, value);
             }
@@ -651,14 +676,30 @@ fn read_uint(bytes: &[u8], order: u32) -> u128 {
     let mut value = 0u128;
     if order == ORDER_LE {
         for (idx, byte) in bytes.iter().take(16).enumerate() {
-            value |= (*byte as u128) << (idx * 8);
+            value |= u128::from(*byte) << (idx * 8);
         }
     } else {
         for byte in bytes.iter().take(16) {
-            value = (value << 8) | (*byte as u128);
+            value = (value << 8) | u128::from(*byte);
         }
     }
     value
+}
+
+fn low_u32(value: u128) -> u32 {
+    let bytes = value.to_le_bytes();
+    u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+}
+
+fn low_u64(value: u128) -> u64 {
+    let bytes = value.to_le_bytes();
+    u64::from_le_bytes([
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+    ])
+}
+
+fn signed_low_i64(value: u128) -> i64 {
+    i64::from_le_bytes(low_u64(value).to_le_bytes())
 }
 
 fn write_uint(bytes: &mut [u8], order: u32, value: u128) {
@@ -677,7 +718,7 @@ fn write_uint(bytes: &mut [u8], order: u32, value: u128) {
 fn read_le_u128(bytes: &[u8]) -> u128 {
     let mut value = 0u128;
     for (idx, byte) in bytes.iter().take(16).enumerate() {
-        value |= (*byte as u128) << (idx * 8);
+        value |= u128::from(*byte) << (idx * 8);
     }
     value
 }
@@ -687,6 +728,11 @@ fn read_u32_le_at(data: &[u8], offset: usize, context: &str) -> Result<u32> {
     Ok(u32::from_le_bytes(bytes.try_into().map_err(|_| {
         Error::InvalidFormat(format!("{context} is truncated"))
     })?))
+}
+
+fn scaleoffset_usize(value: u32, context: &'static str) -> Result<usize> {
+    usize::try_from(value)
+        .map_err(|_| Error::InvalidFormat(format!("{context} does not fit in usize")))
 }
 
 fn checked_window<'a>(
@@ -699,6 +745,19 @@ fn checked_window<'a>(
         .checked_add(len)
         .ok_or_else(|| Error::InvalidFormat(format!("{context} offset overflow")))?;
     data.get(offset..end)
+        .ok_or_else(|| Error::InvalidFormat(format!("{context} is truncated")))
+}
+
+fn checked_window_mut<'a>(
+    data: &'a mut [u8],
+    offset: usize,
+    len: usize,
+    context: &str,
+) -> Result<&'a mut [u8]> {
+    let end = offset
+        .checked_add(len)
+        .ok_or_else(|| Error::InvalidFormat(format!("{context} offset overflow")))?;
+    data.get_mut(offset..end)
         .ok_or_else(|| Error::InvalidFormat(format!("{context} is truncated")))
 }
 
@@ -768,7 +827,7 @@ impl<'a> BitStream<'a> {
             } else {
                 ((1u16 << take) - 1) as u8
             };
-            value = (value << take) | (((byte >> shift) & mask) as u16);
+            value = (value << take) | u16::from((byte >> shift) & mask);
             self.bits_left -= take;
             nbits -= take;
             if self.bits_left == 0 {
@@ -814,7 +873,8 @@ impl BitWriter {
             } else {
                 (1u16 << take) - 1
             };
-            let bits = ((value >> shift) & mask) as u8;
+            let bits = u8::try_from((value >> shift) & mask)
+                .map_err(|_| Error::InvalidFormat("scaleoffset bit run exceeds byte".into()))?;
             self.current |= bits << (free - take);
             self.bits_used += take;
             nbits -= take;
@@ -981,6 +1041,18 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("scaleoffset test window offset overflow"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn checked_window_mut_rejects_offset_overflow() {
+        let mut data = [];
+        let err = checked_window_mut(&mut data, usize::MAX, 1, "scaleoffset test mutable window")
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("scaleoffset test mutable window offset overflow"),
             "unexpected error: {err}"
         );
     }

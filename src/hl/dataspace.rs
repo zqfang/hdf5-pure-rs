@@ -93,7 +93,7 @@ impl Dataspace {
 
     /// Number of dimensions.
     pub fn ndim(&self) -> usize {
-        self.msg.ndims as usize
+        usize::from(self.msg.ndims)
     }
 
     /// Internal simple-extent rank helper.
@@ -279,6 +279,180 @@ impl Dataspace {
     }
 }
 
+#[allow(non_snake_case)]
+pub fn H5S_init() -> bool {
+    Dataspace::init()
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__init_package() -> bool {
+    Dataspace::init_package()
+}
+
+#[allow(non_snake_case)]
+pub fn H5S_top_term_package() {
+    Dataspace::top_term_package()
+}
+
+#[allow(non_snake_case)]
+pub fn H5S_term_package() {
+    Dataspace::term_package()
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__close_cb(space: Dataspace) {
+    space.close_cb()
+}
+
+#[allow(non_snake_case)]
+pub fn H5S_create(space_type: DataspaceType) -> Dataspace {
+    Dataspace::create(space_type)
+}
+
+#[allow(non_snake_case)]
+pub fn H5Screate_simple(dims: Vec<u64>, max_dims: Option<Vec<u64>>) -> crate::Result<Dataspace> {
+    Dataspace::simple(dims, max_dims)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S_copy(space: &Dataspace) -> Dataspace {
+    space.copy()
+}
+
+#[allow(non_snake_case)]
+pub fn H5S_get_npoints_max(space: &Dataspace) -> u64 {
+    space.npoints_max()
+}
+
+#[allow(non_snake_case)]
+pub fn H5S_get_simple_extent_ndims(space: &Dataspace) -> usize {
+    space.simple_extent_ndims()
+}
+
+#[allow(non_snake_case)]
+pub fn H5Sget_simple_extent_ndims(space: &Dataspace) -> usize {
+    H5S_get_simple_extent_ndims(space)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S_extent_get_dims(space: &Dataspace) -> (Vec<u64>, Option<Vec<u64>>) {
+    let (dims, max_dims) = space.extent_dims();
+    (dims.to_vec(), max_dims.map(|dims| dims.to_vec()))
+}
+
+#[allow(non_snake_case)]
+pub fn H5S_get_simple_extent_dims(space: &Dataspace) -> (Vec<u64>, Option<Vec<u64>>) {
+    H5S_extent_get_dims(space)
+}
+
+#[allow(non_snake_case)]
+pub fn H5Sget_simple_extent_dims(space: &Dataspace) -> (Vec<u64>, Option<Vec<u64>>) {
+    H5S_get_simple_extent_dims(space)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__is_simple(space: &Dataspace) -> bool {
+    space.is_simple_internal()
+}
+
+#[allow(non_snake_case)]
+pub fn H5Sis_simple(space: &Dataspace) -> bool {
+    space.is_simple()
+}
+
+#[allow(non_snake_case)]
+pub fn H5S_get_simple_extent(space: &Dataspace) -> Dataspace {
+    Dataspace::from_message(space.simple_extent())
+}
+
+#[allow(non_snake_case)]
+pub fn H5S_get_simple_extent_type(space: &Dataspace) -> DataspaceType {
+    space.simple_extent_type()
+}
+
+#[allow(non_snake_case)]
+pub fn H5Sget_simple_extent_type(space: &Dataspace) -> DataspaceType {
+    H5S_get_simple_extent_type(space)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S_get_simple_extent_npoints(space: &Dataspace) -> u64 {
+    space.extent_nelem()
+}
+
+#[allow(non_snake_case)]
+pub fn H5Sget_simple_extent_npoints(space: &Dataspace) -> u64 {
+    H5S_get_simple_extent_npoints(space)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S_has_extent(space: &Dataspace) -> bool {
+    space.has_extent()
+}
+
+#[allow(non_snake_case)]
+pub fn H5S_set_extent_real(
+    space: &mut Dataspace,
+    dims: Vec<u64>,
+    max_dims: Option<Vec<u64>>,
+) -> crate::Result<()> {
+    space.set_extent_real(dims, max_dims)
+}
+
+#[allow(non_snake_case)]
+pub fn H5Sset_extent_simple(
+    space: &mut Dataspace,
+    dims: Vec<u64>,
+    max_dims: Option<Vec<u64>>,
+) -> crate::Result<()> {
+    space.set_extent_simple(dims, max_dims)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S_select_offset(space: &Dataspace, offsets: &[i64]) -> crate::Result<Vec<i64>> {
+    space.offset_simple(offsets)
+}
+
+#[allow(non_snake_case)]
+pub fn H5Soffset_simple(space: &Dataspace, offsets: &[i64]) -> crate::Result<Vec<i64>> {
+    H5S_select_offset(space, offsets)
+}
+
+#[allow(non_snake_case)]
+pub fn H5Sextent_equal(left: &Dataspace, right: &Dataspace) -> bool {
+    left.extent_equal(right)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S_extent_equal(left: &Dataspace, right: &Dataspace) -> bool {
+    H5Sextent_equal(left, right)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S_extent_nelem(space: &Dataspace) -> u64 {
+    space.extent_nelem()
+}
+
+#[allow(non_snake_case)]
+pub fn H5S_debug(space: &Dataspace) -> String {
+    space.debug()
+}
+
+#[allow(non_snake_case)]
+pub fn H5S_mpio_space_type(space: &Dataspace) -> DataspaceType {
+    space.mpio_space_type()
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__obtain_datatype(space: &Dataspace) -> DataspaceType {
+    space.obtain_datatype()
+}
+
+#[allow(non_snake_case)]
+pub fn H5S_set_version(space: &mut Dataspace, version: u8) -> crate::Result<()> {
+    space.set_version(version)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -298,5 +472,51 @@ mod tests {
         assert_eq!(space.offset_simple(&[1, -1]).unwrap(), vec![1, -1]);
         assert!(space.offset_simple(&[0]).is_err());
         space.close_cb();
+    }
+
+    #[test]
+    fn h5s_extent_aliases_roundtrip() {
+        assert!(H5S_init());
+        assert!(H5S__init_package());
+        H5S_top_term_package();
+        H5S_term_package();
+
+        let mut space = Dataspace::simple(vec![2, 3], Some(vec![4, u64::MAX])).unwrap();
+        assert_eq!(H5S_get_simple_extent_ndims(&space), 2);
+        assert_eq!(H5Sget_simple_extent_ndims(&space), 2);
+        assert_eq!(
+            H5Screate_simple(vec![2, 3], Some(vec![4, u64::MAX])).unwrap(),
+            space
+        );
+        assert_eq!(
+            H5S_extent_get_dims(&space),
+            (vec![2, 3], Some(vec![4, u64::MAX]))
+        );
+        assert_eq!(H5S_get_npoints_max(&space), u64::MAX);
+        assert_eq!(H5S_extent_nelem(&space), 6);
+        assert_eq!(H5S_get_simple_extent_npoints(&space), 6);
+        assert_eq!(H5Sget_simple_extent_npoints(&space), 6);
+        assert_eq!(H5S_get_simple_extent_type(&space), DataspaceType::Simple);
+        assert_eq!(H5S_select_offset(&space, &[1, -1]).unwrap(), vec![1, -1]);
+        assert!(H5Soffset_simple(&space, &[0]).is_err());
+        assert!(H5S_has_extent(&space));
+        assert!(H5S__is_simple(&space));
+        assert!(H5Sis_simple(&space));
+        assert!(H5S_debug(&space).contains("Simple"));
+        assert_eq!(H5S_mpio_space_type(&space), DataspaceType::Simple);
+        assert_eq!(H5S__obtain_datatype(&space), DataspaceType::Simple);
+
+        let copied = H5S_copy(&space);
+        assert!(H5S_extent_equal(&space, &copied));
+        H5S_set_extent_real(&mut space, vec![5], Some(vec![10])).unwrap();
+        assert!(!H5Sextent_equal(&space, &copied));
+        H5Sset_extent_simple(&mut space, vec![2, 3], Some(vec![4, 5])).unwrap();
+        assert_eq!(
+            H5S_get_simple_extent_dims(&space),
+            (vec![2, 3], Some(vec![4, 5]))
+        );
+        H5S_set_version(&mut space, 1).unwrap();
+        assert_eq!(space.raw_message().version, 1);
+        H5S__close_cb(H5S_create(DataspaceType::Scalar));
     }
 }

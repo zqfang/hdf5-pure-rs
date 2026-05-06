@@ -2,7 +2,6 @@
 ///
 /// This is a direct translation of Bob Jenkins' lookup3 hashlittle() function
 /// from the HDF5 C source (H5checksum.c). It must produce bit-identical output.
-
 #[inline]
 fn rot(x: u32, k: u32) -> u32 {
     (x << k) ^ (x >> (32 - k))

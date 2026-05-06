@@ -28,6 +28,14 @@ pub struct FixedArrayStats {
     pub flush_dependencies: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FixedArrayElementLocation {
+    pub element_addr: u64,
+    pub checksum_start: u64,
+    pub checksum_len: usize,
+    pub checksum_addr: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FixedArray {
     elements: Vec<FixedArrayElement>,
@@ -154,12 +162,14 @@ pub fn test_fill(count: usize) -> Vec<FixedArrayElement> {
     elements
 }
 
-pub fn test_encode(params: &FixedArrayCreateParams) -> Vec<u8> {
+pub fn test_encode(params: &FixedArrayCreateParams) -> Result<Vec<u8>> {
     let mut out = Vec::new();
-    out.extend_from_slice(&(params.raw_element_size as u64).to_le_bytes());
+    out.extend_from_slice(
+        &u64_from_usize(params.raw_element_size, "fixed array raw element size")?.to_le_bytes(),
+    );
     out.push(params.max_page_elements_bits);
     out.extend_from_slice(&params.elements.to_le_bytes());
-    out
+    Ok(out)
 }
 
 pub fn test_decode(data: &[u8]) -> Result<FixedArrayCreateParams> {
@@ -168,21 +178,32 @@ pub fn test_decode(data: &[u8]) -> Result<FixedArrayCreateParams> {
             "fixed array test params are truncated".into(),
         ));
     }
-    let raw_element_size =
-        u64::from_le_bytes(data[0..8].try_into().map_err(|_| {
-            Error::InvalidFormat("fixed array raw element size is truncated".into())
-        })?) as usize;
+    let raw_element_size = usize_from_u64(
+        read_u64_le_at(data, 0, "fixed array raw element size")?,
+        "fixed array raw element size",
+    )?;
     let max_page_elements_bits = data[8];
-    let elements = u64::from_le_bytes(
-        data[9..17]
-            .try_into()
-            .map_err(|_| Error::InvalidFormat("fixed array element count is truncated".into()))?,
-    );
+    let elements = read_u64_le_at(data, 9, "fixed array element count")?;
     Ok(FixedArrayCreateParams {
         raw_element_size,
         max_page_elements_bits,
         elements,
     })
+}
+
+fn checked_window<'a>(data: &'a [u8], pos: usize, len: usize, context: &str) -> Result<&'a [u8]> {
+    let end = pos
+        .checked_add(len)
+        .ok_or_else(|| Error::InvalidFormat(format!("{context} offset overflow")))?;
+    data.get(pos..end)
+        .ok_or_else(|| Error::InvalidFormat(format!("{context} is truncated")))
+}
+
+fn read_u64_le_at(data: &[u8], pos: usize, context: &str) -> Result<u64> {
+    let bytes = checked_window(data, pos, 8, context)?;
+    Ok(u64::from_le_bytes(bytes.try_into().map_err(|_| {
+        Error::InvalidFormat(format!("{context} is truncated"))
+    })?))
 }
 
 pub fn test_debug(params: &FixedArrayCreateParams) -> String {
@@ -237,6 +258,23 @@ pub fn locate_fixed_array_element<R: Read + Seek>(
     chunk_size_len: usize,
     element_index: usize,
 ) -> Result<u64> {
+    Ok(locate_fixed_array_element_with_checksum(
+        reader,
+        addr,
+        filtered,
+        chunk_size_len,
+        element_index,
+    )?
+    .element_addr)
+}
+
+pub fn locate_fixed_array_element_with_checksum<R: Read + Seek>(
+    reader: &mut HdfReader<R>,
+    addr: u64,
+    filtered: bool,
+    chunk_size_len: usize,
+    element_index: usize,
+) -> Result<FixedArrayElementLocation> {
     let header = read_header(reader, addr)?;
     let expected_class = if filtered { 1 } else { 0 };
     if header.class_id != expected_class {
@@ -259,9 +297,17 @@ pub fn locate_fixed_array_element<R: Read + Seek>(
     }
 
     let expected_element_size = if filtered {
-        reader.sizeof_addr() as usize + chunk_size_len + 4
+        checked_usize_add(
+            checked_usize_add(
+                usize::from(reader.sizeof_addr()),
+                chunk_size_len,
+                "fixed array raw element size",
+            )?,
+            4,
+            "fixed array raw element size",
+        )?
     } else {
-        reader.sizeof_addr() as usize
+        usize::from(reader.sizeof_addr())
     };
     if header.raw_element_size != expected_element_size {
         return Err(Error::InvalidFormat(format!(
@@ -271,11 +317,11 @@ pub fn locate_fixed_array_element<R: Read + Seek>(
     }
 
     let page_elements = 1usize
-        .checked_shl(header.max_page_elements_bits as u32)
+        .checked_shl(u32::from(header.max_page_elements_bits))
         .ok_or_else(|| Error::InvalidFormat("fixed array page size overflow".into()))?;
     let data_prefix_size = checked_usize_add(
         4 + 1 + 1,
-        reader.sizeof_addr() as usize,
+        usize::from(reader.sizeof_addr()),
         "fixed array data block prefix size",
     )?;
 
@@ -314,23 +360,37 @@ pub fn locate_fixed_array_element<R: Read + Seek>(
             header.raw_element_size,
             "fixed array data block element offset",
         )?;
-        let offset = checked_usize_add(
+        let page_addr_offset = checked_usize_add(
             prefix_size,
             page_offset,
+            "fixed array data block page offset",
+        )?;
+        let offset = checked_usize_add(
+            page_addr_offset,
+            element_offset,
             "fixed array data block element offset",
-        )
-        .and_then(|value| {
-            checked_usize_add(
-                value,
-                element_offset,
-                "fixed array data block element offset",
-            )
-        })?;
-        checked_u64_add(
+        )?;
+        let element_addr = checked_u64_add(
             header.data_block_addr,
             u64_from_usize(offset, "fixed array data block element offset")?,
             "fixed array data block element address",
-        )
+        )?;
+        let page_addr = checked_u64_add(
+            header.data_block_addr,
+            u64_from_usize(page_addr_offset, "fixed array data block page offset")?,
+            "fixed array data block page address",
+        )?;
+        let checksum_addr = checked_u64_add(
+            page_addr,
+            u64_from_usize(page_payload, "fixed array data block page checksum offset")?,
+            "fixed array data block page checksum address",
+        )?;
+        Ok(FixedArrayElementLocation {
+            element_addr,
+            checksum_start: page_addr,
+            checksum_len: page_payload,
+            checksum_addr,
+        })
     } else {
         let element_offset = checked_usize_mul(
             element_index,
@@ -342,11 +402,32 @@ pub fn locate_fixed_array_element<R: Read + Seek>(
             element_offset,
             "fixed array data block element offset",
         )?;
-        checked_u64_add(
+        let element_addr = checked_u64_add(
             header.data_block_addr,
             u64_from_usize(offset, "fixed array data block element offset")?,
             "fixed array data block element address",
-        )
+        )?;
+        let payload_len = checked_usize_mul(
+            element_count,
+            header.raw_element_size,
+            "fixed array data block payload size",
+        )?;
+        let checksum_offset = checked_usize_add(
+            data_prefix_size,
+            payload_len,
+            "fixed array data block checksum offset",
+        )?;
+        let checksum_addr = checked_u64_add(
+            header.data_block_addr,
+            u64_from_usize(checksum_offset, "fixed array data block checksum offset")?,
+            "fixed array data block checksum address",
+        )?;
+        Ok(FixedArrayElementLocation {
+            element_addr,
+            checksum_start: header.data_block_addr,
+            checksum_len: checksum_offset,
+            checksum_addr,
+        })
     }
 }
 

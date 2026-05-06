@@ -44,7 +44,7 @@ impl FractalHeapHeader {
                 self.max_heap_size
             )));
         }
-        if length > self.max_managed_obj_size as u64 {
+        if length > u64::from(self.max_managed_obj_size) {
             return Err(Error::InvalidFormat(format!(
                 "fractal heap object size {length} exceeds max managed object size {}",
                 self.max_managed_obj_size
@@ -82,7 +82,7 @@ impl FractalHeapHeader {
         self.read_from_indirect_block_rows(
             reader,
             block_addr,
-            self.current_root_rows as usize,
+            usize::from(self.current_root_rows),
             0,
             offset,
             length,
@@ -101,7 +101,7 @@ impl FractalHeapHeader {
         offset: u64,
         length: u64,
     ) -> Result<Vec<u8>> {
-        let width = self.table_width as usize;
+        let width = usize::from(self.table_width);
         let max_direct_rows = self.max_direct_rows();
         let mut current_heap_offset = block_start;
         let mut entry_index = 0usize;
@@ -192,11 +192,13 @@ impl FractalHeapHeader {
         offset: u64,
         length: u64,
     ) -> Result<Vec<u8>> {
-        let width = self.table_width as usize;
+        let width = usize::from(self.table_width);
         let dblock_header_size = checked_add_heap_offset(
-            checked_add_heap_offset(5, self.sizeof_addr as u64)?,
+            checked_add_heap_offset(5, u64::from(self.sizeof_addr))?,
             checked_add_heap_offset(
-                iblock.block_offset_bytes as u64,
+                u64::try_from(iblock.block_offset_bytes).map_err(|_| {
+                    Error::InvalidFormat("filtered indirect block offset width overflow".into())
+                })?,
                 if self.has_checksum { 4 } else { 0 },
             )?,
         )?;

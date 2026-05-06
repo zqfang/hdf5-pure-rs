@@ -14,7 +14,7 @@ use super::chunk::read_v2_continuation;
 use super::msg::{read_v1_messages, read_v2_messages};
 use super::{
     ObjectHeader, HDR_ATTR_CRT_ORDER_TRACKED, HDR_ATTR_STORE_PHASE_CHANGE, HDR_CHUNK0_SIZE_MASK,
-    HDR_STORE_TIMES, OHDR_MAGIC,
+    HDR_STORE_TIMES, HDR_V2_KNOWN_FLAGS, MSG_OBJ_REF_COUNT, OHDR_MAGIC,
 };
 
 impl ObjectHeader {
@@ -30,12 +30,11 @@ impl ObjectHeader {
             )));
         }
 
-        // Reserved byte
         reader.skip(1)?;
 
         let num_messages = reader.read_u16()?;
         let refcount = reader.read_u32()?;
-        let chunk_data_size = reader.read_u32()? as u64;
+        let chunk_data_size = u64::from(reader.read_u32()?);
 
         // Reserved/padding to 8-byte boundary (v1 header is 12 bytes after version,
         // total prefix = 1+1+2+4+4 = 12, need to align to 8: 12 is already aligned to 4,
@@ -78,7 +77,8 @@ impl ObjectHeader {
         // actual count (including NIL and HEADER_CONTINUATION); we strip both
         // before pushing, so the kept count must be ≤ declared. A `messages`
         // count exceeding `num_messages` indicates a corrupted header.
-        if messages.len() > num_messages as usize {
+        let num_messages = usize::from(num_messages);
+        if messages.len() > num_messages {
             return Err(Error::InvalidFormat(format!(
                 "object header v1 declared {num_messages} messages but decoded {} non-NIL/non-continuation messages",
                 messages.len()
@@ -114,7 +114,11 @@ impl ObjectHeader {
         }
 
         let flags = reader.read_u8()?;
-
+        if flags & !HDR_V2_KNOWN_FLAGS != 0 {
+            return Err(Error::InvalidFormat(format!(
+                "object header v2 flags contain reserved bits: {flags:#04x}"
+            )));
+        }
         // Optional timestamps
         let (atime, mtime, ctime, btime) = if flags & HDR_STORE_TIMES != 0 {
             (
@@ -129,7 +133,15 @@ impl ObjectHeader {
 
         // Optional attribute phase change
         let (max_compact_attrs, min_dense_attrs) = if flags & HDR_ATTR_STORE_PHASE_CHANGE != 0 {
-            (Some(reader.read_u16()?), Some(reader.read_u16()?))
+            let max_compact = reader.read_u16()?;
+            let min_dense = reader.read_u16()?;
+            if max_compact < min_dense {
+                return Err(Error::InvalidFormat(
+                    "object header attribute phase change max compact is less than min dense"
+                        .into(),
+                ));
+            }
+            (Some(max_compact), Some(min_dense))
         } else {
             (None, None)
         };
@@ -151,7 +163,13 @@ impl ObjectHeader {
         let stored_checksum = reader.read_u32()?;
 
         // Compute checksum over header_addr .. checksum_pos
-        let check_len = (checksum_pos - header_addr) as usize;
+        let check_len =
+            usize::try_from(checksum_pos.checked_sub(header_addr).ok_or_else(|| {
+                Error::InvalidFormat("object header checksum span underflow".into())
+            })?)
+            .map_err(|_| {
+                Error::InvalidFormat("object header checksum span exceeds usize".into())
+            })?;
         reader.seek(header_addr)?;
         let check_data = reader.read_bytes(check_len)?;
         let computed = checksum_metadata(&check_data);
@@ -196,10 +214,18 @@ impl ObjectHeader {
             )?;
         }
 
+        let refcount = messages
+            .iter()
+            .find(|msg| msg.msg_type == MSG_OBJ_REF_COUNT)
+            .and_then(|msg| msg.data.get(0..4))
+            .and_then(|raw| raw.try_into().ok())
+            .map(u32::from_le_bytes)
+            .unwrap_or(1);
+
         Ok(ObjectHeader {
             version: 2,
             flags,
-            refcount: 1, // v2 headers may have a separate refcount message
+            refcount,
             atime,
             mtime,
             ctime,

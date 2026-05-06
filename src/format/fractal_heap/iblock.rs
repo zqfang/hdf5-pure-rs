@@ -55,21 +55,31 @@ impl FractalHeapHeader {
             ));
         }
 
-        let _version = reader.read_u8()?;
-        let _heap_header_addr = reader.read_addr()?;
+        let version = reader.read_u8()?;
+        if version != 0 {
+            return Err(Error::InvalidFormat(format!(
+                "fractal heap indirect block version {version}"
+            )));
+        }
+        let heap_header_addr = reader.read_addr()?;
+        if heap_header_addr != self.heap_addr {
+            return Err(Error::InvalidFormat(
+                "fractal heap indirect block owner address does not match header".into(),
+            ));
+        }
 
-        let block_offset_bytes = ((self.max_heap_size as usize) + 7) / 8;
+        let block_offset_bytes = heap_offset_bytes(self.max_heap_size)?;
         let _block_offset = read_le_uint(&reader.read_bytes(block_offset_bytes)?);
         if self.has_checksum {
             let checksum_span = 4usize
                 .checked_add(1)
-                .and_then(|n| n.checked_add(self.sizeof_addr as usize))
+                .and_then(|n| n.checked_add(usize::from(self.sizeof_addr)))
                 .and_then(|n| n.checked_add(block_offset_bytes))
                 .and_then(|n| {
                     n.checked_add(
                         nrows
-                            .checked_mul(self.table_width as usize)?
-                            .checked_mul(self.sizeof_addr as usize)?,
+                            .checked_mul(usize::from(self.table_width))?
+                            .checked_mul(usize::from(self.sizeof_addr))?,
                     )
                 })
                 .ok_or_else(|| {
@@ -80,12 +90,12 @@ impl FractalHeapHeader {
             verify_metadata_checksum(
                 reader,
                 block_addr,
-                checksum_span as u64,
+                usize_to_u64(checksum_span, "fractal heap indirect block checksum span")?,
                 "fractal heap indirect block",
             )?;
         }
 
-        let width = self.table_width as usize;
+        let width = usize::from(self.table_width);
         let total_entries = nrows
             .checked_mul(width)
             .ok_or_else(|| Error::InvalidFormat("fractal heap entry count overflow".into()))?;
@@ -114,13 +124,70 @@ impl FractalHeapHeader {
                 "invalid fractal heap indirect block magic".into(),
             ));
         }
-        let _version = reader.read_u8()?;
-        let _heap_header_addr = reader.read_addr()?;
-        let block_offset_bytes = ((self.max_heap_size as usize) + 7) / 8;
-        reader.skip(block_offset_bytes as u64)?;
+        let version = reader.read_u8()?;
+        if version != 0 {
+            return Err(Error::InvalidFormat(format!(
+                "fractal heap indirect block version {version}"
+            )));
+        }
+        let heap_header_addr = reader.read_addr()?;
+        if heap_header_addr != self.heap_addr {
+            return Err(Error::InvalidFormat(
+                "fractal heap indirect block owner address does not match header".into(),
+            ));
+        }
+        let block_offset_bytes = heap_offset_bytes(self.max_heap_size)?;
+        reader.skip(usize_to_u64(
+            block_offset_bytes,
+            "fractal heap indirect block offset width",
+        )?)?;
 
-        let nrows = self.current_root_rows as usize;
-        let width = self.table_width as usize;
+        let nrows = usize::from(self.current_root_rows);
+        let width = usize::from(self.table_width);
+        if self.has_checksum {
+            let mut entry_bytes = 0usize;
+            for row in 0..nrows {
+                let block_size = self.checked_row_block_size(row)?;
+                let direct = block_size <= self.max_direct_block_size;
+                let per_entry = usize::from(self.sizeof_addr)
+                    + if direct {
+                        usize::from(self.sizeof_size) + 4
+                    } else {
+                        0
+                    };
+                entry_bytes = entry_bytes
+                    .checked_add(width.checked_mul(per_entry).ok_or_else(|| {
+                        Error::InvalidFormat(
+                            "fractal heap filtered indirect block checksum span overflow".into(),
+                        )
+                    })?)
+                    .ok_or_else(|| {
+                        Error::InvalidFormat(
+                            "fractal heap filtered indirect block checksum span overflow".into(),
+                        )
+                    })?;
+            }
+            let checksum_span = 4usize
+                .checked_add(1)
+                .and_then(|n| n.checked_add(usize::from(self.sizeof_addr)))
+                .and_then(|n| n.checked_add(block_offset_bytes))
+                .and_then(|n| n.checked_add(entry_bytes))
+                .ok_or_else(|| {
+                    Error::InvalidFormat(
+                        "fractal heap filtered indirect block checksum span overflow".into(),
+                    )
+                })?;
+            verify_metadata_checksum(
+                reader,
+                block_addr,
+                usize_to_u64(
+                    checksum_span,
+                    "fractal heap filtered indirect block checksum span",
+                )?,
+                "fractal heap filtered indirect block",
+            )?;
+        }
+
         let mut entries = Vec::with_capacity(
             nrows
                 .checked_mul(width)
@@ -148,5 +215,141 @@ impl FractalHeapHeader {
             block_offset_bytes,
             entries,
         })
+    }
+}
+
+fn heap_offset_bytes(max_heap_size: u16) -> Result<usize> {
+    usize::from(max_heap_size)
+        .checked_add(7)
+        .map(|value| value / 8)
+        .ok_or_else(|| Error::InvalidFormat("fractal heap offset width overflow".into()))
+}
+
+fn usize_to_u64(value: usize, context: &str) -> Result<u64> {
+    u64::try_from(value).map_err(|_| Error::InvalidFormat(format!("{context} exceeds u64")))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+
+    use crate::io::reader::HdfReader;
+
+    use super::*;
+
+    fn test_header() -> FractalHeapHeader {
+        FractalHeapHeader {
+            heap_addr: 0,
+            heap_id_len: 8,
+            io_filter_len: 0,
+            flags: 0,
+            max_managed_obj_size: 64,
+            table_width: 1,
+            start_block_size: 8,
+            max_direct_block_size: 8,
+            max_heap_size: 8,
+            start_root_rows: 0,
+            root_block_addr: 0,
+            current_root_rows: 0,
+            num_managed_objects: 0,
+            has_checksum: false,
+            sizeof_addr: 8,
+            sizeof_size: 8,
+            huge_btree_addr: 0,
+            root_direct_filtered_size: None,
+            root_direct_filter_mask: 0,
+            filter_pipeline: None,
+        }
+    }
+
+    fn invalid_indirect_block() -> Vec<u8> {
+        let mut block = b"FHIB".to_vec();
+        block.push(1); // invalid version
+        block.extend_from_slice(&0u64.to_le_bytes()); // heap header address
+        block.push(0); // block offset, max_heap_size=8 -> 1 byte
+        block
+    }
+
+    fn filtered_indirect_block_with_bad_checksum() -> Vec<u8> {
+        let mut block = b"FHIB".to_vec();
+        block.push(0);
+        block.extend_from_slice(&0u64.to_le_bytes()); // heap header address
+        block.push(0); // block offset
+        block.extend_from_slice(&64u64.to_le_bytes()); // child direct block address
+        block.extend_from_slice(&8u64.to_le_bytes()); // filtered size
+        block.extend_from_slice(&0u32.to_le_bytes()); // filter mask
+        block.extend_from_slice(&0xdead_beefu32.to_le_bytes()); // bad checksum
+        block
+    }
+
+    fn indirect_block_with_owner(owner: u64) -> Vec<u8> {
+        let mut block = b"FHIB".to_vec();
+        block.push(0);
+        block.extend_from_slice(&owner.to_le_bytes());
+        block.push(0); // block offset, max_heap_size=8 -> 1 byte
+        block
+    }
+
+    #[test]
+    fn indirect_block_rejects_unsupported_version() {
+        let header = test_header();
+        let mut reader = HdfReader::new(Cursor::new(invalid_indirect_block()));
+        let err = match header.decode_indirect_block(&mut reader, 0, 0) {
+            Ok(_) => panic!("invalid indirect block version should fail"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("version"));
+    }
+
+    #[test]
+    fn indirect_blocks_reject_owner_mismatch() {
+        let header = test_header();
+        let mut reader = HdfReader::new(Cursor::new(indirect_block_with_owner(1)));
+        let err = match header.decode_indirect_block(&mut reader, 0, 0) {
+            Ok(_) => panic!("indirect block owner mismatch should fail"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("owner address"));
+
+        let header = FractalHeapHeader {
+            io_filter_len: 1,
+            ..test_header()
+        };
+        let mut reader = HdfReader::new(Cursor::new(indirect_block_with_owner(1)));
+        let err = match header.decode_filtered_indirect_block(&mut reader, 0) {
+            Ok(_) => panic!("filtered indirect block owner mismatch should fail"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("owner address"));
+    }
+
+    #[test]
+    fn filtered_indirect_block_rejects_unsupported_version() {
+        let header = FractalHeapHeader {
+            io_filter_len: 1,
+            ..test_header()
+        };
+        let mut reader = HdfReader::new(Cursor::new(invalid_indirect_block()));
+        let err = match header.decode_filtered_indirect_block(&mut reader, 0) {
+            Ok(_) => panic!("invalid filtered indirect block version should fail"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("version"));
+    }
+
+    #[test]
+    fn filtered_indirect_block_rejects_bad_checksum() {
+        let header = FractalHeapHeader {
+            io_filter_len: 1,
+            current_root_rows: 1,
+            has_checksum: true,
+            ..test_header()
+        };
+        let mut reader = HdfReader::new(Cursor::new(filtered_indirect_block_with_bad_checksum()));
+        let err = match header.decode_filtered_indirect_block(&mut reader, 0) {
+            Ok(_) => panic!("bad filtered indirect block checksum should fail"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("checksum"));
     }
 }

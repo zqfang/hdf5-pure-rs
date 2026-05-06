@@ -39,6 +39,15 @@ fn t9a_global_heap_deleted_objects_duplicate_ids_and_padding() {
         let padded = (data.len() + 7) & !7;
         heap.extend(std::iter::repeat(0xa5).take(padded - data.len()));
     }
+    fn push_free_object(heap: &mut Vec<u8>, body_len: usize) {
+        let padded = (body_len + 7) & !7;
+        let object_size = 16 + padded;
+        heap.extend_from_slice(&0u16.to_le_bytes());
+        heap.extend_from_slice(&0u16.to_le_bytes());
+        heap.extend_from_slice(&[0; 4]);
+        heap.extend_from_slice(&(object_size as u64).to_le_bytes());
+        heap.extend(std::iter::repeat(0xa5).take(padded));
+    }
 
     let mut heap = b"GCOL".to_vec();
     heap.push(1);
@@ -46,7 +55,7 @@ fn t9a_global_heap_deleted_objects_duplicate_ids_and_padding() {
     heap.extend_from_slice(&0u64.to_le_bytes());
     push_object(&mut heap, 2, b"abc");
     push_object(&mut heap, 3, b"padded!!");
-    push_object(&mut heap, 0, b"deleted!");
+    push_free_object(&mut heap, 8);
     let collection_size = heap.len() as u64;
     heap[8..16].copy_from_slice(&collection_size.to_le_bytes());
 
@@ -69,6 +78,19 @@ fn t9a_global_heap_deleted_objects_duplicate_ids_and_padding() {
     let collection = GlobalHeapCollection::read_at(&mut reader, 0).unwrap();
     assert_eq!(collection.objects.len(), 2);
     assert_eq!(collection.get_object(5), Some(&b"first"[..]));
+
+    let mut heap = b"GCOL".to_vec();
+    heap.push(1);
+    heap.extend_from_slice(&[0; 3]);
+    heap.extend_from_slice(&0u64.to_le_bytes());
+    push_free_object(&mut heap, 8);
+    push_object(&mut heap, 9, b"after-free");
+    let collection_size = heap.len() as u64;
+    heap[8..16].copy_from_slice(&collection_size.to_le_bytes());
+    let mut reader = HdfReader::new(Cursor::new(heap));
+    let collection = GlobalHeapCollection::read_at(&mut reader, 0).unwrap();
+    assert_eq!(collection.objects.len(), 1);
+    assert_eq!(collection.get_object(9), Some(&b"after-free"[..]));
 }
 
 #[test]
@@ -82,13 +104,22 @@ fn t9a_global_heap_read_object_skips_deleted_and_padding() {
         let padded = (data.len() + 7) & !7;
         heap.extend(std::iter::repeat(0).take(padded - data.len()));
     }
+    fn push_free_object(heap: &mut Vec<u8>, body_len: usize) {
+        let padded = (body_len + 7) & !7;
+        let object_size = 16 + padded;
+        heap.extend_from_slice(&0u16.to_le_bytes());
+        heap.extend_from_slice(&0u16.to_le_bytes());
+        heap.extend_from_slice(&[0; 4]);
+        heap.extend_from_slice(&(object_size as u64).to_le_bytes());
+        heap.extend(std::iter::repeat(0).take(padded));
+    }
 
     let mut heap = b"GCOL".to_vec();
     heap.push(1);
     heap.extend_from_slice(&[0; 3]);
     heap.extend_from_slice(&0u64.to_le_bytes());
     push_object(&mut heap, 7, b"target");
-    push_object(&mut heap, 0, b"free");
+    push_free_object(&mut heap, 4);
     let collection_size = heap.len() as u64;
     heap[8..16].copy_from_slice(&collection_size.to_le_bytes());
 

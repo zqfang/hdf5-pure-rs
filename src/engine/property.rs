@@ -463,8 +463,11 @@ pub fn H5P__encode_uint64_t(value: u64) -> Vec<u8> {
 }
 
 #[allow(non_snake_case)]
-pub fn H5P__encode_size_t(value: usize) -> Vec<u8> {
-    (value as u64).to_le_bytes().to_vec()
+pub fn H5P__encode_size_t(value: usize) -> Result<Vec<u8>> {
+    Ok(u64::try_from(value)
+        .map_err(|_| Error::InvalidFormat("size_t property exceeds u64".into()))?
+        .to_le_bytes()
+        .to_vec())
 }
 
 #[allow(non_snake_case)]
@@ -478,13 +481,17 @@ pub fn H5P__encode_double(value: f64) -> Vec<u8> {
 }
 
 #[allow(non_snake_case)]
-pub fn H5P__encode(chunks: &[Vec<u8>]) -> Vec<u8> {
+pub fn H5P__encode(chunks: &[Vec<u8>]) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     for chunk in chunks {
-        out.extend_from_slice(&(chunk.len() as u64).to_le_bytes());
+        out.extend_from_slice(
+            &u64::try_from(chunk.len())
+                .map_err(|_| Error::InvalidFormat("property chunk length exceeds u64".into()))?
+                .to_le_bytes(),
+        );
         out.extend_from_slice(chunk);
     }
-    out
+    Ok(out)
 }
 
 #[allow(non_snake_case)]
@@ -512,7 +519,8 @@ pub fn H5P__decode_uint64_t(bytes: &[u8]) -> Result<u64> {
 
 #[allow(non_snake_case)]
 pub fn H5P__decode_size_t(bytes: &[u8]) -> Result<usize> {
-    Ok(H5P__decode_uint64_t(bytes)? as usize)
+    usize::try_from(H5P__decode_uint64_t(bytes)?)
+        .map_err(|_| Error::InvalidFormat("size_t property does not fit usize".into()))
 }
 
 #[allow(non_snake_case)]
@@ -573,11 +581,14 @@ fn unsupported_driver(name: &str) -> Result<()> {
     )))
 }
 
-fn encode_optional_string(out: &mut Vec<u8>, value: Option<&str>) {
+fn encode_optional_string(out: &mut Vec<u8>, value: Option<&str>, context: &str) -> Result<()> {
     match value {
         Some(value) => {
+            let len = u32::try_from(value.len()).map_err(|_| {
+                Error::InvalidFormat(format!("{context} string length exceeds u32"))
+            })?;
             out.push(1);
-            out.extend_from_slice(&(value.len() as u32).to_le_bytes());
+            out.extend_from_slice(&len.to_le_bytes());
             out.extend_from_slice(value.as_bytes());
         }
         None => {
@@ -585,49 +596,86 @@ fn encode_optional_string(out: &mut Vec<u8>, value: Option<&str>) {
             out.extend_from_slice(&0u32.to_le_bytes());
         }
     }
+    Ok(())
 }
 
-fn decode_optional_string(bytes: &[u8], offset: &mut usize) -> Option<Option<String>> {
-    let present = *bytes.get(*offset)?;
-    *offset = offset.checked_add(1)?;
-    let len = u32::from_le_bytes(
-        bytes
-            .get(*offset..offset.checked_add(4)?)?
-            .try_into()
-            .ok()?,
-    ) as usize;
-    *offset = offset.checked_add(4)?;
-    let value = bytes.get(*offset..offset.checked_add(len)?)?;
-    *offset = offset.checked_add(len)?;
+fn advance_offset(offset: &mut usize, delta: usize, context: &str) -> Result<()> {
+    *offset = offset
+        .checked_add(delta)
+        .ok_or_else(|| Error::InvalidFormat(format!("{context} offset overflow")))?;
+    Ok(())
+}
+
+fn decode_optional_string(
+    bytes: &[u8],
+    offset: &mut usize,
+    context: &str,
+) -> Result<Option<String>> {
+    let present = *bytes
+        .get(*offset)
+        .ok_or_else(|| Error::InvalidFormat(format!("truncated {context} string presence flag")))?;
+    advance_offset(offset, 1, context)?;
+    let len = read_u32_le_at(bytes, *offset)
+        .ok_or_else(|| Error::InvalidFormat(format!("truncated {context} string length")))
+        .and_then(|value| {
+            usize::try_from(value).map_err(|_| {
+                Error::InvalidFormat(format!("{context} string length does not fit in usize"))
+            })
+        })?;
+    advance_offset(offset, 4, context)?;
+    let value = checked_window(bytes, *offset, len)
+        .ok_or_else(|| Error::InvalidFormat(format!("truncated {context} string value")))?;
+    advance_offset(offset, len, context)?;
     if present == 0 {
-        (len == 0).then_some(None)
+        if len == 0 {
+            Ok(None)
+        } else {
+            Err(Error::InvalidFormat(format!(
+                "{context} absent string has nonzero length"
+            )))
+        }
+    } else if present == 1 {
+        Ok(Some(
+            std::str::from_utf8(value)
+                .map_err(|_| Error::InvalidFormat(format!("{context} string is not UTF-8")))?
+                .to_string(),
+        ))
     } else {
-        Some(Some(std::str::from_utf8(value).ok()?.to_string()))
+        Err(Error::InvalidFormat(format!(
+            "{context} string presence flag is invalid"
+        )))
     }
 }
 
 #[allow(non_snake_case)]
-pub fn H5P__encode_hdfs_fapl_config(config: &HdfsFaplConfig) -> Vec<u8> {
+pub fn H5P__encode_hdfs_fapl_config(config: &HdfsFaplConfig) -> Result<Vec<u8>> {
     let mut out = Vec::new();
-    encode_optional_string(&mut out, Some(&config.namenode_name));
+    encode_optional_string(&mut out, Some(&config.namenode_name), "HDFS namenode")?;
     out.extend_from_slice(&config.namenode_port.to_le_bytes());
-    encode_optional_string(&mut out, Some(&config.user_name));
+    encode_optional_string(&mut out, Some(&config.user_name), "HDFS user")?;
     out.extend_from_slice(&config.buffer_size.to_le_bytes());
-    out
+    Ok(out)
 }
 
 #[allow(non_snake_case)]
-pub fn H5P__decode_hdfs_fapl_config(bytes: &[u8]) -> Option<HdfsFaplConfig> {
+pub fn H5P__decode_hdfs_fapl_config(bytes: &[u8]) -> Result<HdfsFaplConfig> {
     let mut offset = 0;
-    let namenode_name = decode_optional_string(bytes, &mut offset)??;
-    let namenode_port =
-        u16::from_le_bytes(bytes.get(offset..offset.checked_add(2)?)?.try_into().ok()?);
-    offset = offset.checked_add(2)?;
-    let user_name = decode_optional_string(bytes, &mut offset)??;
-    let buffer_size =
-        u32::from_le_bytes(bytes.get(offset..offset.checked_add(4)?)?.try_into().ok()?);
-    offset = offset.checked_add(4)?;
-    (offset == bytes.len()).then_some(HdfsFaplConfig {
+    let namenode_name = decode_optional_string(bytes, &mut offset, "HDFS namenode")?
+        .ok_or_else(|| Error::InvalidFormat("HDFS namenode string is required".into()))?;
+    let namenode_port = read_u16_le_at(bytes, offset)
+        .ok_or_else(|| Error::InvalidFormat("truncated HDFS namenode port".into()))?;
+    advance_offset(&mut offset, 2, "HDFS FAPL config")?;
+    let user_name = decode_optional_string(bytes, &mut offset, "HDFS user")?
+        .ok_or_else(|| Error::InvalidFormat("HDFS user string is required".into()))?;
+    let buffer_size = read_u32_le_at(bytes, offset)
+        .ok_or_else(|| Error::InvalidFormat("truncated HDFS buffer size".into()))?;
+    advance_offset(&mut offset, 4, "HDFS FAPL config")?;
+    if offset != bytes.len() {
+        return Err(Error::InvalidFormat(
+            "trailing bytes in HDFS FAPL config".into(),
+        ));
+    }
+    Ok(HdfsFaplConfig {
         namenode_name,
         namenode_port,
         user_name,
@@ -636,25 +684,47 @@ pub fn H5P__decode_hdfs_fapl_config(bytes: &[u8]) -> Option<HdfsFaplConfig> {
 }
 
 #[allow(non_snake_case)]
-pub fn H5P__encode_ros3_fapl_config(config: &Ros3FaplConfig) -> Vec<u8> {
+pub fn H5P__encode_ros3_fapl_config(config: &Ros3FaplConfig) -> Result<Vec<u8>> {
     let mut out = Vec::new();
-    encode_optional_string(&mut out, config.endpoint.as_deref());
-    encode_optional_string(&mut out, config.region.as_deref());
-    encode_optional_string(&mut out, config.token.as_deref());
-    out
+    encode_optional_string(&mut out, config.endpoint.as_deref(), "ROS3 endpoint")?;
+    encode_optional_string(&mut out, config.region.as_deref(), "ROS3 region")?;
+    encode_optional_string(&mut out, config.token.as_deref(), "ROS3 token")?;
+    Ok(out)
 }
 
 #[allow(non_snake_case)]
-pub fn H5P__decode_ros3_fapl_config(bytes: &[u8]) -> Option<Ros3FaplConfig> {
+pub fn H5P__decode_ros3_fapl_config(bytes: &[u8]) -> Result<Ros3FaplConfig> {
     let mut offset = 0;
-    let endpoint = decode_optional_string(bytes, &mut offset)?;
-    let region = decode_optional_string(bytes, &mut offset)?;
-    let token = decode_optional_string(bytes, &mut offset)?;
-    (offset == bytes.len()).then_some(Ros3FaplConfig {
+    let endpoint = decode_optional_string(bytes, &mut offset, "ROS3 endpoint")?;
+    let region = decode_optional_string(bytes, &mut offset, "ROS3 region")?;
+    let token = decode_optional_string(bytes, &mut offset, "ROS3 token")?;
+    if offset != bytes.len() {
+        return Err(Error::InvalidFormat(
+            "trailing bytes in ROS3 FAPL config".into(),
+        ));
+    }
+    Ok(Ros3FaplConfig {
         endpoint,
         region,
         token,
     })
+}
+
+fn checked_window(data: &[u8], pos: usize, len: usize) -> Option<&[u8]> {
+    let end = pos.checked_add(len)?;
+    data.get(pos..end)
+}
+
+fn read_u16_le_at(data: &[u8], pos: usize) -> Option<u16> {
+    Some(u16::from_le_bytes(
+        checked_window(data, pos, 2)?.try_into().ok()?,
+    ))
+}
+
+fn read_u32_le_at(data: &[u8], pos: usize) -> Option<u32> {
+    Some(u32::from_le_bytes(
+        checked_window(data, pos, 4)?.try_into().ok()?,
+    ))
 }
 
 #[allow(non_snake_case)]
@@ -673,7 +743,7 @@ pub fn H5Pset_fapl_hdfs_config(list: &mut PropertyList, config: HdfsFaplConfig) 
     plist_set(
         list,
         "fapl_hdfs_config",
-        H5P__encode_hdfs_fapl_config(&config),
+        H5P__encode_hdfs_fapl_config(&config)?,
     )
 }
 
@@ -683,7 +753,7 @@ pub fn H5Pget_fapl_hdfs_config(list: &PropertyList) -> Result<Option<HdfsFaplCon
     if bytes.is_empty() {
         Ok(None)
     } else {
-        Ok(H5P__decode_hdfs_fapl_config(&bytes))
+        H5P__decode_hdfs_fapl_config(&bytes).map(Some)
     }
 }
 
@@ -1661,7 +1731,7 @@ pub fn H5Pset_fapl_ros3_config(list: &mut PropertyList, config: Ros3FaplConfig) 
     plist_set(
         list,
         "fapl_ros3_config",
-        H5P__encode_ros3_fapl_config(&config),
+        H5P__encode_ros3_fapl_config(&config)?,
     )
 }
 
@@ -1671,7 +1741,7 @@ pub fn H5Pget_fapl_ros3_config(list: &PropertyList) -> Result<Option<Ros3FaplCon
     if bytes.is_empty() {
         Ok(None)
     } else {
-        Ok(H5P__decode_ros3_fapl_config(&bytes))
+        H5P__decode_ros3_fapl_config(&bytes).map(Some)
     }
 }
 
@@ -1737,7 +1807,19 @@ mod tests {
     fn property_encoding_roundtrips_scalars() {
         assert_eq!(H5P__decode_bool(&H5P__encode_bool(true)).unwrap(), true);
         assert_eq!(H5P__decode_uint64_t(&H5P__encode_uint64_t(42)).unwrap(), 42);
+        assert_eq!(
+            H5P__decode_size_t(&H5P__encode_size_t(42).unwrap()).unwrap(),
+            42
+        );
         assert_eq!(H5P__decode_double(&H5P__encode_double(1.5)).unwrap(), 1.5);
+        let mut encoded_chunks = Vec::new();
+        encoded_chunks.extend_from_slice(&3u64.to_le_bytes());
+        encoded_chunks.extend_from_slice(b"abc");
+        encoded_chunks.extend_from_slice(&0u64.to_le_bytes());
+        assert_eq!(
+            H5P__encode(&[b"abc".to_vec(), Vec::new()]).unwrap(),
+            encoded_chunks
+        );
     }
 
     #[test]
@@ -1766,5 +1848,47 @@ mod tests {
         assert_eq!(stored.endpoint, ros3.endpoint);
         assert_eq!(stored.region, ros3.region);
         assert_eq!(stored.token.as_deref(), Some("token"));
+    }
+
+    #[test]
+    fn fapl_config_decoders_reject_malformed_payloads() {
+        let hdfs = HdfsFaplConfig {
+            namenode_name: "nn.example.org".into(),
+            namenode_port: 8020,
+            user_name: "hdf5".into(),
+            buffer_size: 65536,
+        };
+        let mut hdfs_bytes = H5P__encode_hdfs_fapl_config(&hdfs).unwrap();
+        assert_eq!(H5P__decode_hdfs_fapl_config(&hdfs_bytes).unwrap(), hdfs);
+        hdfs_bytes.pop();
+        assert!(H5P__decode_hdfs_fapl_config(&hdfs_bytes).is_err());
+
+        let mut hdfs_absent_name = H5P__encode_hdfs_fapl_config(&HdfsFaplConfig {
+            namenode_name: String::new(),
+            namenode_port: 8020,
+            user_name: "hdf5".into(),
+            buffer_size: 65536,
+        })
+        .unwrap();
+        hdfs_absent_name[0] = 0;
+        assert!(H5P__decode_hdfs_fapl_config(&hdfs_absent_name).is_err());
+
+        let ros3 = Ros3FaplConfig {
+            endpoint: Some("s3.us-east-1.amazonaws.com".into()),
+            region: Some("us-east-1".into()),
+            token: None,
+        };
+        let mut ros3_bytes = H5P__encode_ros3_fapl_config(&ros3).unwrap();
+        assert_eq!(H5P__decode_ros3_fapl_config(&ros3_bytes).unwrap(), ros3);
+        ros3_bytes.push(0);
+        assert!(H5P__decode_ros3_fapl_config(&ros3_bytes).is_err());
+
+        let mut invalid_utf8 = Vec::new();
+        encode_optional_string(&mut invalid_utf8, Some("ok"), "test endpoint").unwrap();
+        encode_optional_string(&mut invalid_utf8, Some("ok"), "test region").unwrap();
+        invalid_utf8.push(1);
+        invalid_utf8.extend_from_slice(&1u32.to_le_bytes());
+        invalid_utf8.push(0xff);
+        assert!(H5P__decode_ros3_fapl_config(&invalid_utf8).is_err());
     }
 }

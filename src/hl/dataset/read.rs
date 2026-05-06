@@ -4,7 +4,7 @@ use crate::format::messages::dataspace::DataspaceType;
 use crate::format::messages::fill_value::FILL_TIME_NEVER;
 use crate::format::object_header::ObjectHeader;
 
-use super::{usize_from_u64, Dataset, DatasetAccess, DatasetInfo, VdsView};
+use super::{u64_from_usize, usize_from_u64, Dataset, DatasetAccess, DatasetInfo, VdsView};
 
 impl Dataset {
     /// Read all raw data bytes from the dataset.
@@ -35,7 +35,7 @@ impl Dataset {
         info: DatasetInfo,
         access: &DatasetAccess,
     ) -> Result<Vec<u8>> {
-        let element_size = info.datatype.size as usize;
+        let element_size = usize_from_u64(u64::from(info.datatype.size), "datatype size")?;
         if element_size == 0 {
             return Err(Error::InvalidFormat("zero-sized datatype".into()));
         }
@@ -74,7 +74,9 @@ impl Dataset {
                     Error::InvalidFormat("contiguous dataset missing address".into())
                 })?;
                 let size = usize_from_u64(
-                    info.layout.contiguous_size.unwrap_or(total_bytes as u64),
+                    info.layout
+                        .contiguous_size
+                        .unwrap_or(u64_from_usize(total_bytes, "contiguous dataset size")?),
                     "contiguous dataset size",
                 )?;
 
@@ -116,7 +118,7 @@ impl Dataset {
                         object_index: heap_index,
                     },
                 )?;
-                let sizeof_size = guard.reader.sizeof_size() as usize;
+                let sizeof_size = usize::from(guard.reader.sizeof_size());
                 drop(guard);
                 Self::read_virtual_dataset(&heap_data, sizeof_size, path.as_deref(), &info, access)
             }
@@ -233,7 +235,9 @@ impl Dataset {
             )));
         }
         let vec = self.read::<T>()?;
-        ndarray::Array2::from_shape_vec((shape[0] as usize, shape[1] as usize), vec)
+        let rows = usize_from_u64(shape[0], "ndarray row count")?;
+        let cols = usize_from_u64(shape[1], "ndarray column count")?;
+        ndarray::Array2::from_shape_vec((rows, cols), vec)
             .map_err(|e| Error::Other(format!("ndarray shape error: {e}")))
     }
 

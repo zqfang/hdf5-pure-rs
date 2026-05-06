@@ -74,13 +74,14 @@ impl BTreeV1Node {
                 // Structure: key[0], child[0], key[1], child[1], ..., key[n]
                 // So there are entries_used children and entries_used+1 keys.
 
-                let key_count = (entries_used as usize)
+                let entries_used_usize = usize::from(entries_used);
+                let key_count = entries_used_usize
                     .checked_add(1)
                     .ok_or_else(|| Error::InvalidFormat("v1 B-tree key count overflow".into()))?;
                 keys.reserve(key_count);
-                children.reserve(entries_used as usize);
+                children.reserve(entries_used_usize);
 
-                for _i in 0..entries_used as usize {
+                for _i in 0..entries_used_usize {
                     // Key
                     let key = reader.read_length()?;
                     keys.push(key);
@@ -99,9 +100,9 @@ impl BTreeV1Node {
                 keys.push(final_key);
             }
             BTreeType::RawData => {
-                // Raw data chunk B-tree: keys are chunk coordinates + filter mask.
-                // We'll implement this in Phase 3.
-                // For now just skip.
+                return Err(Error::Unsupported(
+                    "raw data v1 B-tree nodes require dataset chunk key context".into(),
+                ));
             }
         }
 
@@ -228,7 +229,7 @@ impl BTreeV1Node {
     }
 
     pub fn verify_structure(&self) -> Result<()> {
-        if self.children.len() != self.entries_used as usize {
+        if self.children.len() != usize::from(self.entries_used) {
             return Err(Error::InvalidFormat(
                 "v1 B-tree child count does not match entries_used".into(),
             ));
@@ -414,6 +415,8 @@ fn write_var_le(out: &mut Vec<u8>, value: u64, width: usize) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::io::reader::HdfReader;
+    use std::io::Cursor;
 
     #[test]
     fn btree_v1_insert_find_remove_and_split() {
@@ -436,5 +439,19 @@ mod tests {
         assert_eq!(&image[..4], b"TREE");
         assert_eq!(image[4], 0);
         assert_eq!(image.len(), node.cache_image_len(8, 8).unwrap());
+    }
+
+    #[test]
+    fn btree_v1_read_rejects_raw_nodes_without_chunk_context() {
+        let mut image = b"TREE".to_vec();
+        image.push(1);
+        image.push(0);
+        image.extend_from_slice(&0u16.to_le_bytes());
+        image.extend_from_slice(&u64::MAX.to_le_bytes());
+        image.extend_from_slice(&u64::MAX.to_le_bytes());
+
+        let mut reader = HdfReader::new(Cursor::new(image));
+        let err = BTreeV1Node::read_at(&mut reader, 0).unwrap_err();
+        assert!(matches!(err, Error::Unsupported(_)));
     }
 }

@@ -882,37 +882,52 @@ pub fn H5G_node_debug(group: &GroupTable) -> String {
 }
 
 #[allow(non_snake_case)]
-pub fn H5G__cache_node_deserialize(bytes: &[u8]) -> GroupTable {
+pub fn H5G__cache_node_deserialize(bytes: &[u8]) -> Result<GroupTable> {
+    if !bytes.is_empty() && !bytes.ends_with(&[0]) {
+        return Err(Error::InvalidFormat(
+            "group cache node image has an unterminated name".into(),
+        ));
+    }
     let mut group = GroupTable::new_root(0);
     for (i, raw) in bytes
         .split(|b| *b == 0)
         .filter(|s| !s.is_empty())
         .enumerate()
     {
-        let name = String::from_utf8_lossy(raw).to_string();
-        let _ = group.insert_entry(&name, i as u64);
+        let name = std::str::from_utf8(raw)
+            .map_err(|_| Error::InvalidFormat("group cache node name is not UTF-8".into()))?;
+        let index = u64::try_from(i)
+            .map_err(|_| Error::InvalidFormat("group cache node index exceeds u64".into()))?;
+        group.insert_entry(name, index)?;
     }
-    group
+    Ok(group)
 }
 #[allow(non_snake_case)]
-pub fn H5G__cache_node_serialize(group: &GroupTable) -> Vec<u8> {
-    let mut out = Vec::new();
+pub fn H5G__cache_node_serialize(group: &GroupTable) -> Result<Vec<u8>> {
+    let mut len = 0usize;
+    for name in group.links.keys() {
+        len = len
+            .checked_add(name.len())
+            .and_then(|value| value.checked_add(1))
+            .ok_or_else(|| Error::InvalidFormat("group cache node image length overflow".into()))?;
+    }
+    let mut out = Vec::with_capacity(len);
     for name in group.links.keys() {
         out.extend_from_slice(name.as_bytes());
         out.push(0);
     }
-    out
+    Ok(out)
 }
 #[allow(non_snake_case)]
 pub fn H5G__cache_node_free_icr(_group: GroupTable) {}
 
 #[allow(non_snake_case)]
-pub fn H5G__ent_decode_vec(bytes: &[u8]) -> Vec<GroupEntry> {
-    H5G__cache_node_deserialize(bytes)
+pub fn H5G__ent_decode_vec(bytes: &[u8]) -> Result<Vec<GroupEntry>> {
+    Ok(H5G__cache_node_deserialize(bytes)?
         .links
         .values()
         .cloned()
-        .collect()
+        .collect())
 }
 #[allow(non_snake_case)]
 pub fn H5G__ent_copy(entry: &GroupEntry) -> GroupEntry {
@@ -972,8 +987,10 @@ pub fn H5G__dense_btree2_name_compare(left: &GroupEntry, right: &GroupEntry) -> 
     left.name.cmp(&right.name)
 }
 #[allow(non_snake_case)]
-pub fn H5G__dense_btree2_name_decode(bytes: &[u8]) -> String {
-    String::from_utf8_lossy(bytes).to_string()
+pub fn H5G__dense_btree2_name_decode(bytes: &[u8]) -> Result<String> {
+    std::str::from_utf8(bytes)
+        .map(str::to_string)
+        .map_err(|_| Error::InvalidFormat("dense group name is not UTF-8".into()))
 }
 #[allow(non_snake_case)]
 pub fn H5G__dense_btree2_name_debug(entry: &GroupEntry) -> String {
@@ -996,6 +1013,11 @@ pub fn H5G__dense_btree2_corder_encode(entry: &GroupEntry) -> Vec<u8> {
 }
 #[allow(non_snake_case)]
 pub fn H5G__dense_btree2_corder_decode(bytes: &[u8]) -> Result<u64> {
+    if bytes.len() != 8 {
+        return Err(Error::InvalidFormat(
+            "dense group creation order must be exactly 8 bytes".into(),
+        ));
+    }
     let raw: [u8; 8] = bytes
         .get(..8)
         .ok_or_else(|| Error::InvalidFormat("truncated corder".into()))?
@@ -1022,5 +1044,45 @@ mod tests {
         assert!(H5G_loc_exists(&group, "/c"));
         assert_eq!(H5G__loc_addr(&group, "/c").unwrap(), 10);
         assert_eq!(H5Gunlink(&mut group, "/b").unwrap().addr, 20);
+    }
+
+    #[test]
+    fn group_cache_node_deserialize_rejects_invalid_utf8() {
+        let mut group = H5G_mkroot(1);
+        H5Gcreate1(&mut group, "alpha", 10).unwrap();
+        H5Gcreate1(&mut group, "beta", 20).unwrap();
+        let image = H5G__cache_node_serialize(&group).unwrap();
+
+        let decoded = H5G__cache_node_deserialize(&image).unwrap();
+        assert_eq!(H5G_iterate(&decoded).unwrap(), vec!["alpha", "beta"]);
+        assert_eq!(H5G__ent_decode_vec(&image).unwrap().len(), 2);
+
+        assert!(H5G__cache_node_deserialize(&[0xff, 0]).is_err());
+        assert!(H5G__ent_decode_vec(&[0xff, 0]).is_err());
+        assert!(H5G__cache_node_deserialize(b"unterminated").is_err());
+        assert!(H5G__ent_decode_vec(b"unterminated").is_err());
+    }
+
+    #[test]
+    fn dense_btree2_decoders_reject_malformed_records() {
+        let entry = GroupEntry {
+            name: "dense".into(),
+            addr: 42,
+            creation_order: 7,
+            comment: None,
+        };
+
+        assert_eq!(
+            H5G__dense_btree2_name_decode(&H5G__dense_btree2_name_store(&entry)).unwrap(),
+            "dense"
+        );
+        assert!(H5G__dense_btree2_name_decode(&[0xff]).is_err());
+
+        assert_eq!(
+            H5G__dense_btree2_corder_decode(&H5G__dense_btree2_corder_encode(&entry)).unwrap(),
+            7
+        );
+        assert!(H5G__dense_btree2_corder_decode(&[0; 7]).is_err());
+        assert!(H5G__dense_btree2_corder_decode(&[0; 9]).is_err());
     }
 }

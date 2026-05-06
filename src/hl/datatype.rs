@@ -55,7 +55,7 @@ impl Datatype {
 
     /// Total size of one element in bytes.
     pub fn size(&self) -> usize {
-        self.msg.size as usize
+        usize::try_from(self.msg.size).unwrap_or(usize::MAX)
     }
 
     /// Datatype class (FixedPoint, FloatingPoint, String, Compound, etc.).

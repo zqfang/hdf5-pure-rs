@@ -46,6 +46,8 @@ impl Default for FreeSpaceManager {
 }
 
 impl FreeSpaceSection {
+    const SERIALIZED_SIZE: usize = 17;
+
     pub fn new(addr: u64, size: u64, class: FreeSpaceClass) -> Result<Self> {
         if size == 0 {
             return Err(Error::InvalidFormat(
@@ -62,7 +64,7 @@ impl FreeSpaceSection {
     }
 
     pub fn serialize_size(&self) -> usize {
-        8 + 8 + 1
+        Self::SERIALIZED_SIZE
     }
 
     pub fn serialize(&self, out: &mut Vec<u8>) {
@@ -81,14 +83,8 @@ impl FreeSpaceSection {
                 "free-space section image is truncated".into(),
             ));
         }
-        let addr =
-            u64::from_le_bytes(data[0..8].try_into().map_err(|_| {
-                Error::InvalidFormat("free-space section address is truncated".into())
-            })?);
-        let size =
-            u64::from_le_bytes(data[8..16].try_into().map_err(|_| {
-                Error::InvalidFormat("free-space section size is truncated".into())
-            })?);
+        let addr = read_u64_le_at(data, 0, "free-space section address")?;
+        let size = read_u64_le_at(data, 8, "free-space section size")?;
         let class = match data[16] {
             0 => FreeSpaceClass::Simple,
             1 => FreeSpaceClass::Small,
@@ -144,6 +140,21 @@ impl FreeSpaceSection {
     pub fn can_shrink(&self, eoa: u64) -> bool {
         self.end().ok() == Some(eoa)
     }
+}
+
+fn checked_window<'a>(data: &'a [u8], pos: usize, len: usize, context: &str) -> Result<&'a [u8]> {
+    let end = pos
+        .checked_add(len)
+        .ok_or_else(|| Error::InvalidFormat(format!("{context} offset overflow")))?;
+    data.get(pos..end)
+        .ok_or_else(|| Error::InvalidFormat(format!("{context} is truncated")))
+}
+
+fn read_u64_le_at(data: &[u8], pos: usize, context: &str) -> Result<u64> {
+    let bytes = checked_window(data, pos, 8, context)?;
+    Ok(u64::from_le_bytes(bytes.try_into().map_err(|_| {
+        Error::InvalidFormat(format!("{context} is truncated"))
+    })?))
 }
 
 impl FreeSpaceManager {
@@ -244,7 +255,26 @@ impl FreeSpaceManager {
     }
 
     pub fn cache_hdr_deserialize(data: &[u8]) -> Result<Self> {
-        Self::cache_sinfo_deserialize(data)
+        if data.len() != 20 {
+            return Err(Error::InvalidFormat(
+                "free-space header image has invalid length".into(),
+            ));
+        }
+        Self::cache_hdr_verify_chksum(data)?;
+        let alignment = read_u64_le_at(data, 0, "free-space header alignment")?;
+        let threshold = read_u64_le_at(data, 8, "free-space header threshold")?;
+        if alignment == 0 {
+            return Err(Error::InvalidFormat(
+                "free-space header alignment is zero".into(),
+            ));
+        }
+        Ok(Self {
+            params: FreeSpaceCreateParams {
+                alignment,
+                threshold,
+            },
+            ..Self::new()
+        })
     }
 
     pub fn cache_hdr_image_len(&self) -> usize {
@@ -255,13 +285,18 @@ impl FreeSpaceManager {
         self.dirty = false;
     }
 
-    pub fn cache_hdr_serialize(&self) -> Vec<u8> {
-        let mut out = Vec::new();
+    pub fn cache_hdr_serialize(&self) -> Result<Vec<u8>> {
+        if self.params.alignment == 0 {
+            return Err(Error::InvalidFormat(
+                "free-space header alignment is zero".into(),
+            ));
+        }
+        let mut out = Vec::with_capacity(self.cache_hdr_image_len());
         out.extend_from_slice(&self.params.alignment.to_le_bytes());
         out.extend_from_slice(&self.params.threshold.to_le_bytes());
         let checksum = crate::format::checksum::checksum_metadata(&out);
         out.extend_from_slice(&checksum.to_le_bytes());
-        out
+        Ok(out)
     }
 
     pub fn cache_hdr_notify(&self) {}
@@ -283,38 +318,50 @@ impl FreeSpaceManager {
             ));
         }
         let payload_end = data.len().saturating_sub(4);
-        if data.len() >= 8 {
-            let _ = Self::cache_sinfo_verify_chksum(data);
+        let section_size = FreeSpaceSection::SERIALIZED_SIZE;
+        if payload_end % section_size != 0 {
+            return Err(Error::InvalidFormat(
+                "free-space section info has a partial section record".into(),
+            ));
         }
+        Self::cache_sinfo_verify_chksum(data)?;
         let mut pos = 0usize;
         let mut sections = Vec::new();
-        while pos + 17 <= payload_end {
-            sections.push(FreeSpaceSection::deserialize(&data[pos..pos + 17])?);
-            pos += 17;
+        while pos < payload_end {
+            let end = pos
+                .checked_add(section_size)
+                .ok_or_else(|| Error::InvalidFormat("free-space section offset overflow".into()))?;
+            let section = data.get(pos..end).ok_or_else(|| {
+                Error::InvalidFormat("free-space section info is truncated".into())
+            })?;
+            sections.push(FreeSpaceSection::deserialize(section)?);
+            pos = end;
         }
         Self::open(sections)
     }
 
-    pub fn cache_sinfo_image_len(&self) -> usize {
-        self.sections
-            .values()
-            .map(FreeSpaceSection::serialize_size)
-            .sum::<usize>()
-            + 4
+    pub fn cache_sinfo_image_len(&self) -> Result<usize> {
+        let mut len = 4usize;
+        for section in self.sections.values() {
+            len = len.checked_add(section.serialize_size()).ok_or_else(|| {
+                Error::InvalidFormat("free-space section info image length overflow".into())
+            })?;
+        }
+        Ok(len)
     }
 
     pub fn cache_sinfo_pre_serialize(&mut self) {
         self.dirty = false;
     }
 
-    pub fn cache_sinfo_serialize(&self) -> Vec<u8> {
-        let mut out = Vec::new();
+    pub fn cache_sinfo_serialize(&self) -> Result<Vec<u8>> {
+        let mut out = Vec::with_capacity(self.cache_sinfo_image_len()?);
         for section in self.sections.values() {
             section.serialize(&mut out);
         }
         let checksum = crate::format::checksum::checksum_metadata(&out);
         out.extend_from_slice(&checksum.to_le_bytes());
-        out
+        Ok(out)
     }
 
     pub fn cache_sinfo_notify(&self) {}
@@ -579,12 +626,18 @@ fn verify_trailing_checksum(data: &[u8], context: &str) -> Result<()> {
         return Err(Error::InvalidFormat(format!("{context} image too short")));
     }
     let split = data.len() - 4;
+    let stored_bytes = checked_window(data, split, 4, &format!("{context} checksum"))?;
     let stored = u32::from_le_bytes(
-        data[split..]
+        stored_bytes
             .try_into()
             .map_err(|_| Error::InvalidFormat(format!("{context} checksum is truncated")))?,
     );
-    let computed = crate::format::checksum::checksum_metadata(&data[..split]);
+    let computed = crate::format::checksum::checksum_metadata(checked_window(
+        data,
+        0,
+        split,
+        &format!("{context} payload"),
+    )?);
     if stored != computed {
         return Err(Error::InvalidFormat(format!(
             "{context} checksum mismatch: stored={stored:#010x}, computed={computed:#010x}"
@@ -615,8 +668,83 @@ mod tests {
     fn section_info_roundtrips_with_checksum() {
         let mut fs = FreeSpaceManager::new();
         fs.free(64, 32).unwrap();
-        let image = fs.cache_sinfo_serialize();
+        let image = fs.cache_sinfo_serialize().unwrap();
         let decoded = FreeSpaceManager::cache_sinfo_deserialize(&image).unwrap();
         assert_eq!(decoded.get_sect_count(), 1);
+    }
+
+    #[test]
+    fn free_space_header_roundtrips_and_rejects_malformed_images() {
+        let mut fs = FreeSpaceManager::new();
+        fs.params.alignment = 8;
+        fs.params.threshold = 4096;
+
+        let image = fs.cache_hdr_serialize().unwrap();
+        let decoded = FreeSpaceManager::cache_hdr_deserialize(&image).unwrap();
+        assert_eq!(decoded.params.alignment, 8);
+        assert_eq!(decoded.params.threshold, 4096);
+        assert_eq!(decoded.get_sect_count(), 0);
+
+        let err = FreeSpaceManager::cache_hdr_deserialize(&image[..19]).unwrap_err();
+        assert!(matches!(err, Error::InvalidFormat(_)));
+
+        let mut bad_checksum = image.clone();
+        *bad_checksum.last_mut().unwrap() ^= 0x80;
+        let err = FreeSpaceManager::cache_hdr_deserialize(&bad_checksum).unwrap_err();
+        assert!(matches!(err, Error::InvalidFormat(_)));
+
+        let mut zero_alignment = image;
+        zero_alignment[..8].copy_from_slice(&0u64.to_le_bytes());
+        let checksum = crate::format::checksum::checksum_metadata(&zero_alignment[..16]);
+        zero_alignment[16..20].copy_from_slice(&checksum.to_le_bytes());
+        let err = FreeSpaceManager::cache_hdr_deserialize(&zero_alignment).unwrap_err();
+        assert!(matches!(err, Error::InvalidFormat(_)));
+
+        fs.params.alignment = 0;
+        let err = fs.cache_hdr_serialize().unwrap_err();
+        assert!(matches!(err, Error::InvalidFormat(_)));
+    }
+
+    #[test]
+    fn section_info_rejects_partial_section_payload() {
+        let mut image = vec![
+            0u8;
+            FreeSpaceSection::new(1, 1, FreeSpaceClass::Simple)
+                .unwrap()
+                .serialize_size()
+                - 1
+        ];
+        let checksum = crate::format::checksum::checksum_metadata(&image);
+        image.extend_from_slice(&checksum.to_le_bytes());
+
+        let err = FreeSpaceManager::cache_sinfo_deserialize(&image).unwrap_err();
+        assert!(matches!(err, Error::InvalidFormat(_)));
+    }
+
+    #[test]
+    fn section_info_rejects_bad_checksum() {
+        let mut fs = FreeSpaceManager::new();
+        fs.free(64, 32).unwrap();
+        let mut image = fs.cache_sinfo_serialize().unwrap();
+        *image.last_mut().unwrap() ^= 0x80;
+
+        let err = FreeSpaceManager::cache_sinfo_deserialize(&image).unwrap_err();
+        assert!(matches!(err, Error::InvalidFormat(_)));
+
+        let mut empty_image = FreeSpaceManager::new().cache_sinfo_serialize().unwrap();
+        assert_eq!(empty_image.len(), 4);
+        *empty_image.last_mut().unwrap() ^= 0x80;
+        let err = FreeSpaceManager::cache_sinfo_deserialize(&empty_image).unwrap_err();
+        assert!(matches!(err, Error::InvalidFormat(_)));
+    }
+
+    #[test]
+    fn checked_window_rejects_offset_overflow() {
+        let err = checked_window(&[], usize::MAX, 1, "free-space test window").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("free-space test window offset overflow"),
+            "unexpected error: {err}"
+        );
     }
 }

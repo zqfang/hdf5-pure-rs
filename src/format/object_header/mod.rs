@@ -27,6 +27,11 @@ pub const HDR_ATTR_CRT_ORDER_TRACKED: u8 = 0x04;
 pub const HDR_ATTR_CRT_ORDER_INDEXED: u8 = 0x08;
 pub const HDR_ATTR_STORE_PHASE_CHANGE: u8 = 0x10;
 pub const HDR_STORE_TIMES: u8 = 0x20;
+pub const HDR_V2_KNOWN_FLAGS: u8 = HDR_CHUNK0_SIZE_MASK
+    | HDR_ATTR_CRT_ORDER_TRACKED
+    | HDR_ATTR_CRT_ORDER_INDEXED
+    | HDR_ATTR_STORE_PHASE_CHANGE
+    | HDR_STORE_TIMES;
 
 pub(super) const MSG_FLAG_SHARED: u8 = 0x02;
 pub(super) const SHARED_MESSAGE_TABLE_VERSION: u8 = 0;
@@ -131,13 +136,19 @@ impl ObjectHeader {
                 .collect();
             let mut th = tracehash::th_call!("hdf5.object_header.read");
             th.input_u64(addr);
-            th.output_u64(header.version as u64);
-            th.output_u64(header.flags as u64);
-            th.output_u64(header.refcount as u64);
-            th.output_u64(traced_messages.len() as u64);
+            let Ok(message_count) = u64::try_from(traced_messages.len()) else {
+                return result;
+            };
+            th.output_u64(u64::from(header.version));
+            th.output_u64(u64::from(header.flags));
+            th.output_u64(u64::from(header.refcount));
+            th.output_u64(message_count);
             for message in traced_messages {
-                th.output_u64(message.msg_type as u64);
-                th.output_u64(message.data.len() as u64);
+                let Ok(data_len) = u64::try_from(message.data.len()) else {
+                    return result;
+                };
+                th.output_u64(u64::from(message.msg_type));
+                th.output_u64(data_len);
             }
             th.finish();
         }
@@ -157,7 +168,7 @@ pub(super) fn read_le_uint(data: &[u8]) -> Result<u64> {
         ));
     }
     Ok(data.iter().enumerate().fold(0u64, |value, (idx, byte)| {
-        value | ((*byte as u64) << (idx * 8))
+        value | (u64::from(*byte) << (idx * 8))
     }))
 }
 
