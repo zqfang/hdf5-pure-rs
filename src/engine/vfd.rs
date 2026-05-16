@@ -14,6 +14,7 @@ pub enum FileDriverKind {
     Direct,
 }
 
+/// Return the canonical integer id assigned to a [`FileDriverKind`].
 fn file_driver_kind_id(kind: FileDriverKind) -> u64 {
     match kind {
         FileDriverKind::Sec2 => 0,
@@ -91,166 +92,209 @@ impl Default for CoreFileConfig {
 }
 
 impl LocalFileDriver {
+    /// `sec2` VFD: register.
     pub fn sec2_register() -> FileDriverKind {
         FileDriverKind::Sec2
     }
 
+    /// `sec2` VFD: unregister.
     pub fn sec2_unregister() {}
 
+    /// `sec2` VFD: open.
     pub fn sec2_open(path: impl AsRef<Path>, read_write: bool) -> Result<Self> {
         Self::open_file(FileDriverKind::Sec2, path, read_write)
     }
 
+    /// `sec2` VFD: close.
     pub fn sec2_close(self) {}
 
+    /// `sec2` VFD: compare two driver instances.
     pub fn sec2_cmp(&self, other: &Self) -> Ordering {
         self.driver_cmp(other)
     }
 
+    /// `sec2` VFD: query feature flags.
     pub fn sec2_query(&self) -> u64 {
         self.driver_query()
     }
 
+    /// `sec2` VFD: get the end-of-allocation address.
     pub fn sec2_get_eoa(&self) -> u64 {
         self.eoa
     }
 
+    /// `sec2` VFD: set the end-of-allocation address.
     pub fn sec2_set_eoa(&mut self, eoa: u64) {
         self.eoa = eoa;
     }
 
+    /// `sec2` VFD: get the end-of-file address.
     pub fn sec2_get_eof(&mut self) -> Result<u64> {
         self.driver_get_eof()
     }
 
+    /// `sec2` VFD: get the underlying file handle.
     pub fn sec2_get_handle(&self) -> Option<&File> {
         self.file.as_ref()
     }
 
+    /// `sec2` VFD: read bytes from the file.
     pub fn sec2_read(&mut self, addr: u64, buf: &mut [u8]) -> Result<()> {
         self.driver_read(addr, buf)
     }
 
+    /// `sec2` VFD: write bytes to the file.
     pub fn sec2_write(&mut self, addr: u64, data: &[u8]) -> Result<()> {
         self.driver_write(addr, data)
     }
 
+    /// `sec2` VFD: truncate the file to the current EOA.
     pub fn sec2_truncate(&mut self) -> Result<()> {
         self.driver_truncate()
     }
 
+    /// `sec2` VFD: acquire an advisory file lock.
     pub fn sec2_lock(&mut self) {
         self.locked = true;
     }
 
+    /// `sec2` VFD: release an advisory file lock.
     pub fn sec2_unlock(&mut self) {
         self.locked = false;
     }
 
+    /// `sec2` VFD: delete the file.
     pub fn sec2_delete(path: impl AsRef<Path>) -> Result<()> {
         delete_existing(path)
     }
 
+    /// `sec2` VFD: invoke a driver-specific control op.
     pub fn sec2_ctl(&mut self, eoa: Option<u64>) {
         if let Some(eoa) = eoa {
             self.eoa = eoa;
         }
     }
 
+    /// `stdio` VFD: register.
     pub fn stdio_register() -> FileDriverKind {
         FileDriverKind::Stdio
     }
 
+    /// `stdio` VFD: unregister.
     pub fn stdio_unregister() {}
 
+    /// `stdio` VFD: initialize.
     pub fn stdio_init() -> FileDriverKind {
         FileDriverKind::Stdio
     }
 
+    /// `stdio` VFD: open.
     pub fn stdio_open(path: impl AsRef<Path>, read_write: bool) -> Result<Self> {
         Self::open_file(FileDriverKind::Stdio, path, read_write)
     }
 
+    /// `stdio` VFD: close.
     pub fn stdio_close(self) {}
 
+    /// `stdio` VFD: compare two driver instances.
     pub fn stdio_cmp(&self, other: &Self) -> Ordering {
         self.driver_cmp(other)
     }
 
+    /// `stdio` VFD: query feature flags.
     pub fn stdio_query(&self) -> u64 {
         self.driver_query()
     }
 
+    /// `stdio` VFD: allocate space in the file.
     pub fn stdio_alloc(&mut self, size: u64) -> Result<u64> {
         self.driver_alloc(size)
     }
 
+    /// `stdio` VFD: get the end-of-allocation address.
     pub fn stdio_get_eoa(&self) -> u64 {
         self.eoa
     }
 
+    /// `stdio` VFD: set the end-of-allocation address.
     pub fn stdio_set_eoa(&mut self, eoa: u64) {
         self.eoa = eoa;
     }
 
+    /// `stdio` VFD: get the end-of-file address.
     pub fn stdio_get_eof(&mut self) -> Result<u64> {
         self.driver_get_eof()
     }
 
+    /// `stdio` VFD: get the underlying file handle.
     pub fn stdio_get_handle(&self) -> Option<&File> {
         self.file.as_ref()
     }
 
+    /// `stdio` VFD: read bytes from the file.
     pub fn stdio_read(&mut self, addr: u64, buf: &mut [u8]) -> Result<()> {
         self.driver_read(addr, buf)
     }
 
+    /// `stdio` VFD: write bytes to the file.
     pub fn stdio_write(&mut self, addr: u64, data: &[u8]) -> Result<()> {
         self.driver_write(addr, data)
     }
 
+    /// `stdio` VFD: flush buffered writes to disk.
     pub fn stdio_flush(&mut self) -> Result<()> {
         self.driver_flush()
     }
 
+    /// `stdio` VFD: truncate the file to the current EOA.
     pub fn stdio_truncate(&mut self) -> Result<()> {
         self.driver_truncate()
     }
 
+    /// `stdio` VFD: acquire an advisory file lock.
     pub fn stdio_lock(&mut self) {
         self.locked = true;
     }
 
+    /// `stdio` VFD: release an advisory file lock.
     pub fn stdio_unlock(&mut self) {
         self.locked = false;
     }
 
+    /// `stdio` VFD: delete the file.
     pub fn stdio_delete(path: impl AsRef<Path>) -> Result<()> {
         delete_existing(path)
     }
 
+    /// `direct` VFD: register.
     pub fn direct_register() -> FileDriverKind {
         FileDriverKind::Direct
     }
 
+    /// `direct` VFD: unregister.
     pub fn direct_unregister() {}
 
+    /// `direct` VFD: populate the default driver-specific configuration.
     pub fn direct_populate_config() -> DirectFileConfig {
         DirectFileConfig::default()
     }
 
+    /// `direct` VFD: get the driver-specific FAPL configuration.
     pub fn direct_fapl_get(&self) -> Option<DirectFileConfig> {
         (self.kind == FileDriverKind::Direct).then(DirectFileConfig::default)
     }
 
+    /// `direct` VFD: copy the driver-specific FAPL configuration.
     pub fn direct_fapl_copy(config: &DirectFileConfig) -> DirectFileConfig {
         config.clone()
     }
 
+    /// `direct` VFD: open.
     pub fn direct_open(path: impl AsRef<Path>, read_write: bool) -> Result<Self> {
         Self::open_file(FileDriverKind::Direct, path, read_write)
     }
 
+    /// `direct` VFD: check that an I/O request meets alignment requirements.
     pub fn direct_check_alignment_reqs(addr: u64, size: usize, config: &DirectFileConfig) -> bool {
         let Ok(size) = u64::try_from(size) else {
             return false;
@@ -261,78 +305,98 @@ impl LocalFileDriver {
             && size % config.block_size == 0
     }
 
+    /// `direct` VFD: close.
     pub fn direct_close(self) {}
 
+    /// `direct` VFD: compare two driver instances.
     pub fn direct_cmp(&self, other: &Self) -> Ordering {
         self.driver_cmp(other)
     }
 
+    /// `direct` VFD: query feature flags.
     pub fn direct_query(&self) -> u64 {
         self.driver_query()
     }
 
+    /// `direct` VFD: set the end-of-allocation address.
     pub fn direct_set_eoa(&mut self, eoa: u64) {
         self.eoa = eoa;
     }
 
+    /// `direct` VFD: get the end-of-file address.
     pub fn direct_get_eof(&mut self) -> Result<u64> {
         self.driver_get_eof()
     }
 
+    /// `direct` VFD: get the underlying file handle.
     pub fn direct_get_handle(&self) -> Option<&File> {
         self.file.as_ref()
     }
 
+    /// `direct` VFD: read bytes from the file.
     pub fn direct_read(&mut self, addr: u64, buf: &mut [u8]) -> Result<()> {
         self.driver_read(addr, buf)
     }
 
+    /// `direct` VFD: write bytes to the file.
     pub fn direct_write(&mut self, addr: u64, data: &[u8]) -> Result<()> {
         self.driver_write(addr, data)
     }
 
+    /// `direct` VFD: truncate the file to the current EOA.
     pub fn direct_truncate(&mut self) -> Result<()> {
         self.driver_truncate()
     }
 
+    /// `direct` VFD: acquire an advisory file lock.
     pub fn direct_lock(&mut self) {
         self.locked = true;
     }
 
+    /// `direct` VFD: release an advisory file lock.
     pub fn direct_unlock(&mut self) {
         self.locked = false;
     }
 
+    /// `direct` VFD: delete the file.
     pub fn direct_delete(path: impl AsRef<Path>) -> Result<()> {
         delete_existing(path)
     }
 
+    /// `core` VFD: return the default driver-specific configuration.
     pub fn core_get_default_config() -> CoreFileConfig {
         CoreFileConfig::default()
     }
 
+    /// `core` VFD: register.
     pub fn core_register() -> FileDriverKind {
         FileDriverKind::Core
     }
 
+    /// `core` VFD: unregister.
     pub fn core_unregister() {}
 
+    /// `core` VFD: get the driver-specific FAPL configuration.
     pub fn core_fapl_get(&self) -> Option<CoreFileConfig> {
         (self.kind == FileDriverKind::Core).then(CoreFileConfig::default)
     }
 
+    /// `core` VFD: compare two driver instances.
     pub fn core_cmp(&self, other: &Self) -> Ordering {
         self.driver_cmp(other)
     }
 
+    /// `core` VFD: query feature flags.
     pub fn core_query(&self) -> u64 {
         self.driver_query()
     }
 
+    /// `core` VFD: get the end-of-allocation address.
     pub fn core_get_eoa(&self) -> u64 {
         self.eoa
     }
 
+    /// `core` VFD: set the end-of-allocation address.
     pub fn core_set_eoa(&mut self, eoa: u64) {
         self.eoa = eoa;
         if let Ok(eoa) = usize::try_from(eoa) {
@@ -342,43 +406,59 @@ impl LocalFileDriver {
         }
     }
 
+    /// `core` VFD: get the end-of-file address.
     pub fn core_get_eof(&self) -> u64 {
-        u64::try_from(self.core_image.len()).unwrap_or(u64::MAX)
+        self.core_get_eof_checked().unwrap_or(u64::MAX)
     }
 
+    /// `core` VFD: get the end-of-file address with overflow checking.
+    pub fn core_get_eof_checked(&self) -> Result<u64> {
+        u64::try_from(self.core_image.len())
+            .map_err(|_| Error::InvalidFormat("core VFD EOF exceeds u64".into()))
+    }
+
+    /// `core` VFD: get the underlying file handle.
     pub fn core_get_handle(&self) -> Option<&[u8]> {
         (self.kind == FileDriverKind::Core).then_some(self.core_image.as_slice())
     }
 
+    /// `core` VFD: read bytes from the file.
     pub fn core_read(&mut self, addr: u64, buf: &mut [u8]) -> Result<()> {
         self.driver_read(addr, buf)
     }
 
+    /// `core` VFD: write bytes to the file.
     pub fn core_write(&mut self, addr: u64, data: &[u8]) -> Result<()> {
         self.driver_write(addr, data)
     }
 
+    /// `core` VFD: flush buffered writes to disk.
     pub fn core_flush(&mut self) -> Result<()> {
         self.driver_flush()
     }
 
+    /// `core` VFD: truncate the file to the current EOA.
     pub fn core_truncate(&mut self) -> Result<()> {
         self.driver_truncate()
     }
 
+    /// `core` VFD: acquire an advisory file lock.
     pub fn core_lock(&mut self) {
         self.locked = true;
     }
 
+    /// `core` VFD: release an advisory file lock.
     pub fn core_unlock(&mut self) {
         self.locked = false;
     }
 
+    /// `core` VFD: delete the file.
     pub fn core_delete(&mut self) {
         self.core_image.clear();
         self.eoa = 0;
     }
 
+    /// `core` VFD: mark a byte range dirty for later writeback.
     pub fn core_add_dirty_region(&mut self, addr: u64, size: u64) -> Result<()> {
         let end = addr
             .checked_add(size)
@@ -389,18 +469,23 @@ impl LocalFileDriver {
         Ok(())
     }
 
+    /// `core` VFD: clear the in-memory dirty region list.
     pub fn core_destroy_dirty_list(&mut self) {}
 
+    /// `core` VFD: write a buffer to the backing store.
     pub fn core_write_to_bstore(&mut self, addr: u64, data: &[u8]) -> Result<()> {
         self.core_write(addr, data)
     }
 
+    /// VFD: allocate space in the file.
     pub fn alloc(&mut self, size: u64) -> Result<u64> {
         self.driver_alloc(size)
     }
 
+    /// VFD: free a previously allocated region.
     pub fn free(&mut self, _addr: u64, _size: u64) {}
 
+    /// VFD: try to extend the file by `extra` bytes.
     pub fn try_extend(&mut self, addr: u64, old_size: u64, extra: u64) -> Result<bool> {
         let end = addr
             .checked_add(old_size)
@@ -412,6 +497,7 @@ impl LocalFileDriver {
         Ok(true)
     }
 
+    /// Internal helper: open the on-disk file for the given driver kind.
     fn open_file(kind: FileDriverKind, path: impl AsRef<Path>, read_write: bool) -> Result<Self> {
         let mut options = OpenOptions::new();
         options.read(true);
@@ -430,12 +516,14 @@ impl LocalFileDriver {
         })
     }
 
+    /// Dispatch [`cmp`] to the active driver implementation.
     fn driver_cmp(&self, other: &Self) -> Ordering {
         self.kind
             .cmp(&other.kind)
             .then_with(|| self.path.cmp(&other.path))
     }
 
+    /// Dispatch [`query`] to the active driver implementation.
     fn driver_query(&self) -> u64 {
         match self.kind {
             FileDriverKind::Sec2 | FileDriverKind::Stdio | FileDriverKind::Direct => 0x01,
@@ -443,6 +531,7 @@ impl LocalFileDriver {
         }
     }
 
+    /// Dispatch [`alloc`] to the active driver implementation.
     fn driver_alloc(&mut self, size: u64) -> Result<u64> {
         let addr = self.eoa;
         self.eoa = self
@@ -455,6 +544,7 @@ impl LocalFileDriver {
         Ok(addr)
     }
 
+    /// Dispatch [`get_eof`] to the active driver implementation.
     fn driver_get_eof(&mut self) -> Result<u64> {
         if self.kind == FileDriverKind::Core {
             return Ok(self.core_get_eof());
@@ -466,6 +556,7 @@ impl LocalFileDriver {
         Ok(file.metadata()?.len())
     }
 
+    /// Dispatch [`read`] to the active driver implementation.
     fn driver_read(&mut self, addr: u64, buf: &mut [u8]) -> Result<()> {
         if self.kind == FileDriverKind::Core {
             let start = usize::try_from(addr)
@@ -488,6 +579,7 @@ impl LocalFileDriver {
         Ok(())
     }
 
+    /// Dispatch [`write`] to the active driver implementation.
     fn driver_write(&mut self, addr: u64, data: &[u8]) -> Result<()> {
         let data_len = u64::try_from(data.len())
             .map_err(|_| Error::InvalidFormat("VFD write length exceeds u64".into()))?;
@@ -517,6 +609,7 @@ impl LocalFileDriver {
         Ok(())
     }
 
+    /// Dispatch [`flush`] to the active driver implementation.
     fn driver_flush(&mut self) -> Result<()> {
         if let Some(file) = self.file.as_mut() {
             file.flush()?;
@@ -524,6 +617,7 @@ impl LocalFileDriver {
         Ok(())
     }
 
+    /// Dispatch [`truncate`] to the active driver implementation.
     fn driver_truncate(&mut self) -> Result<()> {
         if self.kind == FileDriverKind::Core {
             let eoa = usize::try_from(self.eoa)
@@ -541,17 +635,20 @@ impl LocalFileDriver {
 }
 
 impl Ord for FileDriverKind {
+    /// Compare two driver instances by kind then path/state.
     fn cmp(&self, other: &Self) -> Ordering {
         (*self as u8).cmp(&(*other as u8))
     }
 }
 
 impl PartialOrd for FileDriverKind {
+    /// Total-order partial comparison delegating to [`cmp`].
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
+/// Delete the file at `path` if it exists, ignoring not-found errors.
 fn delete_existing(path: impl AsRef<Path>) -> Result<()> {
     match fs::remove_file(path.as_ref()) {
         Ok(()) => Ok(()),
@@ -560,6 +657,7 @@ fn delete_existing(path: impl AsRef<Path>) -> Result<()> {
     }
 }
 
+/// Render a [`VfdMemType`] as its short name.
 #[allow(non_snake_case)]
 pub fn H5FD__mem_t_to_str(mem_type: VfdMemType) -> &'static str {
     match mem_type {
@@ -575,11 +673,13 @@ pub fn H5FD__mem_t_to_str(mem_type: VfdMemType) -> &'static str {
     }
 }
 
+/// Initialize an empty VFD registry.
 #[allow(non_snake_case)]
 pub fn H5FD_init() -> VfdRegistry {
     H5FD__init_package()
 }
 
+/// Initialize the VFD package and pre-register the built-in drivers.
 #[allow(non_snake_case)]
 pub fn H5FD__init_package() -> VfdRegistry {
     let mut registry = VfdRegistry::default();
@@ -606,27 +706,32 @@ pub fn H5FD__init_package() -> VfdRegistry {
     registry
 }
 
+/// Tear down the VFD registry, dropping all driver registrations.
 #[allow(non_snake_case)]
 pub fn H5FD_term_package(registry: &mut VfdRegistry) {
     registry.by_name.clear();
     registry.by_value.clear();
 }
 
+/// Free a registered driver class by name.
 #[allow(non_snake_case)]
 pub fn H5FD__free_cls(registry: &mut VfdRegistry, name: &str) -> Option<u64> {
     H5FDunregister(registry, name)
 }
 
+/// Public API: register a VFD driver by name and value.
 #[allow(non_snake_case)]
 pub fn H5FDregister(registry: &mut VfdRegistry, name: &str, value: u64) -> u64 {
     H5FD_register_driver_by_name(registry, name, value)
 }
 
+/// Register a VFD driver by name and value.
 #[allow(non_snake_case)]
 pub fn H5FD_register(registry: &mut VfdRegistry, name: &str, value: u64) -> u64 {
     H5FDregister(registry, name, value)
 }
 
+/// Public API: unregister a VFD driver by name.
 #[allow(non_snake_case)]
 pub fn H5FDunregister(registry: &mut VfdRegistry, name: &str) -> Option<u64> {
     let value = registry.by_name.remove(name)?;
@@ -634,6 +739,7 @@ pub fn H5FDunregister(registry: &mut VfdRegistry, name: &str) -> Option<u64> {
     Some(value)
 }
 
+/// Register a VFD driver by name.
 #[allow(non_snake_case)]
 pub fn H5FD_register_driver_by_name(registry: &mut VfdRegistry, name: &str, value: u64) -> u64 {
     registry.by_name.insert(name.to_string(), value);
@@ -641,46 +747,55 @@ pub fn H5FD_register_driver_by_name(registry: &mut VfdRegistry, name: &str, valu
     value
 }
 
+/// Register a VFD driver by numeric value, providing its name.
 #[allow(non_snake_case)]
 pub fn H5FD_register_driver_by_value(registry: &mut VfdRegistry, value: u64, name: &str) -> u64 {
     H5FD_register_driver_by_name(registry, name, value)
 }
 
+/// Return whether a driver is currently registered under the given name.
 #[allow(non_snake_case)]
 pub fn H5FD_is_driver_registered_by_name(registry: &VfdRegistry, name: &str) -> bool {
     registry.by_name.contains_key(name)
 }
 
+/// Return the value/id of a driver registered under the given name.
 #[allow(non_snake_case)]
 pub fn H5FD_get_driver_id_by_name(registry: &VfdRegistry, name: &str) -> Option<u64> {
     registry.by_name.get(name).copied()
 }
 
+/// Look up the name of a driver registered with the given value.
 #[allow(non_snake_case)]
 pub fn H5FD_get_driver_id_by_value(registry: &VfdRegistry, value: u64) -> Option<&str> {
     registry.by_value.get(&value).map(String::as_str)
 }
 
+/// Look up the class name of a driver registered with the given value.
 #[allow(non_snake_case)]
 pub fn H5FD_get_class(registry: &VfdRegistry, value: u64) -> Option<&str> {
     H5FD_get_driver_id_by_value(registry, value)
 }
 
+/// Driver-lookup callback used during package initialization.
 #[allow(non_snake_case)]
 pub fn H5FD__get_driver_cb(registry: &VfdRegistry, name: &str) -> Option<u64> {
     H5FD_get_driver_id_by_name(registry, name)
 }
 
+/// Superblock extension size required for a given driver kind.
 #[allow(non_snake_case)]
 pub fn H5FD_sb_size(_driver: FileDriverKind) -> usize {
     0
 }
 
+/// Return the kind of driver currently in use by the FAPL.
 #[allow(non_snake_case)]
 pub fn H5FD_fapl_get(driver: &LocalFileDriver) -> FileDriverKind {
     driver.kind
 }
 
+/// Public API: open a file using a given driver kind.
 #[allow(non_snake_case)]
 pub fn H5FDopen(
     path: impl AsRef<Path>,
@@ -690,6 +805,7 @@ pub fn H5FDopen(
     H5FD_open(path, kind, read_write)
 }
 
+/// Open a file using a given driver kind.
 #[allow(non_snake_case)]
 pub fn H5FD_open(
     path: impl AsRef<Path>,
@@ -706,87 +822,105 @@ pub fn H5FD_open(
     }
 }
 
+/// Public API: close a driver instance.
 #[allow(non_snake_case)]
 pub fn H5FDclose(driver: LocalFileDriver) {
     H5FD_close(driver);
 }
 
+/// Close a driver instance.
 #[allow(non_snake_case)]
 pub fn H5FD_close(_driver: LocalFileDriver) {}
 
+/// Public API: compare two driver instances.
 #[allow(non_snake_case)]
 pub fn H5FDcmp(left: &LocalFileDriver, right: &LocalFileDriver) -> Ordering {
     H5FD_cmp(left, right)
 }
 
+/// Compare two driver instances.
 #[allow(non_snake_case)]
 pub fn H5FD_cmp(left: &LocalFileDriver, right: &LocalFileDriver) -> Ordering {
     left.driver_cmp(right)
 }
 
+/// Public API: query the feature flags reported by a driver.
 #[allow(non_snake_case)]
 pub fn H5FDquery(driver: &LocalFileDriver) -> u64 {
     H5FD_get_feature_flags(driver)
 }
 
+/// Public API: allocate `size` bytes in the file.
 #[allow(non_snake_case)]
 pub fn H5FDalloc(driver: &mut LocalFileDriver, size: u64) -> Result<u64> {
     driver.alloc(size)
 }
 
+/// Public API: free a region previously allocated in the file.
 #[allow(non_snake_case)]
 pub fn H5FDfree(driver: &mut LocalFileDriver, addr: u64, size: u64) {
     driver.free(addr, size);
 }
 
+/// Public API: return the current EOA.
 #[allow(non_snake_case)]
 pub fn H5FDget_eoa(driver: &LocalFileDriver) -> u64 {
     driver.eoa
 }
 
+/// Public API: set the current EOA.
 #[allow(non_snake_case)]
 pub fn H5FDset_eoa(driver: &mut LocalFileDriver, eoa: u64) {
     driver.eoa = eoa;
 }
 
+/// Public API: return the current EOF.
 #[allow(non_snake_case)]
 pub fn H5FDget_eof(driver: &mut LocalFileDriver) -> Result<u64> {
     driver.driver_get_eof()
 }
 
+/// Return the maximum addressable file offset for the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD_get_maxaddr() -> u64 {
     u64::MAX
 }
 
+/// Return the feature flags reported by a driver.
 #[allow(non_snake_case)]
 pub fn H5FD_get_feature_flags(driver: &LocalFileDriver) -> u64 {
     driver.driver_query()
 }
 
+/// Setting feature flags is a no-op in the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD_set_feature_flags(_driver: &mut LocalFileDriver, _flags: u64) {}
 
+/// Public API: read bytes from the file.
 #[allow(non_snake_case)]
 pub fn H5FDread(driver: &mut LocalFileDriver, addr: u64, buf: &mut [u8]) -> Result<()> {
     driver.driver_read(addr, buf)
 }
 
+/// Public API: write bytes to the file.
 #[allow(non_snake_case)]
 pub fn H5FDwrite(driver: &mut LocalFileDriver, addr: u64, data: &[u8]) -> Result<()> {
     driver.driver_write(addr, data)
 }
 
+/// Read a list of (addr, buffer) requests sequentially.
 #[allow(non_snake_case)]
 pub fn H5FDread_vector(driver: &mut LocalFileDriver, requests: &mut [VfdIoRequest]) -> Result<()> {
     H5FD_read_vector_from_selection(driver, requests)
 }
 
+/// Write a list of (addr, bytes) requests sequentially.
 #[allow(non_snake_case)]
 pub fn H5FDwrite_vector(driver: &mut LocalFileDriver, requests: &[VfdIoRequest]) -> Result<()> {
     H5FD_write_vector_from_selection(driver, requests)
 }
 
+/// Read a list of selection-based requests sequentially.
 #[allow(non_snake_case)]
 pub fn H5FDread_selection(
     driver: &mut LocalFileDriver,
@@ -795,29 +929,35 @@ pub fn H5FDread_selection(
     H5FD_read_from_selection(driver, requests)
 }
 
+/// Write a list of selection-based requests sequentially.
 #[allow(non_snake_case)]
 pub fn H5FDwrite_selection(driver: &mut LocalFileDriver, requests: &[VfdIoRequest]) -> Result<()> {
     H5FD_write_selection(driver, requests)
 }
 
+/// Public API: flush buffered writes to disk.
 #[allow(non_snake_case)]
 pub fn H5FDflush(driver: &mut LocalFileDriver) -> Result<()> {
     driver.driver_flush()
 }
 
+/// Return the file path of the underlying file, if any.
 #[allow(non_snake_case)]
 pub fn H5FD_get_fileno(driver: &LocalFileDriver) -> Option<&Path> {
     driver.path.as_deref()
 }
 
+/// Public API: return the underlying file handle, if any.
 #[allow(non_snake_case)]
 pub fn H5FDget_vfd_handle(driver: &LocalFileDriver) -> Option<&File> {
     driver.file.as_ref()
 }
 
+/// Toggling paged aggregation is a no-op in the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD_set_paged_aggr(_driver: &mut LocalFileDriver, _enabled: bool) {}
 
+/// Locate the HDF5 superblock signature within an image buffer.
 #[allow(non_snake_case)]
 pub fn H5FD_locate_signature(image: &[u8]) -> Option<u64> {
     const SIG: &[u8; 8] = b"\x89HDF\r\n\x1a\n";
@@ -835,16 +975,19 @@ pub fn H5FD_locate_signature(image: &[u8]) -> Option<u64> {
     None
 }
 
+/// Translate selection requests into a flat vector form.
 #[allow(non_snake_case)]
 pub fn H5FD__read_selection_translate(requests: &[VfdIoRequest]) -> Vec<VfdIoRequest> {
     requests.to_vec()
 }
 
+/// Translate selection write requests into a flat vector form.
 #[allow(non_snake_case)]
 pub fn H5FD__write_selection_translate(requests: &[VfdIoRequest]) -> Vec<VfdIoRequest> {
     requests.to_vec()
 }
 
+/// Write a list of selection requests via the active driver.
 #[allow(non_snake_case)]
 pub fn H5FD_write_selection(driver: &mut LocalFileDriver, requests: &[VfdIoRequest]) -> Result<()> {
     for request in requests {
@@ -853,6 +996,7 @@ pub fn H5FD_write_selection(driver: &mut LocalFileDriver, requests: &[VfdIoReque
     Ok(())
 }
 
+/// Write a selection request identified by id.
 #[allow(non_snake_case)]
 pub fn H5FD_write_selection_id(
     driver: &mut LocalFileDriver,
@@ -862,6 +1006,7 @@ pub fn H5FD_write_selection_id(
     H5FD_write_selection(driver, requests)
 }
 
+/// Build a vector read request set from a selection.
 #[allow(non_snake_case)]
 pub fn H5FD_read_vector_from_selection(
     driver: &mut LocalFileDriver,
@@ -873,6 +1018,7 @@ pub fn H5FD_read_vector_from_selection(
     Ok(())
 }
 
+/// Build a vector write request set from a selection.
 #[allow(non_snake_case)]
 pub fn H5FD_write_vector_from_selection(
     driver: &mut LocalFileDriver,
@@ -881,6 +1027,7 @@ pub fn H5FD_write_vector_from_selection(
     H5FD_write_selection(driver, requests)
 }
 
+/// Read directly from a selection request set.
 #[allow(non_snake_case)]
 pub fn H5FD_read_from_selection(
     driver: &mut LocalFileDriver,
@@ -889,6 +1036,7 @@ pub fn H5FD_read_from_selection(
     H5FD_read_vector_from_selection(driver, requests)
 }
 
+/// Write directly from a selection request set.
 #[allow(non_snake_case)]
 pub fn H5FD_write_from_selection(
     driver: &mut LocalFileDriver,
@@ -897,6 +1045,7 @@ pub fn H5FD_write_from_selection(
     H5FD_write_selection(driver, requests)
 }
 
+/// Public API wrapper for [`H5FD_read_vector_from_selection`].
 #[allow(non_snake_case)]
 pub fn H5FDread_vector_from_selection(
     driver: &mut LocalFileDriver,
@@ -905,6 +1054,7 @@ pub fn H5FDread_vector_from_selection(
     H5FD_read_vector_from_selection(driver, requests)
 }
 
+/// Public API wrapper for [`H5FD_write_vector_from_selection`].
 #[allow(non_snake_case)]
 pub fn H5FDwrite_vector_from_selection(
     driver: &mut LocalFileDriver,
@@ -913,6 +1063,7 @@ pub fn H5FDwrite_vector_from_selection(
     H5FD_write_vector_from_selection(driver, requests)
 }
 
+/// Public API wrapper for [`H5FD_read_from_selection`].
 #[allow(non_snake_case)]
 pub fn H5FDread_from_selection(
     driver: &mut LocalFileDriver,
@@ -921,6 +1072,7 @@ pub fn H5FDread_from_selection(
     H5FD_read_from_selection(driver, requests)
 }
 
+/// Public API wrapper for [`H5FD_write_from_selection`].
 #[allow(non_snake_case)]
 pub fn H5FDwrite_from_selection(
     driver: &mut LocalFileDriver,
@@ -929,6 +1081,7 @@ pub fn H5FDwrite_from_selection(
     H5FD_write_from_selection(driver, requests)
 }
 
+/// Comparator that sorts I/O requests by file address.
 #[allow(non_snake_case)]
 pub fn H5FD__srt_tmp_cmp(left: &VfdIoRequest, right: &VfdIoRequest) -> Ordering {
     left.addr
@@ -936,21 +1089,25 @@ pub fn H5FD__srt_tmp_cmp(left: &VfdIoRequest, right: &VfdIoRequest) -> Ordering 
         .then_with(|| left.bytes.len().cmp(&right.bytes.len()))
 }
 
+/// Internal helper that sorts a request slice by address.
 #[allow(non_snake_case)]
 pub fn H5FD__sort_io_req_real(requests: &mut [VfdIoRequest]) {
     requests.sort_by(H5FD__srt_tmp_cmp);
 }
 
+/// Sort a vector I/O request set by address.
 #[allow(non_snake_case)]
 pub fn H5FD_sort_vector_io_req(requests: &mut [VfdIoRequest]) {
     H5FD__sort_io_req_real(requests);
 }
 
+/// Sort a selection I/O request set by address.
 #[allow(non_snake_case)]
 pub fn H5FD_sort_selection_io_req(requests: &mut [VfdIoRequest]) {
     H5FD__sort_io_req_real(requests);
 }
 
+/// MPI: getting the rank is not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD_mpi_get_rank() -> Result<u32> {
     Err(Error::Unsupported(
@@ -958,6 +1115,7 @@ pub fn H5FD_mpi_get_rank() -> Result<u32> {
     ))
 }
 
+/// MPI: getting the communicator is not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD_mpi_get_comm() -> Result<()> {
     Err(Error::Unsupported(
@@ -965,6 +1123,7 @@ pub fn H5FD_mpi_get_comm() -> Result<()> {
     ))
 }
 
+/// MPI: getting the info object is not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD_mpi_get_info() -> Result<()> {
     Err(Error::Unsupported(
@@ -972,21 +1131,25 @@ pub fn H5FD_mpi_get_info() -> Result<()> {
     ))
 }
 
+/// Convert an `MPI_Offset` to an HDF5 address with sign checks.
 #[allow(non_snake_case)]
 pub fn H5FD_mpi_MPIOff_to_haddr(offset: i64) -> Option<u64> {
     u64::try_from(offset).ok()
 }
 
+/// Convert an HDF5 address to an `MPI_Offset`, rejecting overflow.
 #[allow(non_snake_case)]
 pub fn H5FD_mpi_haddr_to_MPIOff(addr: u64) -> Option<i64> {
     i64::try_from(addr).ok()
 }
 
+/// In the pure-Rust backend file sync is never required.
 #[allow(non_snake_case)]
 pub fn H5FD_mpi_get_file_sync_required() -> bool {
     false
 }
 
+/// MPI: waiting for the left neighbor is not supported.
 #[allow(non_snake_case)]
 pub fn H5FD_mpio_wait_for_left_neighbor() -> Result<()> {
     Err(Error::Unsupported(
@@ -994,6 +1157,7 @@ pub fn H5FD_mpio_wait_for_left_neighbor() -> Result<()> {
     ))
 }
 
+/// MPI: signalling the right neighbor is not supported.
 #[allow(non_snake_case)]
 pub fn H5FD_mpio_signal_right_neighbor() -> Result<()> {
     Err(Error::Unsupported(
@@ -1001,131 +1165,158 @@ pub fn H5FD_mpio_signal_right_neighbor() -> Result<()> {
     ))
 }
 
+/// `H5FD__mpio_register`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__mpio_register() -> Result<()> {
     Err(unsupported_vfd_driver("MPIO"))
 }
 
+/// `H5FD__mpio_unregister`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__mpio_unregister() {}
 
+/// `H5FD__mpio_init`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__mpio_init() -> Result<()> {
     Err(unsupported_vfd_driver("MPIO"))
 }
 
+/// `H5FD__mpio_term`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__mpio_term() {}
 
+/// MPI: setting atomicity is not supported.
 #[allow(non_snake_case)]
 pub fn H5FD_set_mpio_atomicity(_atomicity: bool) -> Result<()> {
     Err(unsupported_vfd_driver("MPIO atomicity"))
 }
 
+/// MPI: getting atomicity is not supported.
 #[allow(non_snake_case)]
 pub fn H5FD_get_mpio_atomicity() -> Result<bool> {
     Err(unsupported_vfd_driver("MPIO atomicity"))
 }
 
+/// `H5FD__mpio_open`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__mpio_open(_path: &str) -> Result<()> {
     Err(unsupported_vfd_driver("MPIO"))
 }
 
+/// `H5FD__mpio_close`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__mpio_close() {}
 
+/// `H5FD__mpio_query`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__mpio_query() -> u64 {
     0
 }
 
+/// `H5FD__mpio_get_eoa`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__mpio_get_eoa() -> Result<u64> {
     Err(unsupported_vfd_driver("MPIO"))
 }
 
+/// `H5FD__mpio_set_eoa`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__mpio_set_eoa(_eoa: u64) -> Result<()> {
     Err(unsupported_vfd_driver("MPIO"))
 }
 
+/// `H5FD__mpio_get_eof`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__mpio_get_eof() -> Result<u64> {
     Err(unsupported_vfd_driver("MPIO"))
 }
 
+/// `H5FD__mpio_get_handle`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__mpio_get_handle() -> Result<()> {
     Err(unsupported_vfd_driver("MPIO"))
 }
 
+/// `H5FD__mpio_read`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__mpio_read(_addr: u64, _buf: &mut [u8]) -> Result<()> {
     Err(unsupported_vfd_driver("MPIO"))
 }
 
+/// `H5FD__mpio_write`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__mpio_write(_addr: u64, _data: &[u8]) -> Result<()> {
     Err(unsupported_vfd_driver("MPIO"))
 }
 
+/// `H5FD__mpio_vector_build_types`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__mpio_vector_build_types(requests: &[VfdIoRequest]) -> Vec<VfdIoRequest> {
     requests.to_vec()
 }
 
+/// VFD: selection build types.
 #[allow(non_snake_case)]
 pub fn H5FD__selection_build_types(requests: &[VfdIoRequest]) -> Vec<VfdIoRequest> {
     requests.to_vec()
 }
 
+/// `H5FD__mpio_read_vector`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__mpio_read_vector(_requests: &mut [VfdIoRequest]) -> Result<()> {
     Err(unsupported_vfd_driver("MPIO"))
 }
 
+/// `H5FD__mpio_write_vector`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__mpio_write_vector(_requests: &[VfdIoRequest]) -> Result<()> {
     Err(unsupported_vfd_driver("MPIO"))
 }
 
+/// `H5FD__mpio_read_selection`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__mpio_read_selection(_requests: &mut [VfdIoRequest]) -> Result<()> {
     Err(unsupported_vfd_driver("MPIO"))
 }
 
+/// `H5FD__mpio_write_selection`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__mpio_write_selection(_requests: &[VfdIoRequest]) -> Result<()> {
     Err(unsupported_vfd_driver("MPIO"))
 }
 
+/// `H5FD__mpio_flush`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__mpio_flush() -> Result<()> {
     Err(unsupported_vfd_driver("MPIO"))
 }
 
+/// `H5FD__mpio_truncate`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__mpio_truncate() -> Result<()> {
     Err(unsupported_vfd_driver("MPIO"))
 }
 
+/// `H5FD__mpio_delete`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__mpio_delete(_path: &str) -> Result<()> {
     Err(unsupported_vfd_driver("MPIO"))
 }
 
+/// `H5FD__mpio_ctl`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__mpio_ctl(_opcode: u64) -> Result<()> {
     Err(unsupported_vfd_driver("MPIO"))
 }
 
+/// Build an [`Error::Unsupported`] for an unimplemented VFD driver.
 fn unsupported_vfd_driver(driver: &str) -> Error {
     Error::Unsupported(format!(
         "{driver} VFD is not implemented in pure-Rust local-only mode"
     ))
 }
 
+/// Read a little-endian `u32` from `data` at `offset` with bounds checks.
 fn read_le_u32_at(data: &[u8], offset: usize, context: &str) -> Result<u32> {
     let end = offset
         .checked_add(4)
@@ -1138,11 +1329,13 @@ fn read_le_u32_at(data: &[u8], offset: usize, context: &str) -> Result<u32> {
     Ok(u32::from_le_bytes(bytes))
 }
 
+/// Read a little-endian `u32` length field as a `usize`.
 fn read_le_u32_len_at(data: &[u8], offset: usize, context: &'static str) -> Result<usize> {
     usize::try_from(read_le_u32_at(data, offset, context)?)
         .map_err(|_| Error::InvalidFormat(format!("{context} does not fit in usize")))
 }
 
+/// Read a little-endian `u64` from `data` at `offset` with bounds checks.
 fn read_le_u64_at(data: &[u8], offset: usize, context: &str) -> Result<u64> {
     let end = offset
         .checked_add(8)
@@ -1155,78 +1348,95 @@ fn read_le_u64_at(data: &[u8], offset: usize, context: &str) -> Result<u64> {
     Ok(u64::from_le_bytes(bytes))
 }
 
+/// `H5FD__hdfs_register`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__hdfs_register() -> Result<()> {
     Err(unsupported_vfd_driver("HDFS"))
 }
 
+/// `H5FD__hdfs_unregister`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__hdfs_unregister() {}
 
+/// `H5FD__hdfs_init`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__hdfs_init() -> Result<()> {
     Err(unsupported_vfd_driver("HDFS"))
 }
 
+/// `H5FD__hdfs_handle_open`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__hdfs_handle_open(_path: &str) -> Result<()> {
     Err(unsupported_vfd_driver("HDFS"))
 }
 
+/// `H5FD__hdfs_handle_close`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__hdfs_handle_close() {}
 
+/// `H5FD__hdfs_fapl_get`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__hdfs_fapl_get() -> Result<()> {
     Err(unsupported_vfd_driver("HDFS"))
 }
 
+/// `H5FD__hdfs_fapl_copy`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__hdfs_fapl_copy() -> Result<()> {
     Err(unsupported_vfd_driver("HDFS"))
 }
 
+/// `H5FD__hdfs_fapl_free`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__hdfs_fapl_free() {}
 
+/// `H5FD__hdfs_open`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__hdfs_open(_path: &str) -> Result<()> {
     Err(unsupported_vfd_driver("HDFS"))
 }
 
+/// `H5FD__hdfs_close`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__hdfs_close() {}
 
+/// `H5FD__hdfs_cmp`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__hdfs_cmp() -> Ordering {
     Ordering::Equal
 }
 
+/// `H5FD__hdfs_query`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__hdfs_query() -> u64 {
     0
 }
 
+/// `H5FD__hdfs_get_eoa`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__hdfs_get_eoa() -> Result<u64> {
     Err(unsupported_vfd_driver("HDFS"))
 }
 
+/// `H5FD__hdfs_set_eoa`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__hdfs_set_eoa(_eoa: u64) -> Result<()> {
     Err(unsupported_vfd_driver("HDFS"))
 }
 
+/// `H5FD__hdfs_get_eof`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__hdfs_get_eof() -> Result<u64> {
     Err(unsupported_vfd_driver("HDFS"))
 }
 
+/// `H5FD__hdfs_get_handle`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__hdfs_get_handle() -> Result<()> {
     Err(unsupported_vfd_driver("HDFS"))
 }
 
+/// `H5FD__hdfs_truncate`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__hdfs_truncate() -> Result<()> {
     Err(unsupported_vfd_driver("HDFS"))
@@ -1239,60 +1449,73 @@ pub struct S3ParsedUrl {
     pub key: String,
 }
 
+/// VFD: s3comms init.
 #[allow(non_snake_case)]
 pub fn H5FD__s3comms_init() -> Result<()> {
     Err(unsupported_vfd_driver("S3/ROS3"))
 }
 
+/// VFD: s3comms term func.
 #[allow(non_snake_case)]
 pub fn H5FD__s3comms_term_func() {}
 
+/// VFD: s3comms term.
 #[allow(non_snake_case)]
 pub fn H5FD__s3comms_term() {}
 
+/// VFD: s3comms s3r req finish cb.
 #[allow(non_snake_case)]
 pub fn H5FD__s3comms_s3r_req_finish_cb() -> Result<()> {
     Err(unsupported_vfd_driver("S3/ROS3"))
 }
 
+/// VFD: s3comms s3r req finish pred.
 #[allow(non_snake_case)]
 pub fn H5FD__s3comms_s3r_req_finish_pred(done: bool) -> bool {
     done
 }
 
+/// VFD: s3comms cred provider get creds cb.
 #[allow(non_snake_case)]
 pub fn H5FD__s3comms_cred_provider_get_creds_cb() -> Result<()> {
     Err(unsupported_vfd_driver("S3/ROS3 credentials"))
 }
 
+/// VFD: s3comms cred provider pred.
 #[allow(non_snake_case)]
 pub fn H5FD__s3comms_cred_provider_pred(has_credentials: bool) -> bool {
     has_credentials
 }
 
+/// VFD: s3comms s3r open.
 #[allow(non_snake_case)]
 pub fn H5FD__s3comms_s3r_open(_url: &str) -> Result<()> {
     Err(unsupported_vfd_driver("S3/ROS3"))
 }
 
+/// VFD: s3comms s3r close.
 #[allow(non_snake_case)]
 pub fn H5FD__s3comms_s3r_close() {}
 
+/// VFD: s3comms s3r get filesize.
 #[allow(non_snake_case)]
 pub fn H5FD__s3comms_s3r_get_filesize(_url: &str) -> Result<u64> {
     Err(unsupported_vfd_driver("S3/ROS3"))
 }
 
+/// VFD: s3comms s3r getsize.
 #[allow(non_snake_case)]
 pub fn H5FD__s3comms_s3r_getsize(_url: &str) -> Result<u64> {
     Err(unsupported_vfd_driver("S3/ROS3"))
 }
 
+/// VFD: s3comms s3r getsize headers cb.
 #[allow(non_snake_case)]
 pub fn H5FD__s3comms_s3r_getsize_headers_cb(_headers: &[(&str, &str)]) -> Option<u64> {
     None
 }
 
+/// VFD: s3comms parse url.
 #[allow(non_snake_case)]
 pub fn H5FD__s3comms_parse_url(url: &str) -> Result<S3ParsedUrl> {
     let (scheme, rest) = url
@@ -1308,9 +1531,11 @@ pub fn H5FD__s3comms_parse_url(url: &str) -> Result<S3ParsedUrl> {
     })
 }
 
+/// VFD: s3comms free purl.
 #[allow(non_snake_case)]
 pub fn H5FD__s3comms_free_purl(_url: S3ParsedUrl) {}
 
+/// VFD: s3comms get aws region.
 #[allow(non_snake_case)]
 pub fn H5FD__s3comms_get_aws_region(endpoint: &str) -> Option<String> {
     endpoint
@@ -1319,16 +1544,19 @@ pub fn H5FD__s3comms_get_aws_region(endpoint: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// VFD: s3comms get credentials provider.
 #[allow(non_snake_case)]
 pub fn H5FD__s3comms_get_credentials_provider() -> Result<()> {
     Err(unsupported_vfd_driver("S3/ROS3 credentials"))
 }
 
+/// VFD: s3comms format user agent header.
 #[allow(non_snake_case)]
 pub fn H5FD__s3comms_format_user_agent_header(product: &str, version: &str) -> String {
     format!("{product}/{version}")
 }
 
+/// VFD: s3comms httpcode to str.
 #[allow(non_snake_case)]
 pub fn H5FD__s3comms_httpcode_to_str(code: u16) -> &'static str {
     match code {
@@ -1354,14 +1582,23 @@ pub enum MirrorXmit {
     Write { addr: u64, data: Vec<u8> },
 }
 
+/// `H5FD__mirror_register`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__mirror_register() -> Result<()> {
     Err(unsupported_vfd_driver("mirror"))
 }
 
+/// `H5FD__mirror_unregister`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__mirror_unregister() {}
 
+/// `H5FD__mirror_xmit_encode_uint8`: distributed/cloud driver, not supported by the pure-Rust backend.
+#[allow(non_snake_case)]
+pub fn H5FD__mirror_xmit_encode_uint8(value: u8) -> Vec<u8> {
+    vec![value]
+}
+
+/// `H5FD__mirror_xmit_decode_uint64`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__mirror_xmit_decode_uint64(bytes: &[u8]) -> Result<u64> {
     if bytes.len() != 8 {
@@ -1372,6 +1609,7 @@ pub fn H5FD__mirror_xmit_decode_uint64(bytes: &[u8]) -> Result<u64> {
     read_le_u64_at(bytes, 0, "mirror transmit uint64")
 }
 
+/// `mirror` VFD: xmit decode lock.
 #[allow(non_snake_case)]
 pub fn H5FD_mirror_xmit_decode_lock(bytes: &[u8]) -> Result<MirrorXmit> {
     if !bytes.is_empty() {
@@ -1382,6 +1620,7 @@ pub fn H5FD_mirror_xmit_decode_lock(bytes: &[u8]) -> Result<MirrorXmit> {
     Ok(MirrorXmit::Lock)
 }
 
+/// `mirror` VFD: xmit decode open.
 #[allow(non_snake_case)]
 pub fn H5FD_mirror_xmit_decode_open(bytes: &[u8]) -> Result<MirrorXmit> {
     let path = std::str::from_utf8(bytes)
@@ -1391,6 +1630,7 @@ pub fn H5FD_mirror_xmit_decode_open(bytes: &[u8]) -> Result<MirrorXmit> {
     })
 }
 
+/// `mirror` VFD: xmit decode reply.
 #[allow(non_snake_case)]
 pub fn H5FD_mirror_xmit_decode_reply(bytes: &[u8]) -> Result<MirrorXmit> {
     if bytes.len() != 4 {
@@ -1406,11 +1646,13 @@ pub fn H5FD_mirror_xmit_decode_reply(bytes: &[u8]) -> Result<MirrorXmit> {
     Ok(MirrorXmit::Reply { status })
 }
 
+/// `mirror` VFD: xmit decode set eoa.
 #[allow(non_snake_case)]
 pub fn H5FD_mirror_xmit_decode_set_eoa(bytes: &[u8]) -> Result<MirrorXmit> {
     H5FD__mirror_xmit_decode_uint64(bytes).map(|eoa| MirrorXmit::SetEoa { eoa })
 }
 
+/// `mirror` VFD: xmit decode write.
 #[allow(non_snake_case)]
 pub fn H5FD_mirror_xmit_decode_write(bytes: &[u8]) -> Result<MirrorXmit> {
     if bytes.len() < 8 {
@@ -1425,124 +1667,153 @@ pub fn H5FD_mirror_xmit_decode_write(bytes: &[u8]) -> Result<MirrorXmit> {
     })
 }
 
+/// `mirror` VFD: xmit encode open.
 #[allow(non_snake_case)]
-pub fn H5FD_mirror_xmit_encode_open(path: &str) -> Vec<u8> {
-    path.as_bytes().to_vec()
+pub fn H5FD_mirror_xmit_encode_open(path: &str) -> Result<Vec<u8>> {
+    Ok(path.as_bytes().to_vec())
 }
 
+/// `mirror` VFD: xmit encode reply.
 #[allow(non_snake_case)]
-pub fn H5FD_mirror_xmit_encode_reply(status: i32) -> Vec<u8> {
-    status.to_le_bytes().to_vec()
+pub fn H5FD_mirror_xmit_encode_reply(status: i32) -> Result<Vec<u8>> {
+    Ok(status.to_le_bytes().to_vec())
 }
 
+/// `mirror` VFD: xmit encode set eoa.
 #[allow(non_snake_case)]
-pub fn H5FD_mirror_xmit_encode_set_eoa(eoa: u64) -> Vec<u8> {
-    eoa.to_le_bytes().to_vec()
+pub fn H5FD_mirror_xmit_encode_set_eoa(eoa: u64) -> Result<Vec<u8>> {
+    Ok(eoa.to_le_bytes().to_vec())
 }
 
+/// `mirror` VFD: xmit encode write.
 #[allow(non_snake_case)]
-pub fn H5FD_mirror_xmit_encode_write(addr: u64, data: &[u8]) -> Vec<u8> {
-    let mut out = addr.to_le_bytes().to_vec();
+pub fn H5FD_mirror_xmit_encode_write(addr: u64, data: &[u8]) -> Result<Vec<u8>> {
+    let image_len = 8usize.checked_add(data.len()).ok_or_else(|| {
+        Error::InvalidFormat("mirror transmit write image length overflow".into())
+    })?;
+    let mut out = Vec::with_capacity(image_len);
+    out.extend_from_slice(&addr.to_le_bytes());
     out.extend_from_slice(data);
-    out
+    Ok(out)
 }
 
+/// `mirror` VFD: xmit is close.
 #[allow(non_snake_case)]
 pub fn H5FD_mirror_xmit_is_close(message: &MirrorXmit) -> bool {
     matches!(message, MirrorXmit::Close)
 }
 
+/// `mirror` VFD: xmit is lock.
 #[allow(non_snake_case)]
 pub fn H5FD_mirror_xmit_is_lock(message: &MirrorXmit) -> bool {
     matches!(message, MirrorXmit::Lock)
 }
 
+/// `mirror` VFD: xmit is set eoa.
 #[allow(non_snake_case)]
 pub fn H5FD_mirror_xmit_is_set_eoa(message: &MirrorXmit) -> bool {
     matches!(message, MirrorXmit::SetEoa { .. })
 }
 
+/// `mirror` VFD: xmit is reply.
 #[allow(non_snake_case)]
 pub fn H5FD_mirror_xmit_is_reply(message: &MirrorXmit) -> bool {
     matches!(message, MirrorXmit::Reply { .. })
 }
 
+/// `mirror` VFD: xmit is write.
 #[allow(non_snake_case)]
 pub fn H5FD_mirror_xmit_is_write(message: &MirrorXmit) -> bool {
     matches!(message, MirrorXmit::Write { .. })
 }
 
+/// `mirror` VFD: xmit is xmit.
 #[allow(non_snake_case)]
 pub fn H5FD_mirror_xmit_is_xmit(_message: &MirrorXmit) -> bool {
     true
 }
 
+/// `H5FD__mirror_verify_reply`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__mirror_verify_reply(message: &MirrorXmit) -> bool {
     matches!(message, MirrorXmit::Reply { status: 0 })
 }
 
+/// `H5FD__mirror_fapl_get`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__mirror_fapl_get() -> Result<()> {
     Err(unsupported_vfd_driver("mirror"))
 }
 
+/// `H5FD__mirror_fapl_copy`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__mirror_fapl_copy() -> Result<()> {
     Err(unsupported_vfd_driver("mirror"))
 }
 
+/// `H5FD__mirror_fapl_free`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__mirror_fapl_free() {}
 
+/// `H5FD__mirror_open`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__mirror_open(_path: &str) -> Result<()> {
     Err(unsupported_vfd_driver("mirror"))
 }
 
+/// `H5FD__mirror_close`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__mirror_close() {}
 
+/// `H5FD__mirror_query`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__mirror_query() -> u64 {
     0
 }
 
+/// `H5FD__mirror_get_eoa`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__mirror_get_eoa() -> Result<u64> {
     Err(unsupported_vfd_driver("mirror"))
 }
 
+/// `H5FD__mirror_set_eoa`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__mirror_set_eoa(_eoa: u64) -> Result<()> {
     Err(unsupported_vfd_driver("mirror"))
 }
 
+/// `H5FD__mirror_get_eof`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__mirror_get_eof() -> Result<u64> {
     Err(unsupported_vfd_driver("mirror"))
 }
 
+/// `H5FD__mirror_read`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__mirror_read(_addr: u64, _buf: &mut [u8]) -> Result<()> {
     Err(unsupported_vfd_driver("mirror"))
 }
 
+/// `H5FD__mirror_write`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__mirror_write(_addr: u64, _data: &[u8]) -> Result<()> {
     Err(unsupported_vfd_driver("mirror"))
 }
 
+/// `H5FD__mirror_truncate`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__mirror_truncate() -> Result<()> {
     Err(unsupported_vfd_driver("mirror"))
 }
 
+/// `H5FD__mirror_lock`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__mirror_lock() -> Result<()> {
     Err(unsupported_vfd_driver("mirror"))
 }
 
+/// `H5FD__mirror_unlock`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__mirror_unlock() -> Result<()> {
     Err(unsupported_vfd_driver("mirror"))
@@ -1563,42 +1834,51 @@ impl Default for FamilyFileConfig {
     }
 }
 
+/// `H5FD__family_get_default_config`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__family_get_default_config() -> FamilyFileConfig {
     FamilyFileConfig::default()
 }
 
+/// `H5FD__family_get_default_printf_filename`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__family_get_default_printf_filename() -> &'static str {
     "%05d.h5"
 }
 
+/// `H5FD__family_register`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__family_register() -> Result<()> {
     Err(unsupported_vfd_driver("family"))
 }
 
+/// `H5FD__family_unregister`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__family_unregister() {}
 
+/// `H5FD__family_fapl_get`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__family_fapl_get(config: &FamilyFileConfig) -> FamilyFileConfig {
     config.clone()
 }
 
+/// `H5FD__family_fapl_copy`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__family_fapl_copy(config: &FamilyFileConfig) -> FamilyFileConfig {
     config.clone()
 }
 
+/// `H5FD__family_fapl_free`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__family_fapl_free(_config: FamilyFileConfig) {}
 
+/// `H5FD__family_validate_config`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__family_validate_config(config: &FamilyFileConfig) -> bool {
     config.member_size != 0 && !config.printf_filename.is_empty()
 }
 
+/// `H5FD__family_sb_size`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__family_sb_size(config: &FamilyFileConfig) -> Result<usize> {
     12usize
@@ -1606,6 +1886,7 @@ pub fn H5FD__family_sb_size(config: &FamilyFileConfig) -> Result<usize> {
         .ok_or_else(|| Error::InvalidFormat("family VFD config image length overflow".into()))
 }
 
+/// `H5FD__family_sb_encode`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__family_sb_encode(config: &FamilyFileConfig) -> Result<Vec<u8>> {
     if !H5FD__family_validate_config(config) {
@@ -1621,6 +1902,7 @@ pub fn H5FD__family_sb_encode(config: &FamilyFileConfig) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// `H5FD__family_sb_decode`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__family_sb_decode(bytes: &[u8]) -> Result<FamilyFileConfig> {
     let member_size = read_le_u64_at(bytes, 0, "family VFD member size")?;
@@ -1650,14 +1932,17 @@ pub fn H5FD__family_sb_decode(bytes: &[u8]) -> Result<FamilyFileConfig> {
     Ok(config)
 }
 
+/// `H5FD__family_open`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__family_open(_pattern: &str, _config: &FamilyFileConfig) -> Result<()> {
     Err(unsupported_vfd_driver("family"))
 }
 
+/// `H5FD__family_close`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__family_close() {}
 
+/// `H5FD__family_cmp`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__family_cmp(left: &FamilyFileConfig, right: &FamilyFileConfig) -> Ordering {
     left.member_size
@@ -1665,46 +1950,55 @@ pub fn H5FD__family_cmp(left: &FamilyFileConfig, right: &FamilyFileConfig) -> Or
         .then_with(|| left.printf_filename.cmp(&right.printf_filename))
 }
 
+/// `H5FD__family_query`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__family_query() -> u64 {
     0
 }
 
+/// `H5FD__family_get_eoa`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__family_get_eoa() -> Result<u64> {
     Err(unsupported_vfd_driver("family"))
 }
 
+/// `H5FD__family_set_eoa`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__family_set_eoa(_eoa: u64) -> Result<()> {
     Err(unsupported_vfd_driver("family"))
 }
 
+/// `H5FD__family_read`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__family_read(_addr: u64, _buf: &mut [u8]) -> Result<()> {
     Err(unsupported_vfd_driver("family"))
 }
 
+/// `H5FD__family_flush`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__family_flush() -> Result<()> {
     Err(unsupported_vfd_driver("family"))
 }
 
+/// `H5FD__family_truncate`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__family_truncate() -> Result<()> {
     Err(unsupported_vfd_driver("family"))
 }
 
+/// `H5FD__family_lock`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__family_lock() -> Result<()> {
     Err(unsupported_vfd_driver("family"))
 }
 
+/// `H5FD__family_unlock`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__family_unlock() -> Result<()> {
     Err(unsupported_vfd_driver("family"))
 }
 
+/// `H5FD__family_delete`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__family_delete(_pattern: &str) -> Result<()> {
     Err(unsupported_vfd_driver("family"))
@@ -1721,6 +2015,7 @@ pub struct MultiFileState {
     pub memb_next: HashMap<VfdMemType, u64>,
 }
 
+/// `multi` VFD: populate the default driver-specific configuration.
 #[allow(non_snake_case)]
 pub fn H5FD_multi_populate_config() -> MultiFileConfig {
     let mut config = MultiFileConfig::default();
@@ -1730,6 +2025,7 @@ pub fn H5FD_multi_populate_config() -> MultiFileConfig {
     config
 }
 
+/// VFD: vfd mem type code.
 fn vfd_mem_type_code(mem_type: VfdMemType) -> u8 {
     match mem_type {
         VfdMemType::Default => 0,
@@ -1744,6 +2040,7 @@ fn vfd_mem_type_code(mem_type: VfdMemType) -> u8 {
     }
 }
 
+/// VFD: vfd mem type from code.
 fn vfd_mem_type_from_code(code: u8) -> Option<VfdMemType> {
     Some(match code {
         0 => VfdMemType::Default,
@@ -1759,6 +2056,7 @@ fn vfd_mem_type_from_code(code: u8) -> Option<VfdMemType> {
     })
 }
 
+/// VFD: file driver kind code.
 fn file_driver_kind_code(kind: FileDriverKind) -> u8 {
     match kind {
         FileDriverKind::Sec2 => 0,
@@ -1768,6 +2066,7 @@ fn file_driver_kind_code(kind: FileDriverKind) -> u8 {
     }
 }
 
+/// VFD: file driver kind from code.
 fn file_driver_kind_from_code(code: u8) -> Option<FileDriverKind> {
     Some(match code {
         0 => FileDriverKind::Sec2,
@@ -1778,11 +2077,13 @@ fn file_driver_kind_from_code(code: u8) -> Option<FileDriverKind> {
     })
 }
 
+/// `multi` VFD: validate config.
 #[allow(non_snake_case)]
 pub fn H5FD_multi_validate_config(config: &MultiFileConfig) -> bool {
     !config.memb_map.is_empty()
 }
 
+/// `multi` VFD: return the superblock extension size for a driver.
 #[allow(non_snake_case)]
 pub fn H5FD_multi_sb_size(config: &MultiFileConfig) -> Result<usize> {
     config
@@ -1793,6 +2094,7 @@ pub fn H5FD_multi_sb_size(config: &MultiFileConfig) -> Result<usize> {
         .ok_or_else(|| Error::InvalidFormat("multi VFD member map length overflow".into()))
 }
 
+/// `multi` VFD: sb encode.
 #[allow(non_snake_case)]
 pub fn H5FD_multi_sb_encode(config: &MultiFileConfig) -> Result<Vec<u8>> {
     if !H5FD_multi_validate_config(config) {
@@ -1811,6 +2113,7 @@ pub fn H5FD_multi_sb_encode(config: &MultiFileConfig) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// `multi` VFD: sb decode.
 #[allow(non_snake_case)]
 pub fn H5FD_multi_sb_decode(bytes: &[u8]) -> Result<MultiFileConfig> {
     let count = read_le_u32_len_at(bytes, 0, "multi VFD member count")?;
@@ -1838,42 +2141,51 @@ pub fn H5FD_multi_sb_decode(bytes: &[u8]) -> Result<MultiFileConfig> {
     Ok(config)
 }
 
+/// `multi` VFD: get the driver-specific FAPL configuration.
 #[allow(non_snake_case)]
 pub fn H5FD_multi_fapl_get(config: &MultiFileConfig) -> MultiFileConfig {
     config.clone()
 }
 
+/// `multi` VFD: copy the driver-specific FAPL configuration.
 #[allow(non_snake_case)]
 pub fn H5FD_multi_fapl_copy(config: &MultiFileConfig) -> MultiFileConfig {
     config.clone()
 }
 
+/// `multi` VFD: free the driver-specific FAPL configuration.
 #[allow(non_snake_case)]
 pub fn H5FD_multi_fapl_free(_config: MultiFileConfig) {}
 
+/// `multi` VFD: open.
 #[allow(non_snake_case)]
 pub fn H5FD_multi_open(_path: &str, _config: &MultiFileConfig) -> Result<()> {
     Err(unsupported_vfd_driver("multi"))
 }
 
+/// `multi` VFD: close.
 #[allow(non_snake_case)]
 pub fn H5FD_multi_close() {}
 
+/// `multi` VFD: compare two driver instances.
 #[allow(non_snake_case)]
 pub fn H5FD_multi_cmp(left: &MultiFileConfig, right: &MultiFileConfig) -> Ordering {
     left.memb_map.len().cmp(&right.memb_map.len())
 }
 
+/// `multi` VFD: query feature flags.
 #[allow(non_snake_case)]
 pub fn H5FD_multi_query() -> u64 {
     0
 }
 
+/// `multi` VFD: get type map.
 #[allow(non_snake_case)]
 pub fn H5FD_multi_get_type_map(config: &MultiFileConfig) -> &HashMap<VfdMemType, FileDriverKind> {
     &config.memb_map
 }
 
+/// VFD: compute next.
 pub fn compute_next(file: &mut MultiFileState) {
     file.memb_next.clear();
     let members: Vec<_> = file
@@ -1891,71 +2203,85 @@ pub fn compute_next(file: &mut MultiFileState) {
     }
 }
 
+/// `multi` VFD: get the end-of-allocation address.
 #[allow(non_snake_case)]
 pub fn H5FD_multi_get_eoa() -> Result<u64> {
     Err(unsupported_vfd_driver("multi"))
 }
 
+/// `multi` VFD: set the end-of-allocation address.
 #[allow(non_snake_case)]
 pub fn H5FD_multi_set_eoa(_eoa: u64) -> Result<()> {
     Err(unsupported_vfd_driver("multi"))
 }
 
+/// `multi` VFD: get the end-of-file address.
 #[allow(non_snake_case)]
 pub fn H5FD_multi_get_eof() -> Result<u64> {
     Err(unsupported_vfd_driver("multi"))
 }
 
+/// `multi` VFD: get the underlying file handle.
 #[allow(non_snake_case)]
 pub fn H5FD_multi_get_handle() -> Result<()> {
     Err(unsupported_vfd_driver("multi"))
 }
 
+/// `multi` VFD: allocate space in the file.
 #[allow(non_snake_case)]
 pub fn H5FD_multi_alloc(_size: u64) -> Result<u64> {
     Err(unsupported_vfd_driver("multi"))
 }
 
+/// `multi` VFD: free a previously allocated region.
 #[allow(non_snake_case)]
 pub fn H5FD_multi_free(_addr: u64, _size: u64) -> Result<()> {
     Err(unsupported_vfd_driver("multi"))
 }
 
+/// `multi` VFD: read bytes from the file.
 #[allow(non_snake_case)]
 pub fn H5FD_multi_read(_addr: u64, _buf: &mut [u8]) -> Result<()> {
     Err(unsupported_vfd_driver("multi"))
 }
 
+/// `multi` VFD: write bytes to the file.
 #[allow(non_snake_case)]
 pub fn H5FD_multi_write(_addr: u64, _data: &[u8]) -> Result<()> {
     Err(unsupported_vfd_driver("multi"))
 }
 
+/// `multi` VFD: flush buffered writes to disk.
 #[allow(non_snake_case)]
 pub fn H5FD_multi_flush() -> Result<()> {
     Err(unsupported_vfd_driver("multi"))
 }
 
+/// `multi` VFD: truncate the file to the current EOA.
 #[allow(non_snake_case)]
 pub fn H5FD_multi_truncate() -> Result<()> {
     Err(unsupported_vfd_driver("multi"))
 }
 
+/// `multi` VFD: acquire an advisory file lock.
 #[allow(non_snake_case)]
 pub fn H5FD_multi_lock() -> Result<()> {
     Err(unsupported_vfd_driver("multi"))
 }
 
+/// `multi` VFD: release an advisory file lock.
 #[allow(non_snake_case)]
 pub fn H5FD_multi_unlock() -> Result<()> {
     Err(unsupported_vfd_driver("multi"))
 }
 
+/// `multi` VFD: delete the file.
 #[allow(non_snake_case)]
 pub fn H5FD_multi_delete(_path: &str) -> Result<()> {
     Err(unsupported_vfd_driver("multi"))
 }
 
+/// `multi` VFD: invoke a driver-specific control op.
 #[allow(non_snake_case)]
 pub fn H5FD_multi_ctl(_opcode: u64) -> Result<()> {
     Err(unsupported_vfd_driver("multi"))
@@ -1967,6 +2293,7 @@ pub struct SplitterFileConfig {
     pub ignore_wo_errors: bool,
 }
 
+/// `H5FD__splitter_populate_config`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__splitter_populate_config(write_only_path: Option<PathBuf>) -> SplitterFileConfig {
     SplitterFileConfig {
@@ -1975,37 +2302,45 @@ pub fn H5FD__splitter_populate_config(write_only_path: Option<PathBuf>) -> Split
     }
 }
 
+/// `H5FD__splitter_get_default_wo_path`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__splitter_get_default_wo_path() -> &'static str {
     "%s.splitter"
 }
 
+/// VFD: split populate config.
 #[allow(non_snake_case)]
 pub fn H5FD_split_populate_config(write_only_path: Option<PathBuf>) -> SplitterFileConfig {
     H5FD__splitter_populate_config(write_only_path)
 }
 
+/// `H5FD__splitter_register`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__splitter_register() -> Result<()> {
     Err(unsupported_vfd_driver("splitter"))
 }
 
+/// `H5FD__splitter_unregister`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__splitter_unregister() {}
 
+/// `H5FD__splitter_fapl_get`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__splitter_fapl_get(config: &SplitterFileConfig) -> SplitterFileConfig {
     config.clone()
 }
 
+/// `H5FD__splitter_fapl_copy`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__splitter_fapl_copy(config: &SplitterFileConfig) -> SplitterFileConfig {
     config.clone()
 }
 
+/// `H5FD__splitter_fapl_free`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__splitter_fapl_free(_config: SplitterFileConfig) {}
 
+/// `H5FD__splitter_validate_config`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__splitter_validate_config(config: &SplitterFileConfig) -> bool {
     config
@@ -2014,49 +2349,59 @@ pub fn H5FD__splitter_validate_config(config: &SplitterFileConfig) -> bool {
         .is_none_or(|path| !path.as_os_str().is_empty())
 }
 
+/// `H5FD__splitter_open`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__splitter_open(_path: &str, _config: &SplitterFileConfig) -> Result<()> {
     Err(unsupported_vfd_driver("splitter"))
 }
 
+/// `H5FD__splitter_close`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__splitter_close() {}
 
+/// `H5FD__splitter_flush`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__splitter_flush() -> Result<()> {
     Err(unsupported_vfd_driver("splitter"))
 }
 
+/// `H5FD__splitter_read`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__splitter_read(_addr: u64, _buf: &mut [u8]) -> Result<()> {
     Err(unsupported_vfd_driver("splitter"))
 }
 
+/// `H5FD__splitter_write`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__splitter_write(_addr: u64, _data: &[u8]) -> Result<()> {
     Err(unsupported_vfd_driver("splitter"))
 }
 
+/// `H5FD__splitter_get_eoa`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__splitter_get_eoa() -> Result<u64> {
     Err(unsupported_vfd_driver("splitter"))
 }
 
+/// `H5FD__splitter_set_eoa`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__splitter_set_eoa(_eoa: u64) -> Result<()> {
     Err(unsupported_vfd_driver("splitter"))
 }
 
+/// `H5FD__splitter_get_eof`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__splitter_get_eof() -> Result<u64> {
     Err(unsupported_vfd_driver("splitter"))
 }
 
+/// `H5FD__splitter_truncate`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__splitter_truncate() -> Result<()> {
     Err(unsupported_vfd_driver("splitter"))
 }
 
+/// `H5FD__splitter_sb_size`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__splitter_sb_size(config: &SplitterFileConfig) -> Result<usize> {
     5usize
@@ -2070,6 +2415,7 @@ pub fn H5FD__splitter_sb_size(config: &SplitterFileConfig) -> Result<usize> {
         .ok_or_else(|| Error::InvalidFormat("splitter VFD config image length overflow".into()))
 }
 
+/// `H5FD__splitter_sb_encode`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__splitter_sb_encode(config: &SplitterFileConfig) -> Result<Vec<u8>> {
     if !H5FD__splitter_validate_config(config) {
@@ -2089,6 +2435,7 @@ pub fn H5FD__splitter_sb_encode(config: &SplitterFileConfig) -> Result<Vec<u8>> 
     Ok(out)
 }
 
+/// `H5FD__splitter_sb_decode`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__splitter_sb_decode(bytes: &[u8]) -> Result<SplitterFileConfig> {
     let ignore_wo_errors = *bytes
@@ -2124,6 +2471,7 @@ pub fn H5FD__splitter_sb_decode(bytes: &[u8]) -> Result<SplitterFileConfig> {
     Ok(config)
 }
 
+/// `H5FD__splitter_cmp`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__splitter_cmp(left: &SplitterFileConfig, right: &SplitterFileConfig) -> Ordering {
     left.write_only_path
@@ -2131,51 +2479,61 @@ pub fn H5FD__splitter_cmp(left: &SplitterFileConfig, right: &SplitterFileConfig)
         .then_with(|| left.ignore_wo_errors.cmp(&right.ignore_wo_errors))
 }
 
+/// `H5FD__splitter_get_handle`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__splitter_get_handle() -> Result<()> {
     Err(unsupported_vfd_driver("splitter"))
 }
 
+/// `H5FD__splitter_lock`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__splitter_lock() -> Result<()> {
     Err(unsupported_vfd_driver("splitter"))
 }
 
+/// `H5FD__splitter_unlock`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__splitter_unlock() -> Result<()> {
     Err(unsupported_vfd_driver("splitter"))
 }
 
+/// `H5FD__splitter_ctl`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__splitter_ctl(_opcode: u64) -> Result<()> {
     Err(unsupported_vfd_driver("splitter"))
 }
 
+/// `H5FD__splitter_query`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__splitter_query() -> u64 {
     0
 }
 
+/// `H5FD__splitter_alloc`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__splitter_alloc(_size: u64) -> Result<u64> {
     Err(unsupported_vfd_driver("splitter"))
 }
 
+/// `H5FD__splitter_get_type_map`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__splitter_get_type_map() -> Result<()> {
     Err(unsupported_vfd_driver("splitter"))
 }
 
+/// `H5FD__splitter_free`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__splitter_free(_addr: u64, _size: u64) -> Result<()> {
     Err(unsupported_vfd_driver("splitter"))
 }
 
+/// `H5FD__splitter_delete`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__splitter_delete(_path: &str) -> Result<()> {
     Err(unsupported_vfd_driver("splitter"))
 }
 
+/// `H5FD__splitter_log_error`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__splitter_log_error(message: &str) -> String {
     message.to_string()
@@ -2188,27 +2546,33 @@ pub struct LogFileConfig {
     pub buffer_size: usize,
 }
 
+/// `H5FD__log_register`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__log_register() -> Result<()> {
     Err(unsupported_vfd_driver("log"))
 }
 
+/// `H5FD__log_unregister`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__log_unregister() {}
 
+/// `H5FD__log_fapl_get`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__log_fapl_get(config: &LogFileConfig) -> LogFileConfig {
     config.clone()
 }
 
+/// `H5FD__log_fapl_copy`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__log_fapl_copy(config: &LogFileConfig) -> LogFileConfig {
     config.clone()
 }
 
+/// `H5FD__log_fapl_free`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__log_fapl_free(_config: LogFileConfig) {}
 
+/// `H5FD__log_validate_config`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__log_validate_config(config: &LogFileConfig) -> bool {
     config
@@ -2217,6 +2581,7 @@ pub fn H5FD__log_validate_config(config: &LogFileConfig) -> bool {
         .is_none_or(|path| !path.as_os_str().is_empty())
 }
 
+/// `H5FD__log_sb_size`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__log_sb_size(config: &LogFileConfig) -> Result<usize> {
     20usize
@@ -2230,6 +2595,7 @@ pub fn H5FD__log_sb_size(config: &LogFileConfig) -> Result<usize> {
         .ok_or_else(|| Error::InvalidFormat("log VFD config image length overflow".into()))
 }
 
+/// `H5FD__log_sb_encode`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__log_sb_encode(config: &LogFileConfig) -> Result<Vec<u8>> {
     if !H5FD__log_validate_config(config) {
@@ -2252,6 +2618,7 @@ pub fn H5FD__log_sb_encode(config: &LogFileConfig) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// `H5FD__log_sb_decode`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__log_sb_decode(bytes: &[u8]) -> Result<LogFileConfig> {
     let flags = read_le_u64_at(bytes, 0, "log VFD flags")?;
@@ -2287,14 +2654,17 @@ pub fn H5FD__log_sb_decode(bytes: &[u8]) -> Result<LogFileConfig> {
     Ok(config)
 }
 
+/// `H5FD__log_open`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__log_open(_path: &str, _config: &LogFileConfig) -> Result<()> {
     Err(unsupported_vfd_driver("log"))
 }
 
+/// `H5FD__log_close`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__log_close() {}
 
+/// `H5FD__log_cmp`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__log_cmp(left: &LogFileConfig, right: &LogFileConfig) -> Ordering {
     left.log_path
@@ -2303,66 +2673,79 @@ pub fn H5FD__log_cmp(left: &LogFileConfig, right: &LogFileConfig) -> Ordering {
         .then_with(|| left.buffer_size.cmp(&right.buffer_size))
 }
 
+/// `H5FD__log_query`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__log_query() -> u64 {
     0
 }
 
+/// `H5FD__log_alloc`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__log_alloc(_size: u64) -> Result<u64> {
     Err(unsupported_vfd_driver("log"))
 }
 
+/// `H5FD__log_free`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__log_free(_addr: u64, _size: u64) -> Result<()> {
     Err(unsupported_vfd_driver("log"))
 }
 
+/// `H5FD__log_get_eoa`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__log_get_eoa() -> Result<u64> {
     Err(unsupported_vfd_driver("log"))
 }
 
+/// `H5FD__log_set_eoa`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__log_set_eoa(_eoa: u64) -> Result<()> {
     Err(unsupported_vfd_driver("log"))
 }
 
+/// `H5FD__log_get_eof`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__log_get_eof() -> Result<u64> {
     Err(unsupported_vfd_driver("log"))
 }
 
+/// `H5FD__log_get_handle`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__log_get_handle() -> Result<()> {
     Err(unsupported_vfd_driver("log"))
 }
 
+/// `H5FD__log_read`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__log_read(_addr: u64, _buf: &mut [u8]) -> Result<()> {
     Err(unsupported_vfd_driver("log"))
 }
 
+/// `H5FD__log_write`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__log_write(_addr: u64, _data: &[u8]) -> Result<()> {
     Err(unsupported_vfd_driver("log"))
 }
 
+/// `H5FD__log_truncate`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__log_truncate() -> Result<()> {
     Err(unsupported_vfd_driver("log"))
 }
 
+/// `H5FD__log_lock`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__log_lock() -> Result<()> {
     Err(unsupported_vfd_driver("log"))
 }
 
+/// `H5FD__log_unlock`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__log_unlock() -> Result<()> {
     Err(unsupported_vfd_driver("log"))
 }
 
+/// `H5FD__log_delete`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__log_delete(_path: &str) -> Result<()> {
     Err(unsupported_vfd_driver("log"))
@@ -2375,104 +2758,126 @@ pub struct Ros3Config {
     pub token: Option<String>,
 }
 
+/// `H5FD__ros3_register`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__ros3_register() -> Result<()> {
     Err(unsupported_vfd_driver("ROS3"))
 }
 
+/// `H5FD__ros3_unregister`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__ros3_unregister() {}
 
+/// `H5FD__ros3_init`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__ros3_init() -> Result<()> {
     Err(unsupported_vfd_driver("ROS3"))
 }
 
+/// `H5FD__ros3_term`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__ros3_term() {}
 
+/// `H5FD__ros3_validate_config`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__ros3_validate_config(config: &Ros3Config) -> bool {
     config.endpoint.as_deref().is_none_or(|s| !s.is_empty())
         && config.region.as_deref().is_none_or(|s| !s.is_empty())
 }
 
+/// `H5FD__ros3_fapl_get`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__ros3_fapl_get(config: &Ros3Config) -> Ros3Config {
     config.clone()
 }
 
+/// `H5FD__ros3_fapl_copy`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__ros3_fapl_copy(config: &Ros3Config) -> Ros3Config {
     config.clone()
 }
 
+/// `H5FD__ros3_fapl_free`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__ros3_fapl_free(_config: Ros3Config) {}
 
+/// `H5FD__ros3_str_token_close`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__ros3_str_token_close(token: &mut Option<String>) {
     *token = None;
 }
 
+/// `H5FD__ros3_str_token_delete`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__ros3_str_token_delete(token: &mut Option<String>) {
     *token = None;
 }
 
+/// `H5FD__ros3_str_endpoint_close`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__ros3_str_endpoint_close(endpoint: &mut Option<String>) {
     *endpoint = None;
 }
 
+/// `H5FD__ros3_str_endpoint_delete`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__ros3_str_endpoint_delete(endpoint: &mut Option<String>) {
     *endpoint = None;
 }
 
+/// `H5FD__ros3_query`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__ros3_query() -> u64 {
     0
 }
 
+/// `H5FD__ros3_get_eoa`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__ros3_get_eoa() -> Result<u64> {
     Err(unsupported_vfd_driver("ROS3"))
 }
 
+/// `H5FD__ros3_set_eoa`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__ros3_set_eoa(_eoa: u64) -> Result<()> {
     Err(unsupported_vfd_driver("ROS3"))
 }
 
+/// `H5FD__ros3_get_eof`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__ros3_get_eof() -> Result<u64> {
     Err(unsupported_vfd_driver("ROS3"))
 }
 
+/// `H5FD__ros3_get_handle`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__ros3_get_handle() -> Result<()> {
     Err(unsupported_vfd_driver("ROS3"))
 }
 
+/// `H5FD__ros3_read`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__ros3_read(_addr: u64, _buf: &mut [u8]) -> Result<()> {
     Err(unsupported_vfd_driver("ROS3"))
 }
 
+/// `H5FD__ros3_write`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__ros3_write(_addr: u64, _data: &[u8]) -> Result<()> {
     Err(unsupported_vfd_driver("ROS3"))
 }
 
+/// `H5FD__ros3_truncate`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__ros3_truncate() -> Result<()> {
     Err(unsupported_vfd_driver("ROS3"))
 }
 
+/// `H5FD__ros3_reset_stats`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__ros3_reset_stats() {}
 
+/// `H5FD__ros3_print_stats`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__ros3_print_stats() -> String {
     "ros3 statistics unavailable: ROS3 VFD unsupported".into()
@@ -2497,6 +2902,7 @@ pub struct OnionHeader {
     pub revision_count: u64,
 }
 
+/// `H5FD__onion_ingest_revision_record`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__onion_ingest_revision_record(
     index: &mut OnionRevisionIndex,
@@ -2505,6 +2911,7 @@ pub fn H5FD__onion_ingest_revision_record(
     H5FD__onion_revision_index_insert(index, record);
 }
 
+/// `H5FD__onion_archival_index_is_valid`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__onion_archival_index_is_valid(index: &OnionRevisionIndex) -> bool {
     index
@@ -2513,16 +2920,19 @@ pub fn H5FD__onion_archival_index_is_valid(index: &OnionRevisionIndex) -> bool {
         .all(|pair| pair[0].revision <= pair[1].revision)
 }
 
+/// `H5FD__onion_revision_index_destroy`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__onion_revision_index_destroy(index: &mut OnionRevisionIndex) {
     index.records.clear();
 }
 
+/// `H5FD__onion_revision_index_init`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__onion_revision_index_init() -> OnionRevisionIndex {
     OnionRevisionIndex::default()
 }
 
+/// `H5FD__onion_revision_index_resize`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__onion_revision_index_resize(index: &mut OnionRevisionIndex, capacity: usize) {
     if index.records.capacity() < capacity {
@@ -2530,6 +2940,7 @@ pub fn H5FD__onion_revision_index_resize(index: &mut OnionRevisionIndex, capacit
     }
 }
 
+/// `H5FD__onion_revision_index_insert`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__onion_revision_index_insert(
     index: &mut OnionRevisionIndex,
@@ -2541,6 +2952,7 @@ pub fn H5FD__onion_revision_index_insert(
         .sort_by(H5FD__onion_archival_index_list_sort_cmp);
 }
 
+/// `H5FD__onion_revision_record_decode`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__onion_revision_record_decode(bytes: &[u8]) -> Result<OnionRevisionRecord> {
     if bytes.len() != 24 {
@@ -2558,15 +2970,17 @@ pub fn H5FD__onion_revision_record_decode(bytes: &[u8]) -> Result<OnionRevisionR
     })
 }
 
+/// `H5FD__onion_revision_record_encode`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
-pub fn H5FD__onion_revision_record_encode(record: &OnionRevisionRecord) -> Vec<u8> {
+pub fn H5FD__onion_revision_record_encode(record: &OnionRevisionRecord) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(24);
     out.extend_from_slice(&record.revision.to_le_bytes());
     out.extend_from_slice(&record.address.to_le_bytes());
     out.extend_from_slice(&record.size.to_le_bytes());
-    out
+    Ok(out)
 }
 
+/// `H5FD__onion_archival_index_list_sort_cmp`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__onion_archival_index_list_sort_cmp(
     left: &OnionRevisionRecord,
@@ -2578,6 +2992,7 @@ pub fn H5FD__onion_archival_index_list_sort_cmp(
         .then_with(|| left.size.cmp(&right.size))
 }
 
+/// `H5FD__onion_merge_revision_index_into_archival_index`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__onion_merge_revision_index_into_archival_index(
     archival: &mut OnionRevisionIndex,
@@ -2589,43 +3004,51 @@ pub fn H5FD__onion_merge_revision_index_into_archival_index(
         .sort_by(H5FD__onion_archival_index_list_sort_cmp);
 }
 
+/// `H5FD__onion_ingest_header`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__onion_ingest_header(bytes: &[u8]) -> Result<OnionHeader> {
     H5FD__onion_sb_decode(bytes)
 }
 
+/// `H5FD__onion_write_header`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
-pub fn H5FD__onion_write_header(header: &OnionHeader) -> Vec<u8> {
+pub fn H5FD__onion_write_header(header: &OnionHeader) -> Result<Vec<u8>> {
     H5FD__onion_header_encode(header)
 }
 
+/// `H5FD__onion_header_encode`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
-pub fn H5FD__onion_header_encode(header: &OnionHeader) -> Vec<u8> {
+pub fn H5FD__onion_header_encode(header: &OnionHeader) -> Result<Vec<u8>> {
     H5FD__onion_sb_encode(header)
 }
 
+/// `H5FD__onion_register`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__onion_register() -> Result<()> {
     Err(unsupported_vfd_driver("onion"))
 }
 
+/// `H5FD__onion_unregister`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__onion_unregister() {}
 
+/// `H5FD__onion_sb_size`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__onion_sb_size(_header: &OnionHeader) -> usize {
     10
 }
 
+/// `H5FD__onion_sb_encode`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
-pub fn H5FD__onion_sb_encode(header: &OnionHeader) -> Vec<u8> {
+pub fn H5FD__onion_sb_encode(header: &OnionHeader) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(10);
     out.push(header.version);
     out.push(header.flags);
     out.extend_from_slice(&header.revision_count.to_le_bytes());
-    out
+    Ok(out)
 }
 
+/// `H5FD__onion_sb_decode`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__onion_sb_decode(bytes: &[u8]) -> Result<OnionHeader> {
     if bytes.len() != H5FD__onion_sb_size(&OnionHeader::default()) {
@@ -2644,6 +3067,7 @@ pub fn H5FD__onion_sb_decode(bytes: &[u8]) -> Result<OnionHeader> {
     })
 }
 
+/// `H5FD__onion_commit_new_revision_record`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__onion_commit_new_revision_record(
     index: &mut OnionRevisionIndex,
@@ -2660,34 +3084,41 @@ pub fn H5FD__onion_commit_new_revision_record(
     record
 }
 
+/// `H5FD__onion_close`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__onion_close() {}
 
+/// `H5FD__onion_get_eoa`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__onion_get_eoa() -> Result<u64> {
     Err(unsupported_vfd_driver("onion"))
 }
 
+/// `H5FD__onion_get_eof`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__onion_get_eof() -> Result<u64> {
     Err(unsupported_vfd_driver("onion"))
 }
 
+/// `H5FD__onion_get_legit_fapl_id`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__onion_get_legit_fapl_id() -> Result<()> {
     Err(unsupported_vfd_driver("onion"))
 }
 
+/// `H5FD__onion_create_truncate_onion`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__onion_create_truncate_onion(_path: &str) -> Result<()> {
     Err(unsupported_vfd_driver("onion"))
 }
 
+/// `H5FD__onion_remove_unused_symbols`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__onion_remove_unused_symbols(symbols: &mut Vec<String>) {
     symbols.retain(|symbol| !symbol.is_empty());
 }
 
+/// `H5FD__onion_parse_config_str`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__onion_parse_config_str(config: &str) -> HashMap<String, String> {
     config
@@ -2697,51 +3128,61 @@ pub fn H5FD__onion_parse_config_str(config: &str) -> HashMap<String, String> {
         .collect()
 }
 
+/// `H5FD__onion_open`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__onion_open(_path: &str) -> Result<()> {
     Err(unsupported_vfd_driver("onion"))
 }
 
+/// `H5FD__onion_open_rw`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__onion_open_rw(_path: &str) -> Result<()> {
     Err(unsupported_vfd_driver("onion"))
 }
 
+/// `H5FD__onion_read`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__onion_read(_addr: u64, _buf: &mut [u8]) -> Result<()> {
     Err(unsupported_vfd_driver("onion"))
 }
 
+/// `H5FD__onion_set_eoa`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__onion_set_eoa(_eoa: u64) -> Result<()> {
     Err(unsupported_vfd_driver("onion"))
 }
 
+/// `H5FD__onion_write`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__onion_write(_addr: u64, _data: &[u8]) -> Result<()> {
     Err(unsupported_vfd_driver("onion"))
 }
 
+/// `H5FD__onion_ctl`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__onion_ctl(_opcode: u64) -> Result<()> {
     Err(unsupported_vfd_driver("onion"))
 }
 
+/// VFD: H5FDonion get revision count.
 #[allow(non_snake_case)]
 pub fn H5FDonion_get_revision_count(header: &OnionHeader) -> u64 {
     header.revision_count
 }
 
+/// VFD: get onion revision count.
 #[allow(non_snake_case)]
 pub fn H5FD__get_onion_revision_count(header: &OnionHeader) -> u64 {
     H5FDonion_get_revision_count(header)
 }
 
+/// `H5FD__onion_write_final_history`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__onion_write_final_history(index: &OnionRevisionIndex) -> Result<Vec<u8>> {
     H5FD__onion_history_encode(index)
 }
 
+/// `H5FD__onion_ingest_history`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__onion_ingest_history(bytes: &[u8]) -> Result<OnionRevisionIndex> {
     if bytes.len() % 24 != 0 {
@@ -2757,11 +3198,13 @@ pub fn H5FD__onion_ingest_history(bytes: &[u8]) -> Result<OnionRevisionIndex> {
     Ok(index)
 }
 
+/// `H5FD__onion_write_history`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__onion_write_history(index: &OnionRevisionIndex) -> Result<Vec<u8>> {
     H5FD__onion_history_encode(index)
 }
 
+/// `H5FD__onion_history_encode`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__onion_history_encode(index: &OnionRevisionIndex) -> Result<Vec<u8>> {
     let len = index
@@ -2771,11 +3214,12 @@ pub fn H5FD__onion_history_encode(index: &OnionRevisionIndex) -> Result<Vec<u8>>
         .ok_or_else(|| Error::InvalidFormat("onion revision history length overflow".into()))?;
     let mut out = Vec::with_capacity(len);
     for record in &index.records {
-        out.extend_from_slice(&H5FD__onion_revision_record_encode(record));
+        out.extend_from_slice(&H5FD__onion_revision_record_encode(record)?);
     }
     Ok(out)
 }
 
+/// VFD: supports swmr test.
 #[allow(non_snake_case)]
 pub fn H5FD__supports_swmr_test(driver: FileDriverKind) -> bool {
     matches!(driver, FileDriverKind::Sec2 | FileDriverKind::Stdio)
@@ -2806,14 +3250,17 @@ pub struct IocQueueEntry {
     pub complete: bool,
 }
 
+/// `H5FD__multi_register`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__multi_register() -> Result<()> {
     Err(unsupported_vfd_driver("multi"))
 }
 
+/// `H5FD__multi_unregister`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__multi_unregister() {}
 
+/// `H5FD__ioc_calculate_target_ioc`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__ioc_calculate_target_ioc(addr: u64, config: &SubfilingConfig) -> u32 {
     let count = config.ioc_count.max(1);
@@ -2821,26 +3268,39 @@ pub fn H5FD__ioc_calculate_target_ioc(addr: u64, config: &SubfilingConfig) -> u3
     u32::try_from((addr / stripe) % u64::from(count)).unwrap_or(0)
 }
 
+/// `H5FD__ioc_write_independent_async`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__ioc_write_independent_async(_request: &VfdIoRequest) -> Result<()> {
     Err(unsupported_vfd_driver("subfiling IOC async"))
 }
 
+/// `H5FD__ioc_read_independent_async`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__ioc_read_independent_async(_request: &mut VfdIoRequest) -> Result<()> {
     Err(unsupported_vfd_driver("subfiling IOC async"))
 }
 
+/// `H5FD__ioc_async_completion`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__ioc_async_completion(entry: &mut IocQueueEntry) {
     entry.complete = true;
 }
 
+/// `H5FD__subfiling_new_object_id`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__subfiling_new_object_id(previous: u64) -> u64 {
-    previous.saturating_add(1)
+    H5FD__subfiling_new_object_id_checked(previous).unwrap_or(u64::MAX)
 }
 
+/// `H5FD__subfiling_new_object_id_checked`: distributed/cloud driver, not supported by the pure-Rust backend.
+#[allow(non_snake_case)]
+pub fn H5FD__subfiling_new_object_id_checked(previous: u64) -> Result<u64> {
+    previous
+        .checked_add(1)
+        .ok_or_else(|| Error::InvalidFormat("subfiling object id overflow".into()))
+}
+
+/// `H5FD__subfiling_get_object`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__subfiling_get_object(
     objects: &[SubfilingObject],
@@ -2849,55 +3309,67 @@ pub fn H5FD__subfiling_get_object(
     objects.iter().find(|object| object.id == id)
 }
 
+/// `H5FD__subfiling_free_object`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__subfiling_free_object(_object: SubfilingObject) {}
 
+/// `H5FD__subfiling_free_context`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__subfiling_free_context(_config: SubfilingConfig) {}
 
+/// `H5FD__subfiling_free_topology`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__subfiling_free_topology(_objects: Vec<SubfilingObject>) {}
 
+/// `H5FD__subfiling_open_stub_file`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__subfiling_open_stub_file(_path: &str) -> Result<()> {
     Err(unsupported_vfd_driver("subfiling"))
 }
 
+/// `H5FD__subfiling_open_subfiles`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__subfiling_open_subfiles(_path: &str, _config: &SubfilingConfig) -> Result<()> {
     Err(unsupported_vfd_driver("subfiling"))
 }
 
+/// `H5FD__subfiling_setup_context`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__subfiling_setup_context(config: &SubfilingConfig) -> SubfilingConfig {
     config.clone()
 }
 
+/// `H5FD__subfiling_init_app_topology`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__subfiling_init_app_topology(config: &SubfilingConfig) -> Vec<u32> {
     (0..config.ioc_count).collect()
 }
 
+/// `H5FD__subfiling_get_ioc_selection_criteria_from_env`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__subfiling_get_ioc_selection_criteria_from_env() -> Option<String> {
     std::env::var("HDF5_SUBFILING_IOC_SELECTION").ok()
 }
 
+/// `H5FD__subfiling_find_cached_topology_info`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__subfiling_find_cached_topology_info() -> Option<Vec<u32>> {
     None
 }
 
+/// `H5FD__subfiling_init_app_layout`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__subfiling_init_app_layout(config: &SubfilingConfig) -> SubfilingConfig {
     config.clone()
 }
 
+/// `H5FD__subfiling_gather_topology_info`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__subfiling_gather_topology_info(config: &SubfilingConfig) -> Vec<u32> {
     H5FD__subfiling_init_app_topology(config)
 }
 
+/// `H5FD__subfiling_compare_layout_nodelocal`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__subfiling_compare_layout_nodelocal(
     left: &SubfilingConfig,
@@ -2909,21 +3381,25 @@ pub fn H5FD__subfiling_compare_layout_nodelocal(
         .then_with(|| left.stripe_count.cmp(&right.stripe_count))
 }
 
+/// `H5FD__subfiling_identify_ioc_ranks`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__subfiling_identify_ioc_ranks(config: &SubfilingConfig) -> Vec<u32> {
     H5FD__subfiling_init_app_topology(config)
 }
 
+/// `H5FD__subfiling_init_context`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__subfiling_init_context() -> SubfilingConfig {
     H5FD__subfiling_get_default_config()
 }
 
+/// `H5FD__subfiling_record_fid_map_entry`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__subfiling_record_fid_map_entry(_fid: u64, _object: &SubfilingObject) -> Result<()> {
     Err(unsupported_vfd_driver("subfiling"))
 }
 
+/// `H5FD__subfiling_get_default_ioc_config`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__subfiling_get_default_ioc_config() -> IocConfig {
     IocConfig {
@@ -2932,75 +3408,91 @@ pub fn H5FD__subfiling_get_default_ioc_config() -> IocConfig {
     }
 }
 
+/// `H5FD__subfiling_ioc_open_files`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__subfiling_ioc_open_files(_config: &SubfilingConfig) -> Result<()> {
     Err(unsupported_vfd_driver("subfiling IOC"))
 }
 
+/// `H5FD__subfiling_create_config_file`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__subfiling_create_config_file(_path: &str, _config: &SubfilingConfig) -> Result<()> {
     Err(unsupported_vfd_driver("subfiling config file"))
 }
 
+/// `H5FD__subfiling_open_config_file`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__subfiling_open_config_file(_path: &str) -> Result<SubfilingConfig> {
     Err(unsupported_vfd_driver("subfiling config file"))
 }
 
+/// `H5FD__subfiling_get_config_from_file`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__subfiling_get_config_from_file(_path: &str) -> Result<SubfilingConfig> {
     Err(unsupported_vfd_driver("subfiling config file"))
 }
 
+/// `H5FD__subfiling_resolve_pathname`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__subfiling_resolve_pathname(path: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
+/// `H5FD__subfiling_close_subfiles`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__subfiling_close_subfiles() {}
 
+/// `H5FD__subfiling_set_config_prop`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__subfiling_set_config_prop(config: &mut SubfilingConfig, stripe_size: u64) {
     config.stripe_size = stripe_size;
 }
 
+/// `H5FD__subfiling_log`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__subfiling_log(message: &str) -> String {
     format!("{message}\n")
 }
 
+/// `H5FD__subfiling_log_nonewline`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__subfiling_log_nonewline(message: &str) -> String {
     message.to_string()
 }
 
+/// `H5FD__ioc_register`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__ioc_register() -> Result<()> {
     Err(unsupported_vfd_driver("subfiling IOC"))
 }
 
+/// `H5FD__ioc_unregister`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__ioc_unregister() {}
 
+/// `H5FD__ioc_init`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__ioc_init() -> Result<()> {
     Err(unsupported_vfd_driver("subfiling IOC"))
 }
 
+/// `H5FD__ioc_term`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__ioc_term() {}
 
+/// `H5FD__ioc_validate_config`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__ioc_validate_config(config: &IocConfig) -> bool {
     config.thread_pool_size > 0 && config.queue_depth > 0
 }
 
+/// `H5FD__ioc_sb_size`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__ioc_sb_size(_config: &IocConfig) -> usize {
     16
 }
 
+/// `H5FD__ioc_sb_encode`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__ioc_sb_encode(config: &IocConfig) -> Result<Vec<u8>> {
     if !H5FD__ioc_validate_config(config) {
@@ -3016,6 +3508,7 @@ pub fn H5FD__ioc_sb_encode(config: &IocConfig) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// `H5FD__ioc_sb_decode`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__ioc_sb_decode(bytes: &[u8]) -> Result<IocConfig> {
     if bytes.len() != H5FD__ioc_sb_size(&IocConfig::default()) {
@@ -3039,108 +3532,131 @@ pub fn H5FD__ioc_sb_decode(bytes: &[u8]) -> Result<IocConfig> {
     Ok(config)
 }
 
+/// `H5FD__ioc_fapl_get`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__ioc_fapl_get(config: &IocConfig) -> IocConfig {
     config.clone()
 }
 
+/// `H5FD__ioc_fapl_copy`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__ioc_fapl_copy(config: &IocConfig) -> IocConfig {
     config.clone()
 }
 
+/// `H5FD__ioc_fapl_free`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__ioc_fapl_free(_config: IocConfig) {}
 
+/// `H5FD__ioc_open`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__ioc_open(_path: &str, _config: &IocConfig) -> Result<()> {
     Err(unsupported_vfd_driver("subfiling IOC"))
 }
 
+/// `H5FD__ioc_close_int`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__ioc_close_int() {}
 
+/// `H5FD__ioc_close`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__ioc_close() {}
 
+/// `H5FD__ioc_query`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__ioc_query() -> u64 {
     0
 }
 
+/// `H5FD__ioc_get_eoa`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__ioc_get_eoa() -> Result<u64> {
     Err(unsupported_vfd_driver("subfiling IOC"))
 }
 
+/// `H5FD__ioc_set_eoa`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__ioc_set_eoa(_eoa: u64) -> Result<()> {
     Err(unsupported_vfd_driver("subfiling IOC"))
 }
 
+/// `H5FD__ioc_get_eof`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__ioc_get_eof() -> Result<u64> {
     Err(unsupported_vfd_driver("subfiling IOC"))
 }
 
+/// `H5FD__ioc_read`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__ioc_read(_addr: u64, _buf: &mut [u8]) -> Result<()> {
     Err(unsupported_vfd_driver("subfiling IOC"))
 }
 
+/// `H5FD__ioc_write`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__ioc_write(_addr: u64, _data: &[u8]) -> Result<()> {
     Err(unsupported_vfd_driver("subfiling IOC"))
 }
 
+/// `H5FD__ioc_write_vector`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__ioc_write_vector(_requests: &[VfdIoRequest]) -> Result<()> {
     Err(unsupported_vfd_driver("subfiling IOC"))
 }
 
+/// `H5FD__ioc_truncate`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__ioc_truncate() -> Result<()> {
     Err(unsupported_vfd_driver("subfiling IOC"))
 }
 
+/// `H5FD__ioc_delete`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__ioc_delete(_path: &str) -> Result<()> {
     Err(unsupported_vfd_driver("subfiling IOC"))
 }
 
+/// `H5FD__ioc_write_vector_internal`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__ioc_write_vector_internal(_requests: &[VfdIoRequest]) -> Result<()> {
     Err(unsupported_vfd_driver("subfiling IOC"))
 }
 
+/// `H5FD__ioc_read_vector_internal`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__ioc_read_vector_internal(_requests: &mut [VfdIoRequest]) -> Result<()> {
     Err(unsupported_vfd_driver("subfiling IOC"))
 }
 
+/// `H5FD__subfiling__truncate_sub_files`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__subfiling__truncate_sub_files(_config: &SubfilingConfig) -> Result<()> {
     Err(unsupported_vfd_driver("subfiling"))
 }
 
+/// `H5FD__subfiling__get_real_eof`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__subfiling__get_real_eof() -> Result<u64> {
     Err(unsupported_vfd_driver("subfiling"))
 }
 
+/// `H5FD__ioc_init_threads`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__ioc_init_threads() -> Result<()> {
     Err(unsupported_vfd_driver("subfiling IOC threads"))
 }
 
+/// `H5FD__ioc_finalize_threads`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__ioc_finalize_threads() {}
 
+/// `H5FD__ioc_thread_main`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__ioc_thread_main() -> Result<()> {
     Err(unsupported_vfd_driver("subfiling IOC threads"))
 }
 
+/// VFD: translate opcode.
 pub fn translate_opcode(op: u64) -> &'static str {
     match op {
         0 => "READ_OP",
@@ -3155,21 +3671,25 @@ pub fn translate_opcode(op: u64) -> &'static str {
     }
 }
 
+/// `H5FD__ioc_handle_work_request`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__ioc_handle_work_request(_entry: &mut IocQueueEntry) -> Result<()> {
     Err(unsupported_vfd_driver("subfiling IOC"))
 }
 
+/// `H5FD__ioc_send_ack_to_client`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__ioc_send_ack_to_client(entry: &mut IocQueueEntry) {
     entry.complete = true;
 }
 
+/// `H5FD__ioc_send_nack_to_client`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__ioc_send_nack_to_client(entry: &mut IocQueueEntry) {
     entry.complete = false;
 }
 
+/// `H5FD__ioc_file_queue_write_indep`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__ioc_file_queue_write_indep(request: VfdIoRequest) -> IocQueueEntry {
     IocQueueEntry {
@@ -3178,6 +3698,7 @@ pub fn H5FD__ioc_file_queue_write_indep(request: VfdIoRequest) -> IocQueueEntry 
     }
 }
 
+/// `H5FD__ioc_file_queue_read_indep`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__ioc_file_queue_read_indep(request: VfdIoRequest) -> IocQueueEntry {
     IocQueueEntry {
@@ -3186,16 +3707,19 @@ pub fn H5FD__ioc_file_queue_read_indep(request: VfdIoRequest) -> IocQueueEntry {
     }
 }
 
+/// `H5FD__ioc_file_truncate`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__ioc_file_truncate() -> Result<()> {
     Err(unsupported_vfd_driver("subfiling IOC"))
 }
 
+/// `H5FD__ioc_file_report_eof`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__ioc_file_report_eof() -> Result<u64> {
     Err(unsupported_vfd_driver("subfiling IOC"))
 }
 
+/// `H5FD__ioc_io_queue_alloc_entry`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__ioc_io_queue_alloc_entry(request: VfdIoRequest) -> IocQueueEntry {
     IocQueueEntry {
@@ -3204,11 +3728,13 @@ pub fn H5FD__ioc_io_queue_alloc_entry(request: VfdIoRequest) -> IocQueueEntry {
     }
 }
 
+/// `H5FD__ioc_io_queue_add_entry`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__ioc_io_queue_add_entry(queue: &mut Vec<IocQueueEntry>, entry: IocQueueEntry) {
     queue.push(entry);
 }
 
+/// `H5FD__ioc_io_queue_dispatch_eligible_entries`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__ioc_io_queue_dispatch_eligible_entries(queue: &mut [IocQueueEntry]) {
     for entry in queue {
@@ -3216,32 +3742,39 @@ pub fn H5FD__ioc_io_queue_dispatch_eligible_entries(queue: &mut [IocQueueEntry])
     }
 }
 
+/// `H5FD__ioc_io_queue_complete_entry`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__ioc_io_queue_complete_entry(entry: &mut IocQueueEntry) {
     entry.complete = true;
 }
 
+/// `H5FD__subfiling_register`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__subfiling_register() -> Result<()> {
     Err(unsupported_vfd_driver("subfiling"))
 }
 
+/// `H5FD__subfiling_unregister`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__subfiling_unregister() {}
 
+/// `H5FD__subfiling_init`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__subfiling_init() -> Result<()> {
     Err(unsupported_vfd_driver("subfiling"))
 }
 
+/// `H5FD__subfiling_term`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__subfiling_term() {}
 
+/// VFD: H5FDsubfiling get file mapping.
 #[allow(non_snake_case)]
 pub fn H5FDsubfiling_get_file_mapping(config: &SubfilingConfig) -> Vec<u32> {
     H5FD__subfiling_identify_ioc_ranks(config)
 }
 
+/// `H5FD__subfiling_get_default_config`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__subfiling_get_default_config() -> SubfilingConfig {
     SubfilingConfig {
@@ -3251,11 +3784,13 @@ pub fn H5FD__subfiling_get_default_config() -> SubfilingConfig {
     }
 }
 
+/// `H5FD__subfiling_sb_size`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__subfiling_sb_size(_config: &SubfilingConfig) -> usize {
     16
 }
 
+/// `H5FD__subfiling_sb_encode`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__subfiling_sb_encode(config: &SubfilingConfig) -> Result<Vec<u8>> {
     if config.stripe_size == 0 || config.ioc_count == 0 || config.stripe_count == 0 {
@@ -3268,6 +3803,7 @@ pub fn H5FD__subfiling_sb_encode(config: &SubfilingConfig) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// `H5FD__subfiling_sb_decode`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__subfiling_sb_decode(bytes: &[u8]) -> Result<SubfilingConfig> {
     if bytes.len() != H5FD__subfiling_sb_size(&SubfilingConfig::default()) {
@@ -3286,120 +3822,145 @@ pub fn H5FD__subfiling_sb_decode(bytes: &[u8]) -> Result<SubfilingConfig> {
     Ok(config)
 }
 
+/// `H5FD__subfiling_fapl_get`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__subfiling_fapl_get(config: &SubfilingConfig) -> SubfilingConfig {
     config.clone()
 }
 
+/// VFD: copy plist.
 #[allow(non_snake_case)]
 pub fn H5FD__copy_plist<T: Clone>(value: &T) -> T {
     value.clone()
 }
 
+/// `H5FD__subfiling_fapl_copy`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__subfiling_fapl_copy(config: &SubfilingConfig) -> SubfilingConfig {
     config.clone()
 }
 
+/// `H5FD__subfiling_fapl_free`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__subfiling_fapl_free(_config: SubfilingConfig) {}
 
+/// `H5FD__subfiling_open`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__subfiling_open(_path: &str, _config: &SubfilingConfig) -> Result<()> {
     Err(unsupported_vfd_driver("subfiling"))
 }
 
+/// `H5FD__subfiling_close_int`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__subfiling_close_int() {}
 
+/// `H5FD__subfiling_close`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__subfiling_close() {}
 
+/// `H5FD__subfiling_cmp`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__subfiling_cmp(left: &SubfilingConfig, right: &SubfilingConfig) -> Ordering {
     H5FD__subfiling_compare_layout_nodelocal(left, right)
 }
 
+/// `H5FD__subfiling_query`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__subfiling_query() -> u64 {
     0
 }
 
+/// `H5FD__subfiling_get_eoa`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__subfiling_get_eoa() -> Result<u64> {
     Err(unsupported_vfd_driver("subfiling"))
 }
 
+/// `H5FD__subfiling_set_eoa`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__subfiling_set_eoa(_eoa: u64) -> Result<()> {
     Err(unsupported_vfd_driver("subfiling"))
 }
 
+/// `H5FD__subfiling_get_eof`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__subfiling_get_eof() -> Result<u64> {
     Err(unsupported_vfd_driver("subfiling"))
 }
 
+/// `H5FD__subfiling_get_handle`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__subfiling_get_handle() -> Result<()> {
     Err(unsupported_vfd_driver("subfiling"))
 }
 
+/// `H5FD__subfiling_write_vector`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__subfiling_write_vector(_requests: &[VfdIoRequest]) -> Result<()> {
     Err(unsupported_vfd_driver("subfiling"))
 }
 
+/// `H5FD__subfiling_truncate`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__subfiling_truncate() -> Result<()> {
     Err(unsupported_vfd_driver("subfiling"))
 }
 
+/// `H5FD__subfiling_delete`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__subfiling_delete(_path: &str) -> Result<()> {
     Err(unsupported_vfd_driver("subfiling"))
 }
 
+/// `H5FD__subfiling_ctl`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__subfiling_ctl(_opcode: u64) -> Result<()> {
     Err(unsupported_vfd_driver("subfiling"))
 }
 
+/// `H5FD__subfiling_io_helper`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__subfiling_io_helper(_requests: &[VfdIoRequest]) -> Result<()> {
     Err(unsupported_vfd_driver("subfiling"))
 }
 
+/// `H5FD__subfiling_mirror_writes_to_stub`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__subfiling_mirror_writes_to_stub(_enabled: bool) -> Result<()> {
     Err(unsupported_vfd_driver("subfiling"))
 }
 
+/// `H5FD__subfiling_generate_io_vectors`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__subfiling_generate_io_vectors(requests: &[VfdIoRequest]) -> Vec<VfdIoRequest> {
     requests.to_vec()
 }
 
+/// `H5FD__subfiling_get_iovec_sizes`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__subfiling_get_iovec_sizes(requests: &[VfdIoRequest]) -> Vec<usize> {
     requests.iter().map(|request| request.bytes.len()).collect()
 }
 
+/// `H5FD__subfiling_translate_io_req_to_iovec`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__subfiling_translate_io_req_to_iovec(request: &VfdIoRequest) -> VfdIoRequest {
     request.clone()
 }
 
+/// `H5FD__subfiling_iovec_fill_first`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__subfiling_iovec_fill_first(requests: &[VfdIoRequest]) -> Option<VfdIoRequest> {
     requests.first().cloned()
 }
 
+/// `H5FD__subfiling_iovec_fill_last`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__subfiling_iovec_fill_last(requests: &[VfdIoRequest]) -> Option<VfdIoRequest> {
     requests.last().cloned()
 }
 
+/// `H5FD__subfiling_iovec_fill_first_last`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__subfiling_iovec_fill_first_last(requests: &[VfdIoRequest]) -> Vec<VfdIoRequest> {
     let mut out = Vec::new();
@@ -3414,11 +3975,13 @@ pub fn H5FD__subfiling_iovec_fill_first_last(requests: &[VfdIoRequest]) -> Vec<V
     out
 }
 
+/// `H5FD__subfiling_iovec_fill_uniform`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__subfiling_iovec_fill_uniform(requests: &[VfdIoRequest]) -> Vec<VfdIoRequest> {
     requests.to_vec()
 }
 
+/// `H5FD__subfiling_cast_to_void`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__subfiling_cast_to_void<T>(value: T) -> T {
     value
@@ -3450,6 +4013,7 @@ mod tests {
         let mut out = [0; 4];
         driver.core_read(0, &mut out).unwrap();
         assert_eq!(&out, b"abcd");
+        assert_eq!(driver.core_get_eof_checked().unwrap(), 4);
     }
 
     #[test]
@@ -3526,26 +4090,32 @@ mod tests {
             super::H5FD_mirror_xmit_decode_lock(&[]).unwrap(),
             MirrorXmit::Lock
         );
+        assert_eq!(super::H5FD__mirror_xmit_encode_uint8(0xab), vec![0xab]);
         assert_eq!(
-            super::H5FD_mirror_xmit_decode_open(&super::H5FD_mirror_xmit_encode_open("mirror.h5",))
-                .unwrap(),
+            super::H5FD_mirror_xmit_decode_open(
+                &super::H5FD_mirror_xmit_encode_open("mirror.h5").unwrap()
+            )
+            .unwrap(),
             MirrorXmit::Open {
                 path: "mirror.h5".into()
             }
         );
         assert_eq!(
-            super::H5FD_mirror_xmit_decode_reply(&super::H5FD_mirror_xmit_encode_reply(0)).unwrap(),
+            super::H5FD_mirror_xmit_decode_reply(&super::H5FD_mirror_xmit_encode_reply(0).unwrap())
+                .unwrap(),
             MirrorXmit::Reply { status: 0 }
         );
         assert_eq!(
-            super::H5FD_mirror_xmit_decode_set_eoa(&super::H5FD_mirror_xmit_encode_set_eoa(4096))
-                .unwrap(),
+            super::H5FD_mirror_xmit_decode_set_eoa(
+                &super::H5FD_mirror_xmit_encode_set_eoa(4096).unwrap()
+            )
+            .unwrap(),
             MirrorXmit::SetEoa { eoa: 4096 }
         );
         assert_eq!(
-            super::H5FD_mirror_xmit_decode_write(&super::H5FD_mirror_xmit_encode_write(
-                8192, b"abc",
-            ))
+            super::H5FD_mirror_xmit_decode_write(
+                &super::H5FD_mirror_xmit_encode_write(8192, b"abc").unwrap()
+            )
             .unwrap(),
             MirrorXmit::Write {
                 addr: 8192,
@@ -3558,9 +4128,17 @@ mod tests {
             flags: 0x2,
             revision_count: 3,
         };
-        let onion_bytes = super::H5FD__onion_sb_encode(&onion);
+        let onion_bytes = super::H5FD__onion_sb_encode(&onion).unwrap();
         assert_eq!(super::H5FD__onion_sb_size(&onion), onion_bytes.len());
         assert_eq!(super::H5FD__onion_sb_decode(&onion_bytes).unwrap(), onion);
+        assert_eq!(
+            super::H5FD__onion_write_header(&onion).unwrap(),
+            onion_bytes
+        );
+        assert_eq!(
+            super::H5FD__onion_header_encode(&onion).unwrap(),
+            onion_bytes
+        );
 
         let ioc = IocConfig {
             thread_pool_size: 4,
@@ -3595,6 +4173,12 @@ mod tests {
             stripe_count: 8,
         })
         .is_err());
+        assert_eq!(
+            super::H5FD__subfiling_new_object_id_checked(41).unwrap(),
+            42
+        );
+        assert!(super::H5FD__subfiling_new_object_id_checked(u64::MAX).is_err());
+        assert_eq!(super::H5FD__subfiling_new_object_id(u64::MAX), u64::MAX);
 
         let history = OnionRevisionIndex {
             records: vec![
@@ -3614,6 +4198,13 @@ mod tests {
         assert_eq!(
             super::H5FD__onion_ingest_history(&history_bytes).unwrap(),
             history
+        );
+        assert_eq!(history_bytes.len(), 48);
+        let record_bytes = super::H5FD__onion_revision_record_encode(&history.records[0]).unwrap();
+        assert_eq!(record_bytes.len(), 24);
+        assert_eq!(
+            super::H5FD__onion_revision_record_decode(&record_bytes).unwrap(),
+            history.records[0]
         );
     }
 

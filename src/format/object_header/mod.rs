@@ -68,6 +68,7 @@ pub const MSG_DRIVER_INFO: u16 = 0x0014;
 pub const MSG_ATTR_INFO: u16 = 0x0015;
 pub const MSG_OBJ_REF_COUNT: u16 = 0x0016;
 pub const MSG_FILE_SPACE_INFO: u16 = 0x0017;
+pub const MSG_MDCI: u16 = 0x0018;
 
 /// A raw message from an object header.
 #[derive(Debug, Clone)]
@@ -161,6 +162,9 @@ impl ObjectHeader {
 // Internal numeric helpers shared across submodules.
 // ---------------------------------------------------------------------------
 
+/// Decode a little-endian unsigned integer of up to 8 bytes from `data`.
+/// Mirrors libhdf5's `H5F_DECODE_LENGTH` family of macros: the on-disk length
+/// fields use a configurable width and are always stored LSB-first.
 pub(super) fn read_le_uint(data: &[u8]) -> Result<u64> {
     if data.len() > 8 {
         return Err(Error::InvalidFormat(
@@ -172,6 +176,9 @@ pub(super) fn read_le_uint(data: &[u8]) -> Result<u64> {
     }))
 }
 
+/// True when `addr` equals the "undefined address" sentinel for the file's
+/// configured address width. Equivalent to libhdf5's `H5F_addr_defined` /
+/// `HADDR_UNDEF` check, generalized to arbitrary `sizeof_addr` values.
 pub(super) fn is_undefined_addr(addr: u64, sizeof_addr: u8) -> Result<bool> {
     let bits = u32::from(sizeof_addr)
         .checked_mul(8)

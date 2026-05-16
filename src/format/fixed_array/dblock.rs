@@ -39,6 +39,7 @@ pub(super) struct FixedArrayDataBlockPrefix {
     pub(super) element_count: usize,
 }
 
+/// Format a data-block prefix for debug printing.
 pub(super) fn dblock_debug(prefix: &FixedArrayDataBlockPrefix) -> String {
     format!(
         "FixedArrayDataBlockPrefix(paginated={}, pages={}, prefix_size={}, raw_element_size={}, page_elements={}, element_count={})",
@@ -51,6 +52,7 @@ pub(super) fn dblock_debug(prefix: &FixedArrayDataBlockPrefix) -> String {
     )
 }
 
+/// Compute the on-disk size of a fixed array data block.
 pub(super) fn cache_dblock_image_len(prefix: &FixedArrayDataBlockPrefix) -> Result<usize> {
     if prefix.paginated {
         Ok(prefix.prefix_size)
@@ -64,6 +66,7 @@ pub(super) fn cache_dblock_image_len(prefix: &FixedArrayDataBlockPrefix) -> Resu
     }
 }
 
+/// Serialize a dirty data block to its on-disk image (payload + checksum).
 pub(super) fn cache_dblock_serialize(prefix_and_payload: &[u8]) -> Result<Vec<u8>> {
     let image_len = prefix_and_payload.len().checked_add(4).ok_or_else(|| {
         Error::InvalidFormat("fixed array data block image length overflow".into())
@@ -75,22 +78,28 @@ pub(super) fn cache_dblock_serialize(prefix_and_payload: &[u8]) -> Result<Vec<u8
     Ok(out)
 }
 
+/// Handle metadata-cache action notifications for the data block.
 pub(super) fn cache_dblock_notify(_prefix: &FixedArrayDataBlockPrefix) {}
 
+/// Destroy/release an in-core representation of a data block.
 pub(super) fn cache_dblock_free_icr(_prefix: FixedArrayDataBlockPrefix) {}
 
+/// Report the file-space size of a data block to the metadata cache.
 pub(super) fn cache_dblock_fsf_size(prefix: &FixedArrayDataBlockPrefix) -> usize {
     prefix.prefix_size
 }
 
+/// Initial number of bytes the metadata cache must read for a data block page.
 pub(super) fn cache_dblk_page_get_initial_load_size() -> usize {
     4
 }
 
+/// Verify the trailing checksum of a data-block-page image.
 pub(super) fn cache_dblk_page_verify_chksum(data: &[u8]) -> Result<()> {
     verify_trailing_checksum(data, "fixed array data block page")
 }
 
+/// Verify the page's trailing checksum and return its element payload.
 pub(super) fn cache_dblk_page_deserialize(payload: &[u8]) -> Result<&[u8]> {
     if payload.len() < 4 {
         return Err(Error::InvalidFormat(
@@ -101,35 +110,46 @@ pub(super) fn cache_dblk_page_deserialize(payload: &[u8]) -> Result<&[u8]> {
     Ok(&payload[..payload.len() - 4])
 }
 
+/// Compute the on-disk size of a data-block page.
 pub(super) fn cache_dblk_page_image_len(payload_len: usize) -> Result<usize> {
     payload_len.checked_add(4).ok_or_else(|| {
         Error::InvalidFormat("fixed array data block page image length overflow".into())
     })
 }
 
-pub(super) fn cache_dblk_page_serialize(payload: &[u8]) -> Vec<u8> {
-    let mut out = payload.to_vec();
+/// Serialize a data-block page to its on-disk image (payload + checksum).
+pub(super) fn cache_dblk_page_serialize(payload: &[u8]) -> Result<Vec<u8>> {
+    let image_len = cache_dblk_page_image_len(payload.len())?;
+    let mut out = Vec::with_capacity(image_len);
+    out.extend_from_slice(payload);
     let checksum = crate::format::checksum::checksum_metadata(&out);
     out.extend_from_slice(&checksum.to_le_bytes());
-    out
+    Ok(out)
 }
 
+/// Handle metadata-cache action notifications for a data-block page.
 pub(super) fn cache_dblk_page_notify(_page_index: usize) {}
 
+/// Destroy/release an in-core representation of a data-block page.
 pub(super) fn cache_dblk_page_free_icr(_payload: Vec<u8>) {}
 
+/// Allocate a zero-filled fixed-array data-block page buffer of `size` bytes.
 pub(super) fn dblk_page_alloc(size: usize) -> Vec<u8> {
     vec![0; size]
 }
 
+/// Protect a data-block page in the metadata cache (no-op borrow).
 pub(super) fn dblk_page_protect(payload: &[u8]) -> &[u8] {
     payload
 }
 
+/// Unprotect a data-block page.
 pub(super) fn dblk_page_unprotect(_payload: &[u8]) {}
 
+/// Destroy a fixed-array data-block page in memory.
 pub(super) fn dblk_page_dest(_payload: Vec<u8>) {}
 
+/// Allocate a fixed-array data-block prefix descriptor with the given sizing fields.
 pub(super) fn dblock_alloc(
     paginated: bool,
     pages: usize,
@@ -152,20 +172,26 @@ pub(super) fn dblock_alloc(
     }
 }
 
+/// Create a new fixed-array data block (returns the provided prefix value).
 pub(super) fn dblock_create(prefix: FixedArrayDataBlockPrefix) -> FixedArrayDataBlockPrefix {
     prefix
 }
 
+/// Unprotect a previously protected fixed-array data block.
 pub(super) fn dblock_unprotect(_prefix: FixedArrayDataBlockPrefix) {}
 
+/// Delete a data block by clearing its page-init bitmap and element count.
 pub(super) fn dblock_delete(prefix: &mut FixedArrayDataBlockPrefix) {
     prefix.page_init.clear();
     prefix.element_count = 0;
 }
 
+/// Destroy a fixed-array data block in memory.
 pub(super) fn dblock_dest(_prefix: FixedArrayDataBlockPrefix) {}
 
-/// Pure prefix decode + sanity validation for a fixed-array data block.
+/// Deserialize a fixed-array data block prefix from disk.
+/// Validates magic, version, class, owner address, raw element size, and
+/// (for paginated blocks) reads the page-init bitmap.
 pub(super) fn decode_data_block_prefix<R: Read + Seek>(
     reader: &mut HdfReader<R>,
     header_addr: u64,
@@ -267,6 +293,7 @@ pub(super) fn decode_data_block_prefix<R: Read + Seek>(
     }
 }
 
+/// Verify the trailing 4-byte metadata checksum of an in-memory image.
 fn verify_trailing_checksum(data: &[u8], context: &str) -> Result<()> {
     if data.len() < 4 {
         return Err(Error::InvalidFormat(format!("{context} image too short")));
@@ -286,7 +313,8 @@ fn verify_trailing_checksum(data: &[u8], context: &str) -> Result<()> {
     Ok(())
 }
 
-/// Walk a decoded prefix to materialize the element vector.
+/// Walk a decoded data-block prefix and materialize its element vector,
+/// honoring page-init bitmaps for paginated blocks.
 pub(super) fn collect_data_block_elements<R: Read + Seek>(
     reader: &mut HdfReader<R>,
     header: &FixedArrayHeader,
@@ -346,6 +374,7 @@ pub(super) fn collect_data_block_elements<R: Read + Seek>(
     Ok(elements)
 }
 
+/// Read and validate the trailing checksum of the span starting at `start`.
 fn verify_reader_checksum<R: Read + Seek>(
     reader: &mut HdfReader<R>,
     start: u64,
@@ -373,9 +402,9 @@ fn verify_reader_checksum<R: Read + Seek>(
     Ok(())
 }
 
-/// Drive `decode_data_block_prefix` + `collect_data_block_elements` —
-/// the C-side composition is `H5FA__cache_dblock_deserialize` followed by
-/// the iterate path in `H5FA_iterate`.
+/// Protect (load) a fixed-array data block by composing
+/// `decode_data_block_prefix` and `collect_data_block_elements`. Mirrors
+/// `H5FA__dblock_protect` followed by the iterate path in `H5FA_iterate`.
 pub(super) fn read_data_block<R: Read + Seek>(
     reader: &mut HdfReader<R>,
     header_addr: u64,
@@ -387,6 +416,7 @@ pub(super) fn read_data_block<R: Read + Seek>(
     collect_data_block_elements(reader, header, &prefix, filtered, chunk_size_len)
 }
 
+/// Read a single chunk element (address, optional filtered size and mask) from the reader.
 pub(super) fn read_element<R: Read + Seek>(
     reader: &mut HdfReader<R>,
     filtered: bool,
@@ -479,5 +509,22 @@ mod tests {
             .expect_err("bad fixed array page checksum should fail");
         assert!(err.to_string().contains("checksum"));
         assert_eq!(page_start, 19);
+    }
+
+    #[test]
+    fn fixed_array_page_cache_serializes_and_validates_checksum() {
+        let payload = 55u64.to_le_bytes();
+        let image = cache_dblk_page_serialize(&payload).unwrap();
+        assert_eq!(
+            cache_dblk_page_image_len(payload.len()).unwrap(),
+            image.len()
+        );
+        assert_eq!(cache_dblk_page_deserialize(&image).unwrap(), payload);
+
+        let mut bad = image;
+        let last = bad.len() - 1;
+        bad[last] ^= 0xff;
+        assert!(cache_dblk_page_deserialize(&bad).is_err());
+        assert!(cache_dblk_page_deserialize(&bad[..3]).is_err());
     }
 }

@@ -4,6 +4,7 @@ Pure Rust implementation of the HDF5 file format.
 
 Based on HDF5 C library commit [`62701c4`](https://github.com/HDFGroup/hdf5/commit/62701c4c79775d267deedd15ed14d4c09571e792) (2026-04-10, v1.14.x branch). The machine-readable source pin is `hdf5-source.json`.
 
+* 2026-05-16: Features being added, docstrings. Work still left to be done
 * 2026-05-06: **Available as early release for testers** -- Features are still missing, and more testing is needed. **Due to the risk of data corruption, be especially vigilant if you use this crate. **
 
 
@@ -74,14 +75,16 @@ let x_vals: Vec<f64> = ds.read_field::<f64>("x")?;
 
 ## Features
 
-| Area | Supported | Explicitly Unsupported |
-|------|-----------|------------------------|
-| Superblocks and object headers | Superblock v0-v3; object header v1/v2 with checksums | Full C-library metadata-cache behavior |
-| Dataset storage | Compact, contiguous including external raw data files, chunked with v1 B-tree, v4 single-chunk datasets, unfiltered v4 implicit chunk indexes, v4 fixed-array chunk indexes, v4 extensible-array chunk indexes including data/super-block spillover, v4 v2-B-tree chunk indexes, and virtual datasets with all-selection, point, regular hyperslab, or irregular hyperslab mappings; VDS numeric source-to-destination datatype conversion; VDS view/prefix, fixed-shape missing-source fill behavior, and unlimited-dimension view sizing through `DatasetAccess` | Full libhdf5 datatype conversion parity |
-| Filters | Deflate, shuffle, fletcher32, LZF, NBit, ScaleOffset, optional Blosc | SZip, unknown filters |
-| Datatypes | Primitive numeric types including 128-bit integers, enum metadata, fixed/vlen strings, compound metadata, primitive compound field reads, raw compound member extraction, recursive compound field values for nested compound/array/vlen/reference members | Full HDF5 datatype conversion parity |
-| Groups and links | v1 symbol tables, v2 link messages, dense link/attribute storage, filtered direct fractal heap reads, filtered and unfiltered huge direct/indirect fractal heap reads, soft/external links | Full coverage of every HDF5 index/storage variant |
-| Writing | v2 superblock, compact/contiguous/chunked primitive numeric datasets including 128-bit integers, compact fixed-string, flat/nested compound, enum, opaque, array, and contiguous vlen UTF-8 string datasets, explicit fill-value messages, scalar/array/fixed-string/fixed-string-array compact and dense attributes on root groups, groups, and datasets, deflate/shuffle/Fletcher32 chunk filters, hard/soft/external links, limited `MutableFile::resize_dataset`, compact attribute delete/rename, writer-created dense attribute delete/same-size rename, v1 chunk B-tree append/replace/rebuild, selected v4 extensible-array and v2-B-tree chunk updates, deflate/shuffle/Fletcher32 filtered chunk replacement, and existing v4 fixed-array chunk replacement | Variable-length writer allocation beyond contiguous strings, modern chunk-index creation beyond v1 B-tree, full modern chunk-index mutation/creation matrix, dense attribute mutation for indirect/filtered heaps or creation-order indexes, free-space reuse, and general-purpose HDF5 writer parity with the C library |
+| Area | Supported | Not Supported / Not Full Parity |
+|------|-----------|---------------------------------|
+| File format core | Superblock v0-v3; object header v1/v2 with checksums; structured cache-image decode/encode for the metadata images used by this crate | Full libhdf5 metadata-cache runtime behavior, SWMR runtime behavior, file mounting, and broad low-level C API parity |
+| Dataset storage | Compact, contiguous including external raw data files, chunked v1 B-tree, v4 single-chunk, unfiltered v4 implicit, v4 fixed-array, v4 extensible-array including data/super-block spillover, v4 v2-B-tree including internal nodes, sparse chunk fill fallback, and undefined-storage fill handling | Filtered implicit chunk indexes; creating new fixed-array/extensible-array/v2-B-tree chunk indexes from scratch |
+| Virtual datasets | All-selection, point, regular hyperslab, and irregular hyperslab mappings; same-file and relative sources; view/prefix handling through `DatasetAccess`; fixed-shape missing-source fill behavior; unlimited-dimension view sizing; numeric source-to-destination conversion through the crate conversion path | Full libhdf5 VDS mapping-cache internals and full libhdf5 datatype conversion path selection |
+| Filters | Deflate, shuffle, Fletcher32, LZF, NBit, ScaleOffset, and optional Blosc | SZip; required unknown filters; full NBit/ScaleOffset parameter-space parity |
+| Datatypes and conversion | Primitive numeric types including 128-bit integers, endian swapping, shared numeric conversion for reads, enum metadata and reads, fixed/vlen strings, opaque/time/reference metadata and raw payloads, compound metadata, primitive compound fields, raw compound members, and recursive compound values for nested compound/array/vlen/reference members | Full libhdf5 `H5T__conv_*` conversion engine, packing helpers, and conversion-path selection behavior |
+| Groups, links, attributes, heaps | v1 symbol tables, v2 link messages, dense link/attribute reads, public attribute listing and creation-order iteration, soft/external links, global heap, filtered direct fractal heap reads, and filtered/unfiltered huge fractal heap reads | Every HDF5 index/storage variant; deeper path-normalization edge cases; broad dense mutation for indirect/filtered heaps or creation-order indexes |
+| Writing and mutation | v2 superblock; compact/contiguous/chunked primitive numeric datasets including 128-bit integers; compact fixed-string, compound, enum, opaque, array, and contiguous vlen UTF-8 string datasets; explicit fill values; compact and dense attributes for supported writer layouts; deflate/shuffle/Fletcher32 chunk filters; hard/soft/external links; limited resize; compact attribute delete/rename; writer-created dense attribute delete/same-size rename; v1 chunk B-tree append/replace/rebuild; selected v4 extensible-array and v2-B-tree chunk updates; existing v4 fixed-array chunk replacement | General-purpose writer parity with libhdf5, variable-length writer allocation beyond contiguous strings, modern chunk-index creation beyond v1 B-tree, full modern chunk-index mutation/creation matrix, dense attribute mutation outside the supported writer-created layout, and free-space reuse |
+| Out-of-scope subsystems | Deterministic property/config parsing for some unsupported driver settings, plus explicit unsupported errors | MPI/parallel HDF5, VOL/async/plugin connector dispatch, Map API, cloud/network VFD I/O, alternative VFD runtime parity, and broad package-init/free-list/thread-runtime machinery |
 
 **Reading:**
 - Superblock v0-v3
@@ -89,9 +92,9 @@ let x_vals: Vec<f64> = ds.read_field::<f64>("x")?;
 - All storage layouts: compact, contiguous including external raw storage, chunked
 - Chunk indices: v1 B-tree, single chunk, unfiltered v4 implicit, v4 fixed array, v4 extensible array including data/super-block spillover, and v4 v2-B-tree including internal nodes.
 - Virtual datasets with serialized all-selection, point, regular hyperslab, or irregular hyperslab source and destination selections.
-- Filters: deflate, shuffle, fletcher32, LZF, NBit, ScaleOffset, and optional Blosc. SZip and unknown filters return `Unsupported` for reads.
+- Filters: deflate, shuffle, Fletcher32, LZF, NBit, ScaleOffset, and optional Blosc. SZip and required unknown filters return `Unsupported` for reads.
 - All primitive types (i8-i128, u8-u128, f32, f64) with automatic big-endian byte-swap
-- Compound and enum datatypes, including compound member index/offset/class/type queries
+- Compound and enum datatypes, including enum reads and compound member index/offset/class/type queries
 - Raw compound field extraction and recursive compound field values for non-primitive member payloads
 - Fixed-length and variable-length dataset/attribute strings (via global heap)
 - Attribute listing/info, index-based attribute name/info queries, attribute creation character encoding, tracked creation-order iteration, typed reads with numeric conversion, dataset layout/offset inspection, and datatype/dataspace inspection including numeric precision/offset and floating-point field metadata
@@ -107,11 +110,13 @@ let x_vals: Vec<f64> = ds.read_field::<f64>("x")?;
 - Compact groups and nested groups
 - Primitive numeric datasets, including 128-bit integers, in contiguous, compact, and chunked storage
 - Compact fixed-length string, compound, enum, opaque, and array datasets
+- Contiguous variable-length UTF-8 string datasets
 - Explicit dataset fill-value messages with raw allocation-time and fill-time properties
-- Compact primitive numeric attributes
+- Compact and dense scalar/array/fixed-string/fixed-string-array attributes on supported writer layouts
 - Deflate, shuffle, and Fletcher32 filters for chunked datasets
-- Soft and external links
+- Hard, soft, and external links
 - New chunked datasets use v1 B-tree chunk indexes. `MutableFile::open_rw()` supports limited in-place dataset resizing, v1 chunk B-tree append/replace/rebuild, selected v4 extensible-array and v2-B-tree chunk updates, deflate/shuffle/Fletcher32 filtered chunk replacement, and replacement of existing v4 fixed-array chunks. Creating new fixed-array/extensible-array/v2-B-tree chunk indexes from scratch is not implemented.
+- `MutableFile::open_rw()` supports compact attribute delete/rename and writer-created dense attribute delete/same-size rename for the supported dense layout.
 - Writes append new metadata/raw data and do not implement libhdf5 free-space manager reuse.
 - Verified readable by h5dump and h5py
 

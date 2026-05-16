@@ -8484,8 +8484,8 @@ rust_path = "format/messages/datatype.rs"
 other = "H5T__detect_class"
 
 [[entries]]
-rust = "is_variable_length"
-rust_path = "format/messages/datatype.rs"
+rust = "H5T__detect_vlen_ref"
+rust_path = "engine/datatype_api.rs"
 other = "H5T__detect_vlen_ref"
 
 [[entries]]
@@ -8567,38 +8567,33 @@ other = "H5T__get_super"
 # hl/datatype.rs / hl/dataspace.rs — accessor wrappers
 # ---------------------------------------------------------------------------
 [[entries]]
-rust = "size"
-rust_path = "hl/datatype.rs"
-rust_class = "Datatype"
+rust = "H5Tget_size"
+rust_path = "engine/datatype_api.rs"
 other = "H5Tget_size"
 
 [[entries]]
-rust = "class"
-rust_path = "hl/datatype.rs"
+rust = "H5Tget_class"
+rust_path = "engine/datatype_api.rs"
 other = "H5Tget_class"
 
 [[entries]]
-rust = "byte_order"
-rust_path = "hl/datatype.rs"
-rust_class = "Datatype"
+rust = "H5Tget_order"
+rust_path = "engine/datatype_api.rs"
 other = "H5Tget_order"
 
 [[entries]]
-rust = "is_signed"
-rust_path = "hl/datatype.rs"
-rust_class = "Datatype"
+rust = "H5Tget_sign"
+rust_path = "engine/datatype_api.rs"
 other = "H5Tget_sign"
 
 [[entries]]
-rust = "bit_offset"
-rust_path = "hl/datatype.rs"
-rust_class = "Datatype"
+rust = "H5Tget_offset"
+rust_path = "engine/datatype_api.rs"
 other = "H5Tget_offset"
 
 [[entries]]
-rust = "precision"
-rust_path = "hl/datatype.rs"
-rust_class = "Datatype"
+rust = "H5Tget_precision"
+rust_path = "engine/datatype_api.rs"
 other = "H5Tget_precision"
 
 [[entries]]
@@ -8607,69 +8602,58 @@ rust_path = "hl/datatype.rs"
 other = "H5Tget_class"
 
 [[entries]]
-rust = "float_fields"
-rust_path = "hl/datatype.rs"
-rust_class = "Datatype"
+rust = "H5Tget_fields"
+rust_path = "engine/datatype_api.rs"
 other = "H5Tget_fields"
 
 [[entries]]
-rust = "exponent_bias"
-rust_path = "hl/datatype.rs"
-rust_class = "Datatype"
+rust = "H5Tget_ebias"
+rust_path = "engine/datatype_api.rs"
 other = "H5Tget_ebias"
 
 [[entries]]
-rust = "mantissa_normalization"
-rust_path = "hl/datatype.rs"
-rust_class = "Datatype"
+rust = "H5Tget_norm"
+rust_path = "engine/datatype_api.rs"
 other = "H5Tget_norm"
 
 [[entries]]
-rust = "internal_padding"
-rust_path = "hl/datatype.rs"
-rust_class = "Datatype"
+rust = "H5Tget_inpad"
+rust_path = "engine/datatype_api.rs"
 other = "H5Tget_inpad"
 
 [[entries]]
-rust = "create_plist"
-rust_path = "hl/datatype.rs"
-rust_class = "Datatype"
+rust = "H5Tget_create_plist"
+rust_path = "engine/datatype_api.rs"
 other = "H5Tget_create_plist"
 
 [[entries]]
-rust = "native_type"
-rust_path = "hl/datatype.rs"
-rust_class = "Datatype"
+rust = "H5Tget_native_type"
+rust_path = "engine/datatype_api.rs"
 other = "H5Tget_native_type"
 
 [[entries]]
-rust = "pad"
-rust_path = "hl/datatype.rs"
-rust_class = "Datatype"
+rust = "H5Tget_pad"
+rust_path = "engine/datatype_api.rs"
 other = "H5Tget_pad"
 
 [[entries]]
-rust = "member_index"
-rust_path = "hl/datatype.rs"
-rust_class = "Datatype"
+rust = "H5Tget_member_index"
+rust_path = "engine/datatype_api.rs"
 other = "H5Tget_member_index"
 
 [[entries]]
-rust = "member_offset"
-rust_path = "hl/datatype.rs"
-rust_class = "Datatype"
+rust = "H5Tget_member_offset"
+rust_path = "engine/datatype_api.rs"
 other = "H5Tget_member_offset"
 
 [[entries]]
-rust = "member_class"
-rust_path = "hl/datatype.rs"
-rust_class = "Datatype"
+rust = "H5Tget_member_class"
+rust_path = "engine/datatype_api.rs"
 other = "H5Tget_member_class"
 
 [[entries]]
-rust = "member_type"
-rust_path = "hl/datatype.rs"
-rust_class = "Datatype"
+rust = "H5Tget_member_type"
+rust_path = "engine/datatype_api.rs"
 other = "H5Tget_member_type"
 
 [[entries]]
@@ -8678,20 +8662,18 @@ rust_path = "hl/datatype.rs"
 other = "H5Tget_class"
 
 [[entries]]
-rust = "is_string"
-rust_path = "hl/datatype.rs"
+rust = "H5Tis_variable_str"
+rust_path = "engine/datatype_api.rs"
 other = "H5Tis_variable_str"
 
 [[entries]]
-rust = "char_set"
-rust_path = "hl/datatype.rs"
-rust_class = "Datatype"
+rust = "H5Tget_cset"
+rust_path = "engine/datatype_api.rs"
 other = "H5Tget_cset"
 
 [[entries]]
-rust = "string_padding"
-rust_path = "hl/datatype.rs"
-rust_class = "Datatype"
+rust = "H5Tget_strpad"
+rust_path = "engine/datatype_api.rs"
 other = "H5Tget_strpad"
 
 [[entries]]
@@ -8710,9 +8692,8 @@ rust_path = "hl/datatype.rs"
 other = "H5Tdetect_class"
 
 [[entries]]
-rust = "opaque_tag"
-rust_path = "hl/datatype.rs"
-rust_class = "Datatype"
+rust = "H5Tget_tag"
+rust_path = "engine/datatype_api.rs"
 other = "H5Tget_tag"
 
 [[entries]]
@@ -8722,25 +8703,23 @@ rust_class = "Datatype"
 other = "H5Rget_type"
 
 [[entries]]
-rust = "compound_fields"
-rust_path = "hl/datatype.rs"
+rust = "H5Tget_member_info"
+rust_path = "engine/datatype_api.rs"
 other = "H5Tget_member_info"
 
 [[entries]]
-rust = "enum_members"
-rust_path = "hl/datatype.rs"
+rust = "H5Tget_member_value"
+rust_path = "engine/datatype_api.rs"
 other = "H5Tget_member_value"
 
 [[entries]]
-rust = "vlen_base"
-rust_path = "hl/datatype.rs"
-rust_class = "Datatype"
+rust = "H5Tget_super"
+rust_path = "engine/datatype_api.rs"
 other = "H5Tget_super"
 
 [[entries]]
-rust = "array_dims_base"
-rust_path = "hl/datatype.rs"
-rust_class = "Datatype"
+rust = "H5Tget_array_dims"
+rust_path = "engine/datatype_api.rs"
 other = "H5Tget_array_dims"
 
 [[entries]]
@@ -8976,8 +8955,8 @@ rust_class = "File"
 other = "H5Dopen2"
 
 [[entries]]
-rust = "object_type_at"
-rust_path = "hl/file.rs"
+rust = "H5Oget_info"
+rust_path = "engine/object_api.rs"
 other = "H5Oget_info"
 
 [[entries]]
@@ -8996,50 +8975,43 @@ other = "H5Literate"
 # canonical owners of libhdf5's legacy group-size APIs.
 
 [[entries]]
-rust = "member_type"
-rust_path = "hl/group.rs"
+rust = "H5Oget_info_by_name"
+rust_path = "engine/object_api.rs"
 other = "H5Oget_info_by_name"
 
 [[entries]]
-rust = "object_comment"
-rust_path = "hl/group.rs"
-rust_class = "Group"
+rust = "H5Oget_comment"
+rust_path = "engine/object_api.rs"
 other = "H5Oget_comment"
 
 [[entries]]
-rust = "object_comment_by_name"
-rust_path = "hl/group.rs"
-rust_class = "Group"
+rust = "H5Oget_comment_by_name"
+rust_path = "engine/object_api.rs"
 other = "H5Oget_comment_by_name"
 
 [[entries]]
-rust = "object_info_by_idx_v1"
-rust_path = "hl/group.rs"
-rust_class = "Group"
+rust = "H5Oget_info_by_idx1"
+rust_path = "engine/object_api.rs"
 other = "H5Oget_info_by_idx1"
 
 [[entries]]
-rust = "object_info_by_idx_v2"
-rust_path = "hl/group.rs"
-rust_class = "Group"
+rust = "H5Oget_info_by_idx2"
+rust_path = "engine/object_api.rs"
 other = "H5Oget_info_by_idx2"
 
 [[entries]]
-rust = "object_info_by_idx"
-rust_path = "hl/group.rs"
-rust_class = "Group"
+rust = "H5Oget_info_by_idx3"
+rust_path = "engine/object_api.rs"
 other = "H5Oget_info_by_idx3"
 
 [[entries]]
-rust = "native_info"
-rust_path = "hl/group.rs"
-rust_class = "Group"
+rust = "H5Oget_native_info"
+rust_path = "engine/object_api.rs"
 other = "H5Oget_native_info"
 
 [[entries]]
-rust = "native_info_by_idx"
-rust_path = "hl/group.rs"
-rust_class = "Group"
+rust = "H5Oget_native_info_by_idx"
+rust_path = "engine/object_api.rs"
 other = "H5Oget_native_info_by_idx"
 
 [[entries]]
@@ -9522,9 +9494,8 @@ rust_class = "Attribute"
 other = "H5Aget_space"
 
 [[entries]]
-rust = "dtype"
+rust = "H5Aget_type"
 rust_path = "hl/attribute.rs"
-rust_class = "Attribute"
 other = "H5Aget_type"
 
 [[entries]]
@@ -9534,9 +9505,8 @@ rust_class = "Attribute"
 other = "H5Aget_info"
 
 [[entries]]
-rust = "create_plist"
+rust = "H5Aget_create_plist"
 rust_path = "hl/attribute.rs"
-rust_class = "Attribute"
 other = "H5Aget_create_plist"
 
 [[entries]]
@@ -9546,13 +9516,13 @@ rust_class = "AttributeCreate"
 other = "H5Pget_char_encoding"
 
 [[entries]]
-rust = "attr_count"
-rust_path = "hl/location.rs"
+rust = "H5Aget_num_attrs"
+rust_path = "hl/attribute.rs"
 other = "H5Aget_num_attrs"
 
 [[entries]]
-rust = "attr_name_by_idx"
-rust_path = "hl/location.rs"
+rust = "H5Aget_name_by_idx"
+rust_path = "hl/attribute.rs"
 other = "H5Aget_name_by_idx"
 
 [[entries]]
@@ -10028,9 +9998,8 @@ other = "H5P_DEFAULT"
 # libhdf5's object-name query API.
 
 [[entries]]
-rust = "addr"
-rust_path = "hl/dataset.rs"
-rust_class = "Dataset"
+rust = "H5Oget_info"
+rust_path = "engine/object_api.rs"
 other = "H5Oget_info"
 
 [[entries]]
@@ -10507,9 +10476,8 @@ other = "H5Pget_shared_mesg_phase_change"
 # libhdf5's object-name query API.
 
 [[entries]]
-rust = "addr"
-rust_path = "hl/group.rs"
-rust_class = "Group"
+rust = "H5Oget_info"
+rust_path = "engine/object_api.rs"
 other = "H5Oget_info"
 
 [[entries]]
@@ -13903,27 +13871,23 @@ rust_class = "MetadataCache"
 other = "H5AC_add_candidate"
 
 [[entries]]
-rust = "broadcast_candidate_list_cb"
+rust = "H5AC__broadcast_candidate_list_cb"
 rust_path = "engine/metadata_cache.rs"
-rust_class = "MetadataCache"
 other = "H5AC__broadcast_candidate_list_cb"
 
 [[entries]]
-rust = "broadcast_candidate_list"
+rust = "H5AC__broadcast_candidate_list"
 rust_path = "engine/metadata_cache.rs"
-rust_class = "MetadataCache"
 other = "H5AC__broadcast_candidate_list"
 
 [[entries]]
-rust = "broadcast_clean_list_cb"
+rust = "H5AC__broadcast_clean_list_cb"
 rust_path = "engine/metadata_cache.rs"
-rust_class = "MetadataCache"
 other = "H5AC__broadcast_clean_list_cb"
 
 [[entries]]
-rust = "broadcast_clean_list"
+rust = "H5AC__broadcast_clean_list"
 rust_path = "engine/metadata_cache.rs"
-rust_class = "MetadataCache"
 other = "H5AC__broadcast_clean_list"
 
 [[entries]]
@@ -13939,51 +13903,43 @@ rust_class = "MetadataCache"
 other = "H5AC__copy_candidate_list_to_buffer_cb"
 
 [[entries]]
-rust = "copy_candidate_list_to_buffer"
+rust = "H5AC__copy_candidate_list_to_buffer"
 rust_path = "engine/metadata_cache.rs"
-rust_class = "MetadataCache"
 other = "H5AC__copy_candidate_list_to_buffer"
 
 [[entries]]
-rust = "log_deleted_entry"
+rust = "H5AC__log_deleted_entry"
 rust_path = "engine/metadata_cache.rs"
-rust_class = "MetadataCache"
 other = "H5AC__log_deleted_entry"
 
 [[entries]]
-rust = "log_dirtied_entry"
+rust = "H5AC__log_dirtied_entry"
 rust_path = "engine/metadata_cache.rs"
-rust_class = "MetadataCache"
 other = "H5AC__log_dirtied_entry"
 
 [[entries]]
-rust = "log_cleaned_entry"
+rust = "H5AC__log_cleaned_entry"
 rust_path = "engine/metadata_cache.rs"
-rust_class = "MetadataCache"
 other = "H5AC__log_cleaned_entry"
 
 [[entries]]
-rust = "log_flushed_entry"
+rust = "H5AC__log_flushed_entry"
 rust_path = "engine/metadata_cache.rs"
-rust_class = "MetadataCache"
 other = "H5AC__log_flushed_entry"
 
 [[entries]]
-rust = "log_inserted_entry"
+rust = "H5AC__log_inserted_entry"
 rust_path = "engine/metadata_cache.rs"
-rust_class = "MetadataCache"
 other = "H5AC__log_inserted_entry"
 
 [[entries]]
-rust = "log_moved_entry"
+rust = "H5AC__log_moved_entry"
 rust_path = "engine/metadata_cache.rs"
-rust_class = "MetadataCache"
 other = "H5AC__log_moved_entry"
 
 [[entries]]
-rust = "propagate_and_apply_candidate_list"
+rust = "H5AC__propagate_and_apply_candidate_list"
 rust_path = "engine/metadata_cache.rs"
-rust_class = "MetadataCache"
 other = "H5AC__propagate_and_apply_candidate_list"
 
 [[entries]]
@@ -13993,9 +13949,8 @@ rust_class = "MetadataCache"
 other = "H5AC__propagate_flushed_and_still_clean_entries_list"
 
 [[entries]]
-rust = "receive_haddr_list"
+rust = "H5AC__receive_haddr_list"
 rust_path = "engine/metadata_cache.rs"
-rust_class = "MetadataCache"
 other = "H5AC__receive_haddr_list"
 
 [[entries]]
@@ -14005,45 +13960,38 @@ rust_class = "MetadataCache"
 other = "H5AC__receive_and_apply_clean_list"
 
 [[entries]]
-rust = "receive_candidate_list"
+rust = "H5AC__receive_candidate_list"
 rust_path = "engine/metadata_cache.rs"
-rust_class = "MetadataCache"
 other = "H5AC__receive_candidate_list"
 
 [[entries]]
-rust = "rsp_dist_md_write_flush"
+rust = "H5AC__rsp__dist_md_write__flush"
 rust_path = "engine/metadata_cache.rs"
-rust_class = "MetadataCache"
 other = "H5AC__rsp__dist_md_write__flush"
 
 [[entries]]
-rust = "rsp_dist_md_write_flush_to_min_clean"
+rust = "H5AC__rsp__dist_md_write__flush_to_min_clean"
 rust_path = "engine/metadata_cache.rs"
-rust_class = "MetadataCache"
 other = "H5AC__rsp__dist_md_write__flush_to_min_clean"
 
 [[entries]]
-rust = "rsp_p0_only_flush"
+rust = "H5AC__rsp__p0_only__flush"
 rust_path = "engine/metadata_cache.rs"
-rust_class = "MetadataCache"
 other = "H5AC__rsp__p0_only__flush"
 
 [[entries]]
-rust = "rsp_p0_only_flush_to_min_clean"
+rust = "H5AC__rsp__p0_only__flush_to_min_clean"
 rust_path = "engine/metadata_cache.rs"
-rust_class = "MetadataCache"
 other = "H5AC__rsp__p0_only__flush_to_min_clean"
 
 [[entries]]
-rust = "run_sync_point"
+rust = "H5AC__run_sync_point"
 rust_path = "engine/metadata_cache.rs"
-rust_class = "MetadataCache"
 other = "H5AC__run_sync_point"
 
 [[entries]]
-rust = "tidy_cache_0_lists"
+rust = "H5AC__tidy_cache_0_lists"
 rust_path = "engine/metadata_cache.rs"
-rust_class = "MetadataCache"
 other = "H5AC__tidy_cache_0_lists"
 
 [[entries]]
@@ -14071,9 +14019,8 @@ rust_class = "MetadataCache"
 other = "H5AC_cache_image_pending"
 
 [[entries]]
-rust = "dest"
+rust = "H5AC_dest"
 rust_path = "engine/metadata_cache.rs"
-rust_class = "MetadataCache"
 other = "H5AC_dest"
 
 [[entries]]
@@ -14191,15 +14138,13 @@ rust_class = "MetadataCache"
 other = "H5AC_destroy_flush_dependency"
 
 [[entries]]
-rust = "unprotect"
+rust = "H5AC_unprotect"
 rust_path = "engine/metadata_cache.rs"
-rust_class = "MetadataCache"
 other = "H5AC_unprotect"
 
 [[entries]]
-rust = "get_cache_auto_resize_config"
+rust = "H5AC_get_cache_auto_resize_config"
 rust_path = "engine/metadata_cache.rs"
-rust_class = "MetadataCache"
 other = "H5AC_get_cache_auto_resize_config"
 
 [[entries]]
@@ -14221,9 +14166,8 @@ rust_class = "MetadataCache"
 other = "H5AC_get_tag"
 
 [[entries]]
-rust = "cork"
+rust = "H5AC_cork"
 rust_path = "engine/metadata_cache.rs"
-rust_class = "MetadataCache"
 other = "H5AC_cork"
 
 [[entries]]
@@ -14263,21 +14207,18 @@ rust_class = "MetadataCache"
 other = "H5AC_remove_entry"
 
 [[entries]]
-rust = "proxy_entry_create"
+rust = "H5AC_proxy_entry_create"
 rust_path = "engine/metadata_cache.rs"
-rust_class = "MetadataCache"
 other = "H5AC_proxy_entry_create"
 
 [[entries]]
-rust = "proxy_entry_add_parent"
+rust = "H5AC_proxy_entry_add_parent"
 rust_path = "engine/metadata_cache.rs"
-rust_class = "MetadataCache"
 other = "H5AC_proxy_entry_add_parent"
 
 [[entries]]
-rust = "proxy_entry_remove_parent"
+rust = "H5AC_proxy_entry_remove_parent"
 rust_path = "engine/metadata_cache.rs"
-rust_class = "MetadataCache"
 other = "H5AC_proxy_entry_remove_parent"
 
 [[entries]]
@@ -14287,9 +14228,8 @@ rust_class = "MetadataCache"
 other = "H5AC__proxy_entry_add_child_cb"
 
 [[entries]]
-rust = "proxy_entry_add_child"
+rust = "H5AC_proxy_entry_add_child"
 rust_path = "engine/metadata_cache.rs"
-rust_class = "MetadataCache"
 other = "H5AC_proxy_entry_add_child"
 
 [[entries]]
@@ -14299,15 +14239,13 @@ rust_class = "MetadataCache"
 other = "H5AC__proxy_entry_remove_child_cb"
 
 [[entries]]
-rust = "proxy_entry_remove_child"
+rust = "H5AC_proxy_entry_remove_child"
 rust_path = "engine/metadata_cache.rs"
-rust_class = "MetadataCache"
 other = "H5AC_proxy_entry_remove_child"
 
 [[entries]]
-rust = "proxy_entry_dest"
+rust = "H5AC_proxy_entry_dest"
 rust_path = "engine/metadata_cache.rs"
-rust_class = "MetadataCache"
 other = "H5AC_proxy_entry_dest"
 
 [[entries]]
@@ -14323,9 +14261,8 @@ rust_class = "MetadataCache"
 other = "H5AC__proxy_entry_serialize"
 
 [[entries]]
-rust = "proxy_entry_notify"
+rust = "H5AC__proxy_entry_notify"
 rust_path = "engine/metadata_cache.rs"
-rust_class = "MetadataCache"
 other = "H5AC__proxy_entry_notify"
 
 [[entries]]

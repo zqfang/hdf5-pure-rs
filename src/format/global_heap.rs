@@ -32,16 +32,24 @@ pub struct GlobalHeapCollection {
 }
 
 impl GlobalHeapCollection {
+    /// Creates a new, empty global heap collection. Mirrors libhdf5's
+    /// `H5HG__create`.
     pub fn create() -> Self {
         Self {
             objects: Vec::new(),
         }
     }
 
+    /// Pin a collection for use (wrapper around libhdf5's
+    /// `H5HG__protect`/`H5AC_protect`). The Rust port owns the value
+    /// outright, so this is an identity passthrough.
     pub fn protect(collection: Self) -> Self {
         collection
     }
 
+    /// Allocate a new object in the collection and return its assigned
+    /// index. Mirrors libhdf5's `H5HG__alloc`: splits free space, makes
+    /// room for the object header, returns the heap object ID.
     pub fn alloc(&mut self, data: Vec<u8>) -> Result<u32> {
         let next = self
             .objects
@@ -55,10 +63,16 @@ impl GlobalHeapCollection {
         Ok(next)
     }
 
+    /// Extend the collection's capacity to make room for additional
+    /// objects. Mirrors libhdf5's `H5HG_extend` (round-up-for-alignment
+    /// semantics aside).
     pub fn extend(&mut self, additional: usize) {
         self.objects.reserve(additional);
     }
 
+    /// Insert an object at an explicit index. Mirrors libhdf5's
+    /// `H5HG_insert`: a new object is placed in the collection;
+    /// index 0 is reserved for free space.
     pub fn insert(&mut self, index: u32, data: Vec<u8>) -> Result<()> {
         if index == 0 {
             return Err(Error::InvalidFormat(
@@ -74,6 +88,9 @@ impl GlobalHeapCollection {
         Ok(())
     }
 
+    /// Adjust the link count for a global heap object. Mirrors libhdf5's
+    /// `H5HG_link` (we only verify existence; the Rust port doesn't
+    /// track refcounts on disk).
     pub fn link(&mut self, index: u32) -> Result<()> {
         if self.get_object(index).is_some() {
             Ok(())
@@ -84,6 +101,8 @@ impl GlobalHeapCollection {
         }
     }
 
+    /// Remove the specified object from the global heap collection.
+    /// Mirrors libhdf5's `H5HG_remove`.
     pub fn remove(&mut self, index: u32) -> Result<Vec<u8>> {
         let pos = self
             .objects
@@ -93,10 +112,14 @@ impl GlobalHeapCollection {
         Ok(self.objects.remove(pos).1)
     }
 
+    /// Destroy the in-memory representation of the collection.
+    /// Mirrors libhdf5's `H5HG__free`.
     pub fn free(&mut self) {
         self.objects.clear();
     }
 
+    /// Decode the global heap header at `addr`. Mirrors libhdf5's
+    /// `H5HG__hdr_deserialize`.
     pub fn hdr_deserialize<R: Read + Seek>(
         reader: &mut HdfReader<R>,
         addr: u64,
@@ -104,38 +127,138 @@ impl GlobalHeapCollection {
         Self::decode_header(reader, addr)
     }
 
+    /// Return the final read size for a speculatively read heap to the
+    /// metadata cache. Mirrors `H5HG__cache_heap_get_final_load_size`.
     pub fn cache_heap_get_final_load_size(header: &GlobalHeapHeader) -> Result<usize> {
         heap_object_len(header.collection_size, "global heap collection size")
     }
 
+    /// Return the on-disk image size of this collection assuming an 8-byte
+    /// size field. Mirrors `H5HG__cache_heap_image_len`.
     pub fn cache_heap_image_len(&self) -> Result<usize> {
-        let mut len = 16usize;
+        self.cache_heap_image_len_with_size(8)
+    }
+
+    /// On-disk image size of this collection, parametrized by the file's
+    /// configured size field width.
+    pub fn cache_heap_image_len_with_size(&self, sizeof_size: u8) -> Result<usize> {
+        if sizeof_size == 0 || sizeof_size > 8 {
+            return Err(Error::InvalidFormat(
+                "global heap size field width is invalid".into(),
+            ));
+        }
+        let header_len = 8usize
+            .checked_add(usize::from(sizeof_size))
+            .ok_or_else(|| Error::InvalidFormat("global heap header length overflow".into()))?;
+        let object_header_len = header_len;
+        let mut len = header_len;
         for (_, data) in &self.objects {
+            validate_global_heap_object_size(data.len())?;
             let padded = data
                 .len()
                 .checked_add(7)
                 .map(|size| size & !7)
                 .ok_or_else(|| Error::InvalidFormat("global heap object image overflow".into()))?;
             len = len
-                .checked_add(16)
+                .checked_add(object_header_len)
                 .and_then(|value| value.checked_add(padded))
                 .ok_or_else(|| Error::InvalidFormat("global heap image length overflow".into()))?;
         }
-        Ok(len)
+        len.checked_add(7)
+            .map(|value| value & !7)
+            .ok_or_else(|| Error::InvalidFormat("global heap image length overflow".into()))
     }
 
+    /// Serialize this collection to its on-disk image, using the supplied
+    /// size-field width. Counterpart of the libhdf5 cache-serialize hook.
+    pub fn cache_heap_serialize(&self, sizeof_size: u8) -> Result<Vec<u8>> {
+        if sizeof_size == 0 || sizeof_size > 8 {
+            return Err(Error::InvalidFormat(
+                "global heap size field width is invalid".into(),
+            ));
+        }
+        let mut out = Vec::with_capacity(self.cache_heap_image_len_with_size(sizeof_size)?);
+        out.extend_from_slice(&GCOL_MAGIC);
+        out.push(1);
+        out.extend_from_slice(&[0; 3]);
+        encode_heap_size(&mut out, 0, sizeof_size, "global heap collection size")?;
+
+        for (index, data) in &self.objects {
+            if *index == 0 {
+                return Err(Error::InvalidFormat(
+                    "global heap object index zero is reserved".into(),
+                ));
+            }
+            validate_global_heap_object_size(data.len())?;
+            let data_size = u64::try_from(data.len())
+                .map_err(|_| Error::InvalidFormat("global heap object size exceeds u64".into()))?;
+            let padded = data
+                .len()
+                .checked_add(7)
+                .map(|size| size & !7)
+                .ok_or_else(|| Error::InvalidFormat("global heap object image overflow".into()))?;
+
+            out.extend_from_slice(
+                &u16::try_from(*index)
+                    .map_err(|_| {
+                        Error::InvalidFormat("global heap object index exceeds u16".into())
+                    })?
+                    .to_le_bytes(),
+            );
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(&[0; 4]);
+            encode_heap_size(&mut out, data_size, sizeof_size, "global heap object size")?;
+            out.extend_from_slice(data);
+            let padded_end = out
+                .len()
+                .checked_add(padded - data.len())
+                .ok_or_else(|| Error::InvalidFormat("global heap object image overflow".into()))?;
+            out.resize(padded_end, 0);
+        }
+
+        let padded_collection_len = out
+            .len()
+            .checked_add(7)
+            .map(|value| value & !7)
+            .ok_or_else(|| Error::InvalidFormat("global heap collection size overflow".into()))?;
+        out.resize(padded_collection_len, 0);
+
+        let collection_size = u64::try_from(out.len())
+            .map_err(|_| Error::InvalidFormat("global heap collection size exceeds u64".into()))?;
+        let mut encoded_size = Vec::new();
+        encode_heap_size(
+            &mut encoded_size,
+            collection_size,
+            sizeof_size,
+            "global heap collection size",
+        )?;
+        out[8..8 + usize::from(sizeof_size)].copy_from_slice(&encoded_size);
+        Ok(out)
+    }
+
+    /// Free the in-core image (no-op in Rust where buffers are owned).
+    pub fn cache_heap_free_icr(_image: Vec<u8>) {}
+
+    /// Address of the heap collection that a reference points into.
+    /// Mirrors `H5HG_get_addr`.
     pub fn get_addr(reference: &GlobalHeapRef) -> u64 {
         reference.collection_addr
     }
 
+    /// Size in bytes of the object at `index`, or `None` if absent.
+    /// Mirrors `H5HG_get_size` / `H5HG_get_obj_size`.
     pub fn get_size(&self, index: u32) -> Option<usize> {
         self.get_object(index).map(|data| data.len())
     }
 
+    /// Free space remaining in the collection's allocation buffer.
+    /// Mirrors `H5HG_get_free_size`.
     pub fn get_free_size(&self) -> usize {
         self.objects.capacity().saturating_sub(self.objects.len())
     }
 
+    /// Render debugging information about a global heap collection.
+    /// Mirrors `H5HG_debug`.
     pub fn debug(&self) -> String {
         format!("GlobalHeapCollection(objects={})", self.objects.len())
     }
@@ -184,7 +307,10 @@ impl GlobalHeapCollection {
 
         // Collection size (includes header)
         let collection_size = reader.read_length()?;
-        if collection_size < 16 {
+        let header_len = 8u64
+            .checked_add(u64::from(reader.sizeof_size()))
+            .ok_or_else(|| Error::InvalidFormat("global heap header length overflow".into()))?;
+        if collection_size < header_len {
             return Err(Error::InvalidFormat(
                 "global heap collection is smaller than its header".into(),
             ));
@@ -216,7 +342,12 @@ impl GlobalHeapCollection {
 
         while reader.position()? < data_end {
             let pos = reader.position()?;
-            let min_entry_end = pos.checked_add(16).ok_or_else(|| {
+            let object_header_len = 8u64
+                .checked_add(u64::from(reader.sizeof_size()))
+                .ok_or_else(|| {
+                    Error::InvalidFormat("global heap object header size overflow".into())
+                })?;
+            let min_entry_end = pos.checked_add(object_header_len).ok_or_else(|| {
                 Error::InvalidFormat("global heap object header offset overflow".into())
             })?;
             if min_entry_end > data_end {
@@ -281,6 +412,8 @@ impl GlobalHeapCollection {
     }
 }
 
+/// Convert a heap-encoded object size into a `usize`, rejecting values
+/// that overflow or exceed the supported per-object cap.
 fn heap_object_len(value: u64, context: &str) -> Result<usize> {
     let len = usize::try_from(value)
         .map_err(|_| Error::InvalidFormat(format!("{context} does not fit in usize")))?;
@@ -290,6 +423,29 @@ fn heap_object_len(value: u64, context: &str) -> Result<usize> {
         )));
     }
     Ok(len)
+}
+
+fn validate_global_heap_object_size(len: usize) -> Result<()> {
+    if len > MAX_GLOBAL_HEAP_OBJECT_BYTES {
+        return Err(Error::InvalidFormat(format!(
+            "global heap object size {len} exceeds supported maximum {MAX_GLOBAL_HEAP_OBJECT_BYTES}"
+        )));
+    }
+    Ok(())
+}
+
+fn encode_heap_size(out: &mut Vec<u8>, value: u64, width: u8, context: &str) -> Result<()> {
+    let width = usize::from(width);
+    if width == 0 || width > 8 {
+        return Err(Error::InvalidFormat(format!("{context} width is invalid")));
+    }
+    if width < 8 && value >= (1u64 << (width * 8)) {
+        return Err(Error::InvalidFormat(format!(
+            "{context} value {value:#x} does not fit in {width} bytes"
+        )));
+    }
+    out.extend_from_slice(&value.to_le_bytes()[..width]);
+    Ok(())
 }
 
 /// Read a global heap object by its reference.
@@ -367,5 +523,37 @@ mod tests {
         let mut reader = HdfReader::new(Cursor::new(heap));
         let collection = GlobalHeapCollection::read_at(&mut reader, 0).unwrap();
         assert!(collection.objects.is_empty());
+    }
+
+    #[test]
+    fn global_heap_cache_serialize_roundtrips_and_checks_size_width() {
+        let mut collection = GlobalHeapCollection::create();
+        collection.insert(1, b"alpha".to_vec()).unwrap();
+        collection.insert(2, b"beta".to_vec()).unwrap();
+
+        let image = collection.cache_heap_serialize(8).unwrap();
+        assert_eq!(image.len(), collection.cache_heap_image_len().unwrap());
+        let mut reader = HdfReader::new(Cursor::new(image));
+        let decoded = GlobalHeapCollection::read_at(&mut reader, 0).unwrap();
+        assert_eq!(decoded.get_object(1), Some(&b"alpha"[..]));
+        assert_eq!(decoded.get_object(2), Some(&b"beta"[..]));
+
+        let image_4 = collection.cache_heap_serialize(4).unwrap();
+        assert_eq!(
+            image_4.len(),
+            collection.cache_heap_image_len_with_size(4).unwrap()
+        );
+        let mut reader = HdfReader::new(Cursor::new(image_4));
+        reader.set_sizeof_size(4);
+        let decoded = GlobalHeapCollection::read_at(&mut reader, 0).unwrap();
+        assert_eq!(decoded.get_object(1), Some(&b"alpha"[..]));
+        assert_eq!(decoded.get_object(2), Some(&b"beta"[..]));
+
+        let mut too_large_index = GlobalHeapCollection::create();
+        too_large_index
+            .insert(u32::from(u16::MAX) + 1, Vec::new())
+            .unwrap();
+        assert!(too_large_index.cache_heap_serialize(8).is_err());
+        assert!(collection.cache_heap_serialize(0).is_err());
     }
 }

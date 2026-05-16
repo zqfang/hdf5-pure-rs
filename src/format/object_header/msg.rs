@@ -21,12 +21,13 @@ use crate::io::reader::HdfReader;
 use super::chunk::reserve_continuation_range;
 use super::{
     is_undefined_addr, read_le_uint, RawMessage, MSG_ATTRIBUTE, MSG_ATTR_INFO, MSG_BTREE_K,
-    MSG_DATASPACE, MSG_DATATYPE, MSG_EXTERNAL_FILE_LIST, MSG_FILL_VALUE, MSG_FILL_VALUE_OLD,
-    MSG_FILTER_PIPELINE, MSG_FLAG_SHARED, MSG_GROUP_INFO, MSG_HEADER_CONTINUATION, MSG_LAYOUT,
-    MSG_LINK, MSG_LINK_INFO, MSG_NIL, MSG_OBJ_REF_COUNT, MSG_SHARED_MSG_TABLE, MSG_SYMBOL_TABLE,
-    SHARED_HEAP_ID_LEN, SHARED_MESSAGE_MAX_INDEXES, SHARED_MESSAGE_TABLE_VERSION,
-    SHARED_REFERENCE_VERSION_1, SHARED_REFERENCE_VERSION_2, SHARED_REFERENCE_VERSION_3,
-    SHARED_TYPE_COMMITTED, SHARED_TYPE_SOHM,
+    MSG_DATASPACE, MSG_DATATYPE, MSG_DRIVER_INFO, MSG_EXTERNAL_FILE_LIST, MSG_FILE_SPACE_INFO,
+    MSG_FILL_VALUE, MSG_FILL_VALUE_OLD, MSG_FILTER_PIPELINE, MSG_FLAG_SHARED, MSG_GROUP_INFO,
+    MSG_HEADER_CONTINUATION, MSG_LAYOUT, MSG_LINK, MSG_LINK_INFO, MSG_MDCI, MSG_NIL,
+    MSG_OBJ_REF_COUNT, MSG_SHARED_MSG_TABLE, MSG_SYMBOL_TABLE, SHARED_HEAP_ID_LEN,
+    SHARED_MESSAGE_MAX_INDEXES, SHARED_MESSAGE_TABLE_VERSION, SHARED_REFERENCE_VERSION_1,
+    SHARED_REFERENCE_VERSION_2, SHARED_REFERENCE_VERSION_3, SHARED_TYPE_COMMITTED,
+    SHARED_TYPE_SOHM,
 };
 
 const MSG_FLAG_DONTSHARE: u8 = 0x04;
@@ -35,6 +36,11 @@ const MSG_FLAG_MARK_IF_UNKNOWN: u8 = 0x10;
 const MSG_FLAG_WAS_UNKNOWN: u8 = 0x20;
 const MSG_KNOWN_FLAGS: u8 = 0xff;
 
+/// Decode the message stream of a v1 object header chunk. Walks the chunk
+/// between `[reader.position(), chunk_end)`, dispatches NIL padding and
+/// HEADER_CONTINUATION messages to the chunk layer, validates payloads, and
+/// appends real messages to `messages`. Mirrors the per-message decode loop
+/// in libhdf5's `H5Omessage.c` / `H5Oint.c` for v1 headers.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn read_v1_messages<R: Read + Seek>(
     reader: &mut HdfReader<R>,
@@ -134,6 +140,10 @@ pub(super) fn read_v1_messages<R: Read + Seek>(
     Ok(())
 }
 
+/// Decode the message stream of a v2 object header chunk. Same role as
+/// `read_v1_messages` but uses the more compact v2 message header layout
+/// (1-byte type, 2-byte size, 1-byte flags, optional 2-byte creation order
+/// when the header tracks one).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn read_v2_messages<R: Read + Seek>(
     reader: &mut HdfReader<R>,
@@ -237,6 +247,9 @@ pub(super) fn read_v2_messages<R: Read + Seek>(
     Ok(())
 }
 
+/// Sanity-check a decoded message payload. For shared messages we only verify
+/// the shared reference; for unshared messages we delegate to each message
+/// type's own `decode`/`validate` routine.
 fn validate_message_payload(
     msg_type: u16,
     msg_flags: u8,
@@ -290,6 +303,15 @@ fn validate_message_payload(
         if msg_type == MSG_ATTR_INFO {
             AttributeInfoMessage::decode(data, sizeof_addr)?;
         }
+        if msg_type == MSG_DRIVER_INFO {
+            validate_driver_info_message(data)?;
+        }
+        if msg_type == MSG_MDCI {
+            validate_metadata_cache_image_message(data, sizeof_addr, sizeof_size)?;
+        }
+        if msg_type == MSG_FILE_SPACE_INFO {
+            validate_file_space_info_message(data, sizeof_addr, sizeof_size)?;
+        }
     }
     if msg_type == MSG_OBJ_REF_COUNT {
         validate_refcount_message(data)?;
@@ -300,6 +322,8 @@ fn validate_message_payload(
     Ok(())
 }
 
+/// Validate a Group Info message payload (version 0 with up to two optional
+/// 4-byte phase-change fields gated by the flags byte).
 fn validate_group_info_message(data: &[u8]) -> Result<()> {
     if data.len() < 2 {
         return Err(Error::InvalidFormat(
@@ -330,6 +354,8 @@ fn validate_group_info_message(data: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Validate a B-tree 'K' values message (version 0, at least 7 bytes for the
+/// indexed-storage and group-leaf split values).
 fn validate_btree_k_message(data: &[u8]) -> Result<()> {
     if data.len() < 7 {
         return Err(Error::InvalidFormat(
@@ -345,6 +371,7 @@ fn validate_btree_k_message(data: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Validate an Object Reference Count message (4-byte refcount value).
 fn validate_refcount_message(data: &[u8]) -> Result<()> {
     if data.len() < 4 {
         return Err(Error::InvalidFormat(
@@ -354,6 +381,9 @@ fn validate_refcount_message(data: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Validate an External File List message: version 1 header, slot table
+/// with name/file offsets, and a defined local-heap address holding the
+/// external file names.
 fn validate_external_file_list(data: &[u8], sizeof_addr: u8, sizeof_size: u8) -> Result<()> {
     let mut pos = 0usize;
     let version = read_u8_at(data, &mut pos, "external file list version")?;
@@ -409,6 +439,132 @@ fn validate_external_file_list(data: &[u8], sizeof_addr: u8, sizeof_size: u8) ->
     Ok(())
 }
 
+/// Validate a Driver Info message (version 0, 8-byte driver name, followed
+/// by a length-prefixed opaque driver-specific payload).
+fn validate_driver_info_message(data: &[u8]) -> Result<()> {
+    let mut pos = 0usize;
+    let version = read_u8_at(data, &mut pos, "driver info version")?;
+    if version != 0 {
+        return Err(Error::InvalidFormat(format!(
+            "driver info message version {version}"
+        )));
+    }
+    pos = checked_usize_add(pos, 8, "driver info name")?;
+    if data.len() < pos {
+        return Err(Error::InvalidFormat("driver info name is truncated".into()));
+    }
+    let len = read_le_uint_at(data, &mut pos, 2, "driver info length")?;
+    if len == 0 {
+        return Err(Error::InvalidFormat(
+            "driver info message length is zero".into(),
+        ));
+    }
+    let len = usize::try_from(len)
+        .map_err(|_| Error::InvalidFormat("driver info length exceeds usize".into()))?;
+    let end = checked_usize_add(pos, len, "driver info payload")?;
+    if data.len() < end {
+        return Err(Error::InvalidFormat(
+            "driver info payload is truncated".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Validate a Metadata Cache Image (MDCI) message: version 0 plus an
+/// address/size pair that must not overflow the address space.
+fn validate_metadata_cache_image_message(
+    data: &[u8],
+    sizeof_addr: u8,
+    sizeof_size: u8,
+) -> Result<()> {
+    let mut pos = 0usize;
+    let version = read_u8_at(data, &mut pos, "metadata cache image version")?;
+    if version != 0 {
+        return Err(Error::InvalidFormat(format!(
+            "metadata cache image message version {version}"
+        )));
+    }
+    let addr = read_le_uint_at(
+        data,
+        &mut pos,
+        usize::from(sizeof_addr),
+        "metadata cache image address",
+    )?;
+    let size = read_le_uint_at(
+        data,
+        &mut pos,
+        usize::from(sizeof_size),
+        "metadata cache image size",
+    )?;
+    if !is_undefined_addr(addr, sizeof_addr)? && size != 0 {
+        let undef = undefined_addr_value(sizeof_addr)?;
+        if addr >= undef.saturating_sub(size) {
+            return Err(Error::InvalidFormat(
+                "metadata cache image address plus size overflows".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Validate a File Space Info message (version 1): strategy, persistence
+/// flag, threshold/page-size fields, and optionally 12 free-space-manager
+/// addresses when free-space tracking is persisted.
+fn validate_file_space_info_message(data: &[u8], sizeof_addr: u8, sizeof_size: u8) -> Result<()> {
+    let mut pos = 0usize;
+    let version = read_u8_at(data, &mut pos, "file-space info version")?;
+    if version != 1 {
+        return Err(Error::InvalidFormat(format!(
+            "file-space info message version {version}"
+        )));
+    }
+    read_u8_at(data, &mut pos, "file-space info strategy")?;
+    let persist = read_u8_at(data, &mut pos, "file-space info persist")? != 0;
+    read_le_uint_at(
+        data,
+        &mut pos,
+        usize::from(sizeof_size),
+        "file-space info threshold",
+    )?;
+    let page_size = read_le_uint_at(
+        data,
+        &mut pos,
+        usize::from(sizeof_size),
+        "file-space info page size",
+    )?;
+    if page_size == 0 || page_size > 1024 * 1024 * 1024 {
+        return Err(Error::InvalidFormat(
+            "file-space info page size is invalid".into(),
+        ));
+    }
+    read_le_uint_at(
+        data,
+        &mut pos,
+        2,
+        "file-space info page-end metadata threshold",
+    )?;
+    read_le_uint_at(
+        data,
+        &mut pos,
+        usize::from(sizeof_addr),
+        "file-space info pre-free-space EOA",
+    )?;
+    if persist {
+        for _ in 0..12 {
+            read_le_uint_at(
+                data,
+                &mut pos,
+                usize::from(sizeof_addr),
+                "file-space info free-space-manager address",
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Reject message-header flag bytes that set reserved bits or contain
+/// mutually exclusive flag combinations (shared & do-not-share, was-unknown
+/// & fail-if-unknown-on-write, was-unknown without mark-if-unknown).
 fn validate_message_flags(msg_flags: u8) -> Result<()> {
     if msg_flags & !MSG_KNOWN_FLAGS != 0 {
         return Err(Error::InvalidFormat(format!(
@@ -435,6 +591,8 @@ fn validate_message_flags(msg_flags: u8) -> Result<()> {
     Ok(())
 }
 
+/// Validate a Shared Message Table message: supported version, defined
+/// table address, and an in-range index count.
 fn validate_shared_message_table(data: &[u8], sizeof_addr: u8) -> Result<()> {
     let expected_len = 1usize
         .checked_add(usize::from(sizeof_addr))
@@ -467,6 +625,9 @@ fn validate_shared_message_table(data: &[u8], sizeof_addr: u8) -> Result<()> {
     Ok(())
 }
 
+/// Validate a shared-message reference embedded in a message payload.
+/// Handles the three SOHM reference versions (v1 with heap/addr pair, v2
+/// addr-only, v3 SOHM heap ID or committed-datatype address).
 fn validate_shared_message_reference(data: &[u8], sizeof_addr: u8, sizeof_size: u8) -> Result<()> {
     if data.len() < 2 {
         return Err(Error::InvalidFormat(
@@ -573,20 +734,24 @@ fn validate_shared_message_reference(data: &[u8], sizeof_addr: u8, sizeof_size: 
     Ok(())
 }
 
+/// Add two `u64` values, mapping overflow to a context-annotated error.
 fn checked_u64_add(lhs: u64, rhs: u64, context: &str) -> Result<u64> {
     lhs.checked_add(rhs)
         .ok_or_else(|| Error::InvalidFormat(format!("{context} offset overflow")))
 }
 
+/// Add two `usize` values, mapping overflow to a context-annotated error.
 fn checked_usize_add(lhs: usize, rhs: usize, context: &str) -> Result<usize> {
     lhs.checked_add(rhs)
         .ok_or_else(|| Error::InvalidFormat(format!("{context} size overflow")))
 }
 
+/// Narrow a `u64` to `usize`, mapping overflow to a context-annotated error.
 fn usize_from_u64(value: u64, context: &str) -> Result<usize> {
     usize::try_from(value).map_err(|_| Error::InvalidFormat(format!("{context} exceeds usize")))
 }
 
+/// Read a single byte from `data[*pos]` and advance the cursor.
 fn read_u8_at(data: &[u8], pos: &mut usize, context: &str) -> Result<u8> {
     let value = data
         .get(*pos)
@@ -596,6 +761,8 @@ fn read_u8_at(data: &[u8], pos: &mut usize, context: &str) -> Result<u8> {
     Ok(value)
 }
 
+/// Read a little-endian unsigned integer of `width` bytes (1..=8) from
+/// `data[*pos]` and advance the cursor.
 fn read_le_uint_at(data: &[u8], pos: &mut usize, width: usize, context: &str) -> Result<u64> {
     if !(1..=8).contains(&width) {
         return Err(Error::InvalidFormat(format!(
@@ -609,6 +776,22 @@ fn read_le_uint_at(data: &[u8], pos: &mut usize, width: usize, context: &str) ->
     )?;
     *pos = end;
     Ok(value)
+}
+
+/// Return the "undefined address" sentinel value for the given address
+/// width (all bits set within the on-disk address byte count).
+fn undefined_addr_value(sizeof_addr: u8) -> Result<u64> {
+    let width = usize::from(sizeof_addr);
+    if !(1..=8).contains(&width) {
+        return Err(Error::InvalidFormat(format!(
+            "address size {width} is invalid"
+        )));
+    }
+    Ok(if width == 8 {
+        u64::MAX
+    } else {
+        (1u64 << (width * 8)) - 1
+    })
 }
 
 #[cfg(test)]

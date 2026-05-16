@@ -44,6 +44,7 @@ pub struct FixedArray {
 }
 
 impl FixedArray {
+    /// Allocate and initialize a new fixed array wrapper.
     pub fn new() -> Self {
         Self {
             elements: Vec::new(),
@@ -52,6 +53,7 @@ impl FixedArray {
         }
     }
 
+    /// Create a new fixed array of the given size, populated with fill elements.
     pub fn create(size: usize) -> Self {
         let mut elements = Vec::with_capacity(size);
         append_fill_elements(size, &mut elements);
@@ -62,6 +64,7 @@ impl FixedArray {
         }
     }
 
+    /// Open an existing fixed array around already-loaded elements.
     pub fn open(elements: Vec<FixedArrayElement>) -> Self {
         Self {
             elements,
@@ -70,10 +73,12 @@ impl FixedArray {
         }
     }
 
+    /// Query the current number of elements in the array.
     pub fn get_nelmts(&self) -> usize {
         self.elements.len()
     }
 
+    /// Query the address of the element at `index`.
     pub fn get_addr(&self, index: usize) -> Result<u64> {
         Ok(self
             .elements
@@ -84,6 +89,7 @@ impl FixedArray {
             .addr)
     }
 
+    /// Replace the element at `index`.
     pub fn set(&mut self, index: usize, element: FixedArrayElement) -> Result<()> {
         if self.deleted {
             return Err(Error::InvalidFormat(
@@ -97,17 +103,30 @@ impl FixedArray {
         Ok(())
     }
 
+    /// Close the fixed array.
     pub fn close(self) {}
 
+    /// Delete the fixed array, clearing its elements and marking it deleted.
     pub fn delete(&mut self) {
         self.elements.clear();
         self.deleted = true;
     }
 
+    /// Make a child flush dependency with the fixed array. Saturates on overflow.
     pub fn depend(&mut self) {
-        self.flush_dependencies = self.flush_dependencies.saturating_add(1);
+        let _ = self.depend_checked();
     }
 
+    /// Checked variant of `depend` that returns an error on overflow.
+    pub fn depend_checked(&mut self) -> Result<()> {
+        self.flush_dependencies = self
+            .flush_dependencies
+            .checked_add(1)
+            .ok_or_else(|| Error::InvalidFormat("fixed array flush dependency overflow".into()))?;
+        Ok(())
+    }
+
+    /// Patch the on-disk address recorded for the element at `index`.
     pub fn patch_file(&mut self, index: usize, addr: u64) -> Result<()> {
         let slot = self.elements.get_mut(index).ok_or_else(|| {
             Error::InvalidFormat(format!("fixed array index {index} out of bounds"))
@@ -116,6 +135,7 @@ impl FixedArray {
         Ok(())
     }
 
+    /// Query the metadata statistics of the array.
     pub fn get_stats(&self) -> FixedArrayStats {
         FixedArrayStats {
             elements: self.elements.len(),
@@ -124,10 +144,17 @@ impl FixedArray {
         }
     }
 
+    /// Create a flush dependency between two data-structure components.
     pub fn create_flush_depend(&mut self) {
         self.depend();
     }
 
+    /// Checked variant of `create_flush_depend`.
+    pub fn create_flush_depend_checked(&mut self) -> Result<()> {
+        self.depend_checked()
+    }
+
+    /// Destroy a flush dependency between two data-structure components.
     pub fn destroy_flush_depend(&mut self) -> Result<()> {
         if self.flush_dependencies == 0 {
             return Err(Error::InvalidFormat(
@@ -146,6 +173,7 @@ pub struct FixedArrayCreateParams {
     pub elements: u64,
 }
 
+/// Create a client callback context with default fixed array parameters.
 pub fn test_crt_context() -> FixedArrayCreateParams {
     FixedArrayCreateParams {
         raw_element_size: 8,
@@ -154,14 +182,17 @@ pub fn test_crt_context() -> FixedArrayCreateParams {
     }
 }
 
+/// Destroy a client callback context.
 pub fn test_dst_context(_params: FixedArrayCreateParams) {}
 
+/// Fill a vector with `count` undefined-address fixed array elements ("missing" entries).
 pub fn test_fill(count: usize) -> Vec<FixedArrayElement> {
     let mut elements = Vec::with_capacity(count);
     append_fill_elements(count, &mut elements);
     elements
 }
 
+/// Encode the test creation parameters into a stable little-endian byte stream.
 pub fn test_encode(params: &FixedArrayCreateParams) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     out.extend_from_slice(
@@ -172,6 +203,7 @@ pub fn test_encode(params: &FixedArrayCreateParams) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// Decode a previously encoded creation-parameter byte stream.
 pub fn test_decode(data: &[u8]) -> Result<FixedArrayCreateParams> {
     if data.len() < 17 {
         return Err(Error::InvalidFormat(
@@ -191,6 +223,7 @@ pub fn test_decode(data: &[u8]) -> Result<FixedArrayCreateParams> {
     })
 }
 
+/// Borrow a `[pos..pos+len]` slice from `data`, returning an error on overflow or truncation.
 fn checked_window<'a>(data: &'a [u8], pos: usize, len: usize, context: &str) -> Result<&'a [u8]> {
     let end = pos
         .checked_add(len)
@@ -199,6 +232,7 @@ fn checked_window<'a>(data: &'a [u8], pos: usize, len: usize, context: &str) -> 
         .ok_or_else(|| Error::InvalidFormat(format!("{context} is truncated")))
 }
 
+/// Read a little-endian u64 at `pos` from `data` with bounds checks.
 fn read_u64_le_at(data: &[u8], pos: usize, context: &str) -> Result<u64> {
     let bytes = checked_window(data, pos, 8, context)?;
     Ok(u64::from_le_bytes(bytes.try_into().map_err(|_| {
@@ -206,6 +240,7 @@ fn read_u64_le_at(data: &[u8], pos: usize, context: &str) -> Result<u64> {
     })?))
 }
 
+/// Format the test creation parameters for debug printing.
 pub fn test_debug(params: &FixedArrayCreateParams) -> String {
     format!(
         "FixedArrayCreateParams(raw_element_size={}, max_page_elements_bits={}, elements={})",
@@ -213,18 +248,22 @@ pub fn test_debug(params: &FixedArrayCreateParams) -> String {
     )
 }
 
+/// Create a debugging callback context (aliases `test_crt_context`).
 pub fn test_crt_dbg_context() -> FixedArrayCreateParams {
     test_crt_context()
 }
 
+/// Retrieve the parameters used to create the fixed array.
 pub fn get_cparam_test(params: &FixedArrayCreateParams) -> FixedArrayCreateParams {
     params.clone()
 }
 
+/// Compare two sets of fixed-array creation parameters for equality.
 pub fn cmp_cparam_test(lhs: &FixedArrayCreateParams, rhs: &FixedArrayCreateParams) -> bool {
     lhs == rhs
 }
 
+/// Iterate over the elements of a fixed array, returning the decoded chunk records.
 pub fn read_fixed_array_chunks<R: Read + Seek>(
     reader: &mut HdfReader<R>,
     addr: u64,
@@ -268,6 +307,9 @@ pub fn locate_fixed_array_element<R: Read + Seek>(
     .element_addr)
 }
 
+/// Compute the on-disk locations of a fixed-array element and the page (or
+/// block) checksum that covers it. Used by chunk-update code paths that need
+/// to rewrite a single element and refresh the surrounding checksum.
 pub fn locate_fixed_array_element_with_checksum<R: Read + Seek>(
     reader: &mut HdfReader<R>,
     addr: u64,
@@ -436,6 +478,7 @@ pub fn locate_fixed_array_element_with_checksum<R: Read + Seek>(
 // `H5FAint.c` (the package-internal helper file).
 // ---------------------------------------------------------------------------
 
+/// Append `count` fill elements (undefined-address sentinels) to the running element list.
 pub(super) fn append_fill_elements(count: usize, elements: &mut Vec<FixedArrayElement>) {
     for _ in 0..count {
         elements.push(FixedArrayElement {
@@ -446,30 +489,36 @@ pub(super) fn append_fill_elements(count: usize, elements: &mut Vec<FixedArrayEl
     }
 }
 
+/// Convert `u64` to `usize` with a contextual error on overflow.
 pub(super) fn usize_from_u64(value: u64, context: &str) -> Result<usize> {
     usize::try_from(value)
         .map_err(|_| Error::InvalidFormat(format!("{context} does not fit in usize")))
 }
 
+/// Convert `usize` to `u64` with a contextual error on overflow.
 pub(super) fn u64_from_usize(value: usize, context: &str) -> Result<u64> {
     u64::try_from(value).map_err(|_| Error::InvalidFormat(format!("{context} does not fit in u64")))
 }
 
+/// Add two `usize` values, returning an error on overflow.
 pub(super) fn checked_usize_add(lhs: usize, rhs: usize, context: &str) -> Result<usize> {
     lhs.checked_add(rhs)
         .ok_or_else(|| Error::InvalidFormat(format!("{context} overflow")))
 }
 
+/// Multiply two `usize` values, returning an error on overflow.
 pub(super) fn checked_usize_mul(lhs: usize, rhs: usize, context: &str) -> Result<usize> {
     lhs.checked_mul(rhs)
         .ok_or_else(|| Error::InvalidFormat(format!("{context} overflow")))
 }
 
+/// Add two `u64` values, returning an error on overflow.
 pub(super) fn checked_u64_add(lhs: u64, rhs: u64, context: &str) -> Result<u64> {
     lhs.checked_add(rhs)
         .ok_or_else(|| Error::InvalidFormat(format!("{context} overflow")))
 }
 
+/// Test whether the given bit (MSB-first within a byte) is set in the bitmap.
 pub(super) fn bit_is_set(bytes: &[u8], bit: usize) -> bool {
     bytes
         .get(bit / 8)
@@ -479,11 +528,16 @@ pub(super) fn bit_is_set(bytes: &[u8], bit: usize) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{checked_u64_add, checked_usize_mul};
+    use super::{checked_u64_add, checked_usize_mul, FixedArray};
 
     #[test]
     fn fixed_array_checked_helpers_reject_overflow() {
         assert!(checked_usize_mul(usize::MAX, 2, "fixed array size").is_err());
         assert!(checked_u64_add(u64::MAX, 1, "fixed array address").is_err());
+
+        let mut array = FixedArray::create(0);
+        array.flush_dependencies = usize::MAX;
+        assert!(array.depend_checked().is_err());
+        assert!(array.create_flush_depend_checked().is_err());
     }
 }

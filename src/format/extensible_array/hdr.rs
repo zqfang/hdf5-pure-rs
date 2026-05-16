@@ -7,7 +7,7 @@ use std::io::{Read, Seek};
 
 use crate::error::{Error, Result};
 use crate::format::checksum::checksum_metadata;
-use crate::io::reader::HdfReader;
+use crate::io::reader::{HdfReader, UNDEF_ADDR};
 
 const MAX_EXTENSIBLE_ARRAY_ELEMENTS: usize = 1_000_000;
 
@@ -62,6 +62,8 @@ pub(crate) struct SuperBlockInfo {
     pub(super) start_data_block: u64,
 }
 
+/// Load an extensible array header from disk and project it into the
+/// summary `ExtensibleArrayHeader` consumed by the rest of the module.
 pub(super) fn read_header<R: Read + Seek>(
     reader: &mut HdfReader<R>,
     addr: u64,
@@ -83,6 +85,7 @@ pub(super) fn read_header<R: Read + Seek>(
     })
 }
 
+/// Format an extensible array header for debug printing.
 pub(super) fn hdr_debug(header: &ExtensibleArrayHeader) -> String {
     format!(
         "ExtensibleArrayHeader(class_id={}, raw_element_size={}, index_block_elements={}, max_index_set={}, index_block_addr={:#x})",
@@ -94,10 +97,13 @@ pub(super) fn hdr_debug(header: &ExtensibleArrayHeader) -> String {
     )
 }
 
+/// Initial number of bytes the metadata cache must read to determine the
+/// full extensible array header size (magic + version byte).
 pub(super) fn cache_hdr_get_initial_load_size() -> usize {
     4 + 1
 }
 
+/// Compute the on-disk size of an extensible array header for the given widths.
 pub(super) fn cache_hdr_image_len(addr_size: usize, length_size: usize) -> Result<usize> {
     let fixed = 4usize
         .checked_add(8)
@@ -110,6 +116,7 @@ pub(super) fn cache_hdr_image_len(addr_size: usize, length_size: usize) -> Resul
     Ok(fixed)
 }
 
+/// Serialize a dirty extensible array header to its on-disk image.
 pub(super) fn cache_hdr_serialize(
     header: &ParsedExtensibleArrayHeader,
     addr_size: usize,
@@ -143,25 +150,30 @@ pub(super) fn cache_hdr_serialize(
     encode_var(&mut out, header.data_block_size, length_size)?;
     encode_var(&mut out, header.max_index_set, length_size)?;
     encode_var(&mut out, header.realized_elements, length_size)?;
-    encode_var(&mut out, header.index_block_addr, addr_size)?;
+    encode_addr(&mut out, header.index_block_addr, addr_size)?;
     let checksum = checksum_metadata(&out);
     out.extend_from_slice(&checksum.to_le_bytes());
     Ok(out)
 }
 
+/// Handle metadata-cache action notifications for the header.
 pub(super) fn cache_hdr_notify(_header: &ExtensibleArrayHeader) {}
 
+/// Destroy/release an in-core representation of an extensible array header.
 pub(super) fn cache_hdr_free_icr(_header: ExtensibleArrayHeader) {}
 
+/// Allocate a shared extensible array header (returns the parsed header).
 pub(super) fn hdr_alloc(parsed: ParsedExtensibleArrayHeader) -> ParsedExtensibleArrayHeader {
     parsed
 }
 
+/// Reset the dynamic counters on an extensible array header.
 pub(super) fn hdr_init(header: &mut ParsedExtensibleArrayHeader) {
     header.realized_elements = 0;
     header.max_index_set = 0;
 }
 
+/// Allocate a backing array of `count` extensible array data block elements.
 pub(super) fn hdr_alloc_elmts(count: usize) -> Vec<crate::format::fixed_array::FixedArrayElement> {
     vec![
         crate::format::fixed_array::FixedArrayElement {
@@ -173,18 +185,30 @@ pub(super) fn hdr_alloc_elmts(count: usize) -> Vec<crate::format::fixed_array::F
     ]
 }
 
+/// Free a previously-allocated extensible array element buffer.
 pub(super) fn hdr_free_elmts(elements: &mut Vec<crate::format::fixed_array::FixedArrayElement>) {
     elements.clear();
 }
 
+/// Create a new extensible array header (returns the supplied parsed header).
 pub(super) fn hdr_create(parsed: ParsedExtensibleArrayHeader) -> ParsedExtensibleArrayHeader {
     parsed
 }
 
+/// Increment the component reference count on the shared header (saturates on overflow).
 pub(super) fn hdr_incr(ref_count: &mut usize) {
-    *ref_count = ref_count.saturating_add(1);
+    let _ = hdr_incr_checked(ref_count);
 }
 
+/// Checked variant of `hdr_incr` that returns an error on overflow.
+pub(super) fn hdr_incr_checked(ref_count: &mut usize) -> Result<()> {
+    *ref_count = ref_count
+        .checked_add(1)
+        .ok_or_else(|| Error::InvalidFormat("extensible array header reference overflow".into()))?;
+    Ok(())
+}
+
+/// Decrement the component reference count on the shared header.
 pub(super) fn hdr_decr(ref_count: &mut usize) -> Result<()> {
     if *ref_count == 0 {
         return Err(Error::InvalidFormat(
@@ -195,16 +219,25 @@ pub(super) fn hdr_decr(ref_count: &mut usize) -> Result<()> {
     Ok(())
 }
 
+/// Increment the file reference count on the shared header (saturates).
 pub(super) fn hdr_fuse_incr(ref_count: &mut usize) {
     hdr_incr(ref_count);
 }
 
+/// Checked variant of `hdr_fuse_incr`.
+pub(super) fn hdr_fuse_incr_checked(ref_count: &mut usize) -> Result<()> {
+    hdr_incr_checked(ref_count)
+}
+
+/// Decrement the file reference count on the shared header.
 pub(super) fn hdr_fuse_decr(ref_count: &mut usize) -> Result<()> {
     hdr_decr(ref_count)
 }
 
+/// Mark the extensible array as modified so it will be flushed.
 pub(super) fn hdr_modified(_header: &mut ParsedExtensibleArrayHeader) {}
 
+/// Protect the extensible array header (loads it from disk).
 pub(super) fn hdr_protect<R: Read + Seek>(
     reader: &mut HdfReader<R>,
     addr: u64,
@@ -212,16 +245,22 @@ pub(super) fn hdr_protect<R: Read + Seek>(
     read_header_core(reader, addr)
 }
 
+/// Release the protected header.
 pub(super) fn hdr_unprotect(_header: ParsedExtensibleArrayHeader) {}
 
+/// Mark the array deleted by clearing the index block address and counters.
 pub(super) fn hdr_delete(header: &mut ParsedExtensibleArrayHeader) {
     header.index_block_addr = crate::io::reader::UNDEF_ADDR;
     header.max_index_set = 0;
     header.realized_elements = 0;
 }
 
+/// Destroy the extensible array header in memory.
 pub(super) fn hdr_dest(_header: ParsedExtensibleArrayHeader) {}
 
+/// Low-level deserializer for the extensible array header. Validates the
+/// magic, version, fixed fields, derives the super-block table, and verifies
+/// the trailing checksum.
 pub(crate) fn read_header_core<R: Read + Seek>(
     reader: &mut HdfReader<R>,
     addr: u64,
@@ -346,6 +385,7 @@ pub(crate) fn read_header_core<R: Read + Seek>(
     })
 }
 
+/// Verify the trailing metadata checksum for an extensible-array image span.
 pub(super) fn verify_checksum<R: Read + Seek>(
     reader: &mut HdfReader<R>,
     start: u64,
@@ -369,6 +409,7 @@ pub(super) fn verify_checksum<R: Read + Seek>(
     Ok(())
 }
 
+/// Compute the per-super-block sizing table (`SuperBlockInfo` entries).
 fn build_super_block_info(
     count: usize,
     min_data_block_elements: usize,
@@ -427,15 +468,36 @@ fn build_super_block_info(
     Ok(infos)
 }
 
+/// Encode an unsigned integer as `size` little-endian bytes, validating range.
 fn encode_var(out: &mut Vec<u8>, value: u64, size: usize) -> Result<()> {
-    if size > 8 {
+    if size == 0 || size > 8 {
         return Err(Error::InvalidFormat(
-            "extensible array encoded integer size exceeds u64".into(),
+            "extensible array encoded integer size is invalid".into(),
         ));
+    }
+    if size < 8 && value >= (1u64 << (size * 8)) {
+        return Err(Error::InvalidFormat(format!(
+            "extensible array encoded integer value {value:#x} does not fit in {size} bytes"
+        )));
     }
     let bytes = value.to_le_bytes();
     out.extend_from_slice(&bytes[..size]);
     Ok(())
+}
+
+/// Encode an address as `size` little-endian bytes, writing the all-`0xff`
+/// sentinel for undefined addresses.
+fn encode_addr(out: &mut Vec<u8>, value: u64, size: usize) -> Result<()> {
+    if size == 0 || size > 8 {
+        return Err(Error::InvalidFormat(
+            "extensible array encoded address size is invalid".into(),
+        ));
+    }
+    if value == UNDEF_ADDR {
+        out.extend(std::iter::repeat_n(0xff, size));
+        return Ok(());
+    }
+    encode_var(out, value, size)
 }
 
 #[cfg(test)]
@@ -444,7 +506,10 @@ mod tests {
 
     use crate::io::HdfReader;
 
-    use super::{build_super_block_info, read_header_core};
+    use super::{
+        build_super_block_info, cache_hdr_serialize, hdr_fuse_incr_checked, hdr_incr_checked,
+        read_header_core,
+    };
 
     #[test]
     fn build_super_block_info_rejects_start_index_product_overflow() {
@@ -478,5 +543,57 @@ mod tests {
             err.to_string().contains("element size"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn extensible_array_header_cache_serialize_checks_configured_widths() {
+        let header = super::ParsedExtensibleArrayHeader {
+            class_id: 1,
+            raw_element_size: 4,
+            index_block_elements: 1,
+            data_block_min_elements: 1,
+            super_block_count: 0,
+            super_block_size: 0,
+            data_block_count: 0,
+            data_block_size: 0,
+            max_index_set: 1,
+            realized_elements: 0,
+            index_block_addr: crate::io::reader::UNDEF_ADDR,
+            array_offset_size: 1,
+            data_block_page_elements: 1,
+            index_block_super_blocks: 0,
+            index_block_data_block_addrs: 0,
+            index_block_super_block_addrs: 0,
+            derived_super_block_count: 0,
+            super_block_info: Vec::new(),
+            checksum_pos: 0,
+            super_block_count_pos: 0,
+            super_block_size_pos: 0,
+            data_block_count_pos: 0,
+            data_block_size_pos: 0,
+            max_index_set_pos: 0,
+            realized_elements_pos: 0,
+        };
+        let image = cache_hdr_serialize(&header, 4, 4).unwrap();
+        assert_eq!(&image[36..40], &[0xff; 4]);
+
+        let too_large_index = super::ParsedExtensibleArrayHeader {
+            max_index_set: u64::from(u32::MAX) + 1,
+            ..header.clone()
+        };
+        assert!(cache_hdr_serialize(&too_large_index, 4, 4).is_err());
+
+        let too_large_addr = super::ParsedExtensibleArrayHeader {
+            index_block_addr: u64::from(u32::MAX) + 1,
+            ..header
+        };
+        assert!(cache_hdr_serialize(&too_large_addr, 4, 4).is_err());
+    }
+
+    #[test]
+    fn extensible_array_header_refcount_checked_rejects_overflow() {
+        let mut ref_count = usize::MAX;
+        assert!(hdr_incr_checked(&mut ref_count).is_err());
+        assert!(hdr_fuse_incr_checked(&mut ref_count).is_err());
     }
 }

@@ -68,6 +68,9 @@ impl FractalHeapHeader {
         }
     }
 
+    /// Read a managed object from the indirect block at `block_addr`,
+    /// dispatching to the filtered variant when the heap has an I/O
+    /// filter pipeline.
     pub(super) fn read_from_indirect_block<R: Read + Seek>(
         &self,
         reader: &mut HdfReader<R>,
@@ -102,7 +105,7 @@ impl FractalHeapHeader {
         length: u64,
     ) -> Result<Vec<u8>> {
         let width = usize::from(self.table_width);
-        let max_direct_rows = self.max_direct_rows();
+        let max_direct_rows = self.max_direct_rows_checked()?;
         let mut current_heap_offset = block_start;
         let mut entry_index = 0usize;
 
@@ -262,6 +265,8 @@ impl FractalHeapHeader {
     }
 }
 
+/// Number of bytes used to encode a managed heap-ID offset, derived from
+/// `max_heap_size` (in bits). Rejects widths beyond 8 bytes.
 fn managed_heap_offset_bytes(max_heap_size: u16) -> Result<usize> {
     let bytes = (usize::from(max_heap_size) + 7) / 8;
     if bytes > 8 {
@@ -272,6 +277,8 @@ fn managed_heap_offset_bytes(max_heap_size: u16) -> Result<usize> {
     Ok(bytes)
 }
 
+/// Slice a heap-ID byte window, returning a helpful error if the requested
+/// range overflows or runs past the ID length.
 fn managed_heap_id_window<'a>(
     heap_id: &'a [u8],
     offset: usize,
@@ -286,6 +293,8 @@ fn managed_heap_id_window<'a>(
         .ok_or_else(|| Error::InvalidFormat(format!("heap ID too short for {field}")))
 }
 
+/// Read the first `len` bytes of `bytes` as a little-endian unsigned
+/// integer (up to 8 bytes), returning a contextual error on overflow.
 fn read_le_u64_prefix(bytes: &[u8], len: usize, context: &str) -> Result<u64> {
     if len > 8 || len > bytes.len() {
         return Err(Error::InvalidFormat(format!(
@@ -323,6 +332,8 @@ mod tests {
     }
 }
 
+/// Checked addition for fractal-heap byte offsets, surfacing an
+/// `InvalidFormat` error rather than silently wrapping.
 fn checked_add_heap_offset(lhs: u64, rhs: u64) -> Result<u64> {
     lhs.checked_add(rhs)
         .ok_or_else(|| Error::InvalidFormat("fractal heap offset span overflow".into()))

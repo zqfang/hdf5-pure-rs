@@ -18,10 +18,10 @@ use hdf5_pure_rust::format::messages::link_info::LinkInfoMessage;
 use hdf5_pure_rust::format::messages::symbol_table::SymbolTableMessage;
 use hdf5_pure_rust::format::object_header::{
     ObjectHeader, HDR_ATTR_CRT_ORDER_INDEXED, HDR_ATTR_STORE_PHASE_CHANGE, MSG_ATTRIBUTE,
-    MSG_ATTR_INFO, MSG_BTREE_K, MSG_DATASPACE, MSG_DATATYPE, MSG_EXTERNAL_FILE_LIST,
-    MSG_FILL_VALUE, MSG_FILL_VALUE_OLD, MSG_FILTER_PIPELINE, MSG_GROUP_INFO,
-    MSG_HEADER_CONTINUATION, MSG_LAYOUT, MSG_LINK, MSG_LINK_INFO, MSG_OBJ_REF_COUNT,
-    MSG_SHARED_MSG_TABLE, MSG_SYMBOL_TABLE,
+    MSG_ATTR_INFO, MSG_BTREE_K, MSG_DATASPACE, MSG_DATATYPE, MSG_DRIVER_INFO,
+    MSG_EXTERNAL_FILE_LIST, MSG_FILE_SPACE_INFO, MSG_FILL_VALUE, MSG_FILL_VALUE_OLD,
+    MSG_FILTER_PIPELINE, MSG_GROUP_INFO, MSG_HEADER_CONTINUATION, MSG_LAYOUT, MSG_LINK,
+    MSG_LINK_INFO, MSG_MDCI, MSG_OBJ_REF_COUNT, MSG_SHARED_MSG_TABLE, MSG_SYMBOL_TABLE,
 };
 use hdf5_pure_rust::format::superblock::Superblock;
 use hdf5_pure_rust::format::symbol_table::SymbolTableNode;
@@ -552,6 +552,9 @@ fn test_object_header_validates_core_message_decoders_like_libhdf5() {
         ),
         (MSG_SYMBOL_TABLE, Vec::new(), "symbol table"),
         (MSG_ATTR_INFO, vec![9, 0], "attribute info"),
+        (MSG_DRIVER_INFO, vec![0, b's', b'e', b'c'], "driver info"),
+        (MSG_MDCI, vec![9, 0, 0, 0], "metadata cache image"),
+        (MSG_FILE_SPACE_INFO, vec![1, 0, 0, 0], "file-space info"),
     ] {
         let mut reader = HdfReader::new(Cursor::new(v2_header(msg_type, &payload)));
         let err = ObjectHeader::read_at(&mut reader, 0)
@@ -565,6 +568,26 @@ fn test_object_header_validates_core_message_decoders_like_libhdf5() {
     for (msg_type, payload) in [
         (MSG_DATASPACE, vec![2, 0, 0, 0]),
         (MSG_LAYOUT, vec![3, 0, 0, 0, 0xaa]),
+        (MSG_DRIVER_INFO, {
+            let mut bytes = vec![0, b's', b'e', b'c', b'2', 0, 0, 0, 0];
+            bytes.extend_from_slice(&3u16.to_le_bytes());
+            bytes.extend_from_slice(b"abc");
+            bytes.push(0xaa);
+            bytes
+        }),
+        (
+            MSG_MDCI,
+            vec![0, 16, 0, 0, 0, 0, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0],
+        ),
+        (MSG_FILE_SPACE_INFO, {
+            let mut bytes = vec![1, 0, 0];
+            bytes.extend_from_slice(&1u64.to_le_bytes());
+            bytes.extend_from_slice(&4096u64.to_le_bytes());
+            bytes.extend_from_slice(&0u16.to_le_bytes());
+            bytes.extend_from_slice(&u64::MAX.to_le_bytes());
+            bytes.push(0xaa);
+            bytes
+        }),
         (MSG_EXTERNAL_FILE_LIST, {
             let mut bytes = vec![1, 1, 0, 0];
             bytes.extend_from_slice(&1u16.to_le_bytes());

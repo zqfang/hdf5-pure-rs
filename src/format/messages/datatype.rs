@@ -45,6 +45,8 @@ pub enum DatatypeClass {
 }
 
 impl DatatypeClass {
+    /// Convert a raw datatype-class byte (low nibble of the version/class byte
+    /// in a datatype message) into the corresponding `DatatypeClass`.
     pub fn from_u8(val: u8) -> Result<Self> {
         match val {
             0 => Ok(Self::FixedPoint),
@@ -91,6 +93,9 @@ const MAX_DATATYPE_ARRAY_DIMS: usize = 32;
 const MAX_DATATYPE_MEMBERS: usize = 4096;
 
 impl DatatypeMessage {
+    /// Decode the raw disk form of a Datatype (type 0x0003) message into an
+    /// in-memory `DatatypeMessage`. Wraps `decode_impl` and emits a tracehash
+    /// record when that feature is enabled.
     pub fn decode(data: &[u8]) -> Result<Self> {
         let message = Self::decode_impl(data)?;
 
@@ -121,6 +126,12 @@ impl DatatypeMessage {
         Ok(message)
     }
 
+    /// Core decoder for a Datatype message. Mirrors libhdf5's
+    /// `H5O__dtype_decode` / `H5O__dtype_decode_helper`: parses the common
+    /// header (version+class, class bits, byte size), copies the
+    /// class-specific property bytes, and runs the per-class validity checks
+    /// (fixed-point/bitfield bit ranges, floating-point sign/exponent/mantissa
+    /// positions, opaque tag, reference type, vlen subtype, array sizing).
     fn decode_impl(data: &[u8]) -> Result<Self> {
         if data.len() < 8 {
             return Err(Error::InvalidFormat("datatype message too short".into()));
@@ -403,6 +414,8 @@ impl DatatypeMessage {
         self.decode_compound_fields_impl()
     }
 
+    /// Walk this compound datatype's properties and produce the per-member
+    /// `CompoundField` table, rejecting empty/oversized member counts.
     fn decode_compound_fields_impl(&self) -> Result<Vec<CompoundField>> {
         let nmembers = usize::from(
             self.compound_nmembers()
@@ -423,6 +436,7 @@ impl DatatypeMessage {
         self.build_compound_fields(&members)
     }
 
+    /// Decode `nmembers` consecutive compound members from `data`.
     fn decode_compound_members(
         &self,
         data: &[u8],
@@ -443,6 +457,8 @@ impl DatatypeMessage {
         Ok(members)
     }
 
+    /// Decode one compound member at the cursor: name string, byte offset
+    /// within the record, and the embedded member datatype message.
     fn decode_compound_member(
         &self,
         data: &[u8],
@@ -459,6 +475,9 @@ impl DatatypeMessage {
         })
     }
 
+    /// Decode a NUL-terminated compound member name and advance the cursor
+    /// past it. Versions 1/2 pad the name to an 8-byte boundary; version 3
+    /// stores it tightly packed.
     fn decode_compound_member_name(
         &self,
         data: &[u8],
@@ -484,6 +503,9 @@ impl DatatypeMessage {
         Ok((raw_name, name))
     }
 
+    /// Decode the byte offset of a compound member within the record. Pre-v3
+    /// messages use a fixed 4-byte offset; v3 uses a variable-width offset
+    /// sized to the compound type's overall byte size.
     fn decode_compound_member_offset(&self, data: &[u8], pos: &mut usize) -> Result<usize> {
         let offset_size =
             compound_member_offset_size(self.version, self.size_usize("compound datatype size")?)?;
@@ -498,6 +520,9 @@ impl DatatypeMessage {
         Ok(byte_offset)
     }
 
+    /// Decode the embedded datatype message for a compound member. For v1
+    /// messages this also consumes the legacy inline-array dimension block,
+    /// synthesizing an array datatype when any positive dimensions are set.
     fn decode_compound_member_datatype(
         &self,
         data: &[u8],
@@ -527,6 +552,8 @@ impl DatatypeMessage {
         }
     }
 
+    /// Decode the 28-byte legacy compound-member dimension block found in
+    /// version 1 messages: rank, reserved bytes, four 4-byte dimensions.
     fn decode_legacy_compound_array_dims(data: &[u8], pos: &mut usize) -> Result<Vec<u64>> {
         let block_end = checked_usize_add(*pos, 28, "compound datatype member dimension block")?;
         if block_end > data.len() {
@@ -576,6 +603,8 @@ impl DatatypeMessage {
         Ok(dims)
     }
 
+    /// Turn a list of decoded compound members into the public
+    /// `CompoundField` vector, validating uniqueness and bounds along the way.
     fn build_compound_fields(
         &self,
         members: &[DecodedCompoundMember],
@@ -590,6 +619,8 @@ impl DatatypeMessage {
         Ok(fields)
     }
 
+    /// Reject duplicate compound-member names (matched on the raw NUL-free
+    /// byte string, not the UTF-8 lossy form).
     fn validate_compound_member_name(
         &self,
         member: &DecodedCompoundMember,
@@ -607,6 +638,9 @@ impl DatatypeMessage {
         Ok(())
     }
 
+    /// Build a single `CompoundField` for `member`, checking that the member
+    /// fits inside the compound record and does not overlap any previously
+    /// emitted field.
     fn build_compound_field(
         &self,
         member: &DecodedCompoundMember,
@@ -752,6 +786,8 @@ impl DatatypeMessage {
         Ok(members)
     }
 
+    /// Create a new enumeration datatype based on the supplied integer-like
+    /// base type. Equivalent to libhdf5's `H5Tenum_create`.
     pub fn enum_create(base: DatatypeMessage) -> Result<Self> {
         if !matches!(
             base.class,
@@ -772,6 +808,9 @@ impl DatatypeMessage {
         })
     }
 
+    /// Insert a new (name, value) member into this enumeration datatype.
+    /// Both name and value must be unique within the enum. Mirrors
+    /// `H5Tenum_insert`.
     pub fn enum_insert(&mut self, name: &str, value: u64) -> Result<()> {
         if self.class != DatatypeClass::Enum {
             return Err(Error::InvalidFormat("not an enum datatype".into()));
@@ -816,14 +855,22 @@ impl DatatypeMessage {
             }
         }
 
-        let mut new_properties =
-            Vec::with_capacity(self.properties.len() + member_name.len() + base_size);
+        let capacity = checked_usize_sum(
+            &[self.properties.len(), member_name.len(), base_size],
+            "enum datatype properties",
+        )?;
+        let mut new_properties = Vec::with_capacity(capacity);
         new_properties.extend_from_slice(&self.properties[..names_end]);
         new_properties.extend_from_slice(&member_name);
         new_properties.extend_from_slice(&self.properties[names_end..values_end]);
         new_properties.extend_from_slice(&value_bytes[..base_size.min(value_bytes.len())]);
         if base_size > value_bytes.len() {
-            new_properties.resize(new_properties.len() + (base_size - value_bytes.len()), 0);
+            let padded_len = checked_usize_add(
+                new_properties.len(),
+                base_size - value_bytes.len(),
+                "enum datatype value padding",
+            )?;
+            new_properties.resize(padded_len, 0);
         }
 
         self.properties = new_properties;
@@ -832,6 +879,8 @@ impl DatatypeMessage {
         Ok(())
     }
 
+    /// Find the symbol name corresponding to an enumeration value, returning
+    /// `Ok(None)` when no member has that value. Mirrors `H5Tenum_nameof`.
     pub fn enum_nameof(&self, value: u64) -> Result<Option<String>> {
         Ok(self
             .enum_members()?
@@ -839,6 +888,9 @@ impl DatatypeMessage {
             .find_map(|(name, member_value)| (member_value == value).then_some(name)))
     }
 
+    /// Find the integer value corresponding to a named enumeration member,
+    /// returning `Ok(None)` when the name is unknown. Mirrors
+    /// `H5Tenum_valueof`.
     pub fn enum_valueof(&self, name: &str) -> Result<Option<u64>> {
         Ok(self
             .enum_members()?
@@ -972,6 +1024,8 @@ impl DatatypeMessage {
         Ok((dims, base))
     }
 
+    /// Cross-check that an array datatype's declared byte size equals
+    /// `nelem * base_size`, where `nelem` is the product of its dimensions.
     fn validate_array_size_matches_base(&self) -> Result<()> {
         let (dims, base) = self.array_dims_base()?;
         let nelem = dims.iter().try_fold(1usize, |acc, &dim| {
@@ -1032,12 +1086,18 @@ impl DatatypeMessage {
         DatatypeMessage::decode(base).map(Some)
     }
 
+    /// Convert this datatype's `u32` byte size to `usize`, with a contextual
+    /// error message if the value would not fit.
     fn size_usize(&self, context: &'static str) -> Result<usize> {
         usize::try_from(self.size)
             .map_err(|_| Error::InvalidFormat(format!("{context} does not fit in usize")))
     }
 }
 
+/// Compute the encoded length of the datatype message at the head of
+/// `data`, dispatching to class-specific helpers for the variable-length
+/// classes (compound, enum, vlen, array, opaque). Mirrors the size half of
+/// libhdf5's `H5O__dtype_size` family.
 fn datatype_encoded_len(data: &[u8]) -> Result<usize> {
     if data.len() < 8 {
         return Err(Error::InvalidFormat("datatype message too short".into()));
@@ -1070,6 +1130,8 @@ fn datatype_encoded_len(data: &[u8]) -> Result<usize> {
     Ok(len)
 }
 
+/// Length of an opaque datatype's properties (just its NUL-terminated tag,
+/// padded to a multiple of 8 bytes as recorded in `class_bits[0]`).
 fn datatype_opaque_prop_len(data: &[u8], class_bits: [u8; 3]) -> Result<usize> {
     let tag_len = opaque_tag_len_from_class_bits(class_bits)?;
     let end = checked_usize_add(8, tag_len, "opaque datatype tag")?;
@@ -1081,6 +1143,8 @@ fn datatype_opaque_prop_len(data: &[u8], class_bits: [u8; 3]) -> Result<usize> {
     Ok(tag_len)
 }
 
+/// Validate an opaque datatype's tag: properties must hold the full padded
+/// tag and the tag (up to the first NUL) must be valid UTF-8.
 fn validate_opaque_properties(class_bits: [u8; 3], properties: &[u8]) -> Result<()> {
     let tag_len = opaque_tag_len_from_class_bits(class_bits)?;
     if properties.len() < tag_len {
@@ -1095,6 +1159,8 @@ fn validate_opaque_properties(class_bits: [u8; 3], properties: &[u8]) -> Result<
     Ok(())
 }
 
+/// Reject reference datatypes whose reference type (low nibble of
+/// `class_bits[0]`) is neither object (0) nor region (1).
 fn validate_reference_properties(class_bits: [u8; 3]) -> Result<()> {
     let reference_type = class_bits[0] & 0x0f;
     if reference_type > 1 {
@@ -1105,6 +1171,8 @@ fn validate_reference_properties(class_bits: [u8; 3]) -> Result<()> {
     Ok(())
 }
 
+/// Recover the padded opaque tag length stored in the first class-bit byte
+/// of the datatype header (must be a multiple of 8).
 fn opaque_tag_len_from_class_bits(class_bits: [u8; 3]) -> Result<usize> {
     let tag_len = usize::from(class_bits[0]);
     if tag_len & 0x07 != 0 {
@@ -1115,6 +1183,8 @@ fn opaque_tag_len_from_class_bits(class_bits: [u8; 3]) -> Result<usize> {
     Ok(tag_len)
 }
 
+/// Compute the encoded byte length of an enum datatype message: header,
+/// embedded base datatype, padded member names, then per-member values.
 fn datatype_enum_encoded_len(data: &[u8], version: u8, class_bits: [u8; 3]) -> Result<usize> {
     let base_len = datatype_encoded_len(&data[8..])?;
     let base_end = checked_usize_add(8, base_len, "enum datatype base datatype")?;
@@ -1143,6 +1213,8 @@ fn datatype_enum_encoded_len(data: &[u8], version: u8, class_bits: [u8; 3]) -> R
     Ok(p)
 }
 
+/// Advance `pos` past one enum member name, applying 8-byte padding for
+/// pre-v3 messages and rejecting empty or unterminated names.
 fn datatype_advance_enum_member_name(data: &[u8], pos: usize, version: u8) -> Result<usize> {
     if pos >= data.len() {
         return Err(Error::InvalidFormat(
@@ -1175,6 +1247,8 @@ fn datatype_advance_enum_member_name(data: &[u8], pos: usize, version: u8) -> Re
     Ok(next)
 }
 
+/// Locate the byte offset within `message.properties` where the enum
+/// member-name table ends and the value table begins.
 fn enum_member_names_end(message: &DatatypeMessage, base_len: usize) -> Result<usize> {
     let nmembers = usize::from(
         message
@@ -1188,6 +1262,8 @@ fn enum_member_names_end(message: &DatatypeMessage, base_len: usize) -> Result<u
     Ok(pos)
 }
 
+/// Compute the encoded byte length of a compound datatype message by
+/// advancing past each of its `nmembers` member descriptors.
 fn datatype_compound_encoded_len(data: &[u8], version: u8, size: usize) -> Result<usize> {
     let msg = DatatypeMessage::decode(data)?;
     let nmembers = usize::from(
@@ -1212,6 +1288,9 @@ fn datatype_compound_encoded_len(data: &[u8], version: u8, size: usize) -> Resul
     Ok(p)
 }
 
+/// Advance `pos` past one compound member descriptor: padded name, member
+/// offset (fixed 4 bytes pre-v3, variable width in v3), optional v1 legacy
+/// dimension block, and the embedded member datatype message.
 fn datatype_advance_compound_member(
     data: &[u8],
     pos: usize,
@@ -1254,6 +1333,9 @@ fn datatype_advance_compound_member(
         .ok_or_else(|| Error::InvalidFormat("compound datatype size overflow".into()))
 }
 
+/// Compute the encoded byte length of a variable-length datatype message,
+/// handling both the tight layout (header + base) and the legacy layout
+/// with a 4-byte metadata block before the base datatype.
 fn datatype_vlen_encoded_len(data: &[u8]) -> Result<usize> {
     if let Ok(base_len) = datatype_encoded_len(&data[8..]) {
         return checked_usize_add(8, base_len, "vlen datatype size");
@@ -1267,6 +1349,8 @@ fn datatype_vlen_encoded_len(data: &[u8]) -> Result<usize> {
     checked_usize_add(12, base_len, "vlen datatype size")
 }
 
+/// Compute the encoded byte length of an array datatype message: rank +
+/// dimension table + (pre-v3 only) permutation table + base datatype.
 fn datatype_array_encoded_len(data: &[u8], version: u8) -> Result<usize> {
     if data.len() < 9 {
         return Err(Error::InvalidFormat(
@@ -1316,6 +1400,9 @@ fn datatype_array_encoded_len(data: &[u8], version: u8) -> Result<usize> {
     Ok(p)
 }
 
+/// Return the byte width used to encode a compound member's offset: 4 for
+/// pre-v3 messages, otherwise the minimum width that can represent
+/// `compound_size - 1`.
 fn compound_member_offset_size(version: u8, compound_size: usize) -> Result<usize> {
     if version < 3 {
         return Ok(4);
@@ -1327,6 +1414,7 @@ fn compound_member_offset_size(version: u8, compound_size: usize) -> Result<usiz
     Ok(bytes_needed(max_offset.max(1)))
 }
 
+/// Number of bytes required to encode `value` (minimum 1).
 fn bytes_needed(mut value: usize) -> usize {
     let mut bytes = 1;
     while value > 0xff {
@@ -1336,6 +1424,7 @@ fn bytes_needed(mut value: usize) -> usize {
     bytes
 }
 
+/// Read a little-endian u32 at `data[pos..pos+4]` with a contextual error.
 fn read_u32_le_at(data: &[u8], pos: usize, context: &str) -> Result<u32> {
     let end = checked_usize_add(pos, 4, context)?;
     let bytes = data
@@ -1347,11 +1436,13 @@ fn read_u32_le_at(data: &[u8], pos: usize, context: &str) -> Result<u32> {
     Ok(u32::from_le_bytes(bytes))
 }
 
+/// Read a little-endian u32 length and convert it to `usize`.
 fn read_u32_len_at(data: &[u8], pos: usize, context: &'static str) -> Result<usize> {
     usize::try_from(read_u32_le_at(data, pos, context)?)
         .map_err(|_| Error::InvalidFormat(format!("{context} does not fit in usize")))
 }
 
+/// Read a little-endian u16 at `data[pos..pos+2]` with a contextual error.
 fn read_u16_le_at(data: &[u8], pos: usize, context: &str) -> Result<u16> {
     let end = checked_usize_add(pos, 2, context)?;
     let bytes = data
@@ -1363,6 +1454,8 @@ fn read_u16_le_at(data: &[u8], pos: usize, context: &str) -> Result<u16> {
     Ok(u16::from_le_bytes(bytes))
 }
 
+/// Extract the three class-specific bit-field bytes (`data[1..4]`) from a
+/// datatype message header.
 fn datatype_class_bits(data: &[u8]) -> Result<[u8; 3]> {
     let bytes = data
         .get(1..4)
@@ -1370,6 +1463,9 @@ fn datatype_class_bits(data: &[u8]) -> Result<[u8; 3]> {
     Ok([bytes[0], bytes[1], bytes[2]])
 }
 
+/// Decode a variable-width little-endian unsigned integer into `usize`.
+/// Mirrors libhdf5's `H5F_DECODE_LENGTH`-style decoding for fields whose
+/// width is configured at file level.
 fn read_le_var_usize(bytes: &[u8]) -> usize {
     let mut value = 0usize;
     for (idx, byte) in bytes.iter().enumerate() {
@@ -1378,17 +1474,32 @@ fn read_le_var_usize(bytes: &[u8]) -> usize {
     value
 }
 
+/// Add two `usize` values, mapping overflow to a context-annotated error.
 fn checked_usize_add(lhs: usize, rhs: usize, context: &str) -> Result<usize> {
     lhs.checked_add(rhs)
         .ok_or_else(|| Error::InvalidFormat(format!("{context} overflow")))
 }
 
+/// Sum a slice of `usize` values, mapping overflow to a context-annotated
+/// error.
+fn checked_usize_sum(parts: &[usize], context: &str) -> Result<usize> {
+    parts.iter().try_fold(0usize, |acc, &part| {
+        acc.checked_add(part)
+            .ok_or_else(|| Error::InvalidFormat(format!("{context} overflow")))
+    })
+}
+
+/// Round `len` up to the next multiple of 8, mapping overflow to a
+/// context-annotated error.
 fn align8(len: usize, context: &str) -> Result<usize> {
     len.checked_add(7)
         .map(|value| value & !7)
         .ok_or_else(|| Error::InvalidFormat(format!("{context} padding overflow")))
 }
 
+/// Decode up to 8 bytes as an unsigned integer in the requested endianness.
+/// Used to interpret enum member value bytes whose byte order is dictated
+/// by the enum's base integer datatype.
 fn read_unsigned_value(bytes: &[u8], little_endian: bool) -> u64 {
     let mut value = 0u64;
     if little_endian {
@@ -1403,6 +1514,9 @@ fn read_unsigned_value(bytes: &[u8], little_endian: bool) -> u64 {
     value
 }
 
+/// Synthesize a v2 array `DatatypeMessage` from a base datatype and the
+/// dimension list found in a v1 compound member's legacy inline-array
+/// block, so the rest of the decoder can treat it as a normal array type.
 fn create_legacy_compound_array_member(
     base_dt: DatatypeMessage,
     dims: Vec<u64>,
@@ -1440,6 +1554,8 @@ fn create_legacy_compound_array_member(
     })
 }
 
+/// Re-encode a `DatatypeMessage` into its raw 8-byte header plus property
+/// bytes for embedding inside enum/array/compound parent datatypes.
 fn encode_embedded_datatype_message(message: &DatatypeMessage) -> Result<Vec<u8>> {
     let class = match message.class {
         DatatypeClass::FixedPoint => 0u8,
@@ -1461,7 +1577,8 @@ fn encode_embedded_datatype_message(message: &DatatypeMessage) -> Result<Vec<u8>
         )));
     }
 
-    let mut buf = Vec::with_capacity(8 + message.properties.len());
+    let image_len = checked_usize_add(8, message.properties.len(), "datatype message image")?;
+    let mut buf = Vec::with_capacity(image_len);
     buf.push((message.version << 4) | class);
     buf.extend_from_slice(&message.class_bits);
     buf.extend_from_slice(&message.size.to_le_bytes());
@@ -1582,5 +1699,11 @@ mod tests {
             err.to_string().contains("datatype test u16 overflow"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn datatype_image_sizing_helpers_reject_overflow() {
+        assert!(checked_usize_sum(&[usize::MAX, 1], "datatype test sum").is_err());
+        assert!(checked_usize_add(usize::MAX, 1, "datatype test add").is_err());
     }
 }

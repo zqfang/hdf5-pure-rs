@@ -9,6 +9,8 @@ pub struct Reference {
     loc_id: Option<u64>,
 }
 
+const MAX_REFERENCE_REGION_BYTES: usize = 4 * 1024 * 1024 * 1024;
+
 impl Reference {
     /// Render an object token.
     pub fn print_token(token: u64) -> String {
@@ -90,10 +92,36 @@ impl Reference {
 
     /// Encode a reference.
     pub fn encode(&self) -> Result<Vec<u8>> {
-        let mut out = Vec::new();
+        let capacity = 16usize
+            .checked_add(self.region.as_ref().map_or(0, Vec::len))
+            .ok_or_else(|| Error::InvalidFormat("reference image length overflow".into()))?;
+        let mut out = Vec::with_capacity(capacity);
         Self::encode_obj_token_into(self.object_token, &mut out);
         Self::encode_region_into(self.region.as_deref(), &mut out)?;
         Ok(out)
+    }
+
+    /// Decode a full encoded reference image.
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() < 16 {
+            return Err(Error::InvalidFormat(
+                "reference image is shorter than object token and region length".into(),
+            ));
+        }
+        let object_token =
+            Self::decode_token_obj_compat(checked_window(bytes, 0, 8, "reference object token")?)?;
+        let region = Self::decode_region(checked_window(
+            bytes,
+            8,
+            bytes.len() - 8,
+            "reference region payload",
+        )?)?;
+        Ok(Self {
+            object_token,
+            region,
+            file_name: None,
+            loc_id: None,
+        })
     }
 
     /// Encode an object token.
@@ -119,6 +147,11 @@ impl Reference {
             let len = usize::try_from(len_u64).map_err(|_| {
                 Error::InvalidFormat("reference region length exceeds usize".into())
             })?;
+            if len > MAX_REFERENCE_REGION_BYTES {
+                return Err(Error::InvalidFormat(format!(
+                    "reference region length {len} exceeds supported maximum {MAX_REFERENCE_REGION_BYTES}"
+                )));
+            }
             let end = 8usize
                 .checked_add(len)
                 .ok_or_else(|| Error::InvalidFormat("reference region length overflow".into()))?;
@@ -192,6 +225,12 @@ impl Reference {
 
     fn encode_region_into(region: Option<&[u8]>, out: &mut Vec<u8>) -> Result<()> {
         let len = region.map_or(Ok(0u64), |region| {
+            if region.len() > MAX_REFERENCE_REGION_BYTES {
+                return Err(Error::InvalidFormat(format!(
+                    "reference region length {} exceeds supported maximum {MAX_REFERENCE_REGION_BYTES}",
+                    region.len()
+                )));
+            }
             u64::try_from(region.len())
                 .map_err(|_| Error::InvalidFormat("reference region length exceeds u64".into()))
         })?;
@@ -203,6 +242,7 @@ impl Reference {
     }
 }
 
+/// Bounds-checked subslice `data[pos..pos+len]`, surfacing `context` in errors.
 fn checked_window<'a>(data: &'a [u8], pos: usize, len: usize, context: &str) -> Result<&'a [u8]> {
     let end = pos
         .checked_add(len)
@@ -211,6 +251,7 @@ fn checked_window<'a>(data: &'a [u8], pos: usize, len: usize, context: &str) -> 
         .ok_or_else(|| Error::InvalidFormat(format!("{context} is truncated")))
 }
 
+/// Read a little-endian `u64` from `data` at `pos`, surfacing `context` in errors.
 fn read_u64_le_at(data: &[u8], pos: usize, context: &str) -> Result<u64> {
     let bytes: [u8; 8] = checked_window(data, pos, 8, context)?
         .try_into()
@@ -235,6 +276,9 @@ mod tests {
         assert_eq!(r.get_file_name(), Some("a.h5"));
         assert_eq!(r.get_region(), Some([1, 2, 3].as_slice()));
         assert!(r.equal(&r.copy()));
+        let decoded = Reference::decode(&r.encode().unwrap()).unwrap();
+        assert_eq!(decoded.get_obj_token(), 8);
+        assert_eq!(decoded.get_region(), Some([1, 2, 3].as_slice()));
         assert_eq!(
             Reference::decode_token_obj_compat(&r.encode_obj_token()).unwrap(),
             8
@@ -249,6 +293,10 @@ mod tests {
             Some(vec![1, 2, 3])
         );
         assert!(Reference::decode_token_obj_compat(&[0; 7]).is_err());
+        assert!(Reference::decode(&[0; 15]).is_err());
+        let mut trailing = r.encode().unwrap();
+        trailing.push(0);
+        assert!(Reference::decode(&trailing).is_err());
         assert!(Reference::decode_token_region_compat(&[2, 0, 0, 0, 0, 0, 0, 0, 1]).is_err());
         assert!(Reference::decode_region(&u64::MAX.to_le_bytes()).is_err());
         assert_eq!(r.open_attr_api_common(), 8);

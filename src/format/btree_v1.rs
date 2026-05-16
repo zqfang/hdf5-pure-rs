@@ -1,7 +1,7 @@
 use std::io::{Read, Seek};
 
 use crate::error::{Error, Result};
-use crate::io::reader::{is_undef_addr, HdfReader};
+use crate::io::reader::{is_undef_addr, HdfReader, UNDEF_ADDR};
 
 /// v1 B-tree node magic: "TREE"
 const BTREE_MAGIC: [u8; 4] = [b'T', b'R', b'E', b'E'];
@@ -38,7 +38,7 @@ pub struct BTreeV1Info {
 }
 
 impl BTreeV1Node {
-    /// Read a v1 B-tree node at the given address.
+    /// Deserialize a v1 B-tree node from disk at the given address.
     pub fn read_at<R: Read + Seek>(reader: &mut HdfReader<R>, addr: u64) -> Result<Self> {
         reader.seek(addr)?;
 
@@ -127,6 +127,8 @@ impl BTreeV1Node {
         Self::collect_symbol_table_addrs_inner(reader, btree_addr, 0, &mut visited)
     }
 
+    /// Recursive helper that walks internal B-tree nodes down to leaves while
+    /// tracking visited addresses to detect cycles and runaway depth.
     fn collect_symbol_table_addrs_inner<R: Read + Seek>(
         reader: &mut HdfReader<R>,
         btree_addr: u64,
@@ -178,10 +180,12 @@ impl BTreeV1Node {
         result
     }
 
+    /// Compute the on-disk size of a v1 B-tree node prefix (used by the metadata cache).
     pub fn cache_get_initial_load_size(sizeof_addr: usize) -> Result<usize> {
         checked_usize_sum(&[4, 1, 1, 2, sizeof_addr, sizeof_addr], "v1 B-tree prefix")
     }
 
+    /// Compute the on-disk size of this B-tree node.
     pub fn cache_image_len(&self, sizeof_addr: usize, sizeof_size: usize) -> Result<usize> {
         let prefix = Self::cache_get_initial_load_size(sizeof_addr)?;
         let per_entry = sizeof_size
@@ -196,6 +200,7 @@ impl BTreeV1Node {
             .ok_or_else(|| Error::InvalidFormat("v1 B-tree image length overflow".into()))
     }
 
+    /// Serialize the B-tree node into its on-disk image.
     pub fn cache_serialize(&self, sizeof_addr: usize, sizeof_size: usize) -> Result<Vec<u8>> {
         self.verify_structure()?;
         let mut out = Vec::with_capacity(self.cache_image_len(sizeof_addr, sizeof_size)?);
@@ -206,18 +211,40 @@ impl BTreeV1Node {
         });
         out.push(self.level);
         out.extend_from_slice(&self.entries_used.to_le_bytes());
-        write_var_le(&mut out, self.left_sibling, sizeof_addr)?;
-        write_var_le(&mut out, self.right_sibling, sizeof_addr)?;
+        write_addr_le(
+            &mut out,
+            self.left_sibling,
+            sizeof_addr,
+            "v1 B-tree left sibling",
+        )?;
+        write_addr_le(
+            &mut out,
+            self.right_sibling,
+            sizeof_addr,
+            "v1 B-tree right sibling",
+        )?;
         for index in 0..self.children.len() {
             write_var_le(&mut out, self.keys[index], sizeof_size)?;
-            write_var_le(&mut out, self.children[index], sizeof_addr)?;
+            if self.children[index] == UNDEF_ADDR {
+                return Err(Error::InvalidFormat(
+                    "v1 B-tree child address is undefined".into(),
+                ));
+            }
+            write_addr_le(
+                &mut out,
+                self.children[index],
+                sizeof_addr,
+                "v1 B-tree child",
+            )?;
         }
         write_var_le(&mut out, *self.keys.last().unwrap_or(&0), sizeof_size)?;
         Ok(out)
     }
 
+    /// Destroy/release an in-core representation of the B-tree node.
     pub fn cache_free_icr(self) {}
 
+    /// Format the node for debug printing (B-tree debug dump).
     pub fn debug(&self) -> String {
         format!(
             "BTreeV1Node(type={:?}, level={}, entries={}, children={})",
@@ -228,13 +255,20 @@ impl BTreeV1Node {
         )
     }
 
+    /// Verify that the node is internally consistent (correct child count,
+    /// matching key count, and sorted keys).
     pub fn verify_structure(&self) -> Result<()> {
         if self.children.len() != usize::from(self.entries_used) {
             return Err(Error::InvalidFormat(
                 "v1 B-tree child count does not match entries_used".into(),
             ));
         }
-        if self.keys.len() != self.children.len().saturating_add(1) {
+        let expected_keys = self
+            .children
+            .len()
+            .checked_add(1)
+            .ok_or_else(|| Error::InvalidFormat("v1 B-tree key count overflow".into()))?;
+        if self.keys.len() != expected_keys {
             return Err(Error::InvalidFormat(
                 "v1 B-tree key count must be entries_used + 1".into(),
             ));
@@ -245,6 +279,7 @@ impl BTreeV1Node {
         Ok(())
     }
 
+    /// Create a new empty B-tree leaf node.
     pub fn create(node_type: BTreeType, level: u8) -> Self {
         Self {
             node_type,
@@ -257,11 +292,14 @@ impl BTreeV1Node {
         }
     }
 
+    /// Locate the child whose key range contains `key`, returning its address.
+    /// Returns `None` if the key falls outside this node's range.
     pub fn find(&self, key: u64) -> Result<Option<u64>> {
         self.verify_structure()?;
         Ok(self.find_helper(key))
     }
 
+    /// Unchecked find helper that returns the child whose key range contains `key`.
     pub fn find_helper(&self, key: u64) -> Option<u64> {
         self.children
             .iter()
@@ -270,6 +308,8 @@ impl BTreeV1Node {
             .map(|(_, child)| *child)
     }
 
+    /// Split this full node into two, returning the new right-hand sibling.
+    /// This node keeps the left children; the returned node holds the right children.
     pub fn split(&mut self) -> Result<Self> {
         self.verify_structure()?;
         if self.children.len() < 2 {
@@ -296,10 +336,12 @@ impl BTreeV1Node {
         })
     }
 
+    /// Add a new item to the B-tree node.
     pub fn insert(&mut self, key: u64, child: u64, upper_key: u64) -> Result<()> {
         self.insert_helper(key, child, upper_key)
     }
 
+    /// Insert a child at the given position, updating the surrounding keys.
     pub fn insert_child(
         &mut self,
         index: usize,
@@ -320,6 +362,7 @@ impl BTreeV1Node {
         self.verify_structure()
     }
 
+    /// Recursive insert helper: locate the correct slot for `key` and add the child.
     pub fn insert_helper(&mut self, key: u64, child: u64, upper_key: u64) -> Result<()> {
         let index = self.keys.partition_point(|&existing| existing <= key);
         self.insert_child(
@@ -330,6 +373,7 @@ impl BTreeV1Node {
         )
     }
 
+    /// Call `f(key, child)` once for each entry in this leaf node.
     pub fn iterate_helper<F: FnMut(u64, u64)>(&self, mut f: F) -> Result<()> {
         self.verify_structure()?;
         for (index, &child) in self.children.iter().enumerate() {
@@ -338,6 +382,7 @@ impl BTreeV1Node {
         Ok(())
     }
 
+    /// Recursive removal helper: removes the child whose key range contains `key`.
     pub fn remove_helper(&mut self, key: u64) -> Result<Option<u64>> {
         self.verify_structure()?;
         let Some(index) = self
@@ -355,10 +400,12 @@ impl BTreeV1Node {
         Ok(Some(child))
     }
 
+    /// Remove an item from the B-tree node. The tree is not rebalanced on removal.
     pub fn remove(&mut self, key: u64) -> Result<Option<u64>> {
         self.remove_helper(key)
     }
 
+    /// Delete the entire B-tree node, clearing all children and keys.
     pub fn delete(&mut self) {
         self.children.clear();
         self.keys.clear();
@@ -366,35 +413,57 @@ impl BTreeV1Node {
         self.entries_used = 0;
     }
 
+    /// Allocate and construct a shared v1 B-tree node for a client.
     pub fn shared_new(node_type: BTreeType, level: u8) -> Self {
         Self::create(node_type, level)
     }
 
+    /// Free the shared B-tree info.
     pub fn shared_free(self) {}
 
+    /// Return a deep copy of the node.
     pub fn copy(&self) -> Self {
         self.clone()
     }
 
+    /// Walk this node and gather node/record/depth information.
+    /// On overflow returns a saturated value rather than an error (matches the
+    /// historical `H5B__get_info_helper` lossy behavior).
     pub fn get_info_helper(&self) -> BTreeV1Info {
-        BTreeV1Info {
+        self.get_info_helper_checked().unwrap_or(BTreeV1Info {
             node_count: 1,
             record_count: self.children.len(),
-            depth: self.level.saturating_add(1),
-        }
+            depth: u8::MAX,
+        })
     }
 
+    /// Checked variant of `get_info_helper` that returns an error on depth overflow.
+    pub fn get_info_helper_checked(&self) -> Result<BTreeV1Info> {
+        Ok(BTreeV1Info {
+            node_count: 1,
+            record_count: self.children.len(),
+            depth: self
+                .level
+                .checked_add(1)
+                .ok_or_else(|| Error::InvalidFormat("v1 B-tree depth overflow".into()))?,
+        })
+    }
+
+    /// Return the amount of storage used for this B-tree node.
     pub fn get_info(&self) -> BTreeV1Info {
         self.get_info_helper()
     }
 
+    /// Returns `true` if the node passes structural validation.
     pub fn valid(&self) -> bool {
         self.verify_structure().is_ok()
     }
 
+    /// Destroy/release the B-tree node, consuming it.
     pub fn node_dest(self) {}
 }
 
+/// Sum a slice of `usize` values, returning an error on overflow.
 fn checked_usize_sum(values: &[usize], context: &str) -> Result<usize> {
     values.iter().try_fold(0usize, |acc, &value| {
         acc.checked_add(value)
@@ -402,10 +471,37 @@ fn checked_usize_sum(values: &[usize], context: &str) -> Result<usize> {
     })
 }
 
+/// Write a variable-width little-endian integer, validating that `value` fits.
 fn write_var_le(out: &mut Vec<u8>, value: u64, width: usize) -> Result<()> {
-    if width > 8 {
+    if width == 0 || width > 8 {
         return Err(Error::Unsupported(format!(
             "v1 B-tree integer width {width} exceeds u64"
+        )));
+    }
+    if width < 8 && value >= (1u64 << (width * 8)) {
+        return Err(Error::InvalidFormat(format!(
+            "v1 B-tree integer value {value:#x} does not fit in {width} bytes"
+        )));
+    }
+    out.extend_from_slice(&value.to_le_bytes()[..width]);
+    Ok(())
+}
+
+/// Write a variable-width little-endian address. The undefined-address sentinel
+/// is written as all-`0xff` bytes regardless of width.
+fn write_addr_le(out: &mut Vec<u8>, value: u64, width: usize, context: &str) -> Result<()> {
+    if width == 0 || width > 8 {
+        return Err(Error::Unsupported(format!(
+            "{context} width {width} exceeds u64"
+        )));
+    }
+    if value == UNDEF_ADDR {
+        out.extend(std::iter::repeat_n(0xff, width));
+        return Ok(());
+    }
+    if width < 8 && value >= (1u64 << (width * 8)) {
+        return Err(Error::InvalidFormat(format!(
+            "{context} address {value:#x} does not fit in {width} bytes"
         )));
     }
     out.extend_from_slice(&value.to_le_bytes()[..width]);
@@ -439,6 +535,30 @@ mod tests {
         assert_eq!(&image[..4], b"TREE");
         assert_eq!(image[4], 0);
         assert_eq!(image.len(), node.cache_image_len(8, 8).unwrap());
+    }
+
+    #[test]
+    fn btree_v1_cache_serialize_checks_configured_widths() {
+        let mut node = BTreeV1Node::create(BTreeType::Group, 0);
+        node.insert(0, 0x1122, 8).unwrap();
+        let image = node.cache_serialize(4, 4).unwrap();
+        assert_eq!(&image[8..12], &[0xff; 4]);
+        assert_eq!(&image[12..16], &[0xff; 4]);
+
+        let mut too_large_child = node.clone();
+        too_large_child.children[0] = u64::from(u32::MAX) + 1;
+        assert!(too_large_child.cache_serialize(4, 4).is_err());
+
+        let mut too_large_key = node;
+        too_large_key.keys[1] = u64::from(u32::MAX) + 1;
+        assert!(too_large_key.cache_serialize(4, 4).is_err());
+    }
+
+    #[test]
+    fn btree_v1_checked_info_rejects_depth_overflow() {
+        let node = BTreeV1Node::create(BTreeType::Group, u8::MAX);
+        assert!(node.get_info_helper_checked().is_err());
+        assert_eq!(node.get_info_helper().depth, u8::MAX);
     }
 
     #[test]

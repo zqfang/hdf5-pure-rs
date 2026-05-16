@@ -25,6 +25,7 @@ pub(super) struct ExtArrayDataBlockPrefix {
     pub(super) prefix_size: usize,
 }
 
+/// Format a data-block prefix for debug printing.
 pub(super) fn dblock_debug(prefix: &ExtArrayDataBlockPrefix) -> String {
     format!(
         "ExtArrayDataBlockPrefix(pages={}, prefix_size={})",
@@ -32,10 +33,12 @@ pub(super) fn dblock_debug(prefix: &ExtArrayDataBlockPrefix) -> String {
     )
 }
 
+/// Verify the trailing checksum of a data-block image.
 pub(super) fn cache_dblock_verify_chksum(data: &[u8]) -> Result<()> {
     verify_trailing_checksum(data, "extensible array data block")
 }
 
+/// Compute the on-disk size of an extensible array data block.
 pub(super) fn cache_dblock_image_len(
     prefix: &ExtArrayDataBlockPrefix,
     payload_len: usize,
@@ -49,6 +52,7 @@ pub(super) fn cache_dblock_image_len(
         })
 }
 
+/// Serialize a dirty data block to its on-disk image (prefix + payload + checksum).
 pub(super) fn cache_dblock_serialize(prefix: &[u8], payload: &[u8]) -> Result<Vec<u8>> {
     let image_len = prefix
         .len()
@@ -65,59 +69,88 @@ pub(super) fn cache_dblock_serialize(prefix: &[u8], payload: &[u8]) -> Result<Ve
     Ok(out)
 }
 
+/// Handle metadata-cache action notifications for a data block.
 pub(super) fn cache_dblock_notify(_prefix: &ExtArrayDataBlockPrefix) {}
 
+/// Destroy/release an in-core representation of a data block.
 pub(super) fn cache_dblock_free_icr(_prefix: ExtArrayDataBlockPrefix) {}
 
+/// Report the file-space size of a data block to the metadata cache.
 pub(super) fn cache_dblock_fsf_size(prefix: &ExtArrayDataBlockPrefix) -> usize {
     prefix.prefix_size
 }
 
+/// Initial number of bytes the metadata cache must read for a data block page.
 pub(super) fn cache_dblk_page_get_initial_load_size() -> usize {
     4
 }
 
+/// Verify the trailing checksum of a data-block-page image.
 pub(super) fn cache_dblk_page_verify_chksum(data: &[u8]) -> Result<()> {
     verify_trailing_checksum(data, "extensible array data block page")
 }
 
+/// Compute the on-disk size of a data-block page.
 pub(super) fn cache_dblk_page_image_len(payload_len: usize) -> Result<usize> {
     payload_len.checked_add(4).ok_or_else(|| {
         Error::InvalidFormat("extensible array data block page image length overflow".into())
     })
 }
 
-pub(super) fn cache_dblk_page_serialize(payload: &[u8]) -> Vec<u8> {
-    let mut out = payload.to_vec();
-    let checksum = crate::format::checksum::checksum_metadata(&out);
-    out.extend_from_slice(&checksum.to_le_bytes());
-    out
+/// Verify the trailing checksum and return the page's element payload.
+pub(super) fn cache_dblk_page_deserialize(payload: &[u8]) -> Result<&[u8]> {
+    if payload.len() < 4 {
+        return Err(Error::InvalidFormat(
+            "extensible array data block page is truncated".into(),
+        ));
+    }
+    cache_dblk_page_verify_chksum(payload)?;
+    Ok(&payload[..payload.len() - 4])
 }
 
+/// Serialize a data-block page to its on-disk image (payload + checksum).
+pub(super) fn cache_dblk_page_serialize(payload: &[u8]) -> Result<Vec<u8>> {
+    let image_len = cache_dblk_page_image_len(payload.len())?;
+    let mut out = Vec::with_capacity(image_len);
+    out.extend_from_slice(payload);
+    let checksum = crate::format::checksum::checksum_metadata(&out);
+    out.extend_from_slice(&checksum.to_le_bytes());
+    Ok(out)
+}
+
+/// Handle metadata-cache action notifications for a data-block page.
 pub(super) fn cache_dblk_page_notify(_page_index: usize) {}
 
+/// Destroy/release an in-core representation of a data-block page.
 pub(super) fn cache_dblk_page_free_icr(_payload: Vec<u8>) {}
 
+/// Allocate a zero-filled data-block page buffer of the given size.
 pub(super) fn dblk_page_alloc(size: usize) -> Vec<u8> {
     vec![0; size]
 }
 
+/// Create a new data-block page (returns the provided payload buffer).
 pub(super) fn dblk_page_create(payload: Vec<u8>) -> Vec<u8> {
     payload
 }
 
+/// Protect a data-block page in the metadata cache (no-op borrow).
 pub(super) fn dblk_page_protect(payload: &[u8]) -> &[u8] {
     payload
 }
 
+/// Unprotect a data-block page.
 pub(super) fn dblk_page_unprotect(_payload: &[u8]) {}
 
+/// Destroy a data-block page in memory.
 pub(super) fn dblk_page_dest(_payload: Vec<u8>) {}
 
+/// Allocate an extensible-array data-block prefix descriptor.
 pub(super) fn dblock_alloc(pages: usize, prefix_size: usize) -> ExtArrayDataBlockPrefix {
     ExtArrayDataBlockPrefix { pages, prefix_size }
 }
 
+/// Compute the index of the super block that owns a data block of the given size.
 pub(super) fn dblock_sblk_idx(
     header: &ExtensibleArrayHeader,
     data_block_elements: usize,
@@ -128,6 +161,7 @@ pub(super) fn dblock_sblk_idx(
         .position(|info| info.data_block_elements == data_block_elements)
 }
 
+/// Protect an extensible array data block in the metadata cache (deserializes the prefix).
 pub(super) fn dblock_protect<R: Read + Seek>(
     reader: &mut HdfReader<R>,
     header_addr: u64,
@@ -144,13 +178,16 @@ pub(super) fn dblock_protect<R: Read + Seek>(
     )
 }
 
+/// Unprotect a previously protected extensible array data block.
 pub(super) fn dblock_unprotect(_prefix: ExtArrayDataBlockPrefix) {}
 
+/// Delete a data block by zeroing the prefix sizing fields.
 pub(super) fn dblock_delete(prefix: &mut ExtArrayDataBlockPrefix) {
     prefix.pages = 0;
     prefix.prefix_size = 0;
 }
 
+/// Destroy a data block in memory.
 pub(super) fn dblock_dest(_prefix: ExtArrayDataBlockPrefix) {}
 
 /// Pure prefix decode for an extensible-array data block.
@@ -217,6 +254,7 @@ pub(super) fn decode_data_block_prefix<R: Read + Seek>(
     Ok(ExtArrayDataBlockPrefix { pages, prefix_size })
 }
 
+/// Verify the trailing 4-byte metadata checksum of an in-memory image.
 fn verify_trailing_checksum(data: &[u8], context: &str) -> Result<()> {
     if data.len() < 4 {
         return Err(Error::InvalidFormat(format!("{context} image too short")));
@@ -341,6 +379,7 @@ pub(super) fn append_data_block_elements<R: Read + Seek>(
     Ok(())
 }
 
+/// Read and validate the trailing checksum of the span starting at `start`.
 fn verify_reader_checksum<R: Read + Seek>(
     reader: &mut HdfReader<R>,
     start: u64,
@@ -368,6 +407,7 @@ fn verify_reader_checksum<R: Read + Seek>(
     Ok(())
 }
 
+/// Read a single chunk element (address, optional filtered size and mask) from the reader.
 pub(super) fn read_element<R: Read + Seek>(
     reader: &mut HdfReader<R>,
     filtered: bool,
@@ -500,5 +540,22 @@ mod tests {
         )
         .expect_err("bad extensible array data block page checksum should fail");
         assert!(err.to_string().contains("checksum"));
+    }
+
+    #[test]
+    fn extensible_array_page_cache_serializes_and_validates_checksum() {
+        let payload = 55u64.to_le_bytes();
+        let image = cache_dblk_page_serialize(&payload).unwrap();
+        assert_eq!(
+            cache_dblk_page_image_len(payload.len()).unwrap(),
+            image.len()
+        );
+        assert_eq!(cache_dblk_page_deserialize(&image).unwrap(), payload);
+
+        let mut bad = image;
+        let last = bad.len() - 1;
+        bad[last] ^= 0xff;
+        assert!(cache_dblk_page_deserialize(&bad).is_err());
+        assert!(cache_dblk_page_deserialize(&bad[..3]).is_err());
     }
 }

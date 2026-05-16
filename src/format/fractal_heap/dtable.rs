@@ -10,19 +10,31 @@ use crate::io::reader::HdfReader;
 use super::{log2_floor, log2_power2, FractalHeapHeader};
 
 impl FractalHeapHeader {
-    pub(super) fn max_direct_rows(&self) -> usize {
+    /// Compute the maximum number of direct rows in the doubling table, with
+    /// overflow checking. Mirrors `H5HF__man_iblock_size`'s row-count math.
+    pub(super) fn max_direct_rows_checked(&self) -> Result<usize> {
         let start_bits = log2_power2(self.start_block_size);
         let max_direct_bits = log2_power2(self.max_direct_block_size);
-        usize::try_from(max_direct_bits - start_bits + 2).unwrap_or(usize::MAX)
+        usize::try_from(max_direct_bits - start_bits + 2)
+            .map_err(|_| Error::InvalidFormat("fractal heap direct row count overflow".into()))
     }
 
+    /// Maximum number of direct rows in the doubling table; returns
+    /// `usize::MAX` on overflow rather than failing.
+    pub(super) fn max_direct_rows(&self) -> usize {
+        self.max_direct_rows_checked().unwrap_or(usize::MAX)
+    }
+
+    /// Compute the size covered by a span of entries in an indirect block.
+    /// Mirrors `H5HF_dtable_span_size`, recursing through nested indirect
+    /// rows once direct rows are exhausted.
     pub(super) fn indirect_data_span<R: Read + Seek>(
         &self,
         reader: &HdfReader<R>,
         nrows: usize,
     ) -> Result<u64> {
         let width = u64::from(self.table_width);
-        let max_direct_rows = self.max_direct_rows();
+        let max_direct_rows = self.max_direct_rows_checked()?;
         let mut span = 0u64;
 
         for row in 0..nrows {
@@ -51,6 +63,9 @@ impl FractalHeapHeader {
         Ok(span)
     }
 
+    /// Compute the per-block size for a given row of the doubling table,
+    /// rejecting shift / multiply overflow. Row 0 is `start_block_size`;
+    /// subsequent rows double.
     pub(super) fn checked_row_block_size(&self, row: usize) -> Result<u64> {
         if row == 0 {
             return Ok(self.start_block_size);
@@ -64,6 +79,9 @@ impl FractalHeapHeader {
             .ok_or_else(|| Error::InvalidFormat("fractal heap row block size overflow".into()))
     }
 
+    /// Number of rows in the child indirect block at the given parent row.
+    /// Derived from the doubling-table geometry the way libhdf5's
+    /// `H5HF__man_iblock_size`/dtable helpers compute it.
     pub(super) fn child_indirect_rows(&self, row: usize) -> Result<usize> {
         let first_row_bits =
             log2_power2(self.start_block_size) + log2_power2(u64::from(self.table_width));

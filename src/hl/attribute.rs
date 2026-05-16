@@ -49,6 +49,7 @@ pub struct AttributeTable {
 }
 
 impl AttributeTable {
+    /// Create an empty attribute table at the latest (v3) attribute encoding.
     pub fn new() -> Self {
         Self {
             attrs: Vec::new(),
@@ -57,6 +58,7 @@ impl AttributeTable {
         }
     }
 
+    /// Return an error if the table has been closed; otherwise `Ok(())`.
     fn ensure_open(&self) -> Result<()> {
         if self.closed {
             Err(Error::InvalidFormat("attribute table is closed".into()))
@@ -65,10 +67,13 @@ impl AttributeTable {
         }
     }
 
+    /// Locate the slot of an attribute by exact name match.
     fn find_index(&self, name: &str) -> Option<usize> {
         self.attrs.iter().position(|entry| entry.attr.name == name)
     }
 
+    /// Compute the next creation-order index to assign (one past the current
+    /// maximum, saturating on overflow).
     fn next_creation_order(&self) -> u64 {
         self.attrs
             .iter()
@@ -78,6 +83,9 @@ impl AttributeTable {
     }
 }
 
+/// Build a default in-memory `AttributeMessage` for `name` whose payload is
+/// `data`, using a fixed-point datatype sized to fit the bytes and a scalar
+/// or 1-D simple dataspace depending on whether the data is empty.
 fn default_attribute_message(name: &str, data: Vec<u8>) -> Result<AttributeMessage> {
     let data_len_u32 = u32::try_from(data.len().max(1))
         .map_err(|_| Error::InvalidFormat("attribute data length exceeds u32".into()))?;
@@ -113,22 +121,33 @@ fn default_attribute_message(name: &str, data: Vec<u8>) -> Result<AttributeMessa
     })
 }
 
+/// Initialize the attribute interface. Stub for parity with libhdf5's
+/// `H5A_init` — no per-interface state to set up in this port.
 #[allow(non_snake_case)]
 pub fn H5A_init() -> bool {
     true
 }
 
+/// Package-level initialization hook. Mirrors `H5A__init_package`; defers
+/// to `H5A_init` in this port.
 #[allow(non_snake_case)]
 pub fn H5A__init_package() -> bool {
     H5A_init()
 }
 
+/// First-phase interface shutdown. Mirrors `H5A_top_term_package`; nothing
+/// to release in this port.
 #[allow(non_snake_case)]
 pub fn H5A_top_term_package() {}
 
+/// Second-phase interface shutdown. Mirrors `H5A_term_package`; nothing to
+/// release in this port.
 #[allow(non_snake_case)]
 pub fn H5A_term_package() {}
 
+/// Insert a fully-built attribute message into `table`, rejecting duplicate
+/// names and assigning the next available creation-order index. Mirrors the
+/// internals of libhdf5's `H5A__create`.
 #[allow(non_snake_case)]
 pub fn H5A__create(table: &mut AttributeTable, attr: AttributeMessage) -> Result<()> {
     table.ensure_open()?;
@@ -147,16 +166,22 @@ pub fn H5A__create(table: &mut AttributeTable, attr: AttributeMessage) -> Result
     Ok(())
 }
 
+/// Create an attribute on an object by name, using a default datatype and
+/// dataspace derived from the data payload. Mirrors `H5A__create_by_name`.
 #[allow(non_snake_case)]
 pub fn H5A__create_by_name(table: &mut AttributeTable, name: &str, data: Vec<u8>) -> Result<()> {
     H5A__create(table, default_attribute_message(name, data)?)
 }
 
+/// Common API entry point for attribute creation. Mirrors
+/// `H5A__create_api_common`.
 #[allow(non_snake_case)]
 pub fn H5A__create_api_common(table: &mut AttributeTable, name: &str, data: Vec<u8>) -> Result<()> {
     H5A__create_by_name(table, name, data)
 }
 
+/// Common API entry point for attribute creation by object name. Mirrors
+/// `H5A__create_by_name_api_common`.
 #[allow(non_snake_case)]
 pub fn H5A__create_by_name_api_common(
     table: &mut AttributeTable,
@@ -166,11 +191,15 @@ pub fn H5A__create_by_name_api_common(
     H5A__create_by_name(table, name, data)
 }
 
+/// Deprecated 1.6-era public attribute-create entry point. Mirrors
+/// `H5Acreate1`; superseded by `H5Acreate2`.
 #[allow(non_snake_case)]
 pub fn H5Acreate1(table: &mut AttributeTable, name: &str, data: Vec<u8>) -> Result<()> {
     H5A__create_api_common(table, name, data)
 }
 
+/// Look up an attribute by name and return a clone of its table entry.
+/// Mirrors libhdf5's `H5A__open_common`.
 #[allow(non_snake_case)]
 pub fn H5A__open_common(table: &AttributeTable, name: &str) -> Result<AttributeTableEntry> {
     table.ensure_open()?;
@@ -182,16 +211,21 @@ pub fn H5A__open_common(table: &AttributeTable, name: &str) -> Result<AttributeT
         .ok_or_else(|| Error::InvalidFormat(format!("attribute '{name}' not found")))
 }
 
+/// Open an attribute by name. Mirrors `H5A__open`.
 #[allow(non_snake_case)]
 pub fn H5A__open(table: &AttributeTable, name: &str) -> Result<AttributeTableEntry> {
     H5A__open_common(table, name)
 }
 
+/// Common API entry point for opening an attribute by name. Mirrors
+/// `H5A__open_api_common`.
 #[allow(non_snake_case)]
 pub fn H5A__open_api_common(table: &AttributeTable, name: &str) -> Result<AttributeTableEntry> {
     H5A__open_common(table, name)
 }
 
+/// Common API entry point for opening an attribute on a named object.
+/// Mirrors `H5A__open_by_name_api_common`.
 #[allow(non_snake_case)]
 pub fn H5A__open_by_name_api_common(
     table: &AttributeTable,
@@ -200,11 +234,14 @@ pub fn H5A__open_by_name_api_common(
     H5A__open_common(table, name)
 }
 
+/// Deprecated 1.6-era public open-by-name entry point. Mirrors
+/// `H5Aopen_name`; superseded by `H5Aopen`.
 #[allow(non_snake_case)]
 pub fn H5Aopen_name(table: &AttributeTable, name: &str) -> Result<AttributeTableEntry> {
     H5A__open_common(table, name)
 }
 
+/// Open an attribute by its index in the table. Mirrors `H5A__open_by_idx`.
 #[allow(non_snake_case)]
 pub fn H5A__open_by_idx(table: &AttributeTable, index: usize) -> Result<AttributeTableEntry> {
     table.ensure_open()?;
@@ -215,6 +252,8 @@ pub fn H5A__open_by_idx(table: &AttributeTable, index: usize) -> Result<Attribut
         .ok_or_else(|| Error::InvalidFormat(format!("attribute index {index} out of range")))
 }
 
+/// Common API entry point for opening an attribute by index. Mirrors
+/// `H5A__open_by_idx_api_common`.
 #[allow(non_snake_case)]
 pub fn H5A__open_by_idx_api_common(
     table: &AttributeTable,
@@ -223,26 +262,45 @@ pub fn H5A__open_by_idx_api_common(
     H5A__open_by_idx(table, index)
 }
 
+/// Deprecated 1.6-era open-by-index entry point. Mirrors `H5Aopen_idx`;
+/// superseded by `H5Aopen_by_idx`.
 #[allow(non_snake_case)]
 pub fn H5Aopen_idx(table: &AttributeTable, index: usize) -> Result<AttributeTableEntry> {
     H5A__open_by_idx(table, index)
 }
 
+/// Return the attribute's name. Mirrors `H5A__get_name`.
 #[allow(non_snake_case)]
 pub fn H5A__get_name(entry: &AttributeTableEntry) -> &str {
     &entry.attr.name
 }
 
+/// Retrieve an attribute's name. Mirrors `H5Aget_name`.
+#[allow(non_snake_case)]
+pub fn H5Aget_name(entry: &AttributeTableEntry) -> &str {
+    H5A__get_name(entry)
+}
+
+/// Return a copy of the dataspace of an attribute. Mirrors `H5A_get_space`.
 #[allow(non_snake_case)]
 pub fn H5A_get_space(entry: &AttributeTableEntry) -> DataspaceMessage {
     entry.attr.dataspace.clone()
 }
 
+/// Return a copy of the datatype of an attribute. Mirrors `H5A__get_type`.
 #[allow(non_snake_case)]
 pub fn H5A__get_type(entry: &AttributeTableEntry) -> DatatypeMessage {
     entry.attr.datatype.clone()
 }
 
+/// Get a copy of the datatype for an attribute. Mirrors `H5Aget_type`.
+#[allow(non_snake_case)]
+pub fn H5Aget_type(entry: &AttributeTableEntry) -> DatatypeMessage {
+    H5A__get_type(entry)
+}
+
+/// Return a copy of the attribute's creation property list. Mirrors
+/// `H5A__get_create_plist`.
 #[allow(non_snake_case)]
 pub fn H5A__get_create_plist(
     entry: &AttributeTableEntry,
@@ -256,6 +314,17 @@ pub fn H5A__get_create_plist(
     attr.create_plist()
 }
 
+/// Get a copy of the creation property list for an attribute. Mirrors
+/// `H5Aget_create_plist`.
+#[allow(non_snake_case)]
+pub fn H5Aget_create_plist(
+    entry: &AttributeTableEntry,
+) -> crate::hl::plist::attribute_create::AttributeCreate {
+    H5A__get_create_plist(entry)
+}
+
+/// Retrieve metadata about an attribute (creation order, character encoding,
+/// data size). Mirrors `H5A__get_info`.
 #[allow(non_snake_case)]
 pub fn H5A__get_info(entry: &AttributeTableEntry) -> AttributeInfo {
     AttributeInfo {
@@ -266,63 +335,121 @@ pub fn H5A__get_info(entry: &AttributeTableEntry) -> AttributeInfo {
     }
 }
 
+/// Retrieve information about an attribute looked up by name. Mirrors
+/// `H5Aget_info_by_name`.
+#[allow(non_snake_case)]
+pub fn H5Aget_info_by_name(table: &AttributeTable, name: &str) -> Result<AttributeInfo> {
+    H5A__open_common(table, name).map(|entry| H5A__get_info(&entry))
+}
+
+/// Return a copy of the attribute's raw bytes. Mirrors `H5A__read` /
+/// `H5Aread`.
+#[allow(non_snake_case)]
+pub fn H5A__read(entry: &AttributeTableEntry) -> Vec<u8> {
+    entry.attr.data.clone()
+}
+
+/// Replace an attribute's data bytes with `data`. Mirrors `H5A__write` /
+/// `H5Awrite`.
+#[allow(non_snake_case)]
+pub fn H5A__write(entry: &mut AttributeTableEntry, data: &[u8]) {
+    entry.attr.data.clear();
+    entry.attr.data.extend_from_slice(data);
+}
+
+/// Return a deep copy of an attribute table entry. Mirrors `H5A__copy`.
 #[allow(non_snake_case)]
 pub fn H5A__copy(entry: &AttributeTableEntry) -> AttributeTableEntry {
     entry.clone()
 }
 
+/// Release the shared part of an attribute, dropping its reference count to
+/// zero. Mirrors `H5A__shared_free`.
 #[allow(non_snake_case)]
 pub fn H5A__shared_free(entry: &mut AttributeTableEntry) {
     entry.shared_refcount = 0;
 }
 
+/// Called when the ref count reaches zero on an attribute's ID. Mirrors
+/// `H5A__close_cb`.
 #[allow(non_snake_case)]
 pub fn H5A__close_cb(entry: &mut AttributeTableEntry) {
     entry.shared_refcount = entry.shared_refcount.saturating_sub(1);
 }
 
+/// Release an attribute and its associated resources. Mirrors `H5A__close`.
 #[allow(non_snake_case)]
 pub fn H5A__close(entry: &mut AttributeTableEntry) {
     H5A__close_cb(entry);
 }
 
+/// Return the object location for the attribute's parent object. Mirrors
+/// `H5A_oloc`; always `None` in this port because table entries don't carry
+/// the back-reference.
 #[allow(non_snake_case)]
 pub fn H5A_oloc(_entry: &AttributeTableEntry) -> Option<u64> {
     None
 }
 
+/// Return the group hierarchy name for the attribute (here, just the
+/// attribute name itself). Mirrors `H5A_nameof`.
 #[allow(non_snake_case)]
 pub fn H5A_nameof(entry: &AttributeTableEntry) -> &str {
     H5A__get_name(entry)
 }
 
+/// Check whether an attribute with the given name exists. Mirrors
+/// `H5A__exists_by_name`.
 #[allow(non_snake_case)]
 pub fn H5A__exists_by_name(table: &AttributeTable, name: &str) -> Result<bool> {
     table.ensure_open()?;
     Ok(table.find_index(name).is_some())
 }
 
+/// Common API entry point for `H5Aexists`. Mirrors `H5A__exists_api_common`.
 #[allow(non_snake_case)]
 pub fn H5A__exists_api_common(table: &AttributeTable, name: &str) -> Result<bool> {
     H5A__exists_by_name(table, name)
 }
 
+/// Common API entry point for `H5Aexists_by_name`. Mirrors
+/// `H5A__exists_by_name_api_common`.
 #[allow(non_snake_case)]
 pub fn H5A__exists_by_name_api_common(table: &AttributeTable, name: &str) -> Result<bool> {
     H5A__exists_by_name(table, name)
 }
 
+/// Build a sorted table of attributes from compact (object-header) storage.
+/// Mirrors `H5A__compact_build_table`.
 #[allow(non_snake_case)]
 pub fn H5A__compact_build_table(table: &AttributeTable) -> Result<Vec<AttributeTableEntry>> {
     table.ensure_open()?;
     Ok(table.attrs.clone())
 }
 
+/// Object-header iterator callback that copies a single attribute into the
+/// compact build table. Mirrors `H5A__compact_build_table_cb`.
+#[allow(non_snake_case)]
+pub fn H5A__compact_build_table_cb(entry: &AttributeTableEntry) -> AttributeTableEntry {
+    entry.clone()
+}
+
+/// Build a sorted table of attributes from dense (fractal-heap + B-tree)
+/// storage. Mirrors `H5A__dense_build_table`.
 #[allow(non_snake_case)]
 pub fn H5A__dense_build_table(table: &AttributeTable) -> Result<Vec<AttributeTableEntry>> {
     H5A__compact_build_table(table)
 }
 
+/// Callback used while building a table of attributes from dense storage.
+/// Mirrors `H5A__dense_build_table_cb`.
+#[allow(non_snake_case)]
+pub fn H5A__dense_build_table_cb(entry: &AttributeTableEntry) -> AttributeTableEntry {
+    entry.clone()
+}
+
+/// Comparator that orders attributes by name in decreasing alphabetic order.
+/// Mirrors `H5A__attr_cmp_name_dec`.
 #[allow(non_snake_case)]
 pub fn H5A__attr_cmp_name_dec(
     left: &AttributeTableEntry,
@@ -331,6 +458,8 @@ pub fn H5A__attr_cmp_name_dec(
     right.attr.name.cmp(&left.attr.name)
 }
 
+/// Comparator that orders attributes by creation order, decreasing.
+/// Mirrors `H5A__attr_cmp_corder_dec`.
 #[allow(non_snake_case)]
 pub fn H5A__attr_cmp_corder_dec(
     left: &AttributeTableEntry,
@@ -339,32 +468,73 @@ pub fn H5A__attr_cmp_corder_dec(
     right.creation_order.cmp(&left.creation_order)
 }
 
+/// Return the number of attributes attached to the object. Mirrors
+/// `H5A__get_ainfo` (which retrieves the AINFO message and resolves the
+/// attribute count for either compact or dense storage).
 #[allow(non_snake_case)]
 pub fn H5A__get_ainfo(table: &AttributeTable) -> Result<usize> {
     table.ensure_open()?;
     Ok(table.attrs.len())
 }
 
+/// Return the number of attributes attached to the object. Mirrors the
+/// deprecated `H5Aget_num_attrs`.
+#[allow(non_snake_case)]
+pub fn H5Aget_num_attrs(table: &AttributeTable) -> Result<usize> {
+    H5A__get_ainfo(table)
+}
+
+/// Retrieve the name of the attribute at `index` in iteration order.
+/// Mirrors `H5Aget_name_by_idx`.
+#[allow(non_snake_case)]
+pub fn H5Aget_name_by_idx(table: &AttributeTable, index: usize) -> Result<String> {
+    Ok(H5A__open_by_idx(table, index)?.attr.name)
+}
+
+/// Asynchronous variant of `H5Aexists`. Mirrors `H5Aexists_async`; this
+/// port runs the query synchronously.
+#[allow(non_snake_case)]
+pub fn H5Aexists_async(table: &AttributeTable, name: &str) -> Result<bool> {
+    H5A__exists_by_name(table, name)
+}
+
+/// Asynchronous variant of `H5Aexists_by_name`. Mirrors
+/// `H5Aexists_by_name_async`; this port runs the query synchronously.
+#[allow(non_snake_case)]
+pub fn H5Aexists_by_name_async(table: &AttributeTable, name: &str) -> Result<bool> {
+    H5A__exists_by_name(table, name)
+}
+
+/// Set the on-disk encoding version for new attributes in this table.
+/// Mirrors `H5A__set_version`.
 #[allow(non_snake_case)]
 pub fn H5A__set_version(table: &mut AttributeTable, version: u8) {
     table.version = version;
 }
 
+/// Copy an attribute when copying its parent object between files. Mirrors
+/// the first phase of libhdf5's `H5A__attr_copy_file`.
 #[allow(non_snake_case)]
 pub fn H5A__attr_copy_file(entry: &AttributeTableEntry) -> AttributeTableEntry {
     entry.clone()
 }
 
+/// Finish copying an attribute between files (bumps shared refcount).
+/// Mirrors `H5A__attr_post_copy_file`.
 #[allow(non_snake_case)]
 pub fn H5A__attr_post_copy_file(entry: &mut AttributeTableEntry) {
     entry.shared_refcount = entry.shared_refcount.saturating_add(1);
 }
 
+/// Per-attribute callback for the dense post-copy pass. Mirrors
+/// `H5A__dense_post_copy_file_cb`.
 #[allow(non_snake_case)]
 pub fn H5A__dense_post_copy_file_cb(entry: &mut AttributeTableEntry) {
     H5A__attr_post_copy_file(entry);
 }
 
+/// Run the dense post-copy callback over every attribute in the table.
+/// Mirrors `H5A__dense_post_copy_file_all`.
 #[allow(non_snake_case)]
 pub fn H5A__dense_post_copy_file_all(table: &mut AttributeTable) {
     for entry in &mut table.attrs {
@@ -372,6 +542,8 @@ pub fn H5A__dense_post_copy_file_all(table: &mut AttributeTable) {
     }
 }
 
+/// Collect the names of all attributes in the table, in stored order.
+/// Mirrors `H5A__iterate_common`.
 #[allow(non_snake_case)]
 pub fn H5A__iterate_common(table: &AttributeTable) -> Result<Vec<String>> {
     table.ensure_open()?;
@@ -382,26 +554,34 @@ pub fn H5A__iterate_common(table: &AttributeTable) -> Result<Vec<String>> {
         .collect())
 }
 
+/// Iterate over the attribute names of an object. Mirrors `H5A__iterate`.
 #[allow(non_snake_case)]
 pub fn H5A__iterate(table: &AttributeTable) -> Result<Vec<String>> {
     H5A__iterate_common(table)
 }
 
+/// Deprecated iteration entry point. Mirrors `H5A__iterate_old` (the
+/// internal backing for `H5Aiterate1`).
 #[allow(non_snake_case)]
 pub fn H5A__iterate_old(table: &AttributeTable) -> Result<Vec<String>> {
     H5A__iterate_common(table)
 }
 
+/// Deprecated 1.6-era attribute iteration entry point. Mirrors `H5Aiterate1`.
 #[allow(non_snake_case)]
 pub fn H5Aiterate1(table: &AttributeTable) -> Result<Vec<String>> {
     H5A__iterate_common(table)
 }
 
+/// Iterate over the attributes of an object identified by name. Mirrors
+/// `H5Aiterate_by_name`.
 #[allow(non_snake_case)]
 pub fn H5Aiterate_by_name(table: &AttributeTable) -> Result<Vec<String>> {
     H5A__iterate_common(table)
 }
 
+/// Remove the attribute at the given index from the table and return it.
+/// Mirrors `H5A__delete_by_idx`.
 #[allow(non_snake_case)]
 pub fn H5A__delete_by_idx(table: &mut AttributeTable, index: usize) -> Result<AttributeTableEntry> {
     table.ensure_open()?;
@@ -413,11 +593,14 @@ pub fn H5A__delete_by_idx(table: &mut AttributeTable, index: usize) -> Result<At
     Ok(table.attrs.remove(index))
 }
 
+/// Public entry point to delete an attribute by index. Mirrors
+/// `H5Adelete_by_idx`.
 #[allow(non_snake_case)]
 pub fn H5Adelete_by_idx(table: &mut AttributeTable, index: usize) -> Result<AttributeTableEntry> {
     H5A__delete_by_idx(table, index)
 }
 
+/// Delete an attribute by name. Mirrors `H5Adelete`.
 #[allow(non_snake_case)]
 pub fn H5Adelete(table: &mut AttributeTable, name: &str) -> Result<AttributeTableEntry> {
     let index = table
@@ -426,11 +609,21 @@ pub fn H5Adelete(table: &mut AttributeTable, name: &str) -> Result<AttributeTabl
     H5A__delete_by_idx(table, index)
 }
 
+/// Delete an attribute by name on a named object. Mirrors
+/// `H5Adelete_by_name`.
 #[allow(non_snake_case)]
 pub fn H5Adelete_by_name(table: &mut AttributeTable, name: &str) -> Result<AttributeTableEntry> {
     H5Adelete(table, name)
 }
 
+/// Private version of `H5Adelete_by_name`. Mirrors `H5A__delete_by_name`.
+#[allow(non_snake_case)]
+pub fn H5A__delete_by_name(table: &mut AttributeTable, name: &str) -> Result<AttributeTableEntry> {
+    H5Adelete_by_name(table, name)
+}
+
+/// Rename an attribute in place, rejecting collisions with an existing
+/// attribute of the new name. Mirrors `H5A__rename_common`.
 #[allow(non_snake_case)]
 pub fn H5A__rename_common(
     table: &mut AttributeTable,
@@ -450,6 +643,7 @@ pub fn H5A__rename_common(
     Ok(())
 }
 
+/// Common API entry point for `H5Arename`. Mirrors `H5A__rename_api_common`.
 #[allow(non_snake_case)]
 pub fn H5A__rename_api_common(
     table: &mut AttributeTable,
@@ -459,6 +653,8 @@ pub fn H5A__rename_api_common(
     H5A__rename_common(table, old_name, new_name)
 }
 
+/// Common API entry point for `H5Arename_by_name`. Mirrors
+/// `H5A__rename_by_name_api_common`.
 #[allow(non_snake_case)]
 pub fn H5A__rename_by_name_api_common(
     table: &mut AttributeTable,
@@ -468,6 +664,18 @@ pub fn H5A__rename_by_name_api_common(
     H5A__rename_common(table, old_name, new_name)
 }
 
+/// Private version of `H5Arename_by_name`. Mirrors `H5A__rename_by_name`.
+#[allow(non_snake_case)]
+pub fn H5A__rename_by_name(
+    table: &mut AttributeTable,
+    old_name: &str,
+    new_name: &str,
+) -> Result<()> {
+    H5A__rename_common(table, old_name, new_name)
+}
+
+/// Callback invoked when an attribute is located in a dense index. Mirrors
+/// `H5A__dense_fnd_cb`.
 #[allow(non_snake_case)]
 pub fn H5A__dense_fnd_cb(
     table: &AttributeTable,
@@ -481,36 +689,63 @@ pub fn H5A__dense_fnd_cb(
         .cloned())
 }
 
+/// Open an attribute stored in dense storage by name. Mirrors
+/// `H5A__dense_open`.
 #[allow(non_snake_case)]
 pub fn H5A__dense_open(table: &AttributeTable, name: &str) -> Result<AttributeTableEntry> {
     H5A__open_common(table, name)
 }
 
+/// Insert a new attribute into dense storage. Mirrors `H5A__dense_insert`.
 #[allow(non_snake_case)]
 pub fn H5A__dense_insert(table: &mut AttributeTable, attr: AttributeMessage) -> Result<()> {
     H5A__create(table, attr)
 }
 
+/// v2 B-tree 'modify' callback used when updating dense-storage attribute
+/// data via the name index. Mirrors `H5A__dense_write_bt2_cb`.
 #[allow(non_snake_case)]
 pub fn H5A__dense_write_bt2_cb(entry: &AttributeTableEntry) -> Vec<u8> {
     H5A__dense_btree2_name_encode(entry)
 }
 
+/// Modify an existing attribute stored in dense form. Mirrors
+/// `H5A__dense_write`.
 #[allow(non_snake_case)]
 pub fn H5A__dense_write(table: &mut AttributeTable, attr: AttributeMessage) -> Result<()> {
     H5A__dense_insert(table, attr)
 }
 
+/// Fractal-heap callback that hands back a cloned attribute to the caller.
+/// Mirrors `H5A__dense_copy_fh_cb`.
 #[allow(non_snake_case)]
 pub fn H5A__dense_copy_fh_cb(entry: &AttributeTableEntry) -> AttributeTableEntry {
     entry.clone()
 }
 
+/// Iterate over attributes stored in dense form. Mirrors
+/// `H5A__dense_iterate`.
 #[allow(non_snake_case)]
 pub fn H5A__dense_iterate(table: &AttributeTable) -> Result<Vec<String>> {
     H5A__iterate_common(table)
 }
 
+/// v2 B-tree callback used to iterate the dense storage name index.
+/// Mirrors `H5A__dense_iterate_bt2_cb`.
+#[allow(non_snake_case)]
+pub fn H5A__dense_iterate_bt2_cb(entry: &AttributeTableEntry) -> String {
+    entry.attr.name.clone()
+}
+
+/// Check whether an attribute exists in dense storage. Mirrors
+/// `H5A__dense_exists`.
+#[allow(non_snake_case)]
+pub fn H5A__dense_exists(table: &AttributeTable, name: &str) -> Result<bool> {
+    H5A__exists_by_name(table, name)
+}
+
+/// v2 B-tree callback used when removing an entry from dense storage.
+/// Mirrors `H5A__dense_remove_bt2_cb`.
 #[allow(non_snake_case)]
 pub fn H5A__dense_remove_bt2_cb(
     table: &mut AttributeTable,
@@ -519,11 +754,15 @@ pub fn H5A__dense_remove_bt2_cb(
     H5Adelete(table, name)
 }
 
+/// Remove an attribute from dense storage by name. Mirrors
+/// `H5A__dense_remove`.
 #[allow(non_snake_case)]
 pub fn H5A__dense_remove(table: &mut AttributeTable, name: &str) -> Result<AttributeTableEntry> {
     H5Adelete(table, name)
 }
 
+/// v2 B-tree callback used when removing an entry by index. Mirrors
+/// `H5A__dense_remove_by_idx_bt2_cb`.
 #[allow(non_snake_case)]
 pub fn H5A__dense_remove_by_idx_bt2_cb(
     table: &mut AttributeTable,
@@ -532,6 +771,8 @@ pub fn H5A__dense_remove_by_idx_bt2_cb(
     H5A__delete_by_idx(table, index)
 }
 
+/// Remove an attribute from dense storage by index. Mirrors
+/// `H5A__dense_remove_by_idx`.
 #[allow(non_snake_case)]
 pub fn H5A__dense_remove_by_idx(
     table: &mut AttributeTable,
@@ -540,21 +781,29 @@ pub fn H5A__dense_remove_by_idx(
     H5A__delete_by_idx(table, index)
 }
 
+/// Tear down all dense-storage structures for attributes on an object.
+/// Mirrors `H5A__dense_delete`.
 #[allow(non_snake_case)]
 pub fn H5A__dense_delete(table: &mut AttributeTable) {
     table.attrs.clear();
 }
 
+/// Test hook: true if the attribute is currently shared (refcount > 1).
+/// Mirrors `H5A__is_shared_test`.
 #[allow(non_snake_case)]
 pub fn H5A__is_shared_test(entry: &AttributeTableEntry) -> bool {
     entry.shared_refcount > 1
 }
 
+/// Test hook: return the current shared refcount of an attribute. Mirrors
+/// `H5A__get_shared_rc_test`.
 #[allow(non_snake_case)]
 pub fn H5A__get_shared_rc_test(entry: &AttributeTableEntry) -> u32 {
     entry.shared_refcount
 }
 
+/// Compare two attributes by name, used as a fractal-heap object comparator
+/// for dense attribute storage. Mirrors `H5A__dense_fh_name_cmp`.
 #[allow(non_snake_case)]
 pub fn H5A__dense_fh_name_cmp(
     left: &AttributeTableEntry,
@@ -563,11 +812,15 @@ pub fn H5A__dense_fh_name_cmp(
     left.attr.name.cmp(&right.attr.name)
 }
 
+/// Store user information into a native record for the dense-storage name
+/// v2 B-tree. Mirrors `H5A__dense_btree2_name_store`.
 #[allow(non_snake_case)]
 pub fn H5A__dense_btree2_name_store(entry: &AttributeTableEntry) -> Vec<u8> {
     H5A__dense_btree2_name_encode(entry)
 }
 
+/// Compare two name-index v2 B-tree records by attribute name. Mirrors
+/// `H5A__dense_btree2_name_compare`.
 #[allow(non_snake_case)]
 pub fn H5A__dense_btree2_name_compare(
     left: &AttributeTableEntry,
@@ -576,16 +829,22 @@ pub fn H5A__dense_btree2_name_compare(
     left.attr.name.cmp(&right.attr.name)
 }
 
+/// Encode the native form of a name-index v2 B-tree record into its raw
+/// disk bytes. Mirrors `H5A__dense_btree2_name_encode`.
 #[allow(non_snake_case)]
 pub fn H5A__dense_btree2_name_encode(entry: &AttributeTableEntry) -> Vec<u8> {
     entry.attr.name.as_bytes().to_vec()
 }
 
+/// Store user information into a native record for the dense-storage
+/// creation-order v2 B-tree. Mirrors `H5A__dense_btree2_corder_store`.
 #[allow(non_snake_case)]
 pub fn H5A__dense_btree2_corder_store(entry: &AttributeTableEntry) -> Vec<u8> {
     H5A__dense_btree2_corder_encode(entry)
 }
 
+/// Compare two creation-order v2 B-tree records. Mirrors
+/// `H5A__dense_btree2_corder_compare`.
 #[allow(non_snake_case)]
 pub fn H5A__dense_btree2_corder_compare(
     left: &AttributeTableEntry,
@@ -594,11 +853,15 @@ pub fn H5A__dense_btree2_corder_compare(
     left.creation_order.cmp(&right.creation_order)
 }
 
+/// Encode the native form of a creation-order v2 B-tree record into its
+/// raw disk bytes. Mirrors `H5A__dense_btree2_corder_encode`.
 #[allow(non_snake_case)]
 pub fn H5A__dense_btree2_corder_encode(entry: &AttributeTableEntry) -> Vec<u8> {
     entry.creation_order.unwrap_or(0).to_le_bytes().to_vec()
 }
 
+/// Format a creation-order v2 B-tree record for debug output. Mirrors
+/// `H5A__dense_btree2_corder_debug`.
 #[allow(non_snake_case)]
 pub fn H5A__dense_btree2_corder_debug(entry: &AttributeTableEntry) -> String {
     format!(
@@ -640,6 +903,8 @@ impl Drop for Attribute {
 }
 
 impl Attribute {
+    /// Construct an `Attribute` handle from a decoded message and register
+    /// the new handle with the owning file's open-object tracker.
     pub(crate) fn from_message(
         msg: AttributeMessage,
         creation_order: Option<u64>,
@@ -810,6 +1075,8 @@ impl Attribute {
             .collect()
     }
 
+    /// Materialize a variable-length string attribute by walking its
+    /// per-element global-heap references and decoding each payload as UTF-8.
     fn read_vlen_strings(&self) -> Result<Vec<String>> {
         let inner = self.inner.as_ref().ok_or_else(|| {
             Error::Unsupported(format!(
@@ -868,6 +1135,8 @@ impl Attribute {
     }
 }
 
+/// Decode a single vlen-string descriptor (sequence length, global-heap
+/// collection address, object index) out of one element-sized chunk.
 fn decode_vlen_string_ref(chunk: &[u8], sizeof_addr: usize) -> Result<(usize, u64, u32)> {
     let addr_start = 4usize;
     let addr_end = addr_start
@@ -897,6 +1166,8 @@ fn decode_vlen_string_ref(chunk: &[u8], sizeof_addr: usize) -> Result<(usize, u6
     Ok((seq_len, addr, index))
 }
 
+/// Return `data[pos..pos+len]`, mapping out-of-range/overflow errors to a
+/// context-annotated `Error`.
 fn checked_window<'a>(data: &'a [u8], pos: usize, len: usize, context: &str) -> Result<&'a [u8]> {
     let end = pos
         .checked_add(len)
@@ -905,6 +1176,7 @@ fn checked_window<'a>(data: &'a [u8], pos: usize, len: usize, context: &str) -> 
         .ok_or_else(|| Error::InvalidFormat(format!("{context} is truncated")))
 }
 
+/// Read a little-endian u32 at `data[pos..pos+4]` with a contextual error.
 fn read_u32_le_at(data: &[u8], pos: usize, context: &str) -> Result<u32> {
     let bytes = checked_window(data, pos, 4, context)?;
     let bytes: [u8; 4] = bytes
@@ -913,6 +1185,8 @@ fn read_u32_le_at(data: &[u8], pos: usize, context: &str) -> Result<u32> {
     Ok(u32::from_le_bytes(bytes))
 }
 
+/// Decode a fixed-length string element, stopping at the first NUL byte
+/// and (for `padding == 2`, i.e. space-padded) trimming trailing whitespace.
 fn decode_fixed_string_with_padding(bytes: &[u8], padding: u8) -> Result<String> {
     let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
     let bytes = &bytes[..end];
@@ -925,6 +1199,8 @@ fn decode_fixed_string_with_padding(bytes: &[u8], padding: u8) -> Result<String>
     })
 }
 
+/// Decode `bytes` as UTF-8 and trim trailing NUL bytes (used for vlen
+/// string payloads pulled out of the global heap).
 fn decode_utf8_string(bytes: &[u8], context: &str) -> Result<String> {
     Ok(std::str::from_utf8(bytes)
         .map_err(|_| Error::InvalidFormat(format!("{context} is not UTF-8")))?
@@ -989,6 +1265,8 @@ pub(crate) fn collect_attributes(
         .collect())
 }
 
+/// Extract the 4-byte creation-order index that follows the heap ID and
+/// flags byte in a dense-attribute name-index v2 B-tree record.
 fn dense_attribute_record_creation_order(record: &[u8], heap_id_len: usize) -> Option<u64> {
     let start = heap_id_len.checked_add(1)?;
     let bytes = checked_window(record, start, 4, "dense attribute creation order").ok()?;

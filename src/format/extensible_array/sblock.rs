@@ -28,6 +28,7 @@ pub(super) struct ExtArraySuperBlock {
     pub(super) data_block_addrs: Vec<u64>,
 }
 
+/// Format a super-block for debug printing.
 pub(super) fn sblock_debug(block: &ExtArraySuperBlock) -> String {
     format!(
         "ExtArraySuperBlock(page_init_len={}, page_init_size={}, data_block_addrs={})",
@@ -37,10 +38,12 @@ pub(super) fn sblock_debug(block: &ExtArraySuperBlock) -> String {
     )
 }
 
+/// Verify the trailing checksum of a super-block image.
 pub(super) fn cache_sblock_verify_chksum(data: &[u8]) -> Result<()> {
     verify_trailing_checksum(data, "extensible array super block")
 }
 
+/// Compute the on-disk size of a super-block for the given header/sizing info.
 pub(super) fn cache_sblock_image_len(
     header: &ExtensibleArrayHeader,
     info: &SuperBlockInfo,
@@ -70,35 +73,56 @@ pub(super) fn cache_sblock_image_len(
         })
 }
 
-pub(super) fn cache_sblock_serialize(prefix_and_payload: &[u8]) -> Vec<u8> {
-    let mut out = prefix_and_payload.to_vec();
+/// Serialize a dirty super-block by appending the trailing checksum.
+pub(super) fn cache_sblock_serialize(prefix_and_payload: &[u8]) -> Result<Vec<u8>> {
+    let image_len = prefix_and_payload.len().checked_add(4).ok_or_else(|| {
+        Error::InvalidFormat("extensible array super block image length overflow".into())
+    })?;
+    let mut out = Vec::with_capacity(image_len);
+    out.extend_from_slice(prefix_and_payload);
     let checksum = crate::format::checksum::checksum_metadata(&out);
     out.extend_from_slice(&checksum.to_le_bytes());
-    out
+    Ok(out)
 }
 
+/// Handle metadata-cache action notifications for a super-block.
 pub(super) fn cache_sblock_notify(_block: &ExtArraySuperBlock) {}
 
+/// Destroy/release an in-core representation of a super-block.
 pub(super) fn cache_sblock_free_icr(_block: ExtArraySuperBlock) {}
 
-pub(super) fn sblock_alloc(page_init_size: usize, data_blocks: usize) -> ExtArraySuperBlock {
-    ExtArraySuperBlock {
-        page_init: vec![0; page_init_size.saturating_mul(data_blocks)],
+/// Allocate a super-block with zeroed page-init bytes and undefined data block addresses.
+pub(super) fn sblock_alloc(
+    page_init_size: usize,
+    data_blocks: usize,
+) -> Result<ExtArraySuperBlock> {
+    let page_init_len = super::checked_usize_mul(
+        page_init_size,
+        data_blocks,
+        "extensible array super block allocation",
+    )?;
+    Ok(ExtArraySuperBlock {
+        page_init: vec![0; page_init_len],
         page_init_size,
         data_block_addrs: vec![crate::io::reader::UNDEF_ADDR; data_blocks],
-    }
+    })
 }
 
+/// Unprotect a previously protected super-block.
 pub(super) fn sblock_unprotect(_block: ExtArraySuperBlock) {}
 
+/// Delete a super-block by clearing its page-init and data-block address tables.
 pub(super) fn sblock_delete(block: &mut ExtArraySuperBlock) {
     block.page_init.clear();
     block.data_block_addrs.clear();
 }
 
+/// Destroy a super-block in memory.
 pub(super) fn sblock_dest(_block: ExtArraySuperBlock) {}
 
-/// Pure deserializer for an extensible-array super-block.
+/// Deserialize an extensible-array super-block from disk.
+/// Validates the magic, version, owner, page-init bitmap, and data-block
+/// address table, then the trailing checksum.
 pub(super) fn decode_super_block<R: Read + Seek>(
     reader: &mut HdfReader<R>,
     header_addr: u64,
@@ -166,6 +190,7 @@ pub(super) fn decode_super_block<R: Read + Seek>(
     })
 }
 
+/// Verify the trailing 4-byte metadata checksum of an in-memory image.
 fn verify_trailing_checksum(data: &[u8], context: &str) -> Result<()> {
     if data.len() < 4 {
         return Err(Error::InvalidFormat(format!("{context} image too short")));
@@ -185,6 +210,7 @@ fn verify_trailing_checksum(data: &[u8], context: &str) -> Result<()> {
     Ok(())
 }
 
+/// Read and validate the trailing checksum of the span starting at `start`.
 fn verify_reader_checksum<R: Read + Seek>(
     reader: &mut HdfReader<R>,
     start: u64,
@@ -330,5 +356,39 @@ mod tests {
             Err(err) => err,
         };
         assert!(err.to_string().contains("checksum"));
+    }
+
+    #[test]
+    fn extensible_array_super_block_cache_serialize_appends_checksum() {
+        let mut prefix = b"EASB".to_vec();
+        prefix.push(0);
+        prefix.push(1);
+        prefix.extend_from_slice(&100u64.to_le_bytes());
+        prefix.push(0);
+        prefix.extend_from_slice(&55u64.to_le_bytes());
+
+        let image = cache_sblock_serialize(&prefix).unwrap();
+        assert_eq!(image.len(), prefix.len() + 4);
+        assert_eq!(
+            u32::from_le_bytes(image[image.len() - 4..].try_into().unwrap()),
+            checksum_metadata(&prefix)
+        );
+
+        let info = SuperBlockInfo {
+            data_blocks: 1,
+            data_block_elements: 1,
+            start_data_block: 0,
+        };
+        let mut reader = HdfReader::new(Cursor::new(image));
+        decode_super_block(&mut reader, 100, &header(), 0, &info).unwrap();
+    }
+
+    #[test]
+    fn super_block_allocation_rejects_page_bitmap_overflow() {
+        assert!(sblock_alloc(usize::MAX, 2).is_err());
+
+        let block = sblock_alloc(3, 2).unwrap();
+        assert_eq!(block.page_init.len(), 6);
+        assert_eq!(block.data_block_addrs.len(), 2);
     }
 }
