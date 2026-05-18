@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::io::{Seek, SeekFrom, Write};
 
 use crate::error::{Error, Result};
@@ -135,24 +136,32 @@ impl MutableFile {
         Ok(())
     }
 
-    fn encode_chunk_write_data(
+    fn encode_chunk_write_data<'a>(
         info: &crate::hl::dataset::DatasetInfo,
-        data: &[u8],
+        data: &'a [u8],
         element_size: usize,
-    ) -> Result<Vec<u8>> {
-        let mut filtered = data.to_vec();
+    ) -> Result<Cow<'a, [u8]>> {
+        let mut filtered = Cow::Borrowed(data);
         if let Some(ref pipeline) = info.filter_pipeline {
             for filter in &pipeline.filters {
                 match filter.id {
                     FILTER_SHUFFLE => {
-                        filtered = crate::filters::shuffle::shuffle(&filtered, element_size)?;
+                        filtered = Cow::Owned(crate::filters::shuffle::shuffle(
+                            filtered.as_ref(),
+                            element_size,
+                        )?);
                     }
                     FILTER_DEFLATE => {
                         let level = filter.client_data.first().copied().unwrap_or(6);
-                        filtered = crate::filters::deflate::compress(&filtered, level)?;
+                        filtered = Cow::Owned(crate::filters::deflate::compress(
+                            filtered.as_ref(),
+                            level,
+                        )?);
                     }
                     FILTER_FLETCHER32 => {
-                        filtered = crate::filters::fletcher32::append_checksum(&filtered)?;
+                        filtered = Cow::Owned(crate::filters::fletcher32::append_checksum(
+                            filtered.as_ref(),
+                        )?);
                     }
                     other => {
                         return Err(Error::Unsupported(format!(

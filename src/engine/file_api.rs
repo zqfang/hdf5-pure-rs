@@ -643,6 +643,20 @@ pub fn H5F__get_file_image(file: &FileApiState) -> Vec<u8> {
     file.image.clone()
 }
 
+/// Copy the in-memory file image into a caller-provided buffer.
+///
+/// Mirrors the caller-buffer form of `H5Fget_file_image`: callers can query
+/// the image size separately and reuse their own storage across calls.
+pub fn H5F__get_file_image_into(file: &FileApiState, out: &mut [u8]) -> Result<usize> {
+    if out.len() < file.image.len() {
+        return Err(Error::InvalidFormat(
+            "H5F file image output buffer is too small".into(),
+        ));
+    }
+    out[..file.image.len()].copy_from_slice(&file.image);
+    Ok(file.image.len())
+}
+
 /// Return a `(eof, eoa)` tuple summarizing the file's allocation state.
 pub fn H5F__get_info(file: &FileApiState) -> (u64, u64) {
     (file.eof, file.eoa)
@@ -724,15 +738,33 @@ pub fn H5F_shared_block_read(file: &FileApiState, offset: usize, len: usize) -> 
     H5F_block_read(file, offset, len)
 }
 
+/// Read bytes from the file's shared image into caller-provided storage.
+pub fn H5F_shared_block_read_into(
+    file: &FileApiState,
+    offset: usize,
+    out: &mut [u8],
+) -> Result<()> {
+    H5F_block_read_into(file, offset, out)
+}
+
 /// Read `len` bytes from the file's image at `offset`, erroring if out of bounds.
 pub fn H5F_block_read(file: &FileApiState, offset: usize, len: usize) -> Result<Vec<u8>> {
+    let mut out = vec![0u8; len];
+    H5F_block_read_into(file, offset, &mut out)?;
+    Ok(out)
+}
+
+/// Read bytes from the file image into caller-provided storage.
+pub fn H5F_block_read_into(file: &FileApiState, offset: usize, out: &mut [u8]) -> Result<()> {
     let end = offset
-        .checked_add(len)
+        .checked_add(out.len())
         .ok_or_else(|| Error::InvalidFormat("H5F read overflow".into()))?;
-    file.image
+    let src = file
+        .image
         .get(offset..end)
-        .map(<[u8]>::to_vec)
-        .ok_or_else(|| Error::InvalidFormat("H5F read is outside file image".into()))
+        .ok_or_else(|| Error::InvalidFormat("H5F read is outside file image".into()))?;
+    out.copy_from_slice(src);
+    Ok(())
 }
 
 /// Write `data` to the file's shared image at `offset`.
@@ -756,11 +788,38 @@ pub fn H5F_block_write(file: &mut FileApiState, offset: usize, data: &[u8]) -> R
 
 /// Read multiple ranges from the file image and concatenate the results.
 pub fn H5F_shared_select_read(file: &FileApiState, spans: &[(usize, usize)]) -> Result<Vec<u8>> {
-    let mut out = Vec::new();
-    for &(offset, len) in spans {
-        out.extend(H5F_block_read(file, offset, len)?);
-    }
+    let total = spans.iter().try_fold(0usize, |acc, &(_, len)| {
+        acc.checked_add(len)
+            .ok_or_else(|| Error::InvalidFormat("H5F select read size overflow".into()))
+    })?;
+    let mut out = vec![0u8; total];
+    H5F_shared_select_read_into(file, spans, &mut out)?;
     Ok(out)
+}
+
+/// Read multiple ranges from the file image into a caller-provided contiguous buffer.
+pub fn H5F_shared_select_read_into(
+    file: &FileApiState,
+    spans: &[(usize, usize)],
+    out: &mut [u8],
+) -> Result<()> {
+    let mut out_offset = 0usize;
+    for &(offset, len) in spans {
+        let end = out_offset
+            .checked_add(len)
+            .ok_or_else(|| Error::InvalidFormat("H5F select output offset overflow".into()))?;
+        let dst = out
+            .get_mut(out_offset..end)
+            .ok_or_else(|| Error::InvalidFormat("H5F select output buffer is too small".into()))?;
+        H5F_block_read_into(file, offset, dst)?;
+        out_offset = end;
+    }
+    if out_offset != out.len() {
+        return Err(Error::InvalidFormat(
+            "H5F select output buffer length does not match requested spans".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Write multiple `(offset, data)` ranges to the file image.
@@ -774,6 +833,15 @@ pub fn H5F_shared_select_write(file: &mut FileApiState, spans: &[(usize, &[u8])]
 /// Vectored read of multiple `(offset, len)` ranges, returning concatenated bytes.
 pub fn H5F_shared_vector_read(file: &FileApiState, spans: &[(usize, usize)]) -> Result<Vec<u8>> {
     H5F_shared_select_read(file, spans)
+}
+
+/// Vectored read into a caller-provided contiguous buffer.
+pub fn H5F_shared_vector_read_into(
+    file: &FileApiState,
+    spans: &[(usize, usize)],
+    out: &mut [u8],
+) -> Result<()> {
+    H5F_shared_select_read_into(file, spans, out)
 }
 
 /// Vectored write of multiple `(offset, data)` ranges to the file image.
@@ -1380,6 +1448,30 @@ mod tests {
         assert!(flags.metadata_logging);
         assert!(flags.coll_metadata_reads);
         assert!(flags.mpi_atomicity);
+    }
+
+    #[test]
+    fn file_image_and_block_reads_support_caller_buffers() {
+        let file = FileApiState {
+            image: b"abcdefghijkl".to_vec(),
+            ..FileApiState::default()
+        };
+
+        let mut image = vec![0; file.image.len()];
+        assert_eq!(
+            H5F__get_file_image_into(&file, &mut image).unwrap(),
+            file.image.len()
+        );
+        assert_eq!(image, file.image);
+
+        let mut block = [0; 3];
+        H5F_block_read_into(&file, 2, &mut block).unwrap();
+        assert_eq!(&block, b"cde");
+
+        let mut selected = [0; 5];
+        H5F_shared_select_read_into(&file, &[(0, 2), (9, 3)], &mut selected).unwrap();
+        assert_eq!(&selected, b"abjkl");
+        assert!(H5F_block_read_into(&file, 10, &mut selected).is_err());
     }
 
     #[test]

@@ -126,8 +126,13 @@ impl<W: Write + Seek> HdfWriter<W> {
 
     /// Write `n` zero bytes (padding).
     pub fn write_zeros(&mut self, n: usize) -> Result<()> {
-        let zeros = vec![0u8; n];
-        self.inner.write_all(&zeros)?;
+        const ZERO_BLOCK: [u8; 8192] = [0; 8192];
+        let mut remaining = n;
+        while remaining > 0 {
+            let chunk = remaining.min(ZERO_BLOCK.len());
+            self.inner.write_all(&ZERO_BLOCK[..chunk])?;
+            remaining -= chunk;
+        }
         Ok(())
     }
 
@@ -201,5 +206,20 @@ mod tests {
         buf.set_position(0);
         let mut r = HdfReader::new(&mut buf);
         assert_eq!(r.read_var_uint(5).unwrap(), 0xABCDEF);
+    }
+
+    #[test]
+    fn test_write_zeros_large_padding() {
+        let mut buf = Cursor::new(Vec::new());
+        let mut w = HdfWriter::new(&mut buf);
+        w.write_u8(0xaa).unwrap();
+        w.write_zeros(9000).unwrap();
+        w.write_u8(0xbb).unwrap();
+
+        let data = buf.into_inner();
+        assert_eq!(data.len(), 9002);
+        assert_eq!(data[0], 0xaa);
+        assert!(data[1..9001].iter().all(|&byte| byte == 0));
+        assert_eq!(data[9001], 0xbb);
     }
 }

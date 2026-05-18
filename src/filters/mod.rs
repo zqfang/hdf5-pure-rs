@@ -90,7 +90,7 @@ fn apply_pipeline_reverse_with_mask_and_expected(
         th
     };
 
-    let mut buf = data.to_vec();
+    let mut buf: Option<Vec<u8>> = None;
 
     // Apply filters in reverse order
     for (index, filter) in pipeline.filters.iter().enumerate().rev() {
@@ -98,8 +98,16 @@ fn apply_pipeline_reverse_with_mask_and_expected(
             continue;
         }
         let deflate_exact_len = deflate_exact_len_hint(pipeline, filter_mask, index, expected_len);
-        buf = apply_filter_reverse(&buf, filter, element_size, expected_len, deflate_exact_len)?;
+        let input = buf.as_deref().unwrap_or(data);
+        buf = Some(apply_filter_reverse(
+            input,
+            filter,
+            element_size,
+            expected_len,
+            deflate_exact_len,
+        )?);
     }
+    let buf = buf.unwrap_or_else(|| data.to_vec());
 
     if let Some(expected_len) = expected_len {
         if buf.len() != expected_len {

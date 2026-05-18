@@ -616,19 +616,21 @@ fn validate_float_size(size: usize, role: &str) -> Result<()> {
 }
 
 fn read_float(bytes: &[u8], size: usize, byte_order: Option<ByteOrder>) -> Result<f64> {
-    let mut raw = bytes[..size].to_vec();
-    maybe_swap_elements(&mut raw, size, byte_order);
+    let input = bytes
+        .get(..size)
+        .ok_or_else(|| Error::InvalidFormat("floating-point payload is truncated".into()))?;
+    let mut raw = [0u8; 8];
+    raw[..size].copy_from_slice(input);
+    maybe_swap_elements(&mut raw[..size], size, byte_order);
     match size {
         4 => {
-            let arr: [u8; 4] = raw
+            let arr: [u8; 4] = raw[..4]
                 .try_into()
                 .map_err(|_| Error::InvalidFormat("float32 payload size mismatch".into()))?;
             Ok(f32::from_ne_bytes(arr) as f64)
         }
         8 => {
-            let arr: [u8; 8] = raw
-                .try_into()
-                .map_err(|_| Error::InvalidFormat("float64 payload size mismatch".into()))?;
+            let arr: [u8; 8] = raw;
             Ok(f64::from_ne_bytes(arr))
         }
         _ => Err(Error::Unsupported(format!(
