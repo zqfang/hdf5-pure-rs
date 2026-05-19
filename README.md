@@ -2,10 +2,12 @@
 
 Pure Rust implementation of the HDF5 file format. 
 
-Based on HDF5 C library commit [`62701c4`](https://github.com/HDFGroup/hdf5/commit/62701c4c79775d267deedd15ed14d4c09571e792) (2026-04-10, v1.14.x branch). The machine-readable source pin is `hdf5-source.json`.
+Based on HDF5 C library commit [`62701c4`](https://github.com/HDFGroup/hdf5/commit/62701c4c79775d267deedd15ed14d4c09571e792) (2026-04-10, v1.14.x branch).
 
+**Available as early release for testers. Due to the risk of data corruption, be especially vigilant if you use this crate.**
+
+* 2026-05-19: Improved hdf5-metno dropin compatibility. Plenty speed improvements. Some limitations removed. Feaures still missing
 * 2026-05-16: Features being added, docstrings. Work still left to be done
-* 2026-05-06: **Available as early release for testers** -- Features are still missing, and more testing is needed. **Due to the risk of data corruption, be especially vigilant if you use this crate. **
 
 
 ## This is an LLM-mediated faithful (hopefully) translation, not the original code! 

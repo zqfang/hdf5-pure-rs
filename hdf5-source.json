@@ -1,8 +1,0 @@
-{
-  "upstream": "https://github.com/HDFGroup/hdf5",
-  "commit": "62701c4c79775d267deedd15ed14d4c09571e792",
-  "short_commit": "62701c4",
-  "branch": "v1.14.x",
-  "snapshot_date": "2026-04-10",
-  "vendored_path": "hdf5"
-}
