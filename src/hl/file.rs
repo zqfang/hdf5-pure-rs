@@ -783,11 +783,6 @@ impl File {
         self.inner.lock().dset_no_attrs_hint = enabled;
     }
 
-    #[cfg(feature = "tracehash")]
-    pub(crate) fn inner_arc(&self) -> Arc<Mutex<FileInner<BufReader<fs::File>>>> {
-        self.inner.clone()
-    }
-
     pub(crate) fn from_inner(inner: Arc<Mutex<FileInner<BufReader<fs::File>>>>) -> Self {
         let guard = inner.lock();
         let superblock = guard.superblock.clone();

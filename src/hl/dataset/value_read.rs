@@ -633,39 +633,45 @@ impl Dataset {
             return Ok(H5Value::VarLen(Vec::new()));
         }
 
-        let data = heap_cache.read_object(
-            reader,
-            &crate::format::global_heap::GlobalHeapRef {
-                collection_addr: addr,
-                object_index: index,
-            },
-        )?;
+        let gh_ref = crate::format::global_heap::GlobalHeapRef {
+            collection_addr: addr,
+            object_index: index,
+        };
         let Some(base) = base else {
-            trace_vlen_read(seq_len, &data[..data.len().min(seq_len)]);
-            return Ok(H5Value::Raw(data[..data.len().min(seq_len)].to_vec()));
+            return heap_cache.visit_object(reader, &gh_ref, |data| {
+                let data = &data[..data.len().min(seq_len)];
+                trace_vlen_read(seq_len, data);
+                Ok(H5Value::Raw(data.to_vec()))
+            });
         };
 
         if base.class == crate::format::messages::datatype::DatatypeClass::String {
-            if data.len() < seq_len {
-                return Err(Error::InvalidFormat(format!(
-                    "variable-length string payload too short: expected {seq_len} bytes, got {}",
-                    data.len()
-                )));
-            }
-            let data = &data[..seq_len];
-            trace_vlen_read(seq_len, data);
-            return Ok(H5Value::String(decode_utf8_string(
-                data,
-                "variable-length string payload",
-            )?));
+            return heap_cache.visit_object(reader, &gh_ref, |data| {
+                if data.len() < seq_len {
+                    return Err(Error::InvalidFormat(format!(
+                        "variable-length string payload too short: expected {seq_len} bytes, got {}",
+                        data.len()
+                    )));
+                }
+                let data = &data[..seq_len];
+                trace_vlen_read(seq_len, data);
+                Ok(H5Value::String(decode_utf8_string(
+                    data,
+                    "variable-length string payload",
+                )?))
+            });
         }
 
         let elem_size = usize_from_u64(u64::from(base.size), "vlen base datatype size")?;
         if elem_size == 0 {
-            let data = &data[..data.len().min(seq_len)];
-            trace_vlen_read(seq_len, data);
-            return Ok(H5Value::Raw(data.to_vec()));
+            return heap_cache.visit_object(reader, &gh_ref, |data| {
+                let data = &data[..data.len().min(seq_len)];
+                trace_vlen_read(seq_len, data);
+                Ok(H5Value::Raw(data.to_vec()))
+            });
         }
+
+        let data = heap_cache.read_object(reader, &gh_ref)?;
         let expected_len = seq_len
             .checked_mul(elem_size)
             .ok_or_else(|| Error::InvalidFormat("variable-length payload size overflow".into()))?;

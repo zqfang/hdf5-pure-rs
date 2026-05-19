@@ -924,6 +924,51 @@ impl FractalHeapHeader {
         }
     }
 
+    /// Visit a heap object while reusing cached managed direct blocks.
+    ///
+    /// Managed objects are passed as a slice borrowed from the cached direct
+    /// block image, mirroring `H5HF_op`/`H5HF__man_op_real`. Tiny objects
+    /// borrow directly from the heap ID. Huge objects still materialize into
+    /// a temporary buffer before invoking the callback.
+    pub fn visit_managed_object_cached<R, T, F>(
+        &self,
+        reader: &mut HdfReader<R>,
+        heap_id: &[u8],
+        cache: &mut FractalHeapManagedObjectCache,
+        op: F,
+    ) -> Result<T>
+    where
+        R: Read + Seek,
+        F: FnOnce(&[u8]) -> Result<T>,
+    {
+        match decode_heap_id_type(heap_id)? {
+            0 => self.visit_managed_with_cache(reader, heap_id, cache, op),
+            1 => self.visit_huge(reader, heap_id, op),
+            2 => {
+                let data = self.read_tiny_payload(heap_id)?;
+                op(data)
+            }
+            id_type => Err(Error::InvalidFormat(format!(
+                "unknown heap ID type {id_type}"
+            ))),
+        }
+    }
+
+    /// Visit a heap object with a fresh managed-object cache.
+    pub fn visit_managed_object<R, T, F>(
+        &self,
+        reader: &mut HdfReader<R>,
+        heap_id: &[u8],
+        op: F,
+    ) -> Result<T>
+    where
+        R: Read + Seek,
+        F: FnOnce(&[u8]) -> Result<T>,
+    {
+        let mut cache = FractalHeapManagedObjectCache::new();
+        self.visit_managed_object_cached(reader, heap_id, &mut cache, op)
+    }
+
     /// Read a batch of managed heap objects while reusing decoded direct
     /// blocks across records.
     pub fn read_managed_objects_batched<R: Read + Seek>(
@@ -944,14 +989,7 @@ impl FractalHeapHeader {
         heap_id: &[u8],
         cache: &mut FractalHeapManagedObjectCache,
     ) -> Result<Vec<u8>> {
-        match decode_heap_id_type(heap_id)? {
-            0 => self.read_managed_with_cache(reader, heap_id, cache),
-            1 => self.read_huge(reader, heap_id),
-            2 => Ok(self.read_tiny_payload(heap_id)?.to_vec()),
-            id_type => Err(Error::InvalidFormat(format!(
-                "unknown heap ID type {id_type}"
-            ))),
-        }
+        self.visit_managed_object_cached(reader, heap_id, cache, |data| Ok(data.to_vec()))
     }
 
     /// Sanity-check fixed fields of the heap header (address/size widths,
@@ -2766,6 +2804,60 @@ mod tests {
         too_short.objects.clear();
         too_short.header.num_managed_objects = 0;
         assert!(too_short.insert(vec![1]).is_err());
+    }
+
+    #[test]
+    fn visit_managed_object_cached_visits_borrowed_direct_block_slice() {
+        let mut header = FractalHeapHeader::hdr_alloc(FractalHeapCreateParams {
+            heap_id_len: 3,
+            table_width: 1,
+            start_block_size: 16,
+            max_direct_block_size: 16,
+            max_heap_size: 8,
+        })
+        .unwrap();
+        header.root_block_addr = 0;
+        header.current_root_rows = 0;
+        header.sizeof_addr = 8;
+        header.sizeof_size = 8;
+        header.huge_btree_addr = UNDEF_ADDR;
+
+        let heap_id = [0x00, 2, 5];
+        let mut reader = HdfReader::new(std::io::Cursor::new(b"abcdefghijklmnop".to_vec()));
+        let mut cache = FractalHeapManagedObjectCache::new();
+
+        let len = header
+            .visit_managed_object_cached(&mut reader, &heap_id, &mut cache, |data| {
+                assert_eq!(data, b"cdefg");
+                Ok(data.len())
+            })
+            .unwrap();
+
+        assert_eq!(len, 5);
+    }
+
+    #[test]
+    fn visit_managed_object_cached_visits_tiny_heap_id_payload() {
+        let header = FractalHeapHeader::hdr_alloc(FractalHeapCreateParams {
+            heap_id_len: 8,
+            table_width: 1,
+            start_block_size: 16,
+            max_direct_block_size: 16,
+            max_heap_size: 8,
+        })
+        .unwrap();
+        let heap_id = [0x22, b'x', b'y', b'z'];
+        let mut reader = HdfReader::new(std::io::Cursor::new(Vec::<u8>::new()));
+        let mut cache = FractalHeapManagedObjectCache::new();
+
+        let bytes =
+            header
+                .visit_managed_object_cached(&mut reader, &heap_id, &mut cache, |data| {
+                    Ok(data.to_vec())
+                })
+                .unwrap();
+
+        assert_eq!(bytes, b"xyz");
     }
 
     #[test]

@@ -8,7 +8,7 @@
 
 use std::{
     fmt,
-    io::{Read, Seek},
+    io::{Cursor, Read, Seek},
 };
 
 use crate::error::{Error, Result};
@@ -211,36 +211,6 @@ pub(super) fn decode_data_block_prefix<R: Read + Seek>(
     filtered: bool,
     chunk_size_len: usize,
 ) -> Result<FixedArrayDataBlockPrefix> {
-    reader.seek(header.data_block_addr)?;
-    let mut magic = [0u8; 4];
-    reader.read_bytes_into(&mut magic)?;
-    if magic != *b"FADB" {
-        return Err(Error::InvalidFormat(
-            "invalid fixed array data block magic".into(),
-        ));
-    }
-
-    let version = reader.read_u8()?;
-    if version != 0 {
-        return Err(Error::Unsupported(format!(
-            "fixed array data block version {version}"
-        )));
-    }
-
-    let class_id = reader.read_u8()?;
-    if class_id != header.class_id {
-        return Err(Error::InvalidFormat(
-            "fixed array data block class does not match header".into(),
-        ));
-    }
-
-    let owner = reader.read_addr()?;
-    if owner != header_addr {
-        return Err(Error::InvalidFormat(
-            "fixed array data block owner address does not match header".into(),
-        ));
-    }
-
     let page_elements = 1usize
         .checked_shl(u32::from(header.max_page_elements_bits))
         .ok_or_else(|| Error::InvalidFormat("fixed array page size overflow".into()))?;
@@ -257,6 +227,55 @@ pub(super) fn decode_data_block_prefix<R: Read + Seek>(
     } else {
         usize::from(reader.sizeof_addr())
     };
+    let element_count = super::usize_from_u64(header.elements, "fixed array element count")?;
+    let paginated = element_count > page_elements;
+    let pages = if paginated {
+        element_count.div_ceil(page_elements)
+    } else {
+        0
+    };
+    let page_init_size = if paginated { pages.div_ceil(8) } else { 0 };
+    let prefix_payload_size =
+        fixed_array_prefix_payload_size(usize::from(reader.sizeof_addr()), page_init_size)?;
+    let prefix_image_size = if paginated {
+        checked_usize_add(prefix_payload_size, 4, "fixed array data block prefix size")?
+    } else {
+        prefix_payload_size
+    };
+    let mut image = vec![0; prefix_image_size];
+    reader.seek(header.data_block_addr)?;
+    reader.read_bytes_into(&mut image)?;
+    let mut image_reader = image_reader(&image, reader);
+
+    let mut magic = [0u8; 4];
+    image_reader.read_bytes_into(&mut magic)?;
+    if magic != *b"FADB" {
+        return Err(Error::InvalidFormat(
+            "invalid fixed array data block magic".into(),
+        ));
+    }
+
+    let version = image_reader.read_u8()?;
+    if version != 0 {
+        return Err(Error::Unsupported(format!(
+            "fixed array data block version {version}"
+        )));
+    }
+
+    let class_id = image_reader.read_u8()?;
+    if class_id != header.class_id {
+        return Err(Error::InvalidFormat(
+            "fixed array data block class does not match header".into(),
+        ));
+    }
+
+    let owner = image_reader.read_addr()?;
+    if owner != header_addr {
+        return Err(Error::InvalidFormat(
+            "fixed array data block owner address does not match header".into(),
+        ));
+    }
+
     if header.raw_element_size != expected_element_size {
         return Err(Error::InvalidFormat(format!(
             "fixed array raw element size {} does not match expected {}",
@@ -264,32 +283,15 @@ pub(super) fn decode_data_block_prefix<R: Read + Seek>(
         )));
     }
 
-    let element_count = super::usize_from_u64(header.elements, "fixed array element count")?;
-    let paginated = element_count > page_elements;
     if paginated {
-        let pages = element_count.div_ceil(page_elements);
-        let page_init_size = pages.div_ceil(8);
         let mut page_init = vec![0; page_init_size];
-        reader.read_bytes_into(&mut page_init)?;
-        verify_reader_checksum(
-            reader,
-            header.data_block_addr,
-            "fixed array data block prefix",
-        )?;
-        let prefix_size = checked_usize_add(
-            4 + 1 + 1,
-            usize::from(reader.sizeof_addr()),
-            "fixed array data block prefix size",
-        )
-        .and_then(|value| {
-            checked_usize_add(value, page_init_size, "fixed array data block prefix size")
-        })
-        .and_then(|value| checked_usize_add(value, 4, "fixed array data block prefix size"))?;
+        image_reader.read_bytes_into(&mut page_init)?;
+        verify_trailing_checksum(&image, "fixed array data block prefix")?;
         Ok(FixedArrayDataBlockPrefix {
             paginated: true,
             pages,
             page_init,
-            prefix_size,
+            prefix_size: prefix_image_size,
             raw_element_size: header.raw_element_size,
             page_elements,
             element_count,
@@ -305,6 +307,22 @@ pub(super) fn decode_data_block_prefix<R: Read + Seek>(
             element_count,
         })
     }
+}
+
+fn image_reader<'a, R: Read + Seek>(
+    image: &'a [u8],
+    source: &HdfReader<R>,
+) -> HdfReader<Cursor<&'a [u8]>> {
+    let mut reader = HdfReader::new(Cursor::new(image));
+    reader.set_sizeof_addr(source.sizeof_addr());
+    reader.set_sizeof_size(source.sizeof_size());
+    reader
+}
+
+fn fixed_array_prefix_payload_size(sizeof_addr: usize, page_init_size: usize) -> Result<usize> {
+    checked_usize_add(4 + 1 + 1, sizeof_addr, "fixed array data block prefix size").and_then(
+        |value| checked_usize_add(value, page_init_size, "fixed array data block prefix size"),
+    )
 }
 
 /// Verify the trailing 4-byte metadata checksum of an in-memory image.
@@ -346,6 +364,7 @@ pub(super) fn collect_data_block_elements_into<R: Read + Seek>(
             "fixed array data block page size",
         )?;
         let page_size = checked_usize_add(page_payload, 4, "fixed array data block page size")?;
+        let mut page_image = Vec::new();
         for page_index in 0..prefix.pages {
             let page_start = checked_usize_mul(
                 page_index,
@@ -372,20 +391,45 @@ pub(super) fn collect_data_block_elements_into<R: Read + Seek>(
                     u64_from_usize(offset, "fixed array data block page offset")?,
                     "fixed array data block page address",
                 )?;
+                page_image.clear();
+                page_image.resize(page_size, 0);
                 reader.seek(page_addr)?;
+                reader.read_bytes_into(&mut page_image)?;
+                cache_dblk_page_verify_chksum(&page_image)?;
+                let mut page_reader = image_reader(&page_image[..page_payload], reader);
                 for _ in 0..page_count {
-                    elements.push(read_element(reader, filtered, chunk_size_len)?);
+                    elements.push(read_element(&mut page_reader, filtered, chunk_size_len)?);
                 }
-                verify_reader_checksum(reader, page_addr, "fixed array data block page")?;
             } else {
                 super::append_fill_elements(page_count, elements);
             }
         }
     } else {
+        let prefix_payload_size =
+            fixed_array_prefix_payload_size(usize::from(reader.sizeof_addr()), 0)?;
+        let payload_size = checked_usize_mul(
+            prefix.element_count,
+            prefix.raw_element_size,
+            "fixed array data block payload size",
+        )?;
+        let image_size = checked_usize_add(
+            checked_usize_add(
+                prefix_payload_size,
+                payload_size,
+                "fixed array data block image size",
+            )?,
+            4,
+            "fixed array data block image size",
+        )?;
+        let mut image = vec![0; image_size];
+        reader.seek(header.data_block_addr)?;
+        reader.read_bytes_into(&mut image)?;
+        verify_trailing_checksum(&image, "fixed array data block")?;
+        let payload = &image[prefix_payload_size..prefix_payload_size + payload_size];
+        let mut image_reader = image_reader(payload, reader);
         for _ in 0..header.elements {
-            elements.push(read_element(reader, filtered, chunk_size_len)?);
+            elements.push(read_element(&mut image_reader, filtered, chunk_size_len)?);
         }
-        verify_reader_checksum(reader, header.data_block_addr, "fixed array data block")?;
     }
     Ok(())
 }
@@ -410,6 +454,7 @@ where
             "fixed array data block page size",
         )?;
         let page_size = checked_usize_add(page_payload, 4, "fixed array data block page size")?;
+        let mut page_image = Vec::new();
         for page_index in 0..prefix.pages {
             let page_start = checked_usize_mul(
                 page_index,
@@ -436,11 +481,15 @@ where
                     u64_from_usize(offset, "fixed array data block page offset")?,
                     "fixed array data block page address",
                 )?;
+                page_image.clear();
+                page_image.resize(page_size, 0);
                 reader.seek(page_addr)?;
+                reader.read_bytes_into(&mut page_image)?;
+                cache_dblk_page_verify_chksum(&page_image)?;
+                let mut page_reader = image_reader(&page_image[..page_payload], reader);
                 for _ in 0..page_count {
-                    visitor(read_element(reader, filtered, chunk_size_len)?)?;
+                    visitor(read_element(&mut page_reader, filtered, chunk_size_len)?)?;
                 }
-                verify_reader_checksum(reader, page_addr, "fixed array data block page")?;
             } else {
                 for _ in 0..page_count {
                     visitor(FixedArrayElement {
@@ -452,10 +501,31 @@ where
             }
         }
     } else {
+        let prefix_payload_size =
+            fixed_array_prefix_payload_size(usize::from(reader.sizeof_addr()), 0)?;
+        let payload_size = checked_usize_mul(
+            prefix.element_count,
+            prefix.raw_element_size,
+            "fixed array data block payload size",
+        )?;
+        let image_size = checked_usize_add(
+            checked_usize_add(
+                prefix_payload_size,
+                payload_size,
+                "fixed array data block image size",
+            )?,
+            4,
+            "fixed array data block image size",
+        )?;
+        let mut image = vec![0; image_size];
+        reader.seek(header.data_block_addr)?;
+        reader.read_bytes_into(&mut image)?;
+        verify_trailing_checksum(&image, "fixed array data block")?;
+        let payload = &image[prefix_payload_size..prefix_payload_size + payload_size];
+        let mut image_reader = image_reader(payload, reader);
         for _ in 0..header.elements {
-            visitor(read_element(reader, filtered, chunk_size_len)?)?;
+            visitor(read_element(&mut image_reader, filtered, chunk_size_len)?)?;
         }
-        verify_reader_checksum(reader, header.data_block_addr, "fixed array data block")?;
     }
     Ok(())
 }

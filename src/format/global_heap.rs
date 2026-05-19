@@ -473,6 +473,35 @@ fn resize_heap_object_buffer(out: &mut Vec<u8>, len: usize) -> Result<()> {
     Ok(())
 }
 
+fn read_u16_le_at(bytes: &[u8], offset: usize, context: &str) -> Result<u16> {
+    let end = offset
+        .checked_add(2)
+        .ok_or_else(|| Error::InvalidFormat(format!("{context} offset overflow")))?;
+    let window = bytes
+        .get(offset..end)
+        .ok_or_else(|| Error::InvalidFormat(format!("{context} is truncated")))?;
+    Ok(u16::from_le_bytes([window[0], window[1]]))
+}
+
+fn read_heap_size_at(bytes: &[u8], offset: usize, width: usize) -> Result<usize> {
+    if width == 0 || width > 8 {
+        return Err(Error::InvalidFormat(
+            "global heap size field width is invalid".into(),
+        ));
+    }
+    let end = offset
+        .checked_add(width)
+        .ok_or_else(|| Error::InvalidFormat("global heap size offset overflow".into()))?;
+    let window = bytes
+        .get(offset..end)
+        .ok_or_else(|| Error::InvalidFormat("global heap size field is truncated".into()))?;
+    let mut value = 0u64;
+    for (idx, byte) in window.iter().copied().enumerate() {
+        value |= u64::from(byte) << (idx * 8);
+    }
+    heap_object_len(value, "global heap object size")
+}
+
 fn encode_heap_size_bytes(value: u64, width: u8, context: &str) -> Result<[u8; 8]> {
     let width = usize::from(width);
     if width == 0 || width > 8 {
@@ -570,27 +599,96 @@ pub struct GlobalHeapObjectCache {
 
 #[derive(Debug)]
 struct CachedGlobalHeapCollection {
-    collection: GlobalHeapCollection,
-    object_positions: HashMap<u32, usize>,
+    image: Vec<u8>,
+    object_positions: HashMap<u32, (usize, usize)>,
 }
 
 impl CachedGlobalHeapCollection {
-    fn new(collection: GlobalHeapCollection) -> Self {
-        let mut object_positions = HashMap::with_capacity(collection.objects.len());
-        for (position, (index, _)) in collection.objects.iter().enumerate() {
-            object_positions.entry(*index).or_insert(position);
+    fn read_at<R: Read + Seek>(reader: &mut HdfReader<R>, addr: u64) -> Result<Self> {
+        let header = GlobalHeapCollection::decode_header(reader, addr)?;
+        let image_len = heap_object_len(header.collection_size, "global heap collection size")?;
+        let mut image = vec![0u8; image_len];
+        reader.seek(addr)?;
+        reader.read_bytes_into(&mut image)?;
+        Self::from_image(image, reader.sizeof_size())
+    }
+
+    fn from_image(image: Vec<u8>, sizeof_size: u8) -> Result<Self> {
+        let sizeof_size = usize::from(sizeof_size);
+        let header_len = 8usize
+            .checked_add(sizeof_size)
+            .ok_or_else(|| Error::InvalidFormat("global heap header length overflow".into()))?;
+        let object_header_len = header_len;
+        if image.len() < header_len {
+            return Err(Error::InvalidFormat(
+                "global heap collection image is truncated".into(),
+            ));
         }
-        Self {
-            collection,
+
+        let mut object_positions = HashMap::new();
+        let mut pos = header_len;
+        while pos < image.len() {
+            let min_entry_end = pos.checked_add(object_header_len).ok_or_else(|| {
+                Error::InvalidFormat("global heap object header offset overflow".into())
+            })?;
+            if min_entry_end > image.len() {
+                break;
+            }
+
+            let index = u32::from(read_u16_le_at(&image, pos, "global heap object index")?);
+            let size_pos = pos.checked_add(8).ok_or_else(|| {
+                Error::InvalidFormat("global heap object size offset overflow".into())
+            })?;
+            let obj_size = read_heap_size_at(&image, size_pos, sizeof_size)?;
+
+            if index == 0 {
+                if obj_size == 0 {
+                    break;
+                }
+                let next_pos = pos.checked_add(obj_size).ok_or_else(|| {
+                    Error::InvalidFormat("global heap free object offset overflow".into())
+                })?;
+                if next_pos > image.len() {
+                    return Err(Error::InvalidFormat(
+                        "global heap free object exceeds collection bounds".into(),
+                    ));
+                }
+                pos = next_pos;
+                continue;
+            }
+
+            let padded = obj_size
+                .checked_add(7)
+                .map(|size| size & !7)
+                .ok_or_else(|| Error::InvalidFormat("global heap object size overflow".into()))?;
+            let data_start = min_entry_end;
+            let data_end = data_start
+                .checked_add(obj_size)
+                .ok_or_else(|| Error::InvalidFormat("global heap object offset overflow".into()))?;
+            let next_pos = data_start
+                .checked_add(padded)
+                .ok_or_else(|| Error::InvalidFormat("global heap object offset overflow".into()))?;
+            if next_pos > image.len() {
+                return Err(Error::InvalidFormat(
+                    "global heap object exceeds collection bounds".into(),
+                ));
+            }
+            object_positions
+                .entry(index)
+                .or_insert((data_start, data_end));
+            pos = next_pos;
+        }
+
+        Ok(Self {
+            image,
             object_positions,
-        }
+        })
     }
 
     fn get_object(&self, index: u32) -> Option<&[u8]> {
         self.object_positions
             .get(&index)
-            .and_then(|position| self.collection.objects.get(*position))
-            .map(|(_, data)| data.as_slice())
+            .and_then(|&(start, end)| self.image.get(start..end))
     }
 }
 
@@ -614,11 +712,9 @@ impl GlobalHeapObjectCache {
     ) -> Result<&[u8]> {
         let collection = match self.collections.entry(gh_ref.collection_addr) {
             std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                entry.insert(CachedGlobalHeapCollection::new(
-                    GlobalHeapCollection::read_at(reader, gh_ref.collection_addr)?,
-                ))
-            }
+            std::collections::hash_map::Entry::Vacant(entry) => entry.insert(
+                CachedGlobalHeapCollection::read_at(reader, gh_ref.collection_addr)?,
+            ),
         };
         collection.get_object(gh_ref.object_index).ok_or_else(|| {
             Error::InvalidFormat(format!(

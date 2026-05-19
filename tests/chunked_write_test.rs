@@ -1,6 +1,7 @@
 use std::fs;
 
 use hdf5_pure_rust::engine::writer::{DatasetSpec, DtypeSpec, HdfFileWriter};
+use hdf5_pure_rust::format::messages::data_layout::ChunkIndexType;
 use hdf5_pure_rust::{Dataset, File, H5Type, Result};
 
 fn assert_dataset_shape(ds: &Dataset, expected: &[u64]) -> Result<()> {
@@ -58,6 +59,100 @@ fn test_write_chunked_no_compression() {
             assert_eq!(*v, i as f32, "mismatch at index {i}");
         }
     }
+}
+
+#[test]
+fn test_write_single_chunk_uses_v4_single_chunk_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("written_single_chunk.h5");
+
+    {
+        let f = fs::File::create(&path).unwrap();
+        let mut w = HdfFileWriter::new(f);
+        w.begin().unwrap();
+        w.create_root_group().unwrap();
+
+        let data: Vec<i32> = (0..12).collect();
+        let data_bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
+
+        w.create_chunked_dataset(
+            "/",
+            &DatasetSpec {
+                name: "single",
+                shape: &[12],
+                max_shape: None,
+                dtype: DtypeSpec::I32,
+                data: &data_bytes,
+            },
+            &[16],
+            None,
+            false,
+        )
+        .unwrap();
+
+        w.finalize().unwrap();
+    }
+
+    let f = File::open(&path).unwrap();
+    let ds = f.dataset("single").unwrap();
+    let info = ds.info().unwrap();
+    assert_eq!(info.layout.version, 4);
+    assert_eq!(
+        info.layout.chunk_index_type,
+        Some(ChunkIndexType::SingleChunk)
+    );
+
+    let mut values = vec![0i32; ds.size().unwrap() as usize];
+    read_dataset_into(&ds, &mut values).unwrap();
+    assert_eq!(values, (0..12).collect::<Vec<_>>());
+}
+
+#[test]
+fn test_write_filtered_single_chunk_uses_v4_single_chunk_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("written_filtered_single_chunk.h5");
+
+    {
+        let f = fs::File::create(&path).unwrap();
+        let mut w = HdfFileWriter::new(f);
+        w.begin().unwrap();
+        w.create_root_group().unwrap();
+
+        let data: Vec<i32> = (0..64).map(|i| i % 7).collect();
+        let data_bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
+
+        w.create_chunked_dataset(
+            "/",
+            &DatasetSpec {
+                name: "single_deflate",
+                shape: &[64],
+                max_shape: None,
+                dtype: DtypeSpec::I32,
+                data: &data_bytes,
+            },
+            &[64],
+            Some(6),
+            true,
+        )
+        .unwrap();
+
+        w.finalize().unwrap();
+    }
+
+    let f = File::open(&path).unwrap();
+    let ds = f.dataset("single_deflate").unwrap();
+    let info = ds.info().unwrap();
+    assert_eq!(info.layout.version, 4);
+    assert_eq!(
+        info.layout.chunk_index_type,
+        Some(ChunkIndexType::SingleChunk)
+    );
+    assert!(info.layout.single_chunk_filtered_size.is_some());
+    assert_eq!(info.layout.single_chunk_filter_mask, Some(0));
+
+    let mut values = vec![0i32; ds.size().unwrap() as usize];
+    read_dataset_into(&ds, &mut values).unwrap();
+    assert_eq!(values, (0..64).map(|i| i % 7).collect::<Vec<_>>());
 }
 
 #[test]

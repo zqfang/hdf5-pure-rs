@@ -1,7 +1,7 @@
 use std::{borrow::Cow, fs};
 
 use crate::engine::writer::{
-    CompoundFieldSpec, DatasetSpec, DtypeSpec, FillValueSpec, HdfFileWriter,
+    ChunkWriteSpec, CompoundFieldSpec, DatasetSpec, DtypeSpec, FillValueSpec, HdfFileWriter,
 };
 use crate::error::{Error, Result};
 use crate::hl::types::{slice_as_bytes, H5Type, TypeClass};
@@ -309,6 +309,130 @@ impl<'a> DatasetBuilder<'a> {
         Ok(())
     }
 
+    /// Create a fill-only chunked dataset without allocating chunk payloads.
+    ///
+    /// The dataset shape must be set explicitly. Missing chunks read back as
+    /// the configured fill value, or zero bytes when no fill value was set.
+    pub fn write_fill<T: H5Type>(self) -> Result<()> {
+        if self.compact {
+            return Err(Error::Unsupported(
+                "fill-only dataset writer does not support compact storage".into(),
+            ));
+        }
+        if self.chunk_dims.is_none()
+            && self.deflate_level.is_none()
+            && !self.shuffle
+            && !self.fletcher32
+        {
+            return Err(Error::Unsupported(
+                "fill-only dataset writer currently supports chunked storage only".into(),
+            ));
+        }
+        let dtype = dtype_for_type::<T>()?;
+        let fill = Self::fill_spec(
+            self.fill_value.as_deref(),
+            dtype.size() as usize,
+            self.alloc_time,
+            self.fill_time,
+        )?;
+        let shape = self.shape.as_deref().ok_or_else(|| {
+            Error::InvalidFormat("fill-only dataset writer requires an explicit shape".into())
+        })?;
+        let max_shape =
+            Self::effective_max_shape(self.resizable, self.max_shape.as_deref(), shape)?;
+        let chunk_dims = self.chunk_dims.as_deref().unwrap_or(shape);
+        let spec = DatasetSpec {
+            name: &self.name,
+            shape,
+            max_shape: max_shape.as_ref().map(|shape| shape.as_ref()),
+            dtype,
+            data: &[],
+        };
+        with_attr_specs(&self.attrs, |attrs| {
+            self.writer
+                .create_sparse_chunked_dataset_with_attrs_and_fill(
+                    &self.parent,
+                    &spec,
+                    chunk_dims,
+                    self.deflate_level,
+                    self.shuffle,
+                    self.fletcher32,
+                    fill,
+                    attrs,
+                )
+        })?;
+        Ok(())
+    }
+
+    /// Create a sparse chunked dataset from caller-supplied full chunks.
+    ///
+    /// Only the listed chunks are written. Unlisted chunks read as the
+    /// configured fill value, or zero bytes when no fill value was set.
+    pub fn write_chunks<'b, T, I, C>(self, chunks: I) -> Result<()>
+    where
+        T: H5Type + 'b,
+        I: IntoIterator<Item = (C, &'b [T])>,
+        C: AsRef<[u64]>,
+    {
+        if self.compact {
+            return Err(Error::Unsupported(
+                "chunk-list dataset writer does not support compact storage".into(),
+            ));
+        }
+        let dtype = dtype_for_type::<T>()?;
+        let fill = Self::fill_spec(
+            self.fill_value.as_deref(),
+            dtype.size() as usize,
+            self.alloc_time,
+            self.fill_time,
+        )?;
+        let shape = self.shape.as_deref().ok_or_else(|| {
+            Error::InvalidFormat("chunk-list dataset writer requires an explicit shape".into())
+        })?;
+        let max_shape =
+            Self::effective_max_shape(self.resizable, self.max_shape.as_deref(), shape)?;
+        let chunk_dims = self.chunk_dims.as_deref().ok_or_else(|| {
+            Error::InvalidFormat(
+                "chunk-list dataset writer requires explicit chunk dimensions".into(),
+            )
+        })?;
+
+        let owned_chunks: Vec<(Vec<u64>, &'b [T])> = chunks
+            .into_iter()
+            .map(|(coords, data)| (coords.as_ref().to_vec(), data))
+            .collect();
+        let byte_chunks: Vec<ChunkWriteSpec<'_>> = owned_chunks
+            .iter()
+            .map(|(coords, data)| ChunkWriteSpec {
+                coords,
+                data: slice_as_bytes(*data),
+            })
+            .collect();
+
+        let spec = DatasetSpec {
+            name: &self.name,
+            shape,
+            max_shape: max_shape.as_ref().map(|shape| shape.as_ref()),
+            dtype,
+            data: &[],
+        };
+        with_attr_specs(&self.attrs, |attrs| {
+            self.writer
+                .create_chunked_dataset_from_chunks_with_attrs_and_fill(
+                    &self.parent,
+                    &spec,
+                    chunk_dims,
+                    &byte_chunks,
+                    self.deflate_level,
+                    self.shuffle,
+                    self.fletcher32,
+                    fill,
+                    attrs,
+                )
+        })?;
+        Ok(())
+    }
+
     /// Write raw element bytes with an explicit HDF5 datatype.
     ///
     /// This exposes writer datatypes that cannot be inferred from a Rust
@@ -483,11 +607,12 @@ impl<'a> DatasetBuilder<'a> {
                 "variable-length string writer does not support compact storage".into(),
             ));
         }
-        if self.fill_value.is_some() {
-            return Err(Error::Unsupported(
-                "variable-length string fill values are not supported yet".into(),
-            ));
-        }
+        let fill = Self::fill_spec(
+            self.fill_value.as_deref(),
+            DtypeSpec::VarLenUtf8String.size() as usize,
+            self.alloc_time,
+            self.fill_time,
+        )?;
         let shape = match self.shape.as_deref() {
             Some(shape) => Cow::Borrowed(shape),
             None => Cow::Owned(vec![usize_to_u64(data.len(), "dataset element count")?]),
@@ -512,6 +637,7 @@ impl<'a> DatasetBuilder<'a> {
                         self.deflate_level,
                         self.shuffle,
                         self.fletcher32,
+                        fill,
                         attrs,
                     )
             } else {
@@ -521,6 +647,7 @@ impl<'a> DatasetBuilder<'a> {
                     shape.as_ref(),
                     data,
                     max_shape.as_ref().map(|shape| shape.as_ref()),
+                    fill,
                     attrs,
                 )
             }

@@ -7,7 +7,7 @@
 
 use std::{
     fmt,
-    io::{Read, Seek},
+    io::{Cursor, Read, Seek},
 };
 
 use crate::error::{Error, Result};
@@ -211,48 +211,79 @@ pub(super) fn decode_data_block_prefix<R: Read + Seek>(
     data_block_addr: u64,
     data_block_elements: usize,
 ) -> Result<ExtArrayDataBlockPrefix> {
+    let pages = super::data_block_pages(header, data_block_elements);
+    let prefix_payload_size =
+        extensible_array_prefix_payload_size(usize::from(reader.sizeof_addr()), header)?;
+    let prefix_image_size = if pages > 0 {
+        super::checked_usize_add(
+            prefix_payload_size,
+            4,
+            "extensible array data block prefix size",
+        )?
+    } else {
+        prefix_payload_size
+    };
+    let mut image = vec![0; prefix_image_size];
     reader.seek(data_block_addr)?;
+    reader.read_bytes_into(&mut image)?;
+    let mut image_reader = image_reader(&image, reader);
+
     let mut magic = [0u8; 4];
-    reader.read_bytes_into(&mut magic)?;
+    image_reader.read_bytes_into(&mut magic)?;
     if magic != *b"EADB" {
         return Err(Error::InvalidFormat(
             "invalid extensible array data block magic".into(),
         ));
     }
 
-    let version = reader.read_u8()?;
+    let version = image_reader.read_u8()?;
     if version != 0 {
         return Err(Error::Unsupported(format!(
             "extensible array data block version {version}"
         )));
     }
 
-    let class_id = reader.read_u8()?;
+    let class_id = image_reader.read_u8()?;
     if class_id != header.class_id {
         return Err(Error::InvalidFormat(
             "extensible array data block class does not match header".into(),
         ));
     }
 
-    let owner = reader.read_addr()?;
+    let owner = image_reader.read_addr()?;
     if owner != header_addr {
         return Err(Error::InvalidFormat(
             "extensible array data block owner address does not match header".into(),
         ));
     }
 
-    let _block_offset = reader.read_uint(header.array_offset_size)?;
-    let pages = super::data_block_pages(header, data_block_elements);
+    let _block_offset = image_reader.read_uint(header.array_offset_size)?;
     if pages > 0 {
-        verify_reader_checksum(
-            reader,
-            data_block_addr,
-            "extensible array data block prefix",
-        )?;
+        verify_trailing_checksum(&image, "extensible array data block prefix")?;
     }
-    let prefix_size = super::checked_usize_add(
+    Ok(ExtArrayDataBlockPrefix {
+        pages,
+        prefix_size: prefix_image_size,
+    })
+}
+
+fn image_reader<'a, R: Read + Seek>(
+    image: &'a [u8],
+    source: &HdfReader<R>,
+) -> HdfReader<Cursor<&'a [u8]>> {
+    let mut reader = HdfReader::new(Cursor::new(image));
+    reader.set_sizeof_addr(source.sizeof_addr());
+    reader.set_sizeof_size(source.sizeof_size());
+    reader
+}
+
+fn extensible_array_prefix_payload_size(
+    sizeof_addr: usize,
+    header: &ExtensibleArrayHeader,
+) -> Result<usize> {
+    super::checked_usize_add(
         4 + 1 + 1,
-        usize::from(reader.sizeof_addr()),
+        sizeof_addr,
         "extensible array data block prefix size",
     )
     .and_then(|value| {
@@ -262,10 +293,6 @@ pub(super) fn decode_data_block_prefix<R: Read + Seek>(
             "extensible array data block prefix size",
         )
     })
-    .and_then(|value| {
-        super::checked_usize_add(value, 4, "extensible array data block prefix size")
-    })?;
-    Ok(ExtArrayDataBlockPrefix { pages, prefix_size })
 }
 
 /// Verify the trailing 4-byte metadata checksum of an in-memory image.
@@ -350,31 +377,37 @@ pub(super) fn append_data_block_elements_with_scratch<R: Read + Seek>(
         data_block_elements,
     )?;
     if prefix.pages == 0 {
-        for _ in 0..count {
-            elements.push(read_element(reader, filtered, chunk_size_len)?);
-        }
-        let unread = data_block_elements.checked_sub(count).ok_or_else(|| {
-            Error::InvalidFormat(
+        if count > data_block_elements {
+            return Err(Error::InvalidFormat(
                 "extensible array data block read count exceeds data block elements".into(),
-            )
-        })?;
-        if unread > 0 {
-            let skip_bytes = super::checked_usize_mul(
-                unread,
-                header.raw_element_size,
-                "extensible array unread data block span",
-            )?;
-            reader.skip(super::u64_from_usize(
-                skip_bytes,
-                "extensible array unread data block span",
-            )?)?;
+            ));
         }
-        verify_reader_checksum_with_scratch(
-            reader,
-            data_block_addr,
-            "extensible array data block",
-            checksum_scratch,
+        let prefix_payload_size =
+            extensible_array_prefix_payload_size(usize::from(reader.sizeof_addr()), header)?;
+        let payload_size = super::checked_usize_mul(
+            data_block_elements,
+            header.raw_element_size,
+            "extensible array data block payload size",
         )?;
+        let image_size = super::checked_usize_add(
+            super::checked_usize_add(
+                prefix_payload_size,
+                payload_size,
+                "extensible array data block image size",
+            )?,
+            4,
+            "extensible array data block image size",
+        )?;
+        checksum_scratch.clear();
+        checksum_scratch.resize(image_size, 0);
+        reader.seek(data_block_addr)?;
+        reader.read_bytes_into(checksum_scratch)?;
+        verify_trailing_checksum(checksum_scratch, "extensible array data block")?;
+        let payload = &checksum_scratch[prefix_payload_size..prefix_payload_size + payload_size];
+        let mut image_reader = image_reader(payload, reader);
+        for _ in 0..count {
+            elements.push(read_element(&mut image_reader, filtered, chunk_size_len)?);
+        }
     } else {
         let page_payload = super::checked_usize_mul(
             header.data_block_page_elements,
@@ -413,16 +446,15 @@ pub(super) fn append_data_block_elements_with_scratch<R: Read + Seek>(
                 .map(|bits| super::bit_is_set(bits, page_index))
                 .unwrap_or(true);
             if page_initialized {
+                checksum_scratch.clear();
+                checksum_scratch.resize(page_size, 0);
                 reader.seek(page_addr)?;
+                reader.read_bytes_into(checksum_scratch)?;
+                cache_dblk_page_verify_chksum(checksum_scratch)?;
+                let mut page_reader = image_reader(&checksum_scratch[..page_payload], reader);
                 for _ in 0..page_elements {
-                    elements.push(read_element(reader, filtered, chunk_size_len)?);
+                    elements.push(read_element(&mut page_reader, filtered, chunk_size_len)?);
                 }
-                verify_reader_checksum_with_scratch(
-                    reader,
-                    page_addr,
-                    "extensible array data block page",
-                    checksum_scratch,
-                )?;
             } else {
                 super::append_fill_elements(header, page_elements, elements)?;
             }

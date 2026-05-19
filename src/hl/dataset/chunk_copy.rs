@@ -10,7 +10,11 @@ use super::{usize_from_u64, Dataset, DatasetInfo};
 struct ChunkCopyPlan {
     out_strides: Vec<usize>,
     chunk_strides: Vec<usize>,
+    data_dims: Vec<usize>,
+    chunk_dims: Vec<usize>,
+    #[cfg(test)]
     chunk_suffix_products: Vec<usize>,
+    #[cfg(test)]
     total_chunk_elements: usize,
 }
 
@@ -207,11 +211,20 @@ impl Dataset {
     ) -> Result<ChunkCopyPlan> {
         let ndims = data_dims.len();
 
+        let data_dims_usize = data_dims
+            .iter()
+            .map(|&dim| usize_from_u64(dim, "dataset dimension"))
+            .collect::<Result<Vec<_>>>()?;
+        let chunk_dims_usize = chunk_dims
+            .iter()
+            .map(|&dim| usize_from_u64(dim, "chunk dimension"))
+            .collect::<Result<Vec<_>>>()?;
+
         let mut out_strides = vec![0usize; ndims];
         out_strides[ndims - 1] = element_size;
         for i in (0..ndims - 1).rev() {
             out_strides[i] = out_strides[i + 1]
-                .checked_mul(usize_from_u64(data_dims[i + 1], "dataset dimension")?)
+                .checked_mul(data_dims_usize[i + 1])
                 .ok_or_else(|| Error::InvalidFormat("chunk output stride overflow".into()))?;
         }
 
@@ -219,31 +232,273 @@ impl Dataset {
         chunk_strides[ndims - 1] = element_size;
         for i in (0..ndims - 1).rev() {
             chunk_strides[i] = chunk_strides[i + 1]
-                .checked_mul(usize_from_u64(chunk_dims[i + 1], "chunk dimension")?)
+                .checked_mul(chunk_dims_usize[i + 1])
                 .ok_or_else(|| Error::InvalidFormat("chunk stride overflow".into()))?;
         }
 
-        let mut chunk_suffix_products = vec![1usize; ndims];
-        for d in (0..ndims - 1).rev() {
-            chunk_suffix_products[d] = chunk_suffix_products[d + 1]
-                .checked_mul(usize_from_u64(chunk_dims[d + 1], "chunk dimension")?)
-                .ok_or_else(|| Error::InvalidFormat("chunk suffix product overflow".into()))?;
-        }
+        #[cfg(test)]
+        let chunk_suffix_products = {
+            let mut products = vec![1usize; ndims];
+            for d in (0..ndims - 1).rev() {
+                products[d] = products[d + 1]
+                    .checked_mul(chunk_dims_usize[d + 1])
+                    .ok_or_else(|| Error::InvalidFormat("chunk suffix product overflow".into()))?;
+            }
+            products
+        };
 
-        let total_chunk_elements = chunk_dims.iter().try_fold(1usize, |acc, &dim| {
-            acc.checked_mul(usize_from_u64(dim, "chunk dimension")?)
+        #[cfg(test)]
+        let total_chunk_elements = chunk_dims_usize.iter().try_fold(1usize, |acc, &dim| {
+            acc.checked_mul(dim)
                 .ok_or_else(|| Error::InvalidFormat("chunk element count overflow".into()))
         })?;
 
         Ok(ChunkCopyPlan {
             out_strides,
             chunk_strides,
+            data_dims: data_dims_usize,
+            chunk_dims: chunk_dims_usize,
+            #[cfg(test)]
             chunk_suffix_products,
+            #[cfg(test)]
             total_chunk_elements,
         })
     }
 
     fn copy_chunk_nd(
+        chunk_data: &[u8],
+        coords: &[u64],
+        _data_dims: &[u64],
+        element_size: usize,
+        output: &mut [u8],
+        copy_plan: &ChunkCopyPlan,
+    ) -> Result<()> {
+        let coords = coords
+            .iter()
+            .map(|&coord| usize_from_u64(coord, "chunk coordinate"))
+            .collect::<Result<Vec<_>>>()?;
+        let copy_counts = Self::chunk_copy_counts(&coords, copy_plan)?;
+        if copy_counts.iter().any(|&count| count == 0) {
+            return Ok(());
+        }
+
+        let span_start = Self::chunk_copy_span_start(&copy_counts, copy_plan);
+        let span_elements = copy_counts[span_start..]
+            .iter()
+            .try_fold(1usize, |acc, &count| {
+                acc.checked_mul(count)
+                    .ok_or_else(|| Error::InvalidFormat("chunk copy span overflow".into()))
+            })?;
+        let span_bytes = span_elements
+            .checked_mul(element_size)
+            .ok_or_else(|| Error::InvalidFormat("chunk copy span byte overflow".into()))?;
+
+        if span_start == 0 {
+            let out_offset = Self::chunk_output_offset(&coords, copy_plan)?;
+            Self::copy_chunk_span(chunk_data, output, out_offset, 0, span_bytes, element_size)?;
+            return Ok(());
+        }
+
+        let mut idx = vec![0usize; span_start];
+        loop {
+            let out_offset = Self::chunk_outer_offset(&coords, &idx, span_start, copy_plan)?;
+            let chunk_offset = Self::chunk_inner_offset(&idx, span_start, copy_plan)?;
+
+            Self::copy_chunk_span(
+                chunk_data,
+                output,
+                out_offset,
+                chunk_offset,
+                span_bytes,
+                element_size,
+            )?;
+
+            if !Self::increment_index(&mut idx, &copy_counts[..span_start]) {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    fn chunk_copy_counts(coords: &[usize], copy_plan: &ChunkCopyPlan) -> Result<Vec<usize>> {
+        coords
+            .iter()
+            .zip(&copy_plan.data_dims)
+            .zip(&copy_plan.chunk_dims)
+            .map(|((&coord, &data_dim), &chunk_dim)| {
+                if coord >= data_dim {
+                    Ok(0)
+                } else {
+                    Ok(chunk_dim.min(data_dim - coord))
+                }
+            })
+            .collect()
+    }
+
+    fn chunk_copy_span_start(copy_counts: &[usize], copy_plan: &ChunkCopyPlan) -> usize {
+        let mut span_start = copy_counts.len() - 1;
+        while span_start > 0 {
+            let dim = span_start;
+            if copy_counts[dim] != copy_plan.chunk_dims[dim]
+                || copy_counts[dim] != copy_plan.data_dims[dim]
+            {
+                break;
+            }
+            span_start -= 1;
+        }
+        span_start
+    }
+
+    fn chunk_output_offset(coords: &[usize], copy_plan: &ChunkCopyPlan) -> Result<usize> {
+        coords
+            .iter()
+            .zip(&copy_plan.out_strides)
+            .try_fold(0usize, |offset, (&coord, &stride)| {
+                offset
+                    .checked_add(coord.checked_mul(stride).ok_or_else(|| {
+                        Error::InvalidFormat("chunk output offset overflow".into())
+                    })?)
+                    .ok_or_else(|| Error::InvalidFormat("chunk output offset overflow".into()))
+            })
+    }
+
+    fn chunk_outer_offset(
+        coords: &[usize],
+        idx: &[usize],
+        span_start: usize,
+        copy_plan: &ChunkCopyPlan,
+    ) -> Result<usize> {
+        let mut offset = 0usize;
+        for d in 0..span_start {
+            let global = coords[d]
+                .checked_add(idx[d])
+                .ok_or_else(|| Error::InvalidFormat("chunk coordinate overflow".into()))?;
+            offset = offset
+                .checked_add(
+                    global
+                        .checked_mul(copy_plan.out_strides[d])
+                        .ok_or_else(|| {
+                            Error::InvalidFormat("chunk output offset overflow".into())
+                        })?,
+                )
+                .ok_or_else(|| Error::InvalidFormat("chunk output offset overflow".into()))?;
+        }
+        offset = offset
+            .checked_add(
+                coords[span_start]
+                    .checked_mul(copy_plan.out_strides[span_start])
+                    .ok_or_else(|| Error::InvalidFormat("chunk output offset overflow".into()))?,
+            )
+            .ok_or_else(|| Error::InvalidFormat("chunk output offset overflow".into()))?;
+        Ok(offset)
+    }
+
+    fn chunk_inner_offset(
+        idx: &[usize],
+        span_start: usize,
+        copy_plan: &ChunkCopyPlan,
+    ) -> Result<usize> {
+        let mut offset = 0usize;
+        for d in 0..span_start {
+            offset =
+                offset
+                    .checked_add(idx[d].checked_mul(copy_plan.chunk_strides[d]).ok_or_else(
+                        || Error::InvalidFormat("chunk input offset overflow".into()),
+                    )?)
+                    .ok_or_else(|| Error::InvalidFormat("chunk input offset overflow".into()))?;
+        }
+        Ok(offset)
+    }
+
+    fn copy_chunk_span(
+        chunk_data: &[u8],
+        output: &mut [u8],
+        out_offset: usize,
+        chunk_offset: usize,
+        span_bytes: usize,
+        element_size: usize,
+    ) -> Result<()> {
+        let Some(dst) =
+            checked_window_mut(output, out_offset, span_bytes, "chunk copy output range")?
+        else {
+            return Self::copy_chunk_span_elementwise(
+                chunk_data,
+                output,
+                out_offset,
+                chunk_offset,
+                span_bytes,
+                element_size,
+            );
+        };
+        let Some(src) = checked_window(
+            chunk_data,
+            chunk_offset,
+            span_bytes,
+            "chunk copy input range",
+        )?
+        else {
+            return Self::copy_chunk_span_elementwise(
+                chunk_data,
+                output,
+                out_offset,
+                chunk_offset,
+                span_bytes,
+                element_size,
+            );
+        };
+        dst.copy_from_slice(src);
+        Ok(())
+    }
+
+    fn copy_chunk_span_elementwise(
+        chunk_data: &[u8],
+        output: &mut [u8],
+        out_offset: usize,
+        chunk_offset: usize,
+        span_bytes: usize,
+        element_size: usize,
+    ) -> Result<()> {
+        for offset in (0..span_bytes).step_by(element_size) {
+            let Some(dst) = checked_window_mut(
+                output,
+                out_offset
+                    .checked_add(offset)
+                    .ok_or_else(|| Error::InvalidFormat("chunk output offset overflow".into()))?,
+                element_size,
+                "chunk copy output range",
+            )?
+            else {
+                continue;
+            };
+            let Some(src) = checked_window(
+                chunk_data,
+                chunk_offset
+                    .checked_add(offset)
+                    .ok_or_else(|| Error::InvalidFormat("chunk input offset overflow".into()))?,
+                element_size,
+                "chunk copy input range",
+            )?
+            else {
+                continue;
+            };
+            dst.copy_from_slice(src);
+        }
+        Ok(())
+    }
+
+    fn increment_index(idx: &mut [usize], limits: &[usize]) -> bool {
+        for d in (0..idx.len()).rev() {
+            idx[d] += 1;
+            if idx[d] < limits[d] {
+                return true;
+            }
+            idx[d] = 0;
+        }
+        false
+    }
+
+    #[cfg(test)]
+    fn copy_chunk_nd_elementwise_reference(
         chunk_data: &[u8],
         coords: &[u64],
         data_dims: &[u64],
@@ -358,5 +613,74 @@ mod tests {
             err.to_string().contains("test range overflow"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn copy_chunk_nd_matches_elementwise_for_middle_2d_chunk() {
+        assert_copy_matches_reference(&[6, 7], &[2, 3], &[2, 3], 2, 0, 0);
+    }
+
+    #[test]
+    fn copy_chunk_nd_matches_elementwise_for_edge_2d_chunk() {
+        assert_copy_matches_reference(&[5, 5], &[3, 3], &[3, 3], 4, 0, 0);
+    }
+
+    #[test]
+    fn copy_chunk_nd_matches_elementwise_for_full_suffix_span() {
+        assert_copy_matches_reference(&[4, 3, 5], &[2, 0, 0], &[2, 3, 5], 1, 0, 0);
+    }
+
+    #[test]
+    fn copy_chunk_nd_matches_elementwise_with_truncated_input() {
+        assert_copy_matches_reference(&[4, 6], &[1, 2], &[3, 3], 1, 2, 0);
+    }
+
+    #[test]
+    fn copy_chunk_nd_matches_elementwise_with_truncated_output() {
+        assert_copy_matches_reference(&[4, 6], &[1, 2], &[3, 3], 1, 0, 3);
+    }
+
+    fn assert_copy_matches_reference(
+        data_dims: &[u64],
+        coords: &[u64],
+        chunk_dims: &[u64],
+        element_size: usize,
+        truncate_input: usize,
+        truncate_output: usize,
+    ) {
+        let plan = Dataset::build_chunk_copy_plan(data_dims, chunk_dims, element_size).unwrap();
+        let chunk_len = plan.total_chunk_elements * element_size;
+        let output_len = data_dims
+            .iter()
+            .try_fold(element_size, |acc, &dim| acc.checked_mul(dim as usize))
+            .unwrap();
+        let chunk_data = (0..chunk_len)
+            .map(|byte| (byte % 251) as u8)
+            .collect::<Vec<_>>();
+        let input_len = chunk_len.saturating_sub(truncate_input);
+        let output_len = output_len.saturating_sub(truncate_output);
+        let mut optimized = vec![0xA5; output_len];
+        let mut reference = optimized.clone();
+
+        Dataset::copy_chunk_nd(
+            &chunk_data[..input_len],
+            coords,
+            data_dims,
+            element_size,
+            &mut optimized,
+            &plan,
+        )
+        .unwrap();
+        Dataset::copy_chunk_nd_elementwise_reference(
+            &chunk_data[..input_len],
+            coords,
+            data_dims,
+            element_size,
+            &mut reference,
+            &plan,
+        )
+        .unwrap();
+
+        assert_eq!(optimized, reference);
     }
 }

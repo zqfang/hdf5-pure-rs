@@ -1299,54 +1299,34 @@ impl Attribute {
             )));
         }
 
-        enum VLenStringSlot {
-            Empty,
-            Heap {
-                seq_len: usize,
-                gh_ref: crate::format::global_heap::GlobalHeapRef,
-            },
-        }
-
-        let mut slots = Vec::with_capacity(self.msg.data.len() / ref_size);
+        let mut heap_cache = crate::format::global_heap::GlobalHeapObjectCache::new();
         for chunk in self.msg.data.chunks_exact(ref_size) {
             let (seq_len, addr, index) = decode_vlen_string_ref(chunk, sizeof_addr)?;
 
             if addr == 0 || crate::io::reader::is_undef_addr(addr) {
-                slots.push(VLenStringSlot::Empty);
+                visitor("")?;
                 continue;
             }
 
-            slots.push(VLenStringSlot::Heap {
-                seq_len,
-                gh_ref: crate::format::global_heap::GlobalHeapRef {
-                    collection_addr: addr,
-                    object_index: index,
-                },
-            });
-        }
-
-        let mut heap_cache = crate::format::global_heap::GlobalHeapObjectCache::new();
-        for slot in slots {
-            match slot {
-                VLenStringSlot::Empty => visitor("")?,
-                VLenStringSlot::Heap { seq_len, gh_ref } => {
-                    heap_cache.visit_object(&mut guard.reader, &gh_ref, |data| {
-                    if seq_len > data.len() {
-                        return Err(Error::InvalidFormat(format!(
-                            "attribute '{}' vlen string payload too short: expected {} bytes, got {}",
-                            self.msg.name,
-                            seq_len,
-                            data.len()
-                        )));
-                    }
-                    let bytes = &data[..seq_len];
-                    visitor(decode_utf8_string_slice(
-                        bytes,
-                        "attribute vlen string payload",
-                    )?)
-                    })?;
+            let gh_ref = crate::format::global_heap::GlobalHeapRef {
+                collection_addr: addr,
+                object_index: index,
+            };
+            heap_cache.visit_object(&mut guard.reader, &gh_ref, |data| {
+                if seq_len > data.len() {
+                    return Err(Error::InvalidFormat(format!(
+                        "attribute '{}' vlen string payload too short: expected {} bytes, got {}",
+                        self.msg.name,
+                        seq_len,
+                        data.len()
+                    )));
                 }
-            }
+                let bytes = &data[..seq_len];
+                visitor(decode_utf8_string_slice(
+                    bytes,
+                    "attribute vlen string payload",
+                )?)
+            })?;
         }
         Ok(())
     }

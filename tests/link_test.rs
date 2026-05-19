@@ -254,6 +254,30 @@ fn test_dense_links_include_soft_external_and_hard_aliases() {
 }
 
 #[test]
+fn test_dense_links_split_name_btree_across_leaves() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("dense_multileaf_links.h5");
+
+    {
+        let mut wf = WritableFile::create(&path).unwrap();
+        for idx in 0..70 {
+            wf.create_group(&format!("group_{idx:02}")).unwrap();
+        }
+        wf.flush().unwrap();
+    }
+
+    let bytes = std::fs::read(&path).unwrap();
+    assert!(bytes.windows(4).any(|window| window == b"BTIN"));
+
+    let f = File::open(&path).unwrap();
+    let root = f.root_group().unwrap();
+    assert!(group_has_member(&root, "group_00").unwrap());
+    assert!(group_has_member(&root, "group_45").unwrap());
+    assert!(group_has_member(&root, "group_69").unwrap());
+    assert_eq!(root.open_group("group_69").unwrap().name(), "/group_69");
+}
+
+#[test]
 fn test_write_external_link() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("ext_link_test.h5");

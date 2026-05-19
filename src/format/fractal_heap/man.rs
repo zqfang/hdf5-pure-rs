@@ -38,12 +38,17 @@ impl FractalHeapHeader {
         }
     }
 
-    pub(super) fn read_managed_with_cache<R: Read + Seek>(
+    pub(super) fn visit_managed_with_cache<R, T, F>(
         &self,
         reader: &mut HdfReader<R>,
         heap_id: &[u8],
         cache: &mut FractalHeapManagedObjectCache,
-    ) -> Result<Vec<u8>> {
+        op: F,
+    ) -> Result<T>
+    where
+        R: Read + Seek,
+        F: FnOnce(&[u8]) -> Result<T>,
+    {
         let (offset, length) = self.decode_managed_heap_id(heap_id)?;
 
         if let Some(span) = cache.lookup_direct_span(offset) {
@@ -52,7 +57,7 @@ impl FractalHeapHeader {
             let filtered_size = span.filtered_size;
             let filter_mask = span.filter_mask;
             let local_offset = offset - span.start;
-            return self.read_from_direct_block_cached(
+            let data = self.read_from_direct_block_cached_slice(
                 reader,
                 block_addr,
                 block_size,
@@ -61,12 +66,13 @@ impl FractalHeapHeader {
                 local_offset,
                 length,
                 cache,
-            );
+            )?;
+            return op(data);
         }
 
         if self.current_root_rows == 0 {
             // Root is a direct block -- offset is relative to block start
-            self.read_from_direct_block_cached(
+            let data = self.read_from_direct_block_cached_slice(
                 reader,
                 self.root_block_addr,
                 self.start_block_size,
@@ -75,15 +81,17 @@ impl FractalHeapHeader {
                 offset,
                 length,
                 cache,
-            )
+            )?;
+            op(data)
         } else {
             // Root is an indirect block -- need to find which direct block contains the offset
-            self.read_from_indirect_block_cached(
+            self.visit_from_indirect_block_cached(
                 reader,
                 self.root_block_addr,
                 offset,
                 length,
                 cache,
+                op,
             )
         }
     }
@@ -146,21 +154,26 @@ impl FractalHeapHeader {
         )
     }
 
-    pub(super) fn read_from_indirect_block_cached<R: Read + Seek>(
+    pub(super) fn visit_from_indirect_block_cached<R, T, F>(
         &self,
         reader: &mut HdfReader<R>,
         block_addr: u64,
         offset: u64,
         length: u64,
         cache: &mut FractalHeapManagedObjectCache,
-    ) -> Result<Vec<u8>> {
+        op: F,
+    ) -> Result<T>
+    where
+        R: Read + Seek,
+        F: FnOnce(&[u8]) -> Result<T>,
+    {
         if self.io_filter_len > 0 {
-            return self.read_from_filtered_indirect_block_cached(
-                reader, block_addr, offset, length, cache,
+            return self.visit_from_filtered_indirect_block_cached(
+                reader, block_addr, offset, length, cache, op,
             );
         }
 
-        self.read_from_indirect_block_rows_cached(
+        self.visit_from_indirect_block_rows_cached(
             reader,
             block_addr,
             usize::from(self.current_root_rows),
@@ -168,6 +181,7 @@ impl FractalHeapHeader {
             offset,
             length,
             cache,
+            op,
         )
     }
 
@@ -247,7 +261,7 @@ impl FractalHeapHeader {
         )))
     }
 
-    pub(super) fn lookup_in_indirect_block_cached<R: Read + Seek>(
+    pub(super) fn visit_in_indirect_block_cached<R, T, F>(
         &self,
         reader: &mut HdfReader<R>,
         iblock: &IndirectBlock,
@@ -255,7 +269,12 @@ impl FractalHeapHeader {
         offset: u64,
         length: u64,
         cache: &mut FractalHeapManagedObjectCache,
-    ) -> Result<Vec<u8>> {
+        op: F,
+    ) -> Result<T>
+    where
+        R: Read + Seek,
+        F: FnOnce(&[u8]) -> Result<T>,
+    {
         let width = usize::from(self.table_width);
         let max_direct_rows = self.max_direct_rows_checked()?;
         let mut current_heap_offset = block_start;
@@ -285,7 +304,7 @@ impl FractalHeapHeader {
                             filtered_size: None,
                             filter_mask: 0,
                         });
-                        return self.read_from_direct_block_cached(
+                        let data = self.read_from_direct_block_cached_slice(
                             reader,
                             child_addr,
                             block_span,
@@ -294,7 +313,8 @@ impl FractalHeapHeader {
                             local_offset,
                             length,
                             cache,
-                        );
+                        )?;
+                        return op(data);
                     }
 
                     current_heap_offset = block_end;
@@ -310,7 +330,7 @@ impl FractalHeapHeader {
                         if crate::io::reader::is_undef_addr(child_addr) {
                             break;
                         }
-                        return self.read_from_indirect_block_rows_cached(
+                        return self.visit_from_indirect_block_rows_cached(
                             reader,
                             child_addr,
                             child_rows,
@@ -318,6 +338,7 @@ impl FractalHeapHeader {
                             offset,
                             length,
                             cache,
+                            op,
                         );
                     }
                     current_heap_offset = child_end;
@@ -347,7 +368,7 @@ impl FractalHeapHeader {
         self.lookup_in_indirect_block(reader, &iblock, block_start, offset, length)
     }
 
-    pub(super) fn read_from_indirect_block_rows_cached<R: Read + Seek>(
+    pub(super) fn visit_from_indirect_block_rows_cached<R, T, F>(
         &self,
         reader: &mut HdfReader<R>,
         block_addr: u64,
@@ -356,20 +377,26 @@ impl FractalHeapHeader {
         offset: u64,
         length: u64,
         cache: &mut FractalHeapManagedObjectCache,
-    ) -> Result<Vec<u8>> {
+        op: F,
+    ) -> Result<T>
+    where
+        R: Read + Seek,
+        F: FnOnce(&[u8]) -> Result<T>,
+    {
         let key = IndirectBlockCacheKey { block_addr, nrows };
         let iblock = if let Some(iblock) = cache.indirect_blocks.remove(&key) {
             iblock
         } else {
             self.decode_indirect_block(reader, block_addr, nrows)?
         };
-        let result = self.lookup_in_indirect_block_cached(
+        let result = self.visit_in_indirect_block_cached(
             reader,
             &iblock,
             block_start,
             offset,
             length,
             cache,
+            op,
         );
         cache.insert_indirect_block(key, iblock);
         result
@@ -441,14 +468,19 @@ impl FractalHeapHeader {
         )))
     }
 
-    pub(super) fn lookup_in_filtered_indirect_block_cached<R: Read + Seek>(
+    pub(super) fn visit_in_filtered_indirect_block_cached<R, T, F>(
         &self,
         reader: &mut HdfReader<R>,
         iblock: &FilteredIndirectBlock,
         offset: u64,
         length: u64,
         cache: &mut FractalHeapManagedObjectCache,
-    ) -> Result<Vec<u8>> {
+        op: F,
+    ) -> Result<T>
+    where
+        R: Read + Seek,
+        F: FnOnce(&[u8]) -> Result<T>,
+    {
         let width = usize::from(self.table_width);
         let dblock_header_size = checked_add_heap_offset(
             checked_add_heap_offset(5, u64::from(self.sizeof_addr))?,
@@ -494,7 +526,7 @@ impl FractalHeapHeader {
                         filtered_size: Some(entry.filtered_size),
                         filter_mask: entry.filter_mask,
                     });
-                    return self.read_from_direct_block_cached(
+                    let data = self.read_from_direct_block_cached_slice(
                         reader,
                         entry.addr,
                         block_size,
@@ -503,7 +535,8 @@ impl FractalHeapHeader {
                         offset - current_heap_offset,
                         length,
                         cache,
-                    );
+                    )?;
+                    return op(data);
                 }
                 current_heap_offset = block_end;
             }
@@ -528,22 +561,27 @@ impl FractalHeapHeader {
         self.lookup_in_filtered_indirect_block(reader, &iblock, offset, length)
     }
 
-    pub(super) fn read_from_filtered_indirect_block_cached<R: Read + Seek>(
+    pub(super) fn visit_from_filtered_indirect_block_cached<R, T, F>(
         &self,
         reader: &mut HdfReader<R>,
         block_addr: u64,
         offset: u64,
         length: u64,
         cache: &mut FractalHeapManagedObjectCache,
-    ) -> Result<Vec<u8>> {
+        op: F,
+    ) -> Result<T>
+    where
+        R: Read + Seek,
+        F: FnOnce(&[u8]) -> Result<T>,
+    {
         let key = FilteredIndirectBlockCacheKey { block_addr };
         let iblock = if let Some(iblock) = cache.filtered_indirect_blocks.remove(&key) {
             iblock
         } else {
             self.decode_filtered_indirect_block(reader, block_addr)?
         };
-        let result =
-            self.lookup_in_filtered_indirect_block_cached(reader, &iblock, offset, length, cache);
+        let result = self
+            .visit_in_filtered_indirect_block_cached(reader, &iblock, offset, length, cache, op);
         cache.insert_filtered_indirect_block(key, iblock);
         result
     }

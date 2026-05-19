@@ -1,6 +1,6 @@
 [package]
 name = "hdf5-pure-rust-derive"
-version = "0.3.3"
+version = "0.3.4"
 edition = "2021"
 description = "Derive macro for H5Type trait (hdf5-pure-rust)"
 license = "MIT OR Apache-2.0"

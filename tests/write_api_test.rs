@@ -1032,6 +1032,66 @@ fn test_dataset_builder_compressed_chunked_attrs_with_fill_value() {
 }
 
 #[test]
+fn test_dataset_builder_sparse_chunked_fill_only_dataset() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("api_write_sparse_chunked_fill_only.h5");
+
+    {
+        let mut wf = WritableFile::create(&path).unwrap();
+        wf.new_dataset_builder("data")
+            .shape(&[1_000])
+            .chunk(&[128])
+            .fill_value::<i32>(-11)
+            .attr("version", 14i64)
+            .unwrap()
+            .write_fill::<i32>()
+            .unwrap();
+        let f = wf.close().unwrap();
+
+        let ds = f.dataset("data").unwrap();
+        assert!(ds.is_chunked().unwrap());
+        assert_eq!(ds.attr("version").unwrap().read_scalar_i64(), Some(14));
+        let values: Vec<i32> = ds.read().unwrap();
+        assert_eq!(values.len(), 1_000);
+        assert!(values.iter().all(|&value| value == -11));
+        let plist = ds.create_plist().unwrap();
+        assert_eq!(plist.fill_value, Some((-11i32).to_le_bytes().to_vec()));
+    }
+}
+
+#[test]
+fn test_dataset_builder_sparse_chunked_explicit_chunks() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir
+        .path()
+        .join("api_write_sparse_chunked_explicit_chunks.h5");
+    let first = [1i32; 128];
+    let middle = [5i32; 128];
+
+    {
+        let mut wf = WritableFile::create(&path).unwrap();
+        wf.new_dataset_builder("data")
+            .shape(&[1_000])
+            .chunk(&[128])
+            .fill_value::<i32>(-7)
+            .deflate(1)
+            .write_chunks::<i32, _, _>([([0u64], &first[..]), ([512u64], &middle[..])])
+            .unwrap();
+        let f = wf.close().unwrap();
+
+        let ds = f.dataset("data").unwrap();
+        assert!(ds.is_chunked().unwrap());
+        let values: Vec<i32> = ds.read().unwrap();
+        assert_eq!(values.len(), 1_000);
+        assert_eq!(&values[..128], &first);
+        assert_eq!(&values[512..640], &middle);
+        assert!(values[128..512].iter().all(|&value| value == -7));
+        assert!(values[640..].iter().all(|&value| value == -7));
+        assert!(dataset_has_filter_id(&ds, 1).unwrap());
+    }
+}
+
+#[test]
 fn test_writable_file_scalar() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("api_write_scalar.h5");
@@ -1369,19 +1429,41 @@ fn test_writable_file_chunked_vlen_utf8_strings_with_fletcher32() {
 }
 
 #[test]
-fn test_writable_file_vlen_utf8_strings_still_reject_fill_values() {
+fn test_writable_file_vlen_utf8_strings_accept_fill_values() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("api_write_vlen_string_fill_rejected.h5");
+    let path = dir.path().join("api_write_vlen_string_fill.h5");
+    let empty_vlen_descriptor = 0u128.to_le_bytes().to_vec();
 
-    let mut wf = WritableFile::create(&path).unwrap();
-    let err = wf
-        .new_dataset_builder("names")
-        .shape(&[2])
-        .chunk(&[1])
-        .fill_value::<u64>(0)
-        .write_vlen_utf8_strings(&["alpha", "beta"])
-        .expect_err("vlen string fill values are not implemented yet");
-    assert!(err.to_string().contains("fill values are not supported"));
+    {
+        let mut wf = WritableFile::create(&path).unwrap();
+        wf.new_dataset_builder("contiguous")
+            .shape(&[2])
+            .fill_value::<u128>(0)
+            .write_vlen_utf8_strings(&["alpha", "beta"])
+            .unwrap();
+        wf.new_dataset_builder("chunked")
+            .shape(&[3])
+            .chunk(&[1])
+            .fill_value::<u128>(0)
+            .write_vlen_utf8_strings(&["", "猫", "gamma"])
+            .unwrap();
+        let f = wf.close().unwrap();
+
+        let ds = f.dataset("contiguous").unwrap();
+        assert!(ds.dtype().unwrap().is_vlen());
+        assert_dataset_strings(&ds, &["alpha", "beta"]).unwrap();
+        let plist = ds.create_plist().unwrap();
+        assert!(plist.fill_value_defined);
+        assert_eq!(plist.fill_value, Some(empty_vlen_descriptor.clone()));
+
+        let ds = f.dataset("chunked").unwrap();
+        assert!(ds.dtype().unwrap().is_vlen());
+        assert!(ds.is_chunked().unwrap());
+        assert_dataset_strings(&ds, &["", "猫", "gamma"]).unwrap();
+        let plist = ds.create_plist().unwrap();
+        assert!(plist.fill_value_defined);
+        assert_eq!(plist.fill_value, Some(empty_vlen_descriptor));
+    }
 }
 
 #[test]
@@ -1680,4 +1762,34 @@ fn test_writable_file_root_attr() {
         let val: i64 = attr.read_scalar::<i64>().unwrap();
         assert_eq!(val, 42);
     }
+}
+
+#[test]
+fn test_writable_file_oversized_object_header_uses_continuation_chunk() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("api_write_header_continuation.h5");
+    let names: Vec<String> = (0..8)
+        .map(|idx| format!("group_{idx}_{}", "x".repeat(20_000)))
+        .collect();
+
+    {
+        let mut wf = WritableFile::create(&path).unwrap();
+        for name in &names {
+            wf.create_group(name).unwrap();
+        }
+        let f = wf.close().unwrap();
+
+        let expected: Vec<&str> = names.iter().map(String::as_str).collect();
+        let mut found = vec![false; expected.len()];
+        let count =
+            group_member_summary_into(&f.root_group().unwrap(), &expected, &mut found).unwrap();
+        assert_eq!(count, expected.len());
+        assert!(found.iter().all(|present| *present));
+    }
+
+    let image = std::fs::read(&path).unwrap();
+    assert!(
+        image.windows(4).any(|window| window == b"OCHK"),
+        "oversized compact root header should be split into a v2 continuation chunk"
+    );
 }

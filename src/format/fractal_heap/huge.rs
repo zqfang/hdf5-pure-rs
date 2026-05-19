@@ -56,9 +56,7 @@ impl FractalHeapHeader {
         reader: &mut HdfReader<R>,
         heap_id: &[u8],
     ) -> Result<Vec<u8>> {
-        let mut out = Vec::new();
-        self.read_huge_into(reader, heap_id, &mut out)?;
-        Ok(out)
+        self.visit_huge(reader, heap_id, |data| Ok(data.to_vec()))
     }
 
     pub(super) fn read_huge_into<R: Read + Seek>(
@@ -210,6 +208,21 @@ impl FractalHeapHeader {
         Err(Error::InvalidFormat(format!(
             "huge fractal heap object id {id} not found"
         )))
+    }
+
+    pub(super) fn visit_huge<R, T, F>(
+        &self,
+        reader: &mut HdfReader<R>,
+        heap_id: &[u8],
+        op: F,
+    ) -> Result<T>
+    where
+        R: Read + Seek,
+        F: FnOnce(&[u8]) -> Result<T>,
+    {
+        let mut out = Vec::new();
+        self.read_huge_into(reader, heap_id, &mut out)?;
+        op(&out)
     }
 
     pub(super) fn decode_huge_record(&self, record: &[u8]) -> Result<HugeRecord> {

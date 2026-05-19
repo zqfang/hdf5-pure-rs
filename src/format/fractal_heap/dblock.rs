@@ -118,59 +118,6 @@ impl FractalHeapHeader {
         Ok(())
     }
 
-    pub(super) fn read_from_direct_block_cached<R: Read + Seek>(
-        &self,
-        reader: &mut HdfReader<R>,
-        block_addr: u64,
-        block_size: u64,
-        filtered_size: Option<u64>,
-        filter_mask: u32,
-        offset: u64,
-        length: u64,
-        cache: &mut FractalHeapManagedObjectCache,
-    ) -> Result<Vec<u8>> {
-        let mut out = Vec::new();
-        self.read_from_direct_block_cached_into(
-            reader,
-            block_addr,
-            block_size,
-            filtered_size,
-            filter_mask,
-            offset,
-            length,
-            cache,
-            &mut out,
-        )?;
-        Ok(out)
-    }
-
-    pub(super) fn read_from_direct_block_cached_into<R: Read + Seek>(
-        &self,
-        reader: &mut HdfReader<R>,
-        block_addr: u64,
-        block_size: u64,
-        filtered_size: Option<u64>,
-        filter_mask: u32,
-        offset: u64,
-        length: u64,
-        cache: &mut FractalHeapManagedObjectCache,
-        out: &mut Vec<u8>,
-    ) -> Result<()> {
-        let slice = self.read_from_direct_block_cached_slice(
-            reader,
-            block_addr,
-            block_size,
-            filtered_size,
-            filter_mask,
-            offset,
-            length,
-            cache,
-        )?;
-        out.clear();
-        out.extend_from_slice(slice);
-        Ok(())
-    }
-
     pub(super) fn read_from_direct_block_cached_slice<'cache, R: Read + Seek>(
         &self,
         reader: &mut HdfReader<R>,

@@ -1,6 +1,6 @@
 use std::cmp::Ordering;
 use std::fmt::{self, Write};
-use std::io::{Read, Seek};
+use std::io::{Cursor, Read, Seek};
 
 use crate::error::{Error, Result};
 use crate::format::checksum::checksum_metadata;
@@ -65,31 +65,38 @@ impl BTreeV2Header {
 
     /// Load a v2 B-tree header from disk at the given address.
     pub fn read_at<R: Read + Seek>(reader: &mut HdfReader<R>, addr: u64) -> Result<Self> {
+        let header_image_len = btree_v2_header_image_len(
+            usize::from(reader.sizeof_addr()),
+            usize::from(reader.sizeof_size()),
+        )?;
+        let mut image = vec![0; header_image_len];
         reader.seek(addr).map_err(|err| {
             Error::InvalidFormat(format!("failed to seek to v2 B-tree header {addr}: {err}"))
         })?;
+        reader.read_bytes_into(&mut image)?;
+        let mut image_reader = image_reader(&image, reader);
 
         let mut magic = [0; 4];
-        reader.read_bytes_into(&mut magic)?;
+        image_reader.read_bytes_into(&mut magic)?;
         if magic != B2HD_MAGIC {
             return Err(Error::InvalidFormat(
                 "invalid v2 B-tree header magic".into(),
             ));
         }
 
-        let version = reader.read_u8()?;
+        let version = image_reader.read_u8()?;
         if version != 0 {
             return Err(Error::Unsupported(format!(
                 "v2 B-tree header version {version}"
             )));
         }
 
-        let tree_type = reader.read_u8()?;
-        let node_size = reader.read_u32()?;
-        let record_size = reader.read_u16()?;
-        let depth = reader.read_u16()?;
-        let split_pct = reader.read_u8()?;
-        let merge_pct = reader.read_u8()?;
+        let tree_type = image_reader.read_u8()?;
+        let node_size = image_reader.read_u32()?;
+        let record_size = image_reader.read_u16()?;
+        let depth = image_reader.read_u16()?;
+        let split_pct = image_reader.read_u8()?;
+        let merge_pct = image_reader.read_u8()?;
         if split_pct == 0 || split_pct > 100 {
             return Err(Error::InvalidFormat(format!(
                 "v2 B-tree split percent {split_pct} must be in 1..=100"
@@ -100,9 +107,9 @@ impl BTreeV2Header {
                 "v2 B-tree merge percent {merge_pct} must be in 1..=100"
             )));
         }
-        let root_addr = reader.read_addr()?;
-        let root_nrecords = reader.read_u16()?;
-        let total_records = reader.read_length()?;
+        let root_addr = image_reader.read_addr()?;
+        let root_nrecords = image_reader.read_u16()?;
+        let total_records = image_reader.read_length()?;
         if total_records == 0 && root_nrecords != 0 {
             return Err(Error::InvalidFormat(
                 "v2 B-tree empty tree declares root records".into(),
@@ -118,8 +125,7 @@ impl BTreeV2Header {
                 "v2 B-tree root record count exceeds total records".into(),
             ));
         }
-
-        verify_checksum(reader, addr, "v2 B-tree header")?;
+        verify_image_checksum(&image, "v2 B-tree header")?;
 
         let header = Self {
             tree_type,
@@ -364,37 +370,74 @@ impl BTreeV2Header {
     }
 }
 
+fn image_reader<'a, R: Read + Seek>(
+    image: &'a [u8],
+    source: &HdfReader<R>,
+) -> HdfReader<Cursor<&'a [u8]>> {
+    let mut reader = HdfReader::new(Cursor::new(image));
+    reader.set_sizeof_addr(source.sizeof_addr());
+    reader.set_sizeof_size(source.sizeof_size());
+    reader
+}
+
+fn btree_v2_header_image_len(sizeof_addr: usize, sizeof_size: usize) -> Result<usize> {
+    4usize
+        .checked_add(1)
+        .and_then(|value| value.checked_add(1))
+        .and_then(|value| value.checked_add(4))
+        .and_then(|value| value.checked_add(2))
+        .and_then(|value| value.checked_add(2))
+        .and_then(|value| value.checked_add(1))
+        .and_then(|value| value.checked_add(1))
+        .and_then(|value| value.checked_add(sizeof_addr))
+        .and_then(|value| value.checked_add(2))
+        .and_then(|value| value.checked_add(sizeof_size))
+        .and_then(|value| value.checked_add(4))
+        .ok_or_else(|| Error::InvalidFormat("v2 B-tree header image length overflow".into()))
+}
+
+fn verify_compact_or_padded_node_image<R: Read + Seek>(
+    reader: &mut HdfReader<R>,
+    image: &mut Vec<u8>,
+    node_size: usize,
+    context: &str,
+) -> Result<()> {
+    if node_size < 4 {
+        return Err(Error::InvalidFormat(format!("{context} node is too small")));
+    }
+    let compact_len = image.len();
+    let compact_payload_len = compact_len
+        .checked_sub(4)
+        .ok_or_else(|| Error::InvalidFormat(format!("{context} image too short")))?;
+    let padded_payload_len = node_size
+        .checked_sub(4)
+        .ok_or_else(|| Error::InvalidFormat(format!("{context} node is too small")))?;
+    if compact_payload_len > padded_payload_len {
+        return Err(Error::InvalidFormat(format!(
+            "{context} records exceed declared node size"
+        )));
+    }
+    match verify_image_checksum(image, context) {
+        Ok(()) => Ok(()),
+        Err(compact_err) => {
+            if compact_len >= node_size {
+                return Err(compact_err);
+            }
+            image.resize(node_size, 0);
+            if reader.read_bytes_into(&mut image[compact_len..]).is_err() {
+                return Err(compact_err);
+            }
+            verify_image_checksum(image, context)
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BTreeV2CacheAction {
     Loaded,
     Dirtied,
     Flushed,
     Evicted,
-}
-
-/// Verify the trailing metadata checksum for a v2 B-tree image starting at `start`.
-fn verify_checksum<R: Read + Seek>(
-    reader: &mut HdfReader<R>,
-    start: u64,
-    context: &str,
-) -> Result<()> {
-    let checksum_pos = reader.position()?;
-    let stored_checksum = reader.read_u32()?;
-    let check_len = usize::try_from(checksum_pos - start)
-        .map_err(|_| Error::InvalidFormat(format!("{context} checksum span is too large")))?;
-    reader.seek(start)?;
-    let mut check_data = vec![0; check_len];
-    reader.read_bytes_into(&mut check_data)?;
-    let computed = checksum_metadata(&check_data);
-    if stored_checksum != computed {
-        return Err(Error::InvalidFormat(format!(
-            "{context} checksum mismatch: stored={stored_checksum:#010x}, computed={computed:#010x}"
-        )));
-    }
-    reader.seek(checksum_pos.checked_add(4).ok_or_else(|| {
-        Error::InvalidFormat(format!("{context} checksum end offset overflow"))
-    })?)?;
-    Ok(())
 }
 
 /// Collect all records from a v2 B-tree into caller-provided storage.
@@ -1029,39 +1072,11 @@ fn decode_internal_node_image_into<R: Read + Seek>(
         ));
     }
 
-    reader.seek(addr).map_err(|err| {
-        Error::InvalidFormat(format!(
-            "failed to seek to v2 B-tree internal node {addr}: {err}"
-        ))
-    })?;
-
-    let mut magic = [0; 4];
-    reader.read_bytes_into(&mut magic)?;
-    if magic != B2IN_MAGIC {
-        return Err(Error::InvalidFormat(
-            "invalid v2 B-tree internal magic".into(),
-        ));
-    }
-
-    validate_node_prefix(reader, header.tree_type, "v2 B-tree internal")?;
-
     let nrecords_usize = usize::from(nrecords);
-    if nrecords_usize > node_info[depth_index].max_nrec {
-        return Err(Error::InvalidFormat(format!(
-            "v2 B-tree internal node has too many records: {} > {}",
-            nrecords, node_info[depth_index].max_nrec
-        )));
-    }
-
     let record_size = usize::from(header.record_size);
     let record_bytes_len = nrecords_usize
         .checked_mul(record_size)
         .ok_or_else(|| Error::InvalidFormat("v2 B-tree internal record bytes overflow".into()))?;
-    image.record_size = record_size;
-    image.record_bytes.clear();
-    image.record_bytes.resize(record_bytes_len, 0);
-    reader.read_bytes_into(&mut image.record_bytes)?;
-
     let max_nrec_size = bytes_needed(btree_usize_to_u64(
         node_info[0].max_nrec,
         "v2 B-tree leaf record capacity",
@@ -1071,20 +1086,61 @@ fn decode_internal_node_image_into<R: Read + Seek>(
     } else {
         0
     };
-
     let child_count = nrecords_usize
         .checked_add(1)
         .ok_or_else(|| Error::InvalidFormat("v2 B-tree child count overflow".into()))?;
+    let child_entry_size = usize::from(reader.sizeof_addr())
+        .checked_add(max_nrec_size)
+        .and_then(|value| value.checked_add(child_all_nrec_size))
+        .ok_or_else(|| Error::InvalidFormat("v2 B-tree child entry size overflow".into()))?;
+    let child_bytes = child_count
+        .checked_mul(child_entry_size)
+        .ok_or_else(|| Error::InvalidFormat("v2 B-tree child bytes overflow".into()))?;
+    let compact_image_len = checked_usize_sum(
+        &[6, record_bytes_len, child_bytes, 4],
+        "v2 B-tree internal image length",
+    )?;
+    let mut node_image = vec![0; compact_image_len];
+    reader.seek(addr).map_err(|err| {
+        Error::InvalidFormat(format!(
+            "failed to seek to v2 B-tree internal node {addr}: {err}"
+        ))
+    })?;
+    reader.read_bytes_into(&mut node_image)?;
+    let mut image_reader = image_reader(&node_image, reader);
+
+    let mut magic = [0; 4];
+    image_reader.read_bytes_into(&mut magic)?;
+    if magic != B2IN_MAGIC {
+        return Err(Error::InvalidFormat(
+            "invalid v2 B-tree internal magic".into(),
+        ));
+    }
+
+    validate_node_prefix(&mut image_reader, header.tree_type, "v2 B-tree internal")?;
+
+    if nrecords_usize > node_info[depth_index].max_nrec {
+        return Err(Error::InvalidFormat(format!(
+            "v2 B-tree internal node has too many records: {} > {}",
+            nrecords, node_info[depth_index].max_nrec
+        )));
+    }
+
+    image.record_size = record_size;
+    image.record_bytes.clear();
+    image.record_bytes.resize(record_bytes_len, 0);
+    image_reader.read_bytes_into(&mut image.record_bytes)?;
+
     image.children.clear();
     image.children.reserve(child_count);
     for _ in 0..=nrecords {
-        let child_addr = reader.read_addr()?;
+        let child_addr = image_reader.read_addr()?;
         let child_nrecords = btree_u64_to_u16(
-            read_var_uint(reader, max_nrec_size)?,
+            read_var_uint(&mut image_reader, max_nrec_size)?,
             "v2 B-tree child record count",
         )?;
         let child_all_records = if child_all_nrec_size > 0 {
-            read_var_uint(reader, child_all_nrec_size)?
+            read_var_uint(&mut image_reader, child_all_nrec_size)?
         } else {
             u64::from(child_nrecords)
         };
@@ -1116,8 +1172,14 @@ fn decode_internal_node_image_into<R: Read + Seek>(
         }
         image.children.push((child_addr, child_nrecords));
     }
-
-    verify_checksum(reader, addr, "v2 B-tree internal")?;
+    verify_compact_or_padded_node_image(
+        reader,
+        &mut node_image,
+        usize::try_from(header.node_size).map_err(|_| {
+            Error::InvalidFormat("v2 B-tree internal node size is too large".into())
+        })?,
+        "v2 B-tree internal",
+    )?;
 
     Ok(())
 }
@@ -1378,24 +1440,33 @@ fn visit_leaf_records_with_buffer<R: Read + Seek>(
     record: &mut Vec<u8>,
     visit: &mut dyn FnMut(&[u8]) -> Result<()>,
 ) -> Result<()> {
+    let nrecords_usize = usize::from(nrecords);
+    let record_size = usize::from(header.record_size);
+    let record_bytes = nrecords_usize
+        .checked_mul(record_size)
+        .ok_or_else(|| Error::InvalidFormat("v2 B-tree leaf record bytes overflow".into()))?;
+    let compact_image_len =
+        checked_usize_sum(&[6, record_bytes, 4], "v2 B-tree leaf image length")?;
+    let mut node_image = vec![0; compact_image_len];
     reader.seek(addr).map_err(|err| {
         Error::InvalidFormat(format!("failed to seek to v2 B-tree leaf {addr}: {err}"))
     })?;
+    reader.read_bytes_into(&mut node_image)?;
+    let mut image_reader = image_reader(&node_image, reader);
 
     let mut magic = [0; 4];
-    reader.read_bytes_into(&mut magic)?;
+    image_reader.read_bytes_into(&mut magic)?;
     if magic != B2LF_MAGIC {
         return Err(Error::InvalidFormat("invalid v2 B-tree leaf magic".into()));
     }
 
-    validate_node_prefix(reader, header.tree_type, "v2 B-tree leaf")?;
+    validate_node_prefix(&mut image_reader, header.tree_type, "v2 B-tree leaf")?;
 
     if header.record_size == 0 {
         return Err(Error::InvalidFormat(
             "v2 B-tree leaf record size must be positive".into(),
         ));
     }
-    let nrecords_usize = usize::from(nrecords);
     if nrecords_usize > node_info[0].max_nrec {
         return Err(Error::InvalidFormat(format!(
             "v2 B-tree leaf has too many records: {} > {}",
@@ -1403,15 +1474,19 @@ fn visit_leaf_records_with_buffer<R: Read + Seek>(
         )));
     }
 
-    let record_size = usize::from(header.record_size);
     record.clear();
     record.resize(record_size, 0);
     for _ in 0..nrecords {
-        reader.read_bytes_into(record)?;
+        image_reader.read_bytes_into(record)?;
         visit(&record)?;
     }
-
-    verify_checksum(reader, addr, "v2 B-tree leaf")?;
+    verify_compact_or_padded_node_image(
+        reader,
+        &mut node_image,
+        usize::try_from(header.node_size)
+            .map_err(|_| Error::InvalidFormat("v2 B-tree leaf node size is too large".into()))?,
+        "v2 B-tree leaf",
+    )?;
 
     Ok(())
 }
