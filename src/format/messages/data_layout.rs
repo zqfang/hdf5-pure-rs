@@ -132,14 +132,20 @@ impl DataLayoutMessage {
             None
         };
 
-        let mut dims = Vec::with_capacity(ndims);
-        for _ in 0..ndims {
-            dims.push(u64::from(read_u32_le(
+        let chunk_dims = if layout_class == LayoutClass::Chunked {
+            Some(read_u32_chunk_dims_and_element_size(
                 data,
                 &mut pos,
+                ndims,
                 "data layout v1/v2 dimensions",
-            )?));
-        }
+                "data layout v1/v2",
+            )?)
+        } else {
+            for _ in 0..ndims {
+                read_u32_le(data, &mut pos, "data layout v1/v2 dimensions")?;
+            }
+            None
+        };
 
         let mut result = Self::empty(version, layout_class);
         result.data_addr = data_addr;
@@ -147,35 +153,23 @@ impl DataLayoutMessage {
         match layout_class {
             LayoutClass::Compact => {
                 let compact_size = read_u32_len(data, &mut pos, "data layout v1/v2 compact size")?;
-                ensure_available(data, pos, compact_size, "data layout v1/v2 compact data")?;
-                let compact_end = checked_end(pos, compact_size, "data layout v1/v2 compact data")?;
-                result.compact_data = Some(data[pos..compact_end].to_vec());
+                let compact_data = read_window(
+                    data,
+                    &mut pos,
+                    compact_size,
+                    "data layout v1/v2 compact data",
+                )?;
+                result.compact_data = Some(compact_data.to_vec());
             }
             LayoutClass::Contiguous => {
                 result.contiguous_addr = data_addr;
             }
             LayoutClass::Chunked => {
-                if dims.len() < 2 {
-                    return Err(Error::InvalidFormat(
-                        "data layout v1/v2 chunk rank must be at least 2".into(),
-                    ));
-                }
+                let (chunk_dims, element_size) =
+                    chunk_dims.expect("v1/v2 chunked layout dimensions were decoded");
                 result.chunk_index_addr = data_addr;
-                if let Some(&last) = dims.last() {
-                    if last == 0 {
-                        return Err(Error::InvalidFormat(
-                            "data layout v1/v2 chunk element size must be positive".into(),
-                        ));
-                    }
-                    let chunk_dims = &dims[..dims.len() - 1];
-                    validate_chunk_dims_positive(chunk_dims, "data layout v1/v2")?;
-                    result.chunk_element_size = Some(u32::try_from(last).map_err(|_| {
-                        Error::InvalidFormat(
-                            "data layout v1/v2 chunk element size exceeds u32".into(),
-                        )
-                    })?);
-                    result.chunk_dims = Some(chunk_dims.to_vec());
-                }
+                result.chunk_element_size = Some(element_size);
+                result.chunk_dims = Some(chunk_dims);
             }
             LayoutClass::Virtual => unreachable!(),
         }
@@ -243,10 +237,7 @@ impl DataLayoutMessage {
         } else {
             "data layout v4 compact data"
         };
-        ensure_available(data, *pos, size, context)?;
-        let end = checked_end(*pos, size, context)?;
-        result.compact_data = Some(data[*pos..end].to_vec());
-        advance_pos(pos, size, context)?;
+        result.compact_data = Some(read_window(data, pos, size, context)?.to_vec());
         Ok(())
     }
 
@@ -354,27 +345,15 @@ impl DataLayoutMessage {
         }
         let addr = read_le_u64(data, pos, sizeof_addr, "data layout v3 chunk index address")?;
 
-        let mut dims = Vec::with_capacity(ndims);
-        for _ in 0..ndims {
-            dims.push(u64::from(read_u32_le(
-                data,
-                pos,
-                "data layout v3 chunk dimensions",
-            )?));
-        }
-        if let Some(&last) = dims.last() {
-            if last == 0 {
-                return Err(Error::InvalidFormat(
-                    "data layout v3 chunk element size must be positive".into(),
-                ));
-            }
-            let chunk_dims = &dims[..dims.len() - 1];
-            validate_chunk_dims_positive(chunk_dims, "data layout v3")?;
-            result.chunk_element_size = Some(u32::try_from(last).map_err(|_| {
-                Error::InvalidFormat("data layout v3 chunk element size exceeds u32".into())
-            })?);
-            result.chunk_dims = Some(chunk_dims.to_vec());
-        }
+        let (chunk_dims, element_size) = read_u32_chunk_dims_and_element_size(
+            data,
+            pos,
+            ndims,
+            "data layout v3 chunk dimensions",
+            "data layout v3",
+        )?;
+        result.chunk_element_size = Some(element_size);
+        result.chunk_dims = Some(chunk_dims);
         result.chunk_index_addr = Some(addr);
         result.data_addr = Some(addr);
         Ok(())
@@ -685,6 +664,16 @@ fn read_u32_len(data: &[u8], pos: &mut usize, context: &'static str) -> Result<u
         .map_err(|_| Error::InvalidFormat(format!("{context} does not fit in usize")))
 }
 
+fn read_window<'a>(data: &'a [u8], pos: &mut usize, len: usize, context: &str) -> Result<&'a [u8]> {
+    ensure_available(data, *pos, len, context)?;
+    let end = checked_end(*pos, len, context)?;
+    let bytes = data
+        .get(*pos..end)
+        .ok_or_else(|| Error::InvalidFormat(format!("{context} is truncated")))?;
+    *pos = end;
+    Ok(bytes)
+}
+
 fn read_le_u64(data: &[u8], pos: &mut usize, size: usize, context: &str) -> Result<u64> {
     if !(1..=8).contains(&size) {
         return Err(Error::InvalidFormat(format!(
@@ -731,6 +720,38 @@ fn checked_end(pos: usize, len: usize, context: &str) -> Result<usize> {
 fn advance_pos(pos: &mut usize, len: usize, context: &str) -> Result<()> {
     *pos = checked_end(*pos, len, context)?;
     Ok(())
+}
+
+fn read_u32_chunk_dims_and_element_size(
+    data: &[u8],
+    pos: &mut usize,
+    ndims: usize,
+    dims_context: &str,
+    context: &str,
+) -> Result<(Vec<u64>, u32)> {
+    let chunk_dim_count = ndims
+        .checked_sub(1)
+        .ok_or_else(|| Error::InvalidFormat(format!("{context} chunk rank must be positive")))?;
+    let mut dims = Vec::with_capacity(chunk_dim_count);
+    for _ in 0..chunk_dim_count {
+        let dim = u64::from(read_u32_le(data, pos, dims_context)?);
+        dims.push(dim);
+    }
+    let element_size = u64::from(read_u32_le(data, pos, dims_context)?);
+    if dims.is_empty() {
+        return Err(Error::InvalidFormat(format!(
+            "{context} chunk rank must be at least 2"
+        )));
+    }
+    if element_size == 0 {
+        return Err(Error::InvalidFormat(format!(
+            "{context} chunk element size must be positive"
+        )));
+    }
+    validate_chunk_dims_positive(&dims, context)?;
+    let element_size = u32::try_from(element_size)
+        .map_err(|_| Error::InvalidFormat(format!("{context} chunk element size exceeds u32")))?;
+    Ok((dims, element_size))
 }
 
 /// Reject any chunk dimension equal to zero — matches upstream

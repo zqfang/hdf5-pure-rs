@@ -3,7 +3,10 @@
 
 #![allow(dead_code)]
 
-use std::io::{Read, Seek};
+use std::{
+    fmt,
+    io::{Read, Seek},
+};
 
 use crate::error::{Error, Result};
 use crate::format::checksum::checksum_metadata;
@@ -86,8 +89,12 @@ pub(super) fn read_header<R: Read + Seek>(
 }
 
 /// Format an extensible array header for debug printing.
-pub(super) fn hdr_debug(header: &ExtensibleArrayHeader) -> String {
-    format!(
+pub(super) fn write_hdr_debug(
+    header: &ExtensibleArrayHeader,
+    out: &mut impl fmt::Write,
+) -> fmt::Result {
+    write!(
+        out,
         "ExtensibleArrayHeader(class_id={}, raw_element_size={}, index_block_elements={}, max_index_set={}, index_block_addr={:#x})",
         header.class_id,
         header.raw_element_size,
@@ -117,12 +124,14 @@ pub(super) fn cache_hdr_image_len(addr_size: usize, length_size: usize) -> Resul
 }
 
 /// Serialize a dirty extensible array header to its on-disk image.
-pub(super) fn cache_hdr_serialize(
+pub(super) fn cache_hdr_serialize_into(
     header: &ParsedExtensibleArrayHeader,
     addr_size: usize,
     length_size: usize,
-) -> Result<Vec<u8>> {
-    let mut out = Vec::with_capacity(cache_hdr_image_len(addr_size, length_size)?);
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    out.clear();
+    out.reserve(cache_hdr_image_len(addr_size, length_size)?);
     out.extend_from_slice(b"EAHD");
     out.push(0);
     out.push(header.class_id);
@@ -144,16 +153,16 @@ pub(super) fn cache_hdr_serialize(
             .try_into()
             .map_err(|_| Error::InvalidFormat("extensible array page bits overflow".into()))?,
     );
-    encode_var(&mut out, header.super_block_count, length_size)?;
-    encode_var(&mut out, header.super_block_size, length_size)?;
-    encode_var(&mut out, header.data_block_count, length_size)?;
-    encode_var(&mut out, header.data_block_size, length_size)?;
-    encode_var(&mut out, header.max_index_set, length_size)?;
-    encode_var(&mut out, header.realized_elements, length_size)?;
-    encode_addr(&mut out, header.index_block_addr, addr_size)?;
+    encode_var(out, header.super_block_count, length_size)?;
+    encode_var(out, header.super_block_size, length_size)?;
+    encode_var(out, header.data_block_count, length_size)?;
+    encode_var(out, header.data_block_size, length_size)?;
+    encode_var(out, header.max_index_set, length_size)?;
+    encode_var(out, header.realized_elements, length_size)?;
+    encode_addr(out, header.index_block_addr, addr_size)?;
     let checksum = checksum_metadata(&out);
     out.extend_from_slice(&checksum.to_le_bytes());
-    Ok(out)
+    Ok(())
 }
 
 /// Handle metadata-cache action notifications for the header.
@@ -266,8 +275,9 @@ pub(crate) fn read_header_core<R: Read + Seek>(
     addr: u64,
 ) -> Result<ParsedExtensibleArrayHeader> {
     reader.seek(addr)?;
-    let magic = reader.read_bytes(4)?;
-    if magic != b"EAHD" {
+    let mut magic = [0u8; 4];
+    reader.read_bytes_into(&mut magic)?;
+    if magic != *b"EAHD" {
         return Err(Error::InvalidFormat(
             "invalid extensible array header magic".into(),
         ));
@@ -393,10 +403,15 @@ pub(super) fn verify_checksum<R: Read + Seek>(
 ) -> Result<()> {
     let checksum_pos = reader.position()?;
     let stored_checksum = reader.read_u32()?;
-    let check_len = usize::try_from(checksum_pos - start)
-        .map_err(|_| Error::InvalidFormat(format!("{context} checksum span is too large")))?;
+    let check_len = usize::try_from(
+        checksum_pos
+            .checked_sub(start)
+            .ok_or_else(|| Error::InvalidFormat(format!("{context} checksum span underflow")))?,
+    )
+    .map_err(|_| Error::InvalidFormat(format!("{context} checksum span is too large")))?;
     reader.seek(start)?;
-    let check_data = reader.read_bytes(check_len)?;
+    let mut check_data = vec![0; check_len];
+    reader.read_bytes_into(&mut check_data)?;
     let computed = checksum_metadata(&check_data);
     if stored_checksum != computed {
         return Err(Error::InvalidFormat(format!(
@@ -507,7 +522,7 @@ mod tests {
     use crate::io::HdfReader;
 
     use super::{
-        build_super_block_info, cache_hdr_serialize, hdr_fuse_incr_checked, hdr_incr_checked,
+        build_super_block_info, cache_hdr_serialize_into, hdr_fuse_incr_checked, hdr_incr_checked,
         read_header_core,
     };
 
@@ -574,20 +589,21 @@ mod tests {
             max_index_set_pos: 0,
             realized_elements_pos: 0,
         };
-        let image = cache_hdr_serialize(&header, 4, 4).unwrap();
+        let mut image = Vec::new();
+        cache_hdr_serialize_into(&header, 4, 4, &mut image).unwrap();
         assert_eq!(&image[36..40], &[0xff; 4]);
 
         let too_large_index = super::ParsedExtensibleArrayHeader {
             max_index_set: u64::from(u32::MAX) + 1,
             ..header.clone()
         };
-        assert!(cache_hdr_serialize(&too_large_index, 4, 4).is_err());
+        assert!(cache_hdr_serialize_into(&too_large_index, 4, 4, &mut Vec::new()).is_err());
 
         let too_large_addr = super::ParsedExtensibleArrayHeader {
             index_block_addr: u64::from(u32::MAX) + 1,
             ..header
         };
-        assert!(cache_hdr_serialize(&too_large_addr, 4, 4).is_err());
+        assert!(cache_hdr_serialize_into(&too_large_addr, 4, 4, &mut Vec::new()).is_err());
     }
 
     #[test]

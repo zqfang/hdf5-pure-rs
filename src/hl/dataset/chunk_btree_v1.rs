@@ -4,7 +4,7 @@ use crate::error::{Error, Result};
 use crate::filters;
 use crate::io::reader::HdfReader;
 
-use super::chunk_read::{ChunkBTreeRecord, ChunkReadContext};
+use super::chunk_read::{BorrowedChunkPayloadRead, ChunkBTreeRecord, ChunkReadContext};
 use super::{usize_from_u64, Dataset, DatasetInfo};
 
 const MAX_CHUNK_BTREE_V1_RECURSION: usize = 64;
@@ -30,22 +30,61 @@ impl Dataset {
         info: &DatasetInfo,
         chunk_ctx: &ChunkReadContext<'_>,
     ) -> Result<Vec<u8>> {
+        let mut output = Self::scratch_output(chunk_ctx.total_bytes);
+        Self::read_chunked_btree_v1_into(reader, info, chunk_ctx, &mut output)?;
+        Ok(output)
+    }
+
+    pub(super) fn read_chunked_btree_v1_into<R: Read + Seek>(
+        reader: &mut HdfReader<R>,
+        info: &DatasetInfo,
+        chunk_ctx: &ChunkReadContext<'_>,
+        output: &mut [u8],
+    ) -> Result<()> {
+        if output.len() != chunk_ctx.total_bytes {
+            return Err(Error::InvalidFormat(format!(
+                "v1 B-tree chunk output buffer has {} bytes, expected {}",
+                output.len(),
+                chunk_ctx.total_bytes
+            )));
+        }
         let ndims = chunk_ctx.data_dims.len();
         let chunk_records = Self::collect_btree_v1_chunks(reader, chunk_ctx.idx_addr, ndims)?;
-        let mut output = if Self::has_full_chunk_coverage_1d(&chunk_records, chunk_ctx)? {
-            // Optimization opportunity: this path should fully overwrite the buffer, but proving
-            // every fallback/error edge is safe needs a deeper audit before using uninitialized memory.
-            Self::scratch_output(chunk_ctx.total_bytes)
-        } else {
-            Self::filled_data(
+        if !Self::has_full_chunk_coverage_1d(&chunk_records, chunk_ctx)? {
+            Self::filled_data_into(
                 chunk_ctx.total_bytes / chunk_ctx.element_size,
                 chunk_ctx.element_size,
                 info,
-            )?
-        };
+                output,
+            )?;
+        }
         let mut compressed_scratch = Vec::new();
+        let mut raw_scratch = Vec::new();
+        let mut scaled_scratch = Vec::new();
+        let handled = if Self::btree_v1_uses_unfiltered_coalescing(info) {
+            Self::try_read_coalesced_borrowed_unfiltered_chunks_1d(
+                reader,
+                info,
+                chunk_ctx,
+                chunk_records.len(),
+                chunk_records.iter().map(|record| {
+                    Ok(BorrowedChunkPayloadRead {
+                        coords: &record.coords,
+                        addr: record.chunk_addr,
+                        read_size: usize_from_u64(record.chunk_size, "v1 B-tree chunk size")?,
+                        filter_mask: record.filter_mask,
+                    })
+                }),
+                output,
+            )?
+        } else {
+            Vec::new()
+        };
 
-        for chunk_record in &chunk_records {
+        for (chunk_index, chunk_record) in chunk_records.iter().enumerate() {
+            if handled.get(chunk_index).copied().unwrap_or(false) {
+                continue;
+            }
             if Self::try_read_full_chunk_1d_into_output(
                 reader,
                 info,
@@ -54,7 +93,7 @@ impl Dataset {
                 chunk_record.chunk_addr,
                 usize_from_u64(chunk_record.chunk_size, "v1 B-tree chunk size")?,
                 chunk_record.filter_mask,
-                &mut output,
+                output,
                 &mut compressed_scratch,
             )? {
                 continue;
@@ -68,11 +107,20 @@ impl Dataset {
                 chunk_ctx.chunk_dims,
                 chunk_ctx.chunk_bytes,
                 chunk_ctx.element_size,
-                &mut output,
+                output,
+                &mut raw_scratch,
+                &mut scaled_scratch,
             )?;
         }
 
-        Ok(output)
+        Ok(())
+    }
+
+    fn btree_v1_uses_unfiltered_coalescing(info: &DatasetInfo) -> bool {
+        info.filter_pipeline
+            .as_ref()
+            .map(|pipeline| pipeline.filters.is_empty())
+            .unwrap_or(true)
     }
 
     #[cfg(feature = "tracehash")]
@@ -109,27 +157,30 @@ impl Dataset {
     ) {
     }
 
-    fn scaled_chunk_coords(coords: &[u64], chunk_dims: &[u64]) -> Result<Vec<u64>> {
+    fn scaled_chunk_coords_into(
+        coords: &[u64],
+        chunk_dims: &[u64],
+        out: &mut Vec<u64>,
+    ) -> Result<()> {
         if coords.len() != chunk_dims.len() {
             return Err(Error::InvalidFormat(
                 "chunk coordinate rank does not match chunk dimensions".into(),
             ));
         }
-        coords
-            .iter()
-            .zip(chunk_dims)
-            .map(|(&coord, &dim)| {
-                if dim == 0 {
-                    return Err(Error::InvalidFormat("chunk dimension is zero".into()));
-                }
-                if coord % dim != 0 {
-                    return Err(Error::InvalidFormat(
-                        "chunk coordinate is not aligned to chunk dimension".into(),
-                    ));
-                }
-                Ok(coord / dim)
-            })
-            .collect()
+        out.clear();
+        out.reserve(coords.len());
+        for (&coord, &dim) in coords.iter().zip(chunk_dims) {
+            if dim == 0 {
+                return Err(Error::InvalidFormat("chunk dimension is zero".into()));
+            }
+            if coord % dim != 0 {
+                return Err(Error::InvalidFormat(
+                    "chunk coordinate is not aligned to chunk dimension".into(),
+                ));
+            }
+            out.push(coord / dim);
+        }
+        Ok(())
     }
 
     /// Pure deserializer for one v1 chunk-index B-tree node — returns
@@ -144,7 +195,8 @@ impl Dataset {
     ) -> Result<ChunkBTreeNode> {
         reader.seek(addr)?;
 
-        let magic = reader.read_bytes(4)?;
+        let mut magic = [0u8; 4];
+        reader.read_bytes_into(&mut magic)?;
         if magic != [b'T', b'R', b'E', b'E'] {
             return Err(Error::InvalidFormat("invalid chunk B-tree magic".into()));
         }
@@ -312,11 +364,13 @@ impl Dataset {
         chunk_bytes: usize,
         element_size: usize,
         output: &mut [u8],
+        raw_scratch: &mut Vec<u8>,
+        scaled_scratch: &mut Vec<u64>,
     ) -> Result<()> {
-        let scaled = Self::scaled_chunk_coords(&chunk_record.coords, chunk_dims)?;
+        Self::scaled_chunk_coords_into(&chunk_record.coords, chunk_dims, scaled_scratch)?;
         Self::trace_btree1_chunk_lookup(
             btree_addr,
-            &scaled,
+            scaled_scratch,
             chunk_record.chunk_addr,
             chunk_record.chunk_size,
             chunk_record.filter_mask,
@@ -326,15 +380,16 @@ impl Dataset {
             return Ok(());
         }
 
-        let raw = Self::read_btree_v1_chunk_payload(
+        let raw = Self::read_btree_v1_chunk_payload_into_scratch(
             reader,
             chunk_record,
             info,
             chunk_bytes,
             element_size,
+            raw_scratch,
         )?;
         Self::copy_chunk_to_output(
-            &raw,
+            raw,
             &chunk_record.coords,
             data_dims,
             chunk_dims,
@@ -343,21 +398,23 @@ impl Dataset {
         )
     }
 
-    fn read_btree_v1_chunk_payload<R: Read + Seek>(
+    fn read_btree_v1_chunk_payload_into_scratch<'a, R: Read + Seek>(
         reader: &mut HdfReader<R>,
         chunk_record: &ChunkBTreeRecord,
         info: &DatasetInfo,
         chunk_bytes: usize,
         element_size: usize,
-    ) -> Result<Vec<u8>> {
+        raw_scratch: &'a mut Vec<u8>,
+    ) -> Result<&'a [u8]> {
         reader.seek(chunk_record.chunk_addr)?;
         let read_size = usize_from_u64(chunk_record.chunk_size, "v1 B-tree chunk size")?;
-        let mut raw = reader.read_bytes(read_size)?;
+        raw_scratch.resize(read_size, 0);
+        reader.read_bytes_into(raw_scratch)?;
 
         if let Some(ref pipeline) = info.filter_pipeline {
             if !pipeline.filters.is_empty() {
-                raw = filters::apply_pipeline_reverse_with_mask_expected(
-                    &raw,
+                *raw_scratch = filters::apply_pipeline_reverse_with_mask_expected(
+                    raw_scratch,
                     pipeline,
                     element_size,
                     chunk_record.filter_mask,
@@ -366,6 +423,6 @@ impl Dataset {
             }
         }
 
-        Ok(raw)
+        Ok(raw_scratch)
     }
 }

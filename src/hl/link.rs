@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use crate::error::{Error, Result};
 use crate::format::messages::link::LinkMessage;
-use crate::hl::group::{Group, LinkInfo, LinkValue};
+use crate::hl::group::{Group, LinkInfo, LinkMessageRef, LinkValue};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LinkClass {
@@ -84,21 +84,43 @@ impl LinkClassRegistry {
     }
 }
 
-pub fn extern_traverse(group: &Group, name: &str) -> Result<Option<(String, String)>> {
-    Ok(group.find_link_by_name(name)?.external_link)
+pub fn extern_traverse_with<R, F>(group: &Group, name: &str, visitor: F) -> Result<R>
+where
+    F: FnOnce(Option<(&str, &str)>) -> Result<R>,
+{
+    group.with_link_by_name(name, |link| {
+        visitor(
+            link.external_link
+                .as_ref()
+                .map(|(filename, object_path)| (filename.as_str(), object_path.as_str())),
+        )
+    })
 }
 
 pub fn link(group: &Group, name: &str) -> Result<LinkMessage> {
-    group.find_link_by_name(name)
+    link_with(group, name, |link| Ok(link.clone()))
+}
+
+pub fn link_with<R, F>(group: &Group, name: &str, visitor: F) -> Result<R>
+where
+    F: FnOnce(&LinkMessage) -> Result<R>,
+{
+    group.with_link_by_name(name, visitor)
+}
+
+pub fn link_into(group: &Group, name: &str, out: &mut LinkMessage) -> Result<()> {
+    link_with(group, name, |link| {
+        out.clone_from(link);
+        Ok(())
+    })
 }
 
 pub fn link_object(group: &Group, name: &str) -> Result<u64> {
-    group
-        .find_link_by_name(name)?
-        .hard_link_addr
-        .ok_or_else(|| {
+    group.with_link_by_name(name, |link| {
+        link.hard_link_addr.ok_or_else(|| {
             Error::InvalidFormat(format!("link '{name}' does not reference an object header"))
         })
+    })
 }
 
 pub fn create_soft_api_common(
@@ -180,28 +202,90 @@ pub fn create_ud_api(
     create_ud(writer, name, filename, object_path)
 }
 
-pub fn get_val_cb(link: &LinkMessage) -> Option<LinkValue> {
-    if let Some(target) = &link.soft_link_target {
-        return Some(LinkValue::Soft(target.clone()));
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkValueRef<'a> {
+    Soft(&'a str),
+    External {
+        filename: &'a str,
+        object_path: &'a str,
+    },
+}
+
+impl LinkValueRef<'_> {
+    pub fn to_owned(self) -> LinkValue {
+        match self {
+            LinkValueRef::Soft(target) => LinkValue::Soft(target.to_string()),
+            LinkValueRef::External {
+                filename,
+                object_path,
+            } => LinkValue::External {
+                filename: filename.to_string(),
+                object_path: object_path.to_string(),
+            },
+        }
+    }
+}
+
+pub(crate) fn get_val_ref_borrowed(link: LinkMessageRef<'_>) -> Option<LinkValueRef<'_>> {
+    if let Some(target) = link.soft_link_target {
+        return Some(LinkValueRef::Soft(target));
     }
     link.external_link
-        .as_ref()
-        .map(|(filename, object_path)| LinkValue::External {
-            filename: filename.clone(),
-            object_path: object_path.clone(),
+        .map(|(filename, object_path)| LinkValueRef::External {
+            filename,
+            object_path,
         })
 }
 
-pub fn get_val(group: &Group, name: &str) -> Result<Option<LinkValue>> {
-    Ok(get_val_cb(&group.find_link_by_name(name)?))
+pub fn get_val_cb_borrowed(link: &LinkMessage) -> Option<LinkValueRef<'_>> {
+    if let Some(target) = &link.soft_link_target {
+        return Some(LinkValueRef::Soft(target));
+    }
+    link.external_link
+        .as_ref()
+        .map(|(filename, object_path)| LinkValueRef::External {
+            filename,
+            object_path,
+        })
 }
 
-pub fn get_val_by_idx_cb(link: &LinkMessage) -> Option<LinkValue> {
-    get_val_cb(link)
+pub fn get_val_with<R, F>(group: &Group, name: &str, visitor: F) -> Result<R>
+where
+    F: FnOnce(Option<LinkValueRef<'_>>) -> Result<R>,
+{
+    group.with_link_ref_by_name(name, |link| visitor(get_val_ref_borrowed(link)))
+}
+
+pub fn get_val(group: &Group, name: &str) -> Result<Option<LinkValue>> {
+    get_val_with(group, name, |value| Ok(value.map(LinkValueRef::to_owned)))
+}
+
+pub fn get_val_by_idx_cb_borrowed(link: &LinkMessage) -> Option<LinkValueRef<'_>> {
+    get_val_cb_borrowed(link)
+}
+
+pub fn get_val_by_idx_with<R, F>(group: &Group, index: usize, visitor: F) -> Result<R>
+where
+    F: FnOnce(Option<LinkValueRef<'_>>) -> Result<R>,
+{
+    let mut visitor = Some(visitor);
+    let mut result = None;
+    let mut pos = 0usize;
+    group.visit_link_refs_for_link_access(|link| {
+        if pos == index {
+            let visit = visitor
+                .take()
+                .expect("link index visitor called more than once");
+            result = Some(visit(get_val_ref_borrowed(link))?);
+        }
+        pos += 1;
+        Ok(())
+    })?;
+    result.ok_or_else(|| Error::InvalidFormat(format!("link index {index} is out of bounds")))
 }
 
 pub fn get_val_by_idx(group: &Group, index: usize) -> Result<Option<LinkValue>> {
-    group.link_value_by_idx(index)
+    get_val_by_idx_with(group, index, |value| Ok(value.map(LinkValueRef::to_owned)))
 }
 
 pub fn exists_final_cb(group: &Group, name: &str) -> Result<bool> {
@@ -233,59 +317,97 @@ pub fn get_info_by_idx(group: &Group, index: usize) -> Result<LinkInfo> {
 }
 
 pub fn get_name_by_idx(group: &Group, index: usize) -> Result<String> {
-    group.link_name_by_idx(index)
+    get_name_by_idx_with(group, index, |name| Ok(name.to_string()))
 }
 
-pub fn link_copy_file(link: &LinkMessage) -> LinkMessage {
-    link.clone()
+pub fn get_name_by_idx_with<R, F>(group: &Group, index: usize, visitor: F) -> Result<R>
+where
+    F: FnOnce(&str) -> Result<R>,
+{
+    let mut visitor = Some(visitor);
+    let mut result = None;
+    let mut pos = 0usize;
+    group.visit_link_refs_for_link_access(|link| {
+        if pos == index {
+            let visit = visitor
+                .take()
+                .expect("link name index visitor called more than once");
+            result = Some(visit(link.name)?);
+        }
+        pos += 1;
+        Ok(())
+    })?;
+    result.ok_or_else(|| Error::InvalidFormat(format!("link index {index} is out of bounds")))
 }
 
-pub fn copy(link: &LinkMessage) -> LinkMessage {
-    link_copy_file(link)
+pub fn get_name_by_idx_into(group: &Group, index: usize, out: &mut String) -> Result<()> {
+    get_name_by_idx_with(group, index, |name| {
+        out.clear();
+        out.push_str(name);
+        Ok(())
+    })
+}
+
+pub fn link_copy_file_into(link: &LinkMessage, out: &mut LinkMessage) {
+    out.clone_from(link);
+}
+
+pub fn copy_into(link: &LinkMessage, out: &mut LinkMessage) {
+    link_copy_file_into(link, out)
 }
 
 pub fn iterate(group: &Group) -> Result<Vec<LinkMessage>> {
-    group.links()
+    collect_links(group)
+}
+
+pub fn iterate_with<F>(group: &Group, visitor: F) -> Result<()>
+where
+    F: FnMut(&LinkMessage) -> Result<()>,
+{
+    group.visit_links(visitor)
 }
 
 pub fn iterate_by_name2(group: &Group) -> Result<Vec<LinkMessage>> {
-    iterate(group)
+    collect_links(group)
 }
 
 pub fn visit2(group: &Group) -> Result<Vec<LinkMessage>> {
-    iterate(group)
+    collect_links(group)
+}
+
+pub fn visit_with<F>(group: &Group, visitor: F) -> Result<()>
+where
+    F: FnMut(&LinkMessage) -> Result<()>,
+{
+    group.visit_links(visitor)
 }
 
 pub fn visit_by_name2(group: &Group) -> Result<Vec<LinkMessage>> {
-    iterate(group)
+    collect_links(group)
 }
 
 pub fn iterate1(group: &Group) -> Result<Vec<LinkMessage>> {
-    iterate(group)
+    collect_links(group)
 }
 
 pub fn iterate_by_name1(group: &Group) -> Result<Vec<LinkMessage>> {
-    iterate(group)
+    collect_links(group)
 }
 
 pub fn visit1(group: &Group) -> Result<Vec<LinkMessage>> {
-    iterate(group)
+    collect_links(group)
 }
 
 pub fn visit_by_name1(group: &Group) -> Result<Vec<LinkMessage>> {
-    iterate(group)
+    collect_links(group)
 }
 
 pub fn get_ocrt_info(link: &LinkMessage) -> Option<u64> {
     link.creation_order
 }
 
-pub fn iterate_api_common(group: &Group) -> Result<Vec<LinkMessage>> {
-    iterate(group)
-}
-
-pub fn iterate2_shim(group: &Group) -> Result<Vec<LinkMessage>> {
-    iterate(group)
+fn collect_links(group: &Group) -> Result<Vec<LinkMessage>> {
+    group.links()
 }
 
 #[derive(Debug, Clone, Default)]
@@ -300,6 +422,28 @@ impl LinkTable {
             .map(|link| (link.name.clone(), link))
             .collect();
         Self { links }
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &LinkMessage> {
+        self.links.values()
+    }
+
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.links.keys().map(String::as_str)
+    }
+
+    pub fn get(&self, name: &str) -> Option<&LinkMessage> {
+        self.links.get(name)
+    }
+
+    pub fn visit<F>(&self, mut visitor: F) -> Result<()>
+    where
+        F: FnMut(&LinkMessage) -> Result<()>,
+    {
+        for link in self.links.values() {
+            visitor(link)?;
+        }
+        Ok(())
     }
 
     pub fn insert(&mut self, link: LinkMessage) -> Option<LinkMessage> {
@@ -398,7 +542,95 @@ mod tests {
             external_link: None,
         });
         H5Lmove(&mut table, "old", "new").unwrap();
+        {
+            let mut names = table.names();
+            assert_eq!(names.next(), Some("new"));
+            assert_eq!(names.next(), None);
+        }
+        assert_eq!(table.get("new").map(|link| link.name.as_str()), Some("new"));
+        let mut visited = false;
+        table
+            .visit(|link| {
+                assert_eq!(link.name.as_str(), "new");
+                visited = true;
+                Ok(())
+            })
+            .unwrap();
+        assert!(visited);
         assert!(H5L__delete(&mut table, "new").is_ok());
         assert!(H5L__delete(&mut table, "new").is_err());
+    }
+
+    #[test]
+    fn link_value_ref_borrows_soft_targets() {
+        let link = LinkMessage {
+            link_type: crate::format::messages::link::LinkType::Soft,
+            creation_order: None,
+            char_encoding: 0,
+            name: "soft".into(),
+            hard_link_addr: None,
+            soft_link_target: Some("/target".into()),
+            external_link: None,
+        };
+
+        assert_eq!(
+            get_val_cb_borrowed(&link),
+            Some(LinkValueRef::Soft("/target"))
+        );
+        assert_eq!(
+            get_val_by_idx_cb_borrowed(&link),
+            Some(LinkValueRef::Soft("/target"))
+        );
+    }
+
+    #[test]
+    fn link_value_ref_borrows_external_targets() {
+        let link = LinkMessage {
+            link_type: crate::format::messages::link::LinkType::External,
+            creation_order: None,
+            char_encoding: 0,
+            name: "external".into(),
+            hard_link_addr: None,
+            soft_link_target: None,
+            external_link: Some(("file.h5".into(), "/object".into())),
+        };
+
+        assert_eq!(
+            get_val_cb_borrowed(&link),
+            Some(LinkValueRef::External {
+                filename: "file.h5",
+                object_path: "/object"
+            })
+        );
+    }
+
+    #[test]
+    fn link_copy_file_into_reuses_output_storage() {
+        let link = LinkMessage {
+            link_type: crate::format::messages::link::LinkType::Soft,
+            creation_order: None,
+            char_encoding: 0,
+            name: "soft".into(),
+            hard_link_addr: None,
+            soft_link_target: Some("/target".into()),
+            external_link: None,
+        };
+        let mut out = LinkMessage {
+            link_type: crate::format::messages::link::LinkType::Hard,
+            creation_order: None,
+            char_encoding: 0,
+            name: "hard".into(),
+            hard_link_addr: Some(42),
+            soft_link_target: None,
+            external_link: None,
+        };
+
+        link_copy_file_into(&link, &mut out);
+
+        assert_eq!(out.name, link.name);
+        assert_eq!(out.link_type, link.link_type);
+        assert_eq!(out.hard_link_addr, link.hard_link_addr);
+        assert_eq!(out.soft_link_target, link.soft_link_target);
+        assert_eq!(out.external_link, link.external_link);
     }
 }

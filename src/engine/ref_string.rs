@@ -10,8 +10,14 @@ pub struct RefString {
 
 impl RefString {
     /// Duplicate a Rust string into H5RS-owned storage.
-    pub fn xstrdup(value: &str) -> String {
-        value.to_owned()
+    pub fn xstrdup_ref(value: &str) -> &str {
+        value
+    }
+
+    /// Duplicate a Rust string into caller-owned storage.
+    pub fn xstrdup_into(value: &str, out: &mut String) {
+        out.clear();
+        out.push_str(value);
     }
 
     /// Ensure capacity before appending.
@@ -105,7 +111,10 @@ mod tests {
 
     #[test]
     fn ref_string_aliases_roundtrip() {
-        assert_eq!(RefString::xstrdup("a"), "a");
+        assert_eq!(RefString::xstrdup_ref("a"), "a");
+        let mut out = String::new();
+        RefString::xstrdup_into("b", &mut out);
+        assert_eq!(out, "b");
         let mut s = RefString::create("ab");
         s.prepare_for_append(8);
         s.resize_for_append(8);

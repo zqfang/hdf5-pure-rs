@@ -47,31 +47,25 @@ impl AttributeMessage {
         let mut pos = 8;
 
         // Name (null-padded to 8-byte boundary)
-        ensure_available(raw, pos, name_size, "attribute v1 name")?;
         let name = decode_attribute_name(raw, pos, name_size, "attribute v1 name")?;
         let name_padded = align8(name_size, "attribute v1 name")?;
         ensure_available(raw, pos, name_padded, "attribute v1 padded name")?;
         advance_pos(&mut pos, name_padded, "attribute v1 padded name")?;
 
         // Datatype (padded to 8-byte boundary)
-        ensure_available(raw, pos, dt_size, "attribute v1 datatype")?;
-        let dt_end = checked_end(pos, dt_size, "attribute v1 datatype")?;
-        let datatype = DatatypeMessage::decode(&raw[pos..dt_end])?;
+        let datatype = decode_datatype_message(raw, pos, dt_size, "attribute v1 datatype")?;
         let dt_padded = align8(dt_size, "attribute v1 datatype")?;
         ensure_available(raw, pos, dt_padded, "attribute v1 padded datatype")?;
         advance_pos(&mut pos, dt_padded, "attribute v1 padded datatype")?;
 
         // Dataspace (padded to 8-byte boundary)
-        ensure_available(raw, pos, ds_size, "attribute v1 dataspace")?;
-        let ds_end = checked_end(pos, ds_size, "attribute v1 dataspace")?;
-        let dataspace = DataspaceMessage::decode(&raw[pos..ds_end])?;
+        let dataspace = decode_dataspace_message(raw, pos, ds_size, "attribute v1 dataspace")?;
         let ds_padded = align8(ds_size, "attribute v1 dataspace")?;
         ensure_available(raw, pos, ds_padded, "attribute v1 padded dataspace")?;
         advance_pos(&mut pos, ds_padded, "attribute v1 padded dataspace")?;
 
         // Data
-        let data = raw[pos..].to_vec();
-        validate_attribute_data_length(&datatype, &dataspace, data.len())?;
+        let data = checked_attribute_data(raw, pos, &datatype, &dataspace, "attribute v1 data")?;
 
         Ok(Self {
             version: 1,
@@ -79,7 +73,7 @@ impl AttributeMessage {
             char_encoding: 0,
             datatype,
             dataspace,
-            data,
+            data: data.to_vec(),
         })
     }
 
@@ -93,24 +87,18 @@ impl AttributeMessage {
         let mut pos = 8;
 
         // Name (NOT padded in v2)
-        ensure_available(raw, pos, name_size, "attribute v2 name")?;
         let name = decode_attribute_name(raw, pos, name_size, "attribute v2 name")?;
         advance_pos(&mut pos, name_size, "attribute v2 name")?;
 
         // Datatype (NOT padded in v2)
-        ensure_available(raw, pos, dt_size, "attribute v2 datatype")?;
-        let dt_end = checked_end(pos, dt_size, "attribute v2 datatype")?;
-        let datatype = DatatypeMessage::decode(&raw[pos..dt_end])?;
+        let datatype = decode_datatype_message(raw, pos, dt_size, "attribute v2 datatype")?;
         advance_pos(&mut pos, dt_size, "attribute v2 datatype")?;
 
         // Dataspace (NOT padded in v2)
-        ensure_available(raw, pos, ds_size, "attribute v2 dataspace")?;
-        let ds_end = checked_end(pos, ds_size, "attribute v2 dataspace")?;
-        let dataspace = DataspaceMessage::decode(&raw[pos..ds_end])?;
+        let dataspace = decode_dataspace_message(raw, pos, ds_size, "attribute v2 dataspace")?;
         advance_pos(&mut pos, ds_size, "attribute v2 dataspace")?;
 
-        let data = raw[pos..].to_vec();
-        validate_attribute_data_length(&datatype, &dataspace, data.len())?;
+        let data = checked_attribute_data(raw, pos, &datatype, &dataspace, "attribute v2 data")?;
 
         Ok(Self {
             version: 2,
@@ -118,7 +106,7 @@ impl AttributeMessage {
             char_encoding: 0,
             datatype,
             dataspace,
-            data,
+            data: data.to_vec(),
         })
     }
 
@@ -137,22 +125,16 @@ impl AttributeMessage {
         }
         let mut pos = 9;
 
-        ensure_available(raw, pos, name_size, "attribute v3 name")?;
         let name = decode_attribute_name(raw, pos, name_size, "attribute v3 name")?;
         advance_pos(&mut pos, name_size, "attribute v3 name")?;
 
-        ensure_available(raw, pos, dt_size, "attribute v3 datatype")?;
-        let dt_end = checked_end(pos, dt_size, "attribute v3 datatype")?;
-        let datatype = DatatypeMessage::decode(&raw[pos..dt_end])?;
+        let datatype = decode_datatype_message(raw, pos, dt_size, "attribute v3 datatype")?;
         advance_pos(&mut pos, dt_size, "attribute v3 datatype")?;
 
-        ensure_available(raw, pos, ds_size, "attribute v3 dataspace")?;
-        let ds_end = checked_end(pos, ds_size, "attribute v3 dataspace")?;
-        let dataspace = DataspaceMessage::decode(&raw[pos..ds_end])?;
+        let dataspace = decode_dataspace_message(raw, pos, ds_size, "attribute v3 dataspace")?;
         advance_pos(&mut pos, ds_size, "attribute v3 dataspace")?;
 
-        let data = raw[pos..].to_vec();
-        validate_attribute_data_length(&datatype, &dataspace, data.len())?;
+        let data = checked_attribute_data(raw, pos, &datatype, &dataspace, "attribute v3 data")?;
 
         Ok(Self {
             version: 3,
@@ -160,7 +142,7 @@ impl AttributeMessage {
             char_encoding: encoding,
             datatype,
             dataspace,
-            data,
+            data: data.to_vec(),
         })
     }
 
@@ -216,6 +198,20 @@ fn validate_attribute_data_length(
     Ok(())
 }
 
+fn checked_attribute_data<'a>(
+    raw: &'a [u8],
+    pos: usize,
+    datatype: &DatatypeMessage,
+    dataspace: &DataspaceMessage,
+    context: &str,
+) -> Result<&'a [u8]> {
+    let data = raw
+        .get(pos..)
+        .ok_or_else(|| Error::InvalidFormat(format!("{context} offset overflow")))?;
+    validate_attribute_data_length(datatype, dataspace, data.len())?;
+    Ok(data)
+}
+
 fn validate_attribute_flags(flags: u8) -> Result<()> {
     if flags & !ATTRIBUTE_FLAGS_ALL != 0 {
         return Err(Error::InvalidFormat(format!(
@@ -223,6 +219,24 @@ fn validate_attribute_flags(flags: u8) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+fn decode_datatype_message(
+    raw: &[u8],
+    pos: usize,
+    len: usize,
+    context: &str,
+) -> Result<DatatypeMessage> {
+    DatatypeMessage::decode(checked_window(raw, pos, len, context)?)
+}
+
+fn decode_dataspace_message(
+    raw: &[u8],
+    pos: usize,
+    len: usize,
+    context: &str,
+) -> Result<DataspaceMessage> {
+    DataspaceMessage::decode(checked_window(raw, pos, len, context)?)
 }
 
 fn decode_attribute_name(
@@ -236,17 +250,14 @@ fn decode_attribute_name(
             "attribute message name length is invalid".into(),
         ));
     }
-    let name_text_len = name_size
-        .checked_sub(1)
-        .ok_or_else(|| Error::InvalidFormat(format!("{context} length underflow")))?;
-    let name_text = checked_window(raw, pos, name_text_len, context)?;
+    let name_bytes = checked_window(raw, pos, name_size, context)?;
+    let name_text = &name_bytes[..name_size - 1];
     if name_text.contains(&0) {
         return Err(Error::InvalidFormat(
             "attribute name has different length than stored length".into(),
         ));
     }
-    let null_pos = checked_end(pos, name_text_len, context)?;
-    if raw.get(null_pos).copied() != Some(0) {
+    if name_bytes[name_size - 1] != 0 {
         return Err(Error::InvalidFormat(
             "attribute name has different length than stored length".into(),
         ));

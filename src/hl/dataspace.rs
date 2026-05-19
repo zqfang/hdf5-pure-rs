@@ -1,4 +1,13 @@
+use std::fmt::{self, Write};
+
 use crate::format::messages::dataspace::{DataspaceMessage, DataspaceType};
+use crate::hl::selection::Selection;
+
+/// hdf5-metno compatibility extents alias using this crate's current and maximum dimensions.
+pub type Extents = (Vec<u64>, Option<Vec<u64>>);
+
+/// hdf5-metno compatibility raw-selection alias backed by this crate's selection type.
+pub type RawSelection = Selection;
 
 /// High-level dataspace descriptor.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,13 +86,23 @@ impl Dataspace {
     pub fn close_cb(self) {}
 
     /// Return the parsed low-level dataspace message.
+    pub fn raw_message_ref(&self) -> &DataspaceMessage {
+        &self.msg
+    }
+
+    /// Return the parsed low-level dataspace message.
     pub fn raw_message(&self) -> DataspaceMessage {
-        self.msg.clone()
+        self.raw_message_ref().clone()
+    }
+
+    /// Return the parsed simple extent metadata.
+    pub fn simple_extent_ref(&self) -> &DataspaceMessage {
+        self.raw_message_ref()
     }
 
     /// Return the parsed simple extent metadata.
     pub fn simple_extent(&self) -> DataspaceMessage {
-        self.raw_message()
+        self.simple_extent_ref().clone()
     }
 
     /// Explicit dataspace copy operation.
@@ -136,8 +155,84 @@ impl Dataspace {
         true
     }
 
+    /// hdf5-metno compatibility layer: validate the in-memory extent metadata; do not remove.
+    pub fn is_valid(&self) -> bool {
+        if !matches!(self.msg.version, 1 | 2) {
+            return false;
+        }
+
+        if usize::from(self.msg.ndims) != self.msg.dims.len() {
+            return false;
+        }
+
+        if matches!(
+            self.msg.space_type,
+            DataspaceType::Scalar | DataspaceType::Null
+        ) && self.msg.ndims != 0
+        {
+            return false;
+        }
+
+        if let Some(max_dims) = &self.msg.max_dims {
+            max_dims.len() == self.msg.dims.len()
+                && self
+                    .msg
+                    .dims
+                    .iter()
+                    .zip(max_dims)
+                    .all(|(&dim, &max_dim)| dim <= max_dim)
+        } else {
+            true
+        }
+    }
+
+    /// hdf5-metno compatibility layer: dataspace encoding is not implemented in pure-Rust mode; do not remove.
+    pub fn encode(&self) -> crate::Result<Vec<u8>> {
+        Err(crate::Error::Unsupported(
+            "hdf5-metno compatibility Dataspace::encode is not implemented".into(),
+        ))
+    }
+
+    /// hdf5-metno compatibility layer: return current and maximum dimensions; do not remove.
+    pub fn extents(&self) -> crate::Result<Extents> {
+        let mut dims = Vec::with_capacity(self.msg.dims.len());
+        let mut max_dims = None;
+        self.extents_into(&mut dims, &mut max_dims);
+        Ok((dims, max_dims))
+    }
+
+    /// Store current and maximum dimensions in caller-provided buffers.
+    ///
+    /// This keeps repeated metadata access from allocating new dimension
+    /// vectors while the hdf5-metno compatibility `extents` wrapper still
+    /// returns owned values.
+    pub fn extents_into(&self, dims: &mut Vec<u64>, max_dims: &mut Option<Vec<u64>>) {
+        dims.clear();
+        dims.extend_from_slice(&self.msg.dims);
+
+        match (&self.msg.max_dims, max_dims) {
+            (Some(src), Some(dst)) => {
+                dst.clear();
+                dst.extend_from_slice(src);
+            }
+            (Some(src), slot @ None) => {
+                *slot = Some(src.clone());
+            }
+            (None, slot) => {
+                *slot = None;
+            }
+        }
+    }
+
     /// Validate and return a simple dataspace offset vector.
     pub fn offset_simple(&self, offsets: &[i64]) -> crate::Result<Vec<i64>> {
+        let mut out = Vec::with_capacity(offsets.len());
+        self.offset_simple_into(offsets, &mut out)?;
+        Ok(out)
+    }
+
+    /// Validate and store a simple dataspace offset vector in caller storage.
+    pub fn offset_simple_into(&self, offsets: &[i64], out: &mut Vec<i64>) -> crate::Result<()> {
         if offsets.len() != self.ndim() {
             return Err(crate::Error::InvalidFormat(format!(
                 "dataspace offset rank {} does not match dataspace rank {}",
@@ -145,7 +240,9 @@ impl Dataspace {
                 self.ndim()
             )));
         }
-        Ok(offsets.to_vec())
+        out.clear();
+        out.extend_from_slice(offsets);
+        Ok(())
     }
 
     /// Replace this dataspace with a simple extent.
@@ -191,6 +288,21 @@ impl Dataspace {
     /// Return the extent element count.
     pub fn extent_nelem(&self) -> u64 {
         self.size()
+    }
+
+    /// hdf5-metno compatibility layer: return the current selection element count; do not remove.
+    pub fn selection_size(&self) -> usize {
+        usize::try_from(self.size()).unwrap_or(usize::MAX)
+    }
+
+    /// hdf5-metno compatibility layer: return the implicit all-selection; do not remove.
+    pub fn get_raw_selection(&self) -> crate::Result<RawSelection> {
+        Ok(Selection::All)
+    }
+
+    /// hdf5-metno compatibility layer: return the implicit all-selection; do not remove.
+    pub fn get_selection(&self) -> crate::Result<Selection> {
+        self.get_raw_selection()
     }
 
     /// Return the maximum possible element count if all max dimensions are
@@ -241,8 +353,15 @@ impl Dataspace {
     }
 
     /// Debug representation for dataspace diagnostics.
+    pub fn write_debug<W: Write + ?Sized>(&self, out: &mut W) -> fmt::Result {
+        write!(out, "{:?}", self.msg)
+    }
+
+    /// Debug representation for dataspace diagnostics.
     pub fn debug(&self) -> String {
-        format!("{:?}", self.msg)
+        let mut out = String::new();
+        let _ = self.write_debug(&mut out);
+        out
     }
 
     /// Whether any dimension is resizable (has unlimited max dim).
@@ -335,9 +454,15 @@ pub fn H5Sget_simple_extent_ndims(space: &Dataspace) -> usize {
 }
 
 #[allow(non_snake_case)]
+pub fn H5S_extent_get_dims_ref(space: &Dataspace) -> (&[u64], Option<&[u64]>) {
+    space.extent_dims()
+}
+
+#[allow(non_snake_case)]
 pub fn H5S_extent_get_dims(space: &Dataspace) -> (Vec<u64>, Option<Vec<u64>>) {
-    let (dims, max_dims) = space.extent_dims();
-    (dims.to_vec(), max_dims.map(|dims| dims.to_vec()))
+    space
+        .extents()
+        .expect("dataspace extents are already validated in memory")
 }
 
 #[allow(non_snake_case)]
@@ -362,7 +487,7 @@ pub fn H5Sis_simple(space: &Dataspace) -> bool {
 
 #[allow(non_snake_case)]
 pub fn H5S_get_simple_extent(space: &Dataspace) -> Dataspace {
-    Dataspace::from_message(space.simple_extent())
+    Dataspace::from_message(space.simple_extent_ref().clone())
 }
 
 #[allow(non_snake_case)]
@@ -414,8 +539,26 @@ pub fn H5S_select_offset(space: &Dataspace, offsets: &[i64]) -> crate::Result<Ve
 }
 
 #[allow(non_snake_case)]
+pub fn H5S_select_offset_into(
+    space: &Dataspace,
+    offsets: &[i64],
+    out: &mut Vec<i64>,
+) -> crate::Result<()> {
+    space.offset_simple_into(offsets, out)
+}
+
+#[allow(non_snake_case)]
 pub fn H5Soffset_simple(space: &Dataspace, offsets: &[i64]) -> crate::Result<Vec<i64>> {
     H5S_select_offset(space, offsets)
+}
+
+#[allow(non_snake_case)]
+pub fn H5Soffset_simple_into(
+    space: &Dataspace,
+    offsets: &[i64],
+    out: &mut Vec<i64>,
+) -> crate::Result<()> {
+    H5S_select_offset_into(space, offsets, out)
 }
 
 #[allow(non_snake_case)]
@@ -431,6 +574,11 @@ pub fn H5S_extent_equal(left: &Dataspace, right: &Dataspace) -> bool {
 #[allow(non_snake_case)]
 pub fn H5S_extent_nelem(space: &Dataspace) -> u64 {
     space.extent_nelem()
+}
+
+#[allow(non_snake_case)]
+pub fn H5S_write_debug<W: Write + ?Sized>(space: &Dataspace, out: &mut W) -> fmt::Result {
+    space.write_debug(out)
 }
 
 #[allow(non_snake_case)]
@@ -468,8 +616,13 @@ mod tests {
         assert!(space.is_simple_internal());
         assert_eq!(space.mpio_space_type(), DataspaceType::Simple);
         assert_eq!(space.obtain_datatype(), DataspaceType::Simple);
-        assert!(space.debug().contains("Simple"));
+        let mut debug = String::new();
+        space.write_debug(&mut debug).unwrap();
+        assert!(debug.contains("Simple"));
         assert_eq!(space.offset_simple(&[1, -1]).unwrap(), vec![1, -1]);
+        let mut offsets = vec![99];
+        space.offset_simple_into(&[1, -1], &mut offsets).unwrap();
+        assert_eq!(offsets, vec![1, -1]);
         assert!(space.offset_simple(&[0]).is_err());
         space.close_cb();
     }
@@ -489,8 +642,8 @@ mod tests {
             space
         );
         assert_eq!(
-            H5S_extent_get_dims(&space),
-            (vec![2, 3], Some(vec![4, u64::MAX]))
+            H5S_extent_get_dims_ref(&space),
+            (&[2, 3][..], Some(&[4, u64::MAX][..]))
         );
         assert_eq!(H5S_get_npoints_max(&space), u64::MAX);
         assert_eq!(H5S_extent_nelem(&space), 6);
@@ -498,11 +651,16 @@ mod tests {
         assert_eq!(H5Sget_simple_extent_npoints(&space), 6);
         assert_eq!(H5S_get_simple_extent_type(&space), DataspaceType::Simple);
         assert_eq!(H5S_select_offset(&space, &[1, -1]).unwrap(), vec![1, -1]);
+        let mut offsets = vec![99];
+        H5Soffset_simple_into(&space, &[1, -1], &mut offsets).unwrap();
+        assert_eq!(offsets, vec![1, -1]);
         assert!(H5Soffset_simple(&space, &[0]).is_err());
         assert!(H5S_has_extent(&space));
         assert!(H5S__is_simple(&space));
         assert!(H5Sis_simple(&space));
-        assert!(H5S_debug(&space).contains("Simple"));
+        let mut debug = String::new();
+        H5S_write_debug(&space, &mut debug).unwrap();
+        assert!(debug.contains("Simple"));
         assert_eq!(H5S_mpio_space_type(&space), DataspaceType::Simple);
         assert_eq!(H5S__obtain_datatype(&space), DataspaceType::Simple);
 
@@ -512,11 +670,11 @@ mod tests {
         assert!(!H5Sextent_equal(&space, &copied));
         H5Sset_extent_simple(&mut space, vec![2, 3], Some(vec![4, 5])).unwrap();
         assert_eq!(
-            H5S_get_simple_extent_dims(&space),
-            (vec![2, 3], Some(vec![4, 5]))
+            H5S_extent_get_dims_ref(&space),
+            (&[2, 3][..], Some(&[4, 5][..]))
         );
         H5S_set_version(&mut space, 1).unwrap();
-        assert_eq!(space.raw_message().version, 1);
+        assert_eq!(space.raw_message_ref().version, 1);
         H5S__close_cb(H5S_create(DataspaceType::Scalar));
     }
 }

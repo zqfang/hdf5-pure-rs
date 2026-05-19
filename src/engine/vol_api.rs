@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, fmt};
 
 use crate::error::{Error, Result};
 
@@ -98,8 +98,14 @@ pub fn H5VL_new_vol_obj(connector_id: u64, name: impl Into<String>) -> VolObject
 }
 
 #[allow(non_snake_case)]
+#[deprecated(note = "use H5VL_conn_prop_ref or pass borrowed connector references directly")]
 pub fn H5VL_conn_prop_copy(connector: &VolConnector) -> VolConnector {
     connector.clone()
+}
+
+#[allow(non_snake_case)]
+pub fn H5VL_conn_prop_ref(connector: &VolConnector) -> &VolConnector {
+    connector
 }
 
 #[allow(non_snake_case)]
@@ -265,8 +271,23 @@ pub fn H5VL_connector_set_cap_flags(connector: &mut VolConnector, flags: u64) {
 }
 
 #[allow(non_snake_case)]
+pub fn H5VL__connector_names_iter(registry: &VolRegistry) -> impl Iterator<Item = &str> {
+    registry.by_name.keys().map(String::as_str)
+}
+
+#[allow(non_snake_case)]
+#[deprecated(note = "use H5VL__connector_names_iter or H5VL__connector_names_visit")]
 pub fn H5VL__connector_names(registry: &VolRegistry) -> Vec<String> {
-    registry.by_name.keys().cloned().collect()
+    H5VL__connector_names_iter(registry)
+        .map(str::to_owned)
+        .collect()
+}
+
+#[allow(non_snake_case)]
+pub fn H5VL__connector_names_visit(registry: &VolRegistry, mut visit: impl FnMut(&str)) {
+    for name in H5VL__connector_names_iter(registry) {
+        visit(name);
+    }
 }
 
 #[allow(non_snake_case)]
@@ -349,13 +370,47 @@ pub fn H5VL__is_default_conn(registry: &VolRegistry, id: u64) -> bool {
 }
 
 #[allow(non_snake_case)]
-pub fn H5VL_setup_args(args: &[String]) -> Vec<String> {
-    args.to_vec()
+pub fn H5VL_setup_args_ref(args: &[String]) -> &[String] {
+    args
 }
 
 #[allow(non_snake_case)]
+#[deprecated(note = "use H5VL_setup_args_ref or H5VL_setup_args_iter")]
+pub fn H5VL_setup_args(args: &[String]) -> Vec<String> {
+    let mut copied = Vec::new();
+    H5VL_setup_args_into(args, &mut copied);
+    copied
+}
+
+#[allow(non_snake_case)]
+pub fn H5VL_setup_args_iter(args: &[String]) -> impl Iterator<Item = &str> {
+    args.iter().map(String::as_str)
+}
+
+#[allow(non_snake_case)]
+pub fn H5VL_setup_args_into(args: &[String], dst: &mut Vec<String>) {
+    dst.clear();
+    dst.reserve(args.len());
+    dst.extend(args.iter().cloned());
+}
+
+#[allow(non_snake_case)]
+pub fn H5VL_setup_loc_args_ref(name: &str) -> &str {
+    name
+}
+
+#[allow(non_snake_case)]
+#[deprecated(note = "use H5VL_setup_loc_args_ref")]
 pub fn H5VL_setup_loc_args(name: &str) -> String {
-    name.to_string()
+    let mut copied = String::new();
+    H5VL_setup_loc_args_into(name, &mut copied);
+    copied
+}
+
+#[allow(non_snake_case)]
+pub fn H5VL_setup_loc_args_into(name: &str, dst: &mut String) {
+    dst.clear();
+    dst.push_str(H5VL_setup_loc_args_ref(name));
 }
 
 #[allow(non_snake_case)]
@@ -364,13 +419,40 @@ pub fn H5VL_setup_acc_args(flags: u64) -> u64 {
 }
 
 #[allow(non_snake_case)]
-pub fn H5VL_setup_self_args(object: &VolObject) -> VolObject {
-    object.clone()
+pub fn H5VL_setup_self_args_ref(object: &VolObject) -> &VolObject {
+    object
 }
 
 #[allow(non_snake_case)]
+#[deprecated(note = "use H5VL_setup_self_args_ref")]
+pub fn H5VL_setup_self_args(object: &VolObject) -> VolObject {
+    let mut copied = VolObject::default();
+    H5VL_setup_self_args_into(object, &mut copied);
+    copied
+}
+
+#[allow(non_snake_case)]
+pub fn H5VL_setup_self_args_into(object: &VolObject, dst: &mut VolObject) {
+    dst.clone_from(H5VL_setup_self_args_ref(object));
+}
+
+#[allow(non_snake_case)]
+pub fn H5VL_setup_name_args_ref(name: &str) -> &str {
+    name
+}
+
+#[allow(non_snake_case)]
+#[deprecated(note = "use H5VL_setup_name_args_ref")]
 pub fn H5VL_setup_name_args(name: &str) -> String {
-    name.to_string()
+    let mut copied = String::new();
+    H5VL_setup_name_args_into(name, &mut copied);
+    copied
+}
+
+#[allow(non_snake_case)]
+pub fn H5VL_setup_name_args_into(name: &str, dst: &mut String) {
+    dst.clear();
+    dst.push_str(H5VL_setup_name_args_ref(name));
 }
 
 #[allow(non_snake_case)]
@@ -429,8 +511,23 @@ pub fn H5VL__find_opt_operation(registry: &VolRegistry, name: &str) -> Option<u6
 }
 
 #[allow(non_snake_case)]
+pub fn H5VL__opt_operation_names_iter(registry: &VolRegistry) -> impl Iterator<Item = &str> {
+    registry.optional_ops.keys().map(String::as_str)
+}
+
+#[allow(non_snake_case)]
+#[deprecated(note = "use H5VL__opt_operation_names_iter or H5VL__opt_operation_names_visit")]
 pub fn H5VL__opt_operation_names(registry: &VolRegistry) -> Vec<String> {
-    registry.optional_ops.keys().cloned().collect()
+    H5VL__opt_operation_names_iter(registry)
+        .map(str::to_owned)
+        .collect()
+}
+
+#[allow(non_snake_case)]
+pub fn H5VL__opt_operation_names_visit(registry: &VolRegistry, mut visit: impl FnMut(&str)) {
+    for name in H5VL__opt_operation_names_iter(registry) {
+        visit(name);
+    }
 }
 
 #[allow(non_snake_case)]
@@ -445,8 +542,59 @@ pub fn H5VL__native_blob_put(object: &mut VolObject, data: &[u8]) {
 }
 
 #[allow(non_snake_case)]
+pub fn H5VL__native_blob_view(object: &VolObject) -> &[u8] {
+    &object.payload
+}
+
+#[allow(non_snake_case)]
+#[deprecated(
+    note = "use H5VL__native_blob_view, H5VL__native_blob_read_into, or H5VL__native_blob_visit_chunks"
+)]
 pub fn H5VL__native_blob_get(object: &VolObject) -> Vec<u8> {
-    object.payload.clone()
+    let mut payload = Vec::new();
+    H5VL__native_blob_get_into(object, &mut payload);
+    payload
+}
+
+#[allow(non_snake_case)]
+pub fn H5VL__native_blob_read_into(object: &VolObject, dst: &mut [u8]) -> Result<usize> {
+    let payload = H5VL__native_blob_view(object);
+    if dst.len() < payload.len() {
+        return Err(Error::InvalidFormat(format!(
+            "VOL blob destination buffer is too small: need {}, got {}",
+            payload.len(),
+            dst.len()
+        )));
+    }
+
+    dst[..payload.len()].copy_from_slice(payload);
+    Ok(payload.len())
+}
+
+#[allow(non_snake_case)]
+pub fn H5VL__native_blob_get_into(object: &VolObject, dst: &mut Vec<u8>) {
+    let payload = H5VL__native_blob_view(object);
+    dst.clear();
+    dst.reserve(payload.len());
+    dst.extend_from_slice(payload);
+}
+
+#[allow(non_snake_case)]
+pub fn H5VL__native_blob_visit_chunks(
+    object: &VolObject,
+    chunk_size: usize,
+    mut visit: impl FnMut(&[u8]) -> Result<()>,
+) -> Result<()> {
+    if chunk_size == 0 {
+        return Err(Error::InvalidFormat(
+            "VOL blob chunk size must be non-zero".into(),
+        ));
+    }
+
+    for chunk in H5VL__native_blob_view(object).chunks(chunk_size) {
+        visit(chunk)?;
+    }
+    Ok(())
 }
 
 #[allow(non_snake_case)]
@@ -478,6 +626,7 @@ pub fn H5VL_pass_through_init() -> bool {
 }
 
 #[allow(non_snake_case)]
+#[deprecated(note = "use H5VL_conn_prop_ref or pass borrowed connector references directly")]
 pub fn H5VL_pass_through_info_copy(connector: &VolConnector) -> VolConnector {
     connector.clone()
 }
@@ -486,8 +635,31 @@ pub fn H5VL_pass_through_info_copy(connector: &VolConnector) -> VolConnector {
 pub fn H5VL_pass_through_info_free(_connector: VolConnector) {}
 
 #[allow(non_snake_case)]
+pub fn H5VL_pass_through_info_to_str_ref(connector: &VolConnector) -> &str {
+    connector.name.as_str()
+}
+
+#[allow(non_snake_case)]
+#[deprecated(
+    note = "use H5VL_pass_through_info_to_str_ref, H5VL_pass_through_info_to_str_into, or H5VL_pass_through_info_fmt"
+)]
 pub fn H5VL_pass_through_info_to_str(connector: &VolConnector) -> String {
-    connector.name.clone()
+    let mut rendered = String::new();
+    H5VL_pass_through_info_to_str_into(connector, &mut rendered);
+    rendered
+}
+
+#[allow(non_snake_case)]
+pub fn H5VL_pass_through_info_to_str_into(connector: &VolConnector, dst: &mut String) {
+    dst.push_str(H5VL_pass_through_info_to_str_ref(connector));
+}
+
+#[allow(non_snake_case)]
+pub fn H5VL_pass_through_info_fmt(
+    connector: &VolConnector,
+    dst: &mut impl fmt::Write,
+) -> fmt::Result {
+    dst.write_str(H5VL_pass_through_info_to_str_ref(connector))
 }
 
 #[allow(non_snake_case)]
@@ -512,12 +684,26 @@ mod tests {
         assert_eq!(H5VL_connector_get_id(connector), id);
         assert_eq!(H5VL_connector_get_name(connector), "audit_vol");
         assert_eq!(H5VL_connector_get_value(connector), 42);
-        assert!(H5VL__connector_names(&registry).contains(&"audit_vol".to_string()));
+        assert!(H5VL__connector_names_iter(&registry).any(|name| name == "audit_vol"));
+        let mut saw_audit_vol = false;
+        H5VL__connector_names_visit(&registry, |name| {
+            saw_audit_vol |= name == "audit_vol";
+        });
+        assert!(saw_audit_vol);
         assert!(H5VL__is_default_conn(&registry, id));
 
         let connector = registry.connectors.get_mut(&id).unwrap();
         H5VL_connector_set_cap_flags(connector, 0x1234);
         assert_eq!(H5VL_conn_prop_get_cap_flags(connector), 0x1234);
+        assert!(std::ptr::eq(H5VL_conn_prop_ref(connector), connector));
+
+        let mut rendered = String::from("connector=");
+        H5VL_pass_through_info_to_str_into(connector, &mut rendered);
+        assert_eq!(rendered, "connector=audit_vol");
+
+        rendered.clear();
+        H5VL_pass_through_info_fmt(connector, &mut rendered).unwrap();
+        assert_eq!(rendered, "audit_vol");
     }
 
     #[test]
@@ -528,7 +714,12 @@ mod tests {
 
         assert_eq!(H5VL__num_opt_operation(&registry), 2);
         assert_eq!(H5VL__find_opt_operation(&registry, "snapshot"), Some(11));
-        assert!(H5VL__opt_operation_names(&registry).contains(&"flush_async".to_string()));
+        assert!(H5VL__opt_operation_names_iter(&registry).any(|name| name == "flush_async"));
+        let mut saw_flush_async = false;
+        H5VL__opt_operation_names_visit(&registry, |name| {
+            saw_flush_async |= name == "flush_async";
+        });
+        assert!(saw_flush_async);
 
         H5VL__release_dyn_op(&mut registry, "flush_async");
         assert_eq!(H5VL__find_opt_operation(&registry, "flush_async"), None);
@@ -546,6 +737,65 @@ mod tests {
             H5VL__get_connector_by_name(&registry, "native").unwrap().id,
             id
         );
+    }
+
+    #[test]
+    fn setup_args_can_be_iterated_as_borrowed_strings() {
+        let args = vec!["alpha".to_string(), "beta".to_string()];
+        assert_eq!(H5VL_setup_args_ref(&args), args.as_slice());
+        assert!(H5VL_setup_args_iter(&args).eq(["alpha", "beta"]));
+        assert_eq!(H5VL_setup_loc_args_ref("location"), "location");
+        assert_eq!(H5VL_setup_name_args_ref("name"), "name");
+
+        let object = H5VL_new_vol_obj(7, "self");
+        assert!(std::ptr::eq(H5VL_setup_self_args_ref(&object), &object));
+
+        let mut copied_args = vec!["stale".to_string()];
+        H5VL_setup_args_into(&args, &mut copied_args);
+        assert_eq!(copied_args, args);
+
+        let mut loc = String::from("old");
+        H5VL_setup_loc_args_into("location", &mut loc);
+        assert_eq!(loc, "location");
+
+        let mut name = String::from("old");
+        H5VL_setup_name_args_into("name", &mut name);
+        assert_eq!(name, "name");
+
+        let mut copied_object = VolObject::default();
+        H5VL_setup_self_args_into(&object, &mut copied_object);
+        assert_eq!(copied_object, object);
+    }
+
+    #[test]
+    fn native_blob_readers_can_borrow_copy_and_visit() {
+        let mut object = H5VL_new_vol_obj(0, "payload");
+        H5VL__native_blob_put(&mut object, b"abcdef");
+
+        assert_eq!(H5VL__native_blob_view(&object), b"abcdef");
+
+        let mut payload = vec![9; 16];
+        H5VL__native_blob_get_into(&object, &mut payload);
+        assert_eq!(payload, b"abcdef");
+
+        let mut dst = [0; 8];
+        let copied = H5VL__native_blob_read_into(&object, &mut dst).unwrap();
+        assert_eq!(copied, 6);
+        assert_eq!(&dst[..copied], b"abcdef");
+        assert_eq!(dst[6], 0);
+
+        let expected: [&[u8]; 3] = [b"ab", b"cd", b"ef"];
+        let mut chunk_count = 0;
+        H5VL__native_blob_visit_chunks(&object, 2, |chunk| {
+            assert_eq!(chunk, expected[chunk_count]);
+            chunk_count += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(chunk_count, expected.len());
+
+        assert!(H5VL__native_blob_read_into(&object, &mut [0; 3]).is_err());
+        assert!(H5VL__native_blob_visit_chunks(&object, 0, |_| Ok(())).is_err());
     }
 }
 

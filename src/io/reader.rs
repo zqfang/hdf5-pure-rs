@@ -71,17 +71,15 @@ impl<R: Read + Seek> HdfReader<R> {
         Ok(self.inner.seek(SeekFrom::Current(offset))?)
     }
 
-    /// Read exactly `n` bytes into a new vec.
-    pub fn read_bytes(&mut self, n: usize) -> Result<Vec<u8>> {
-        let mut buf = vec![0u8; n];
-        self.inner.read_exact(&mut buf)?;
-        Ok(buf)
+    /// Read bytes into a provided buffer.
+    pub fn read_bytes_into(&mut self, buf: &mut [u8]) -> Result<()> {
+        self.inner.read_exact(buf)?;
+        Ok(())
     }
 
     /// Read exactly `n` bytes into a provided buffer.
     pub fn read_exact(&mut self, buf: &mut [u8]) -> Result<()> {
-        self.inner.read_exact(buf)?;
-        Ok(())
+        self.read_bytes_into(buf)
     }
 
     /// Read a single byte.
@@ -217,6 +215,29 @@ mod tests {
         let data = vec![0x03, 0x02, 0x01];
         let mut r = HdfReader::new(Cursor::new(data));
         assert_eq!(r.read_var_uint(3).unwrap(), 0x010203);
+    }
+
+    #[test]
+    fn test_read_bytes_into() {
+        let data = vec![1, 2, 3, 4];
+        let mut r = HdfReader::new(Cursor::new(data));
+        let mut buf = [0u8; 4];
+
+        r.read_bytes_into(&mut buf).unwrap();
+
+        assert_eq!(buf, [1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn test_read_exact() {
+        let data = vec![5, 6, 7];
+        let mut r = HdfReader::new(Cursor::new(data));
+        let mut buf = [0u8; 2];
+
+        r.read_exact(&mut buf).unwrap();
+
+        assert_eq!(buf, [5, 6]);
+        assert_eq!(r.read_u8().unwrap(), 7);
     }
 
     #[test]

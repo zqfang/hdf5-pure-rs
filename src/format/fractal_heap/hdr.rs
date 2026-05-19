@@ -13,7 +13,8 @@ impl FractalHeapHeader {
     pub fn read_at<R: Read + Seek>(reader: &mut HdfReader<R>, addr: u64) -> Result<Self> {
         reader.seek(addr)?;
 
-        let magic = reader.read_bytes(4)?;
+        let mut magic = [0; 4];
+        reader.read_bytes_into(&mut magic)?;
         if magic != FRHP_MAGIC {
             return Err(Error::InvalidFormat("invalid fractal heap magic".into()));
         }
@@ -66,7 +67,8 @@ impl FractalHeapHeader {
         if io_filter_len > 0 {
             root_direct_filtered_size = Some(reader.read_length()?);
             root_direct_filter_mask = reader.read_u32()?;
-            let pipeline_bytes = reader.read_bytes(usize::from(io_filter_len))?;
+            let mut pipeline_bytes = vec![0; usize::from(io_filter_len)];
+            reader.read_bytes_into(&mut pipeline_bytes)?;
             filter_pipeline = Some(FilterPipelineMessage::decode(&pipeline_bytes)?);
         }
 

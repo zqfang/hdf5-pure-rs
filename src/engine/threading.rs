@@ -1,3 +1,4 @@
+use std::fmt;
 use std::sync::atomic::{
     AtomicBool, AtomicI32, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering,
 };
@@ -296,9 +297,21 @@ impl TsRwLock {
         self.stats.wrunlocks.store(0, Ordering::Relaxed);
     }
 
-    pub fn rec_rwlock_print_stats(&self) -> String {
+    pub fn rec_rwlock_print_stats_fmt<W>(&self, out: &mut W) -> fmt::Result
+    where
+        W: fmt::Write + ?Sized,
+    {
         let (rd, wr, rdu, wru) = self.rec_rwlock_get_stats();
-        format!("rdlock={rd}, wrlock={wr}, rdunlock={rdu}, wrunlock={wru}")
+        write!(
+            out,
+            "rdlock={rd}, wrlock={wr}, rdunlock={rdu}, wrunlock={wru}"
+        )
+    }
+
+    pub fn rec_rwlock_print_stats_into(&self, out: &mut String) {
+        out.clear();
+        self.rec_rwlock_print_stats_fmt(out)
+            .expect("writing to String cannot fail");
     }
 }
 
@@ -391,11 +404,11 @@ impl ThreadInfo {
 }
 
 #[derive(Debug)]
-pub struct TsKey<T: Clone> {
+pub struct TsKey<T> {
     value: Mutex<Option<T>>,
 }
 
-impl<T: Clone> TsKey<T> {
+impl<T> TsKey<T> {
     pub fn key_create() -> Self {
         Self {
             value: Mutex::new(None),
@@ -406,11 +419,30 @@ impl<T: Clone> TsKey<T> {
         *self.value.lock().expect("key poisoned") = Some(value);
     }
 
-    pub fn key_get_value(&self) -> Option<T> {
-        self.value.lock().expect("key poisoned").clone()
+    pub fn key_with_value<R>(&self, f: impl FnOnce(&T) -> R) -> Option<R> {
+        let value = self.value.lock().expect("key poisoned");
+        value.as_ref().map(f)
+    }
+
+    pub fn key_take_value(&self) -> Option<T> {
+        self.value.lock().expect("key poisoned").take()
     }
 
     pub fn key_delete(self) {}
+}
+
+impl<T: Clone> TsKey<T> {
+    #[deprecated(
+        since = "0.1.0",
+        note = "use key_with_value for borrowed access or key_take_value for ownership transfer"
+    )]
+    pub fn key_get_value(&self) -> Option<T> {
+        self.key_get_value_cloned()
+    }
+
+    pub fn key_get_value_cloned(&self) -> Option<T> {
+        self.value.lock().expect("key poisoned").clone()
+    }
 }
 
 pub fn once(once: &Once, f: impl FnOnce()) {
@@ -477,7 +509,9 @@ pub fn atomic_init_usize(value: usize) -> AtomicUsize {
 
 #[cfg(test)]
 mod tests {
-    use super::{atomic_fetch_add_int, atomic_init_int, atomic_load_int, TsMutex, TsThreadPool};
+    use super::{
+        atomic_fetch_add_int, atomic_init_int, atomic_load_int, TsKey, TsMutex, TsThreadPool,
+    };
 
     #[test]
     fn threading_mutex_and_pool_do_real_work() {
@@ -495,5 +529,21 @@ mod tests {
         }
         pool.pool_do();
         assert_eq!(atomic_load_int(&value), 4);
+    }
+
+    #[test]
+    fn threading_key_supports_borrowed_and_owned_access() {
+        #[derive(Debug, PartialEq, Eq)]
+        struct NoClone(String);
+
+        let key = TsKey::key_create();
+        key.key_set_value(NoClone("value".to_string()));
+
+        assert_eq!(
+            key.key_with_value(|value| value.0.as_str() == "value"),
+            Some(true)
+        );
+        assert_eq!(key.key_take_value(), Some(NoClone("value".to_string())));
+        assert!(key.key_with_value(|_| ()).is_none());
     }
 }

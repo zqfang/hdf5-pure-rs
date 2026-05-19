@@ -137,8 +137,8 @@ impl Dataset {
             }
             Some(pipeline) if Self::is_shuffle_deflate_pipeline(pipeline) && filter_mask == 0 => {
                 Self::read_chunk_into_scratch(reader, addr, read_size, compressed_scratch)?;
-                let mut shuffled =
-                    crate::filters::deflate::decompress_exact(compressed_scratch, dst_range.len())?;
+                let mut shuffled = vec![0u8; dst_range.len()];
+                crate::filters::deflate::decompress_exact_into(compressed_scratch, &mut shuffled)?;
                 crate::filters::shuffle::unshuffle_into(
                     &shuffled,
                     chunk_ctx.element_size,

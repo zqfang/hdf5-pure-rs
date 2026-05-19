@@ -73,6 +73,15 @@ let strings = ds.read_strings()?;       // Vec<String>
 let x_vals: Vec<f64> = ds.read_field::<f64>("x")?;
 ```
 
+## API migration note
+
+The crate is migrating internal and Rust-native APIs toward the original
+library's allocation behavior: borrowed views, iterators, visitor callbacks,
+and caller-provided output buffers should be preferred over `Vec`-returning
+helpers when the original code does not allocate. Future changes should keep
+auditing this migration path, especially where deprecated owned-return APIs
+remain for compatibility with public `hdf5-metno`-style entry points.
+
 ## Features
 
 | Area | Supported | Not Supported / Not Full Parity |

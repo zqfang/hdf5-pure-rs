@@ -8,25 +8,25 @@ use crate::io::reader::HdfReader;
 use super::{usize_from_u64, Dataset, DatasetInfo};
 
 impl Dataset {
-    pub(super) fn read_external_raw_data<R: Read + Seek>(
+    pub(super) fn read_external_raw_data_into<R: Read + Seek>(
         reader: &mut HdfReader<R>,
         hdf5_path: Option<&Path>,
         info: &DatasetInfo,
-        total_bytes: usize,
-    ) -> Result<Vec<u8>> {
+        output: &mut [u8],
+    ) -> Result<()> {
         let external = info.external_file_list.as_ref().ok_or_else(|| {
             Error::InvalidFormat("contiguous dataset has no external file list".into())
         })?;
         let heap = crate::format::local_heap::LocalHeap::read_at(reader, external.heap_addr)?;
-        let mut output = vec![0u8; total_bytes];
+        let total_bytes = output.len();
         let mut output_offset = 0usize;
         for entry in &external.entries {
             if output_offset >= total_bytes {
                 break;
             }
             let name_offset = usize_from_u64(entry.name_offset, "external file name offset")?;
-            let file_name = heap.get_string(name_offset)?;
-            let path = Self::resolve_external_raw_file_path(hdf5_path, &file_name)?;
+            let file_name = heap.get_str(name_offset)?;
+            let path = Self::resolve_external_raw_file_path(hdf5_path, file_name)?;
             let remaining = total_bytes - output_offset;
             let reserved = if entry.size == u64::MAX {
                 remaining
@@ -35,7 +35,7 @@ impl Dataset {
             };
             let mut file = fs::File::open(&path)?;
             file.seek(std::io::SeekFrom::Start(entry.file_offset))?;
-            let dst = external_output_window(&mut output, output_offset, reserved)?;
+            let dst = external_output_window(output, output_offset, reserved)?;
             file.read_exact(dst)?;
             output_offset += reserved;
         }
@@ -44,7 +44,7 @@ impl Dataset {
                 "external raw data storage covers {output_offset} of {total_bytes} bytes"
             )));
         }
-        Ok(output)
+        Ok(())
     }
 
     fn resolve_external_raw_file_path(

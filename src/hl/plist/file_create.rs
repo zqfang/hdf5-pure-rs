@@ -29,7 +29,7 @@ pub enum FileSpaceStrategy {
 }
 
 /// Shared object-header-message index configuration.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SharedMessageIndex {
     pub message_type_flags: u32,
     pub minimum_message_size: u32,
@@ -129,7 +129,17 @@ impl FileCreate {
 
     /// Shared object-header-message index configuration by index.
     pub fn shared_mesg_index(&self, _index: usize) -> Option<SharedMessageIndex> {
-        self.shared_mesg_indexes.get(_index).cloned()
+        self.shared_mesg_indexes.get(_index).copied()
+    }
+
+    /// Borrow shared object-header-message index configuration by index.
+    pub fn shared_mesg_index_ref(&self, index: usize) -> Option<&SharedMessageIndex> {
+        self.shared_mesg_indexes.get(index)
+    }
+
+    /// Borrow all shared object-header-message index configurations.
+    pub fn shared_mesg_indexes(&self) -> &[SharedMessageIndex] {
+        self.shared_mesg_indexes.as_slice()
     }
 
     /// Set one shared object-header-message index configuration.

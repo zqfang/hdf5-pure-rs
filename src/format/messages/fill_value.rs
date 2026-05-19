@@ -59,7 +59,7 @@ impl FillValueMessage {
             )));
         }
         let defined = defined_state != 0;
-        let value = if defined {
+        let value_payload = if defined {
             if data.len() < 8 {
                 return Err(Error::InvalidFormat(
                     "fill value v2 missing value size".into(),
@@ -67,13 +67,14 @@ impl FillValueMessage {
             }
             let size = read_u32_len_at(data, 4, "fill value v2 value size")?;
             if size > 0 {
-                Some(checked_window(data, 8, size, "fill value v2 value")?.to_vec())
+                Some(checked_window(data, 8, size, "fill value v2 value")?)
             } else {
                 None
             }
         } else {
             None
         };
+        let value = value_payload.map(<[u8]>::to_vec);
 
         let message = Self {
             version: data[0],
@@ -118,7 +119,7 @@ impl FillValueMessage {
         }
         let defined = !undefined;
 
-        let value = if have_value {
+        let value_payload = if have_value {
             if data.len() < 6 {
                 return Err(Error::InvalidFormat(
                     "fill value v3 missing value size".into(),
@@ -126,13 +127,14 @@ impl FillValueMessage {
             }
             let size = read_u32_len_at(data, 2, "fill value v3 value size")?;
             if size > 0 {
-                Some(checked_window(data, 6, size, "fill value v3 value")?.to_vec())
+                Some(checked_window(data, 6, size, "fill value v3 value")?)
             } else {
                 None
             }
         } else {
             None
         };
+        let value = value_payload.map(<[u8]>::to_vec);
 
         let message = Self {
             version: 3,
@@ -168,8 +170,8 @@ impl FillValueMessage {
         }
 
         let size = read_u32_len_at(data, 0, "old fill value size")?;
-        let value = if size > 0 {
-            Some(checked_window(data, 4, size, "old fill value")?.to_vec())
+        let value_payload = if size > 0 {
+            Some(checked_window(data, 4, size, "old fill value")?)
         } else {
             None
         };
@@ -181,6 +183,8 @@ impl FillValueMessage {
                 )));
             }
         }
+
+        let value = value_payload.map(<[u8]>::to_vec);
 
         let message = Self {
             version: 0,

@@ -1,4 +1,7 @@
-use std::io::{Read, Seek};
+use std::{
+    fmt,
+    io::{Read, Seek},
+};
 
 use crate::error::{Error, Result};
 use crate::io::reader::{HdfReader, UNDEF_ADDR};
@@ -129,38 +132,59 @@ impl LocalHeap {
 
     /// Deserialize the free list for a heap data block. Mirrors
     /// `H5HL__fl_deserialize`: parses pairs of (offset, size) records.
-    pub fn fl_deserialize(data: &[u8]) -> Result<Vec<(u64, u64)>> {
+    pub fn fl_entries(data: &[u8]) -> Result<impl Iterator<Item = (u64, u64)> + '_> {
         if data.len() % 16 != 0 {
             return Err(Error::InvalidFormat(
                 "local heap free-list image has a partial trailing record".into(),
             ));
         }
-        let mut entries = Vec::new();
-        let mut pos = 0usize;
-        while let Some(record) = checked_window(data, pos, 16) {
-            let offset = read_le_u64_from_record(record, 0).ok_or_else(|| {
-                Error::InvalidFormat("local heap free-list offset is truncated".into())
-            })?;
-            let size = read_le_u64_from_record(record, 8).ok_or_else(|| {
-                Error::InvalidFormat("local heap free-list size is truncated".into())
-            })?;
-            entries.push((offset, size));
-            pos += 16;
-        }
-        Ok(entries)
+        Ok(data.chunks_exact(16).map(|record| {
+            let offset = read_le_u64_from_record(record, 0)
+                .expect("validated local heap free-list record offset");
+            let size = read_le_u64_from_record(record, 8)
+                .expect("validated local heap free-list record size");
+            (offset, size)
+        }))
     }
 
-    /// Serialize the free list for a heap data block. Mirrors
-    /// `H5HL__fl_serialize`.
-    pub fn fl_serialize(entries: &[(u64, u64)]) -> Result<Vec<u8>> {
+    /// Deserialize the free list for a heap data block into `out`.
+    ///
+    /// The output buffer is cleared before entries are written.
+    pub fn fl_deserialize_into(data: &[u8], out: &mut Vec<(u64, u64)>) -> Result<()> {
+        let entries = Self::fl_entries(data)?;
+        out.clear();
+        out.extend(entries);
+        Ok(())
+    }
+
+    /// Deserialize the free list for a heap data block into an owned vector.
+    pub fn fl_deserialize(data: &[u8]) -> Result<Vec<(u64, u64)>> {
+        let entries = Self::fl_entries(data)?;
+        let mut out = Vec::with_capacity(data.len() / 16);
+        out.extend(entries);
+        Ok(out)
+    }
+
+    /// Serialize the free list for a heap data block into `out`.
+    ///
+    /// The output buffer is cleared before the image is written.
+    pub fn fl_serialize_into(entries: &[(u64, u64)], out: &mut Vec<u8>) -> Result<()> {
         let capacity = entries.len().checked_mul(16).ok_or_else(|| {
             Error::InvalidFormat("local heap free-list image length overflow".into())
         })?;
-        let mut out = Vec::with_capacity(capacity);
+        out.clear();
+        out.reserve_exact(capacity);
         for &(offset, size) in entries {
             out.extend_from_slice(&offset.to_le_bytes());
             out.extend_from_slice(&size.to_le_bytes());
         }
+        Ok(())
+    }
+
+    /// Serialize the free list for a heap data block to an owned image.
+    pub fn fl_serialize(entries: &[(u64, u64)]) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        Self::fl_serialize_into(entries, &mut out)?;
         Ok(out)
     }
 
@@ -189,20 +213,35 @@ impl LocalHeap {
             .ok_or_else(|| Error::InvalidFormat("local heap prefix image length overflow".into()))
     }
 
-    /// Serialize a local heap prefix to its on-disk image. Mirrors
-    /// `H5HL__cache_prefix_serialize`.
+    /// Serialize a local heap prefix to `out`.
+    ///
+    /// The output buffer is cleared before the image is written.
+    pub fn cache_prefix_serialize_into(
+        prefix: &LocalHeapPrefix,
+        addr_size: usize,
+        length_size: usize,
+        out: &mut Vec<u8>,
+    ) -> Result<()> {
+        let image_len = Self::cache_prefix_image_len(addr_size, length_size)?;
+        out.clear();
+        out.reserve_exact(image_len);
+        out.extend_from_slice(&HEAP_MAGIC);
+        out.push(0);
+        out.extend_from_slice(&[0, 0, 0]);
+        encode_var(out, prefix.data_size, length_size)?;
+        encode_optional_length(out, prefix.free_list_offset, length_size)?;
+        encode_addr(out, prefix.data_addr, addr_size)?;
+        Ok(())
+    }
+
+    /// Serialize a local heap prefix to its on-disk image.
     pub fn cache_prefix_serialize(
         prefix: &LocalHeapPrefix,
         addr_size: usize,
         length_size: usize,
     ) -> Result<Vec<u8>> {
-        let mut out = Vec::with_capacity(Self::cache_prefix_image_len(addr_size, length_size)?);
-        out.extend_from_slice(&HEAP_MAGIC);
-        out.push(0);
-        out.extend_from_slice(&[0, 0, 0]);
-        encode_var(&mut out, prefix.data_size, length_size)?;
-        encode_optional_length(&mut out, prefix.free_list_offset, length_size)?;
-        encode_addr(&mut out, prefix.data_addr, addr_size)?;
+        let mut out = Vec::new();
+        Self::cache_prefix_serialize_into(prefix, addr_size, length_size, &mut out)?;
         Ok(out)
     }
 
@@ -225,6 +264,20 @@ impl LocalHeap {
     /// Deserialize a local heap data block from its on-disk image.
     /// Mirrors libhdf5's `H5HL__cache_datablock_deserialize`.
     pub fn cache_datablock_deserialize(prefix: &LocalHeapPrefix, image: &[u8]) -> Result<Self> {
+        let mut data = Vec::new();
+        Self::cache_datablock_deserialize_into(prefix, image, &mut data)?;
+        Ok(Self { data })
+    }
+
+    /// Deserialize a local heap data block into `out`.
+    ///
+    /// The output buffer is cleared only after the borrowed image length has
+    /// been validated against the prefix.
+    pub fn cache_datablock_deserialize_into(
+        prefix: &LocalHeapPrefix,
+        image: &[u8],
+        out: &mut Vec<u8>,
+    ) -> Result<()> {
         let expected_len = heap_len(prefix.data_size, "local heap data block size")?;
         if image.len() != expected_len {
             return Err(Error::InvalidFormat(format!(
@@ -232,19 +285,35 @@ impl LocalHeap {
                 image.len()
             )));
         }
-        Ok(Self {
-            data: image.to_vec(),
-        })
+        out.clear();
+        out.reserve_exact(image.len());
+        out.extend_from_slice(image);
+        Ok(())
     }
 
-    /// Serialize the local heap's data block to its on-disk image.
-    /// Mirrors `H5HL__cache_datablock_serialize`.
-    pub fn cache_datablock_serialize(&self) -> Result<Vec<u8>> {
+    /// Borrow the local heap's data block as its on-disk image.
+    pub fn cache_datablock_image(&self) -> Result<&[u8]> {
         let len = u64::try_from(self.data.len()).map_err(|_| {
             Error::InvalidFormat("local heap data block length does not fit in u64".into())
         })?;
         heap_len(len, "local heap data block size")?;
-        Ok(self.data.clone())
+        Ok(&self.data)
+    }
+
+    /// Serialize the local heap's data block into `out`.
+    ///
+    /// The output buffer is cleared before the image is written.
+    pub fn cache_datablock_serialize_into(&self, out: &mut Vec<u8>) -> Result<()> {
+        let image = self.cache_datablock_image()?;
+        out.clear();
+        out.reserve_exact(image.len());
+        out.extend_from_slice(image);
+        Ok(())
+    }
+
+    /// Serialize the local heap's data block to its on-disk image.
+    pub fn cache_datablock_serialize(&self) -> Result<Vec<u8>> {
+        Ok(self.cache_datablock_image()?.to_vec())
     }
 
     /// Flush-dependency lifecycle hook. Mirrors
@@ -283,9 +352,17 @@ impl LocalHeap {
         self.data.resize(new_size, 0);
     }
 
-    /// Render debugging information about the heap. Mirrors `H5HL_debug`.
+    /// Render debugging information about the heap into `out`.
+    pub fn write_debug(&self, out: &mut impl fmt::Write) -> fmt::Result {
+        write!(out, "LocalHeap(size={})", self.data.len())
+    }
+
+    /// Render debugging information about the heap.
     pub fn debug(&self) -> String {
-        format!("LocalHeap(size={})", self.data.len())
+        let mut out = String::new();
+        self.write_debug(&mut out)
+            .expect("writing LocalHeap debug output to String cannot fail");
+        out
     }
 
     /// Read a local heap from the given address.
@@ -307,7 +384,8 @@ impl LocalHeap {
         reader.seek(addr)?;
 
         // Magic
-        let magic = reader.read_bytes(4)?;
+        let mut magic = [0u8; 4];
+        reader.read_bytes_into(&mut magic)?;
         if magic != HEAP_MAGIC {
             return Err(Error::InvalidFormat("invalid local heap magic".into()));
         }
@@ -356,13 +434,33 @@ impl LocalHeap {
         if prefix.data_size == 0 {
             return Ok(Self { data: Vec::new() });
         }
+        let data_len = heap_len(prefix.data_size, "local heap data size")?;
+        let data_end = prefix
+            .data_addr
+            .checked_add(prefix.data_size)
+            .ok_or_else(|| {
+                Error::InvalidFormat("local heap data segment address overflow".into())
+            })?;
+        let file_len = reader.len()?;
+        if data_end > file_len {
+            return Err(Error::InvalidFormat(
+                "local heap data segment extends past end of file".into(),
+            ));
+        }
         reader.seek(prefix.data_addr)?;
-        let data = reader.read_bytes(heap_len(prefix.data_size, "local heap data size")?)?;
+        let mut data = vec![0; data_len];
+        reader.read_bytes_into(&mut data)?;
         Ok(Self { data })
     }
 
-    /// Get a null-terminated string at the given offset in the heap data.
-    pub fn get_string(&self, offset: usize) -> Result<String> {
+    /// Borrow a null-terminated UTF-8 string at the given offset.
+    pub fn get_str(&self, offset: usize) -> Result<&str> {
+        std::str::from_utf8(self.get_bytes(offset)?)
+            .map_err(|_| Error::InvalidFormat("local heap string is not UTF-8".into()))
+    }
+
+    /// Borrow the raw bytes of a null-terminated string at the given offset.
+    pub fn get_bytes(&self, offset: usize) -> Result<&[u8]> {
         if offset >= self.data.len() {
             return Err(Error::InvalidFormat(
                 "local heap string offset is out of bounds".into(),
@@ -377,9 +475,25 @@ impl LocalHeap {
                 Error::InvalidFormat("local heap string is not null-terminated".into())
             })?;
 
-        std::str::from_utf8(&self.data[offset..end])
-            .map(str::to_string)
-            .map_err(|_| Error::InvalidFormat("local heap string is not UTF-8".into()))
+        Ok(&self.data[offset..end])
+    }
+
+    /// Copy a null-terminated UTF-8 string at the given offset into `out`.
+    ///
+    /// The borrowed string range and UTF-8 are validated before `out` is
+    /// cleared, so errors leave the caller's buffer untouched.
+    pub fn get_string_into(&self, offset: usize, out: &mut String) -> Result<()> {
+        let value = self.get_str(offset)?;
+        out.clear();
+        out.push_str(value);
+        Ok(())
+    }
+
+    /// Get a null-terminated UTF-8 string at the given offset as an owned value.
+    pub fn get_string(&self, offset: usize) -> Result<String> {
+        let mut out = String::new();
+        self.get_string_into(offset, &mut out)?;
+        Ok(out)
     }
 
     /// Locate the terminating null byte of the string starting at `offset`,
@@ -495,13 +609,6 @@ fn undefined_address(width: u8) -> Result<u64> {
     })
 }
 
-/// Sub-slice of `data` covering `[pos, pos+len)`, returning `None`
-/// instead of panicking on out-of-range or overflowing inputs.
-fn checked_window(data: &[u8], pos: usize, len: usize) -> Option<&[u8]> {
-    let end = pos.checked_add(len)?;
-    data.get(pos..end)
-}
-
 /// Read an 8-byte little-endian `u64` from `record` at `offset`, returning
 /// `None` if the slice is too short.
 fn read_le_u64_from_record(record: &[u8], offset: usize) -> Option<u64> {
@@ -518,7 +625,11 @@ mod tests {
     fn insert_get_and_remove_string() {
         let mut heap = LocalHeap::new();
         let offset = heap.insert(b"name").unwrap();
-        assert_eq!(heap.get_string(offset).unwrap(), "name");
+        assert_eq!(heap.get_str(offset).unwrap(), "name");
+        assert_eq!(heap.get_bytes(offset).unwrap(), b"name");
+        let mut owned = String::from("previous");
+        heap.get_string_into(offset, &mut owned).unwrap();
+        assert_eq!(owned, "name");
         heap.remove(offset).unwrap();
         assert_eq!(heap.data[offset], 0);
     }
@@ -526,7 +637,8 @@ mod tests {
     #[test]
     fn prefix_serializes_fixed_header_fields() {
         let prefix = LocalHeap::prfx_new(16, 0, 128);
-        let encoded = LocalHeap::cache_prefix_serialize(&prefix, 8, 8).unwrap();
+        let mut encoded = vec![99];
+        LocalHeap::cache_prefix_serialize_into(&prefix, 8, 8, &mut encoded).unwrap();
         assert_eq!(&encoded[..4], b"HEAP");
         assert_eq!(encoded[4], 0);
     }
@@ -534,15 +646,20 @@ mod tests {
     #[test]
     fn local_heap_prefix_serialize_checks_configured_widths() {
         let prefix = LocalHeap::prfx_new(16, u64::MAX, UNDEF_ADDR);
-        let encoded = LocalHeap::cache_prefix_serialize(&prefix, 4, 4).unwrap();
+        let mut encoded = Vec::new();
+        LocalHeap::cache_prefix_serialize_into(&prefix, 4, 4, &mut encoded).unwrap();
         assert_eq!(&encoded[12..16], &[0xff; 4]);
         assert_eq!(&encoded[16..20], &[0xff; 4]);
 
         let too_large_size = LocalHeap::prfx_new(u64::from(u32::MAX) + 1, 0, 128);
-        assert!(LocalHeap::cache_prefix_serialize(&too_large_size, 4, 4).is_err());
+        assert!(
+            LocalHeap::cache_prefix_serialize_into(&too_large_size, 4, 4, &mut encoded).is_err()
+        );
 
         let too_large_addr = LocalHeap::prfx_new(16, 0, u64::from(u32::MAX) + 1);
-        assert!(LocalHeap::cache_prefix_serialize(&too_large_addr, 4, 4).is_err());
+        assert!(
+            LocalHeap::cache_prefix_serialize_into(&too_large_addr, 4, 4, &mut encoded).is_err()
+        );
     }
 
     #[test]
@@ -563,7 +680,8 @@ mod tests {
         );
 
         let prefix = LocalHeap::prfx_new(0, u64::MAX, 128);
-        let image = LocalHeap::cache_prefix_serialize(&prefix, 8, 8).unwrap();
+        let mut image = Vec::new();
+        LocalHeap::cache_prefix_serialize_into(&prefix, 8, 8, &mut image).unwrap();
         let mut reader = HdfReader::new(std::io::Cursor::new(image));
         LocalHeap::decode_prefix(&mut reader, 0)
             .expect("undefined free-list offset should be accepted");
@@ -572,7 +690,8 @@ mod tests {
     #[test]
     fn local_heap_prefix_rejects_nonempty_undefined_data_address() {
         let prefix = LocalHeap::prfx_new(16, u64::MAX, u64::MAX);
-        let image = LocalHeap::cache_prefix_serialize(&prefix, 8, 8).unwrap();
+        let mut image = Vec::new();
+        LocalHeap::cache_prefix_serialize_into(&prefix, 8, 8, &mut image).unwrap();
         let mut reader = HdfReader::new(std::io::Cursor::new(image));
         let err = LocalHeap::decode_prefix(&mut reader, 0)
             .expect_err("nonempty heap with undefined data address should fail");
@@ -582,7 +701,8 @@ mod tests {
         );
 
         let prefix = LocalHeap::prfx_new(0, u64::MAX, u64::MAX);
-        let image = LocalHeap::cache_prefix_serialize(&prefix, 8, 8).unwrap();
+        let mut image = Vec::new();
+        LocalHeap::cache_prefix_serialize_into(&prefix, 8, 8, &mut image).unwrap();
         let mut reader = HdfReader::new(std::io::Cursor::new(image));
         LocalHeap::decode_prefix(&mut reader, 0)
             .expect("empty heap with undefined data address should be accepted");
@@ -598,14 +718,33 @@ mod tests {
     }
 
     #[test]
+    fn local_heap_data_segment_bounds_checked_before_allocation() {
+        let prefix = LocalHeap::prfx_new(1024, u64::MAX, 4096);
+        let mut reader = HdfReader::new(std::io::Cursor::new(Vec::<u8>::new()));
+        let err = LocalHeap::load_data_segment(&mut reader, &prefix)
+            .expect_err("out-of-file heap data segment should fail before allocation");
+        assert!(
+            err.to_string().contains("extends past end of file"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn local_heap_datablock_cache_roundtrips_and_checks_prefix_size() {
         let prefix = LocalHeap::prfx_new(4, u64::MAX, 128);
         let heap = LocalHeap::cache_datablock_deserialize(&prefix, b"name").unwrap();
         assert_eq!(heap.cache_datablock_image_len(), 4);
-        assert_eq!(heap.cache_datablock_serialize().unwrap(), b"name");
+        assert_eq!(heap.cache_datablock_image().unwrap(), b"name");
+        let mut data = vec![99, 99];
+        LocalHeap::cache_datablock_deserialize_into(&prefix, b"name", &mut data).unwrap();
+        assert_eq!(data, b"name");
+        let mut encoded = vec![99];
+        heap.cache_datablock_serialize_into(&mut encoded).unwrap();
+        assert_eq!(encoded, b"name");
 
         let err = LocalHeap::cache_datablock_deserialize(&prefix, b"nam").unwrap_err();
         assert!(err.to_string().contains("does not match prefix size"));
+        assert_eq!(data, b"name");
     }
 
     #[test]
@@ -615,13 +754,24 @@ mod tests {
         image.extend_from_slice(&5u64.to_le_bytes());
         image.extend_from_slice(&7u64.to_le_bytes());
 
-        let err = LocalHeap::fl_deserialize(&image).unwrap_err();
+        let err = match LocalHeap::fl_entries(&image) {
+            Ok(_) => panic!("partial free-list record should fail"),
+            Err(err) => err,
+        };
         assert!(err.to_string().contains("partial trailing record"));
 
         let mut complete = Vec::new();
         complete.extend_from_slice(&3u64.to_le_bytes());
         complete.extend_from_slice(&5u64.to_le_bytes());
-        assert_eq!(LocalHeap::fl_deserialize(&complete).unwrap(), vec![(3, 5)]);
-        assert_eq!(LocalHeap::fl_serialize(&[(3, 5)]).unwrap(), complete);
+        let entries: Vec<_> = LocalHeap::fl_entries(&complete).unwrap().collect();
+        assert_eq!(entries, vec![(3, 5)]);
+
+        let mut entries = vec![(99, 100)];
+        LocalHeap::fl_deserialize_into(&complete, &mut entries).unwrap();
+        assert_eq!(entries, vec![(3, 5)]);
+
+        let mut encoded = vec![99];
+        LocalHeap::fl_serialize_into(&[(3, 5)], &mut encoded).unwrap();
+        assert_eq!(encoded, complete);
     }
 }

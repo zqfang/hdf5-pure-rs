@@ -86,7 +86,8 @@ impl Superblock {
         reader.seek(0)?;
 
         // Read and verify signature
-        let sig = reader.read_bytes(8)?;
+        let mut sig = [0u8; 8];
+        reader.read_bytes_into(&mut sig)?;
         if sig != HDF5_SIGNATURE {
             return Err(Error::InvalidFormat("invalid HDF5 file signature".into()));
         }
@@ -275,8 +276,12 @@ impl Superblock {
         //                status_flags(1) + 4*sizeof_addr addresses = 12 + 4*sizeof_addr bytes
         let sb_size = Self::v2_checksum_span(sizeof_addr)?;
         reader.seek(0)?;
-        let sb_data = reader.read_bytes(sb_size)?;
-        let computed_checksum = checksum_metadata(&sb_data);
+        let mut checksum_input = [0u8; 44];
+        let checksum_input = checksum_input.get_mut(..sb_size).ok_or_else(|| {
+            Error::InvalidFormat("superblock checksum span exceeds stack buffer".into())
+        })?;
+        reader.read_bytes_into(checksum_input)?;
+        let computed_checksum = checksum_metadata(checksum_input);
 
         if stored_checksum != computed_checksum {
             return Err(Error::InvalidFormat(format!(

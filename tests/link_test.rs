@@ -1,5 +1,42 @@
 use hdf5_pure_rust::format::messages::link::{LinkMessage, LinkType};
-use hdf5_pure_rust::{Error, File, LinkAccess, WritableFile};
+use hdf5_pure_rust::{Dataset, Error, File, Group, LinkAccess, Result, WritableFile};
+
+fn file_has_member(file: &File, expected: &str) -> Result<bool> {
+    let mut found = false;
+    file.visit_member_names(|name| {
+        found |= name == expected;
+        Ok(())
+    })?;
+    Ok(found)
+}
+
+fn group_has_member(group: &Group, expected: &str) -> Result<bool> {
+    let mut found = false;
+    group.visit_member_names(|name| {
+        found |= name == expected;
+        Ok(())
+    })?;
+    Ok(found)
+}
+
+fn group_has_link(group: &Group, expected: &str, expected_type: LinkType) -> Result<bool> {
+    let mut found = false;
+    group.visit_links(|link| {
+        found |= link.name == expected && link.link_type == expected_type;
+        Ok(())
+    })?;
+    Ok(found)
+}
+
+fn assert_i32_dataset_values(dataset: &Dataset, expected: &[i32]) -> Result<()> {
+    let mut shape = Vec::new();
+    dataset.shape_into(&mut shape)?;
+    let len = shape.iter().map(|dim| *dim as usize).product();
+    let mut values = vec![0; len];
+    dataset.read_into(&mut values)?;
+    assert_eq!(values.as_slice(), expected);
+    Ok(())
+}
 
 #[test]
 fn test_link_access_defaults() {
@@ -28,21 +65,20 @@ fn test_write_and_read_soft_link() {
 
     {
         let f = File::open(&path).unwrap();
-        let names = f.member_names().unwrap();
-        assert!(names.contains(&"real_data".to_string()));
-        assert!(names.contains(&"alias".to_string()));
+        assert!(file_has_member(&f, "real_data").unwrap());
+        assert!(file_has_member(&f, "alias").unwrap());
 
         let root = f.root_group().unwrap();
-        let links = root.links().unwrap();
-        assert!(links
-            .iter()
-            .any(|link| link.name == "alias" && link.link_type == LinkType::Soft));
+        assert!(group_has_link(&root, "alias", LinkType::Soft).unwrap());
 
         let lt = root.link_type("alias").unwrap();
         assert_eq!(lt, LinkType::Soft);
 
-        let target = root.soft_link_target("alias").unwrap();
-        assert_eq!(target, "/real_data");
+        root.soft_link_target_with("alias", |target| {
+            assert_eq!(target, "/real_data");
+            Ok(())
+        })
+        .unwrap();
     }
 }
 
@@ -65,27 +101,13 @@ fn test_write_and_read_hard_links() {
     }
 
     let f = File::open(&path).unwrap();
-    assert_eq!(
-        f.dataset("alias_data").unwrap().read::<i32>().unwrap(),
-        vec![7, 8, 9]
-    );
-    assert_eq!(
-        f.dataset("aliases/nested_data")
-            .unwrap()
-            .read::<i32>()
-            .unwrap(),
-        vec![7, 8, 9]
-    );
+    assert_i32_dataset_values(&f.dataset("alias_data").unwrap(), &[7, 8, 9]).unwrap();
+    assert_i32_dataset_values(&f.dataset("aliases/nested_data").unwrap(), &[7, 8, 9]).unwrap();
     assert_eq!(f.group("alias_group").unwrap().name(), "/alias_group");
 
     let root = f.root_group().unwrap();
-    let links = root.links().unwrap();
-    assert!(links
-        .iter()
-        .any(|link| link.name == "alias_data" && link.link_type == LinkType::Hard));
-    assert!(links
-        .iter()
-        .any(|link| link.name == "alias_group" && link.link_type == LinkType::Hard));
+    assert!(group_has_link(&root, "alias_data", LinkType::Hard).unwrap());
+    assert!(group_has_link(&root, "alias_group", LinkType::Hard).unwrap());
 }
 
 #[test]
@@ -107,8 +129,7 @@ fn test_soft_link_resolution_and_cycle_limit() {
     }
 
     let f = File::open(&path).unwrap();
-    let alias_values: Vec<i32> = f.dataset("alias_data").unwrap().read().unwrap();
-    assert_eq!(alias_values, vec![10, 20, 30]);
+    assert_i32_dataset_values(&f.dataset("alias_data").unwrap(), &[10, 20, 30]).unwrap();
     assert_eq!(f.group("alias_group").unwrap().name(), "/real_group");
 
     let err = match f.dataset("cycle_a") {
@@ -141,26 +162,10 @@ fn test_soft_link_resolution_normalizes_relative_targets() {
     }
 
     let f = File::open(&path).unwrap();
-    assert_eq!(
-        f.dataset("aliases/relative_data")
-            .unwrap()
-            .read::<i32>()
-            .unwrap(),
-        vec![11, 22]
-    );
-    assert_eq!(
-        f.dataset("through_alias").unwrap().read::<i32>().unwrap(),
-        vec![11, 22]
-    );
+    assert_i32_dataset_values(&f.dataset("aliases/relative_data").unwrap(), &[11, 22]).unwrap();
+    assert_i32_dataset_values(&f.dataset("through_alias").unwrap(), &[11, 22]).unwrap();
     let aliases = f.group("aliases").unwrap();
-    assert_eq!(
-        aliases
-            .open_dataset("relative_data")
-            .unwrap()
-            .read::<i32>()
-            .unwrap(),
-        vec![11, 22]
-    );
+    assert_i32_dataset_values(&aliases.open_dataset("relative_data").unwrap(), &[11, 22]).unwrap();
     assert_eq!(
         aliases.member_type("relative_group").unwrap(),
         hdf5_pure_rust::hl::file::ObjectType::Group
@@ -204,6 +209,51 @@ fn test_link_exists_sees_soft_and_external_links() {
 }
 
 #[test]
+fn test_dense_links_include_soft_external_and_hard_aliases() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("dense_alias_links.h5");
+
+    {
+        let mut wf = WritableFile::create(&path).unwrap();
+        for idx in 0..9 {
+            wf.new_dataset_builder(&format!("data_{idx:02}"))
+                .write::<i32>(&[idx])
+                .unwrap();
+        }
+        wf.link_soft("soft_alias", "/data_00").unwrap();
+        wf.link_external("external_alias", "missing.h5", "/remote")
+            .unwrap();
+        wf.link_hard("hard_alias", "/data_01").unwrap();
+        wf.flush().unwrap();
+    }
+
+    let f = File::open(&path).unwrap();
+    assert!(file_has_member(&f, "data_08").unwrap());
+    assert!(file_has_member(&f, "soft_alias").unwrap());
+    assert!(file_has_member(&f, "external_alias").unwrap());
+    assert!(file_has_member(&f, "hard_alias").unwrap());
+    assert_i32_dataset_values(&f.dataset("hard_alias").unwrap(), &[1]).unwrap();
+
+    let root = f.root_group().unwrap();
+    assert!(group_has_link(&root, "data_08", LinkType::Hard).unwrap());
+    assert!(group_has_link(&root, "soft_alias", LinkType::Soft).unwrap());
+    assert!(group_has_link(&root, "external_alias", LinkType::External).unwrap());
+    assert!(group_has_link(&root, "hard_alias", LinkType::Hard).unwrap());
+
+    root.soft_link_target_with("soft_alias", |target| {
+        assert_eq!(target, "/data_00");
+        Ok(())
+    })
+    .unwrap();
+    root.external_link_target_with("external_alias", |filename, obj_path| {
+        assert_eq!(filename, "missing.h5");
+        assert_eq!(obj_path, "/remote");
+        Ok(())
+    })
+    .unwrap();
+}
+
+#[test]
 fn test_write_external_link() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("ext_link_test.h5");
@@ -217,21 +267,20 @@ fn test_write_external_link() {
 
     {
         let f = File::open(&path).unwrap();
-        let names = f.member_names().unwrap();
-        assert!(names.contains(&"remote".to_string()));
+        assert!(file_has_member(&f, "remote").unwrap());
 
         let root = f.root_group().unwrap();
-        let links = root.links().unwrap();
-        assert!(links
-            .iter()
-            .any(|link| link.name == "remote" && link.link_type == LinkType::External));
+        assert!(group_has_link(&root, "remote", LinkType::External).unwrap());
 
         let lt = root.link_type("remote").unwrap();
         assert_eq!(lt, LinkType::External);
 
-        let (filename, obj_path) = root.external_link_target("remote").unwrap();
-        assert_eq!(filename, "other_file.h5");
-        assert_eq!(obj_path, "/some/dataset");
+        root.external_link_target_with("remote", |filename, obj_path| {
+            assert_eq!(filename, "other_file.h5");
+            assert_eq!(obj_path, "/some/dataset");
+            Ok(())
+        })
+        .unwrap();
     }
 }
 
@@ -299,18 +348,9 @@ fn test_external_link_traversal_missing_relative_absolute_and_same_directory() {
     }
 
     let f = File::open(&source_path).unwrap();
-    assert_eq!(
-        f.dataset("same_dir").unwrap().read::<i32>().unwrap(),
-        vec![1, 2, 3]
-    );
-    assert_eq!(
-        f.dataset("relative").unwrap().read::<i32>().unwrap(),
-        vec![4, 5, 6]
-    );
-    assert_eq!(
-        f.dataset("absolute").unwrap().read::<i32>().unwrap(),
-        vec![1, 2, 3]
-    );
+    assert_i32_dataset_values(&f.dataset("same_dir").unwrap(), &[1, 2, 3]).unwrap();
+    assert_i32_dataset_values(&f.dataset("relative").unwrap(), &[4, 5, 6]).unwrap();
+    assert_i32_dataset_values(&f.dataset("absolute").unwrap(), &[1, 2, 3]).unwrap();
     assert_eq!(f.group("remote_group").unwrap().name(), "/group");
     assert!(matches!(f.dataset("missing"), Err(Error::Io(_))));
 }
@@ -319,19 +359,21 @@ fn test_external_link_traversal_missing_relative_absolute_and_same_directory() {
 fn test_utf8_link_names_and_non_ascii_external_filename() {
     let f = File::open("tests/data/hdf5_ref/link_edge_cases.h5").unwrap();
     let root = f.root_group().unwrap();
-    let names = root.member_names().unwrap();
 
-    assert!(names.contains(&"猫_group".to_string()));
-    assert!(names.contains(&"å_link".to_string()));
-    assert!(names.contains(&"external_å".to_string()));
+    assert!(group_has_member(&root, "猫_group").unwrap());
+    assert!(group_has_member(&root, "å_link").unwrap());
+    assert!(group_has_member(&root, "external_å").unwrap());
     assert_eq!(
         root.member_type("å_link").unwrap(),
         hdf5_pure_rust::hl::file::ObjectType::Dataset
     );
 
-    let (filename, object_path) = root.external_link_target("external_å").unwrap();
-    assert_eq!(filename, "målfil.h5");
-    assert_eq!(object_path, "/dåta");
+    root.external_link_target_with("external_å", |filename, object_path| {
+        assert_eq!(filename, "målfil.h5");
+        assert_eq!(object_path, "/dåta");
+        Ok(())
+    })
+    .unwrap();
 }
 
 #[test]

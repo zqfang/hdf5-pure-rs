@@ -1,4 +1,22 @@
-use hdf5_pure_rust::{File, FileCloseDegree, FileIntent, LibverBound};
+use hdf5_pure_rust::{File, FileCloseDegree, FileIntent, LibverBound, WritableFile};
+
+fn file_has_member(file: &File, expected: &str) -> hdf5_pure_rust::Result<bool> {
+    let mut found = false;
+    file.visit_member_names(|name| {
+        found |= name == expected;
+        Ok(())
+    })?;
+    Ok(found)
+}
+
+fn group_member_count(group: &hdf5_pure_rust::Group) -> hdf5_pure_rust::Result<usize> {
+    let mut count = 0;
+    group.visit_member_names(|_| {
+        count += 1;
+        Ok(())
+    })?;
+    Ok(count)
+}
 
 #[test]
 fn test_file_size_matches_filesystem_metadata() {
@@ -14,14 +32,159 @@ fn test_file_path_returns_open_path() {
     let path = std::path::PathBuf::from("tests/data/simple_v0.h5");
     let f = File::open(&path).expect("failed to open v0 file");
 
-    assert_eq!(f.path().unwrap(), path);
+    f.with_path(|opened| assert_eq!(opened.unwrap(), path.as_path()));
+}
+
+#[test]
+fn test_file_compat_create_append_and_open_rw_modes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("compat_modes.h5");
+
+    let created = File::create(&path).expect("create should write an empty HDF5 file");
+    assert_eq!(created.intent(), FileIntent::ReadWrite);
+    assert!(!created.is_read_only());
+    assert!(created.file_size().unwrap() > 0);
+
+    let opened_rw = File::open_rw(&path).expect("open_rw should open an existing file");
+    assert_eq!(opened_rw.intent(), FileIntent::ReadWrite);
+    assert!(!opened_rw.is_read_only());
+
+    let appended = File::append(&path).expect("append should open an existing file read/write");
+    assert_eq!(appended.intent(), FileIntent::ReadWrite);
+    assert!(appended.file_size().unwrap() > 0);
+
+    let created_from_append = File::append(dir.path().join("created_by_append.h5"))
+        .expect("append should create a missing file");
+    assert_eq!(created_from_append.intent(), FileIntent::ReadWrite);
+}
+
+#[test]
+fn test_file_compat_create_excl_fails_if_present() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("compat_create_excl.h5");
+
+    File::create_excl(&path).expect("create_excl should create missing file");
+    let err = match File::create_excl(&path) {
+        Ok(_) => panic!("create_excl should reject existing file"),
+        Err(err) => err,
+    };
+    assert!(matches!(err, hdf5_pure_rust::Error::Io(_)));
+}
+
+#[test]
+fn test_file_builder_compat_create_modes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("builder_create.h5");
+
+    let file = File::with_options()
+        .create(&path)
+        .expect("builder create should create a file");
+    assert_eq!(file.intent(), FileIntent::ReadWrite);
+
+    let reopened = File::with_options()
+        .append(&path)
+        .expect("builder append should reopen existing file");
+    assert_eq!(reopened.intent(), FileIntent::ReadWrite);
+}
+
+#[test]
+fn test_group_compat_unlink_compact_soft_link() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("unlink_soft.h5");
+    {
+        let mut writable = WritableFile::create(&path).unwrap();
+        writable.link_soft("soft_link", "/missing").unwrap();
+        writable.close().unwrap();
+    }
+
+    let file = File::open_rw(&path).unwrap();
+    let root = file.root_group().unwrap();
+    assert!(root.link_exists("soft_link").unwrap());
+    root.unlink("soft_link").unwrap();
+
+    let reopened = File::open(&path).unwrap();
+    assert!(!reopened
+        .root_group()
+        .unwrap()
+        .link_exists("soft_link")
+        .unwrap());
+}
+
+#[test]
+fn test_group_compat_unlink_compact_hard_link_alias() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("unlink_hard.h5");
+    {
+        let mut writable = WritableFile::create(&path).unwrap();
+        writable
+            .new_dataset_builder("real_data")
+            .write::<i32>(&[1, 2, 3])
+            .unwrap();
+        writable.link_hard("alias_data", "/real_data").unwrap();
+        writable.close().unwrap();
+    }
+
+    let file = File::open_rw(&path).unwrap();
+    let root = file.root_group().unwrap();
+    assert!(root.link_exists("real_data").unwrap());
+    assert!(root.link_exists("alias_data").unwrap());
+    root.unlink("alias_data").unwrap();
+
+    let reopened = File::open(&path).unwrap();
+    let root = reopened.root_group().unwrap();
+    assert!(root.link_exists("real_data").unwrap());
+    assert!(!root.link_exists("alias_data").unwrap());
+    let mut values = vec![0; 3];
+    reopened
+        .dataset("real_data")
+        .unwrap()
+        .read_into(&mut values)
+        .unwrap();
+    assert_eq!(values, [1, 2, 3]);
+}
+
+#[test]
+fn test_group_compat_relink_compact_soft_link_same_size() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("rename_soft.h5");
+    {
+        let mut writable = WritableFile::create(&path).unwrap();
+        writable.link_soft("old_name", "/missing").unwrap();
+        writable.close().unwrap();
+    }
+
+    let file = File::open_rw(&path).unwrap();
+    let root = file.root_group().unwrap();
+    root.relink("old_name", "new_name").unwrap();
+
+    let reopened = File::open(&path).unwrap();
+    let root = reopened.root_group().unwrap();
+    assert!(!root.link_exists("old_name").unwrap());
+    assert!(root.link_exists("new_name").unwrap());
+}
+
+#[test]
+fn test_group_compat_unlink_requires_read_write_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("readonly_unlink.h5");
+    {
+        let mut writable = WritableFile::create(&path).unwrap();
+        writable.link_soft("soft_link", "/missing").unwrap();
+        writable.close().unwrap();
+    }
+
+    let file = File::open(&path).unwrap();
+    let root = file.root_group().unwrap();
+    let err = root.unlink("soft_link").unwrap_err();
+    assert!(matches!(err, hdf5_pure_rust::Error::Unsupported(_)));
 }
 
 #[test]
 fn test_file_metadata_and_access_queries() {
     let path = "tests/data/simple_v0.h5";
     let f = File::open(path).expect("failed to open v0 file");
-    let image = f.file_image().unwrap();
+    let mut image = vec![0u8; f.file_size().unwrap() as usize];
+    f.file_image_into(&mut image).unwrap();
 
     assert_eq!(f.intent(), FileIntent::ReadOnly);
     assert_eq!(f.eoa(), f.superblock().eof_addr);
@@ -101,13 +264,14 @@ fn test_file_metadata_and_access_queries() {
 fn test_file_open_object_registry_queries() {
     let f = File::open("tests/data/simple_v0.h5").expect("failed to open v0 file");
     assert_eq!(f.obj_count(), 1);
-    assert_eq!(f.obj_ids(), vec![f.object_id()]);
+    let mut ids = Vec::new();
+    f.obj_ids_into(&mut ids);
+    assert_eq!(ids, vec![f.object_id()]);
 
     {
         let group = f.group("group1").unwrap();
         let dataset = f.dataset("data").unwrap();
-        let mut ids = f.obj_ids();
-        ids.sort_unstable();
+        f.obj_ids_into(&mut ids);
         assert_eq!(f.obj_count(), 3);
         assert!(ids.contains(&f.object_id()));
         assert!(ids.contains(&group.object_id()));
@@ -115,27 +279,24 @@ fn test_file_open_object_registry_queries() {
     }
 
     assert_eq!(f.obj_count(), 1);
-    assert_eq!(f.obj_ids(), vec![f.object_id()]);
+    f.obj_ids_into(&mut ids);
+    assert_eq!(ids, vec![f.object_id()]);
 }
 
 #[test]
 fn test_list_root_members_v0() {
     let f = File::open("tests/data/simple_v0.h5").expect("failed to open v0 file");
-    let names = f.member_names().expect("failed to list members");
-    println!("v0 root members: {names:?}");
 
-    assert!(names.contains(&"data".to_string()));
-    assert!(names.contains(&"group1".to_string()));
+    assert!(file_has_member(&f, "data").expect("failed to list members"));
+    assert!(file_has_member(&f, "group1").expect("failed to list members"));
 }
 
 #[test]
 fn test_list_root_members_v3() {
     let f = File::open("tests/data/simple_v2.h5").expect("failed to open v3 file");
-    let names = f.member_names().expect("failed to list members");
-    println!("v3 root members: {names:?}");
 
-    assert!(names.contains(&"data".to_string()));
-    assert!(names.contains(&"group1".to_string()));
+    assert!(file_has_member(&f, "data").expect("failed to list members"));
+    assert!(file_has_member(&f, "group1").expect("failed to list members"));
 }
 
 #[test]
@@ -144,9 +305,10 @@ fn test_open_subgroup_v0() {
     let g = f.group("group1").expect("failed to open group1");
     assert_eq!(g.name(), "/group1");
 
-    let members = g.member_names().expect("failed to list group1 members");
-    println!("v0 group1 members: {members:?}");
-    assert!(members.is_empty()); // group1 is empty
+    assert_eq!(
+        group_member_count(&g).expect("failed to list group1 members"),
+        0
+    );
 }
 
 #[test]
@@ -155,9 +317,10 @@ fn test_open_subgroup_v3() {
     let g = f.group("group1").expect("failed to open group1");
     assert_eq!(g.name(), "/group1");
 
-    let members = g.member_names().expect("failed to list group1 members");
-    println!("v3 group1 members: {members:?}");
-    assert!(members.is_empty());
+    assert_eq!(
+        group_member_count(&g).expect("failed to list group1 members"),
+        0
+    );
 }
 
 #[test]

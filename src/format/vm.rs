@@ -92,21 +92,32 @@ pub fn stride_optimize2(stride: usize, count: usize, elem_size: usize) -> Result
         .ok_or_else(|| Error::InvalidFormat("stride optimization overflow".into()))
 }
 
-pub fn hyper_stride(start: &[u64], stride: &[u64], index: &[u64]) -> Result<Vec<u64>> {
+pub fn hyper_stride_into(
+    start: &[u64],
+    stride: &[u64],
+    index: &[u64],
+    out: &mut [u64],
+) -> Result<()> {
     if start.len() != stride.len() || start.len() != index.len() {
         return Err(Error::InvalidFormat("hyperslab rank mismatch".into()));
+    }
+    if out.len() != start.len() {
+        return Err(Error::InvalidFormat(
+            "hyperslab output rank mismatch".into(),
+        ));
     }
     start
         .iter()
         .zip(stride)
         .zip(index)
-        .map(|((&start, &stride), &index)| {
-            index
+        .zip(out.iter_mut())
+        .try_for_each(|(((&start, &stride), &index), out)| {
+            *out = index
                 .checked_mul(stride)
                 .and_then(|delta| start.checked_add(delta))
-                .ok_or_else(|| Error::InvalidFormat("hyperslab coordinate overflow".into()))
+                .ok_or_else(|| Error::InvalidFormat("hyperslab coordinate overflow".into()))?;
+            Ok(())
         })
-        .collect()
 }
 
 pub fn hyper_eq(start_a: &[u64], stride_a: &[u64], start_b: &[u64], stride_b: &[u64]) -> bool {
@@ -185,45 +196,68 @@ pub fn stride_copy_s<T: Clone>(
     Ok(())
 }
 
-pub fn array_down(coords: &[u64], dims: &[u64]) -> Result<Vec<u64>> {
+pub fn array_down_into(coords: &[u64], dims: &[u64], out: &mut [u64]) -> Result<()> {
     if coords.len() != dims.len() {
         return Err(Error::InvalidFormat("array rank mismatch".into()));
+    }
+    if out.len() != coords.len() {
+        return Err(Error::InvalidFormat("array output rank mismatch".into()));
     }
     coords
         .iter()
         .zip(dims)
-        .map(|(&coord, &dim)| {
+        .zip(out.iter_mut())
+        .try_for_each(|((&coord, &dim), out)| {
             if dim == 0 {
                 Err(Error::InvalidFormat("array dimension is zero".into()))
             } else {
-                Ok(coord % dim)
+                *out = coord % dim;
+                Ok(())
             }
         })
-        .collect()
 }
 
-pub fn array_offset_pre(dims: &[u64]) -> Result<Vec<u64>> {
-    let mut strides = vec![1u64; dims.len()];
+pub fn array_offset_pre_into(dims: &[u64], out: &mut [u64]) -> Result<()> {
+    if out.len() != dims.len() {
+        return Err(Error::InvalidFormat("array stride rank mismatch".into()));
+    }
+    out.fill(1);
     if dims.len() > 1 {
         for index in (0..dims.len() - 1).rev() {
-            strides[index] = strides[index + 1]
+            out[index] = out[index + 1]
                 .checked_mul(dims[index + 1])
                 .ok_or_else(|| Error::InvalidFormat("array stride overflow".into()))?;
         }
     }
-    Ok(strides)
+    Ok(())
 }
 
-pub fn array_offset(coords: &[u64], dims: &[u64]) -> Result<u64> {
+pub fn visit_array_offset_pre<F>(dims: &[u64], mut visitor: F) -> Result<()>
+where
+    F: FnMut(u64) -> Result<()>,
+{
+    for index in 0..dims.len() {
+        let stride = dims[index + 1..].iter().try_fold(1u64, |acc, &dim| {
+            acc.checked_mul(dim)
+                .ok_or_else(|| Error::InvalidFormat("array stride overflow".into()))
+        })?;
+        visitor(stride)?;
+    }
+    Ok(())
+}
+
+pub fn array_offset_with_strides(coords: &[u64], dims: &[u64], strides: &[u64]) -> Result<u64> {
     if coords.len() != dims.len() {
         return Err(Error::InvalidFormat("array rank mismatch".into()));
     }
-    let strides = array_offset_pre(dims)?;
+    if strides.len() != coords.len() {
+        return Err(Error::InvalidFormat("array stride rank mismatch".into()));
+    }
     coords
         .iter()
         .zip(dims)
-        .zip(strides)
-        .try_fold(0u64, |acc, ((&coord, &dim), stride)| {
+        .zip(strides.iter())
+        .try_fold(0u64, |acc, ((&coord, &dim), &stride)| {
             if coord >= dim {
                 return Err(Error::InvalidFormat(
                     "array coordinate out of bounds".into(),
@@ -237,31 +271,70 @@ pub fn array_offset(coords: &[u64], dims: &[u64]) -> Result<u64> {
         })
 }
 
+pub fn array_offset(coords: &[u64], dims: &[u64]) -> Result<u64> {
+    if coords.len() != dims.len() {
+        return Err(Error::InvalidFormat("array rank mismatch".into()));
+    }
+    let mut stride = 1u64;
+    let mut offset = 0u64;
+    for index in (0..coords.len()).rev() {
+        let coord = coords[index];
+        let dim = dims[index];
+        if coord >= dim {
+            return Err(Error::InvalidFormat(
+                "array coordinate out of bounds".into(),
+            ));
+        }
+        let term = coord
+            .checked_mul(stride)
+            .ok_or_else(|| Error::InvalidFormat("array offset overflow".into()))?;
+        offset = offset
+            .checked_add(term)
+            .ok_or_else(|| Error::InvalidFormat("array offset overflow".into()))?;
+        if index > 0 {
+            stride = stride
+                .checked_mul(dim)
+                .ok_or_else(|| Error::InvalidFormat("array stride overflow".into()))?;
+        }
+    }
+    Ok(offset)
+}
+
 pub fn chunk_index(coords: &[u64], dims: &[u64]) -> Result<u64> {
     array_offset(coords, dims)
 }
 
-pub fn chunk_scaled(coords: &[u64], chunk_dims: &[u64]) -> Result<Vec<u64>> {
+pub fn chunk_scaled_into(coords: &[u64], chunk_dims: &[u64], out: &mut [u64]) -> Result<()> {
     if coords.len() != chunk_dims.len() {
         return Err(Error::InvalidFormat("chunk rank mismatch".into()));
+    }
+    if out.len() != coords.len() {
+        return Err(Error::InvalidFormat("chunk output rank mismatch".into()));
     }
     coords
         .iter()
         .zip(chunk_dims)
-        .map(|(&coord, &chunk)| {
+        .zip(out.iter_mut())
+        .try_for_each(|((&coord, &chunk), out)| {
             if chunk == 0 {
                 Err(Error::InvalidFormat("chunk dimension is zero".into()))
             } else {
-                Ok(coord / chunk)
+                *out = coord / chunk;
+                Ok(())
             }
         })
-        .collect()
 }
 
-pub fn chunk_index_scaled(coords: &[u64], dims: &[u64], chunk_dims: &[u64]) -> Result<u64> {
-    let scaled = chunk_scaled(coords, chunk_dims)?;
-    let scaled_dims = chunk_scaled(dims, chunk_dims)?;
-    chunk_index(&scaled, &scaled_dims)
+pub fn chunk_index_scaled_into(
+    coords: &[u64],
+    dims: &[u64],
+    chunk_dims: &[u64],
+    scaled: &mut [u64],
+    scaled_dims: &mut [u64],
+) -> Result<u64> {
+    chunk_scaled_into(coords, chunk_dims, scaled)?;
+    chunk_scaled_into(dims, chunk_dims, scaled_dims)?;
+    chunk_index(scaled, scaled_dims)
 }
 
 pub fn opvv<T: Copy, F: Fn(T, T) -> T>(lhs: &[T], rhs: &[T], out: &mut [T], op: F) -> Result<()> {
@@ -312,8 +385,48 @@ mod tests {
 
     #[test]
     fn chunk_scaling_and_indexing_work() {
-        assert_eq!(chunk_scaled(&[9, 5], &[4, 2]).unwrap(), vec![2, 2]);
+        let mut scaled = [0, 0];
+        chunk_scaled_into(&[9, 5], &[4, 2], &mut scaled).unwrap();
+        assert_eq!(scaled, [2, 2]);
         assert_eq!(chunk_index(&[2, 1], &[4, 4]).unwrap(), 9);
+    }
+
+    #[test]
+    fn coordinate_helpers_fill_caller_buffers() {
+        let mut coords = [0, 0];
+        hyper_stride_into(&[10, 20], &[2, 3], &[4, 5], &mut coords).unwrap();
+        assert_eq!(coords, [18, 35]);
+
+        array_down_into(&[9, 5], &[4, 2], &mut coords).unwrap();
+        assert_eq!(coords, [1, 1]);
+
+        array_offset_pre_into(&[3, 4], &mut coords).unwrap();
+        assert_eq!(coords, [4, 1]);
+
+        let mut visited = Vec::new();
+        visit_array_offset_pre(&[3, 4], |stride| {
+            visited.push(stride);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(visited, [4, 1]);
+        assert_eq!(
+            array_offset_with_strides(&[2, 1], &[3, 4], &coords).unwrap(),
+            9
+        );
+
+        chunk_scaled_into(&[9, 5], &[4, 2], &mut coords).unwrap();
+        assert_eq!(coords, [2, 2]);
+
+        let mut scaled = [0, 0];
+        let mut scaled_dims = [0, 0];
+        assert_eq!(
+            chunk_index_scaled_into(&[9, 5], &[16, 8], &[4, 2], &mut scaled, &mut scaled_dims)
+                .unwrap(),
+            10
+        );
+        assert_eq!(scaled, [2, 2]);
+        assert_eq!(scaled_dims, [4, 4]);
     }
 
     #[test]

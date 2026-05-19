@@ -44,7 +44,7 @@ pub enum LibverBound {
 }
 
 /// Metadata cache configuration used by this reader.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MetadataCacheConfig {
     pub enabled: bool,
     pub max_size: usize,
@@ -52,7 +52,7 @@ pub struct MetadataCacheConfig {
 }
 
 /// Metadata-cache image settings.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MetadataCacheImageConfig {
     pub enabled: bool,
     pub generation_enabled: bool,
@@ -281,7 +281,12 @@ impl FileAccess {
     /// Metadata cache configuration. This reader does not maintain libhdf5's
     /// adaptive metadata cache.
     pub fn mdc_config(&self) -> MetadataCacheConfig {
-        self.mdc_config.clone()
+        self.mdc_config
+    }
+
+    /// Borrow metadata cache configuration without materializing an owned copy.
+    pub fn mdc_config_ref(&self) -> &MetadataCacheConfig {
+        &self.mdc_config
     }
 
     /// Set metadata cache configuration.
@@ -291,7 +296,12 @@ impl FileAccess {
 
     /// Metadata cache image configuration.
     pub fn mdc_image_config(&self) -> MetadataCacheImageConfig {
-        self.mdc_image_config.clone()
+        self.mdc_image_config
+    }
+
+    /// Borrow metadata cache image configuration without materializing an owned copy.
+    pub fn mdc_image_config_ref(&self) -> &MetadataCacheImageConfig {
+        &self.mdc_image_config
     }
 
     /// Set metadata cache image configuration.
@@ -302,6 +312,11 @@ impl FileAccess {
     /// Metadata cache logging options.
     pub fn mdc_log_options(&self) -> MetadataCacheLogOptions {
         self.mdc_log_options.clone()
+    }
+
+    /// Borrow metadata cache logging options without cloning the log location.
+    pub fn mdc_log_options_ref(&self) -> &MetadataCacheLogOptions {
+        &self.mdc_log_options
     }
 
     /// Set metadata cache logging options.

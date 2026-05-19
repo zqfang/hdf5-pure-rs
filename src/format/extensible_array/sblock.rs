@@ -4,13 +4,16 @@
 
 #![allow(dead_code)]
 
-use std::io::{Read, Seek};
+use std::{
+    fmt,
+    io::{Read, Seek},
+};
 
 use crate::error::{Error, Result};
 use crate::format::checksum::checksum_metadata;
 use crate::io::reader::{is_undef_addr, HdfReader};
 
-use super::dblock::append_data_block_elements;
+use super::dblock::append_data_block_elements_with_scratch;
 use super::fixed_array::FixedArrayElement;
 use super::hdr::{ExtensibleArrayHeader, SuperBlockInfo};
 
@@ -29,8 +32,12 @@ pub(super) struct ExtArraySuperBlock {
 }
 
 /// Format a super-block for debug printing.
-pub(super) fn sblock_debug(block: &ExtArraySuperBlock) -> String {
-    format!(
+pub(super) fn write_sblock_debug(
+    block: &ExtArraySuperBlock,
+    out: &mut impl fmt::Write,
+) -> fmt::Result {
+    write!(
+        out,
         "ExtArraySuperBlock(page_init_len={}, page_init_size={}, data_block_addrs={})",
         block.page_init.len(),
         block.page_init_size,
@@ -38,6 +45,7 @@ pub(super) fn sblock_debug(block: &ExtArraySuperBlock) -> String {
     )
 }
 
+/// Format a super-block for debug printing.
 /// Verify the trailing checksum of a super-block image.
 pub(super) fn cache_sblock_verify_chksum(data: &[u8]) -> Result<()> {
     verify_trailing_checksum(data, "extensible array super block")
@@ -74,17 +82,22 @@ pub(super) fn cache_sblock_image_len(
 }
 
 /// Serialize a dirty super-block by appending the trailing checksum.
-pub(super) fn cache_sblock_serialize(prefix_and_payload: &[u8]) -> Result<Vec<u8>> {
+pub(super) fn cache_sblock_serialize_into(
+    prefix_and_payload: &[u8],
+    out: &mut Vec<u8>,
+) -> Result<()> {
     let image_len = prefix_and_payload.len().checked_add(4).ok_or_else(|| {
         Error::InvalidFormat("extensible array super block image length overflow".into())
     })?;
-    let mut out = Vec::with_capacity(image_len);
+    out.clear();
+    out.reserve(image_len);
     out.extend_from_slice(prefix_and_payload);
     let checksum = crate::format::checksum::checksum_metadata(&out);
     out.extend_from_slice(&checksum.to_le_bytes());
-    Ok(out)
+    Ok(())
 }
 
+/// Serialize a dirty super-block by appending the trailing checksum.
 /// Handle metadata-cache action notifications for a super-block.
 pub(super) fn cache_sblock_notify(_block: &ExtArraySuperBlock) {}
 
@@ -131,8 +144,9 @@ pub(super) fn decode_super_block<R: Read + Seek>(
     info: &SuperBlockInfo,
 ) -> Result<ExtArraySuperBlock> {
     reader.seek(super_block_addr)?;
-    let magic = reader.read_bytes(4)?;
-    if magic != b"EASB" {
+    let mut magic = [0u8; 4];
+    reader.read_bytes_into(&mut magic)?;
+    if magic != *b"EASB" {
         return Err(Error::InvalidFormat(
             "invalid extensible array super block magic".into(),
         ));
@@ -172,7 +186,9 @@ pub(super) fn decode_super_block<R: Read + Seek>(
             page_init_size,
             "extensible array super block page-init size",
         )?;
-        reader.read_bytes(page_init_len)?
+        let mut page_init = vec![0; page_init_len];
+        reader.read_bytes_into(&mut page_init)?;
+        page_init
     } else {
         Vec::new()
     };
@@ -225,7 +241,8 @@ fn verify_reader_checksum<R: Read + Seek>(
     )
     .map_err(|_| Error::InvalidFormat(format!("{context} checksum span is too large")))?;
     reader.seek(start)?;
-    let bytes = reader.read_bytes(check_len)?;
+    let mut bytes = vec![0; check_len];
+    reader.read_bytes_into(&mut bytes)?;
     let computed = checksum_metadata(&bytes);
     if stored != computed {
         return Err(Error::InvalidFormat(format!(
@@ -250,6 +267,32 @@ pub(super) fn read_super_block<R: Read + Seek>(
     super_block_addr: u64,
     info: &SuperBlockInfo,
     elements: &mut Vec<FixedArrayElement>,
+) -> Result<()> {
+    let mut checksum_scratch = Vec::new();
+    read_super_block_with_scratch(
+        reader,
+        header_addr,
+        header,
+        filtered,
+        chunk_size_len,
+        super_block_addr,
+        info,
+        elements,
+        &mut checksum_scratch,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn read_super_block_with_scratch<R: Read + Seek>(
+    reader: &mut HdfReader<R>,
+    header_addr: u64,
+    header: &ExtensibleArrayHeader,
+    filtered: bool,
+    chunk_size_len: usize,
+    super_block_addr: u64,
+    info: &SuperBlockInfo,
+    elements: &mut Vec<FixedArrayElement>,
+    checksum_scratch: &mut Vec<u8>,
 ) -> Result<()> {
     if is_undef_addr(super_block_addr) {
         let fill_count = super::checked_usize_mul(
@@ -291,7 +334,7 @@ pub(super) fn read_super_block<R: Read + Seek>(
         } else {
             None
         };
-        append_data_block_elements(
+        append_data_block_elements_with_scratch(
             reader,
             header_addr,
             header,
@@ -302,6 +345,7 @@ pub(super) fn read_super_block<R: Read + Seek>(
             page_init_for_block,
             count,
             elements,
+            checksum_scratch,
         )?;
     }
 
@@ -367,7 +411,8 @@ mod tests {
         prefix.push(0);
         prefix.extend_from_slice(&55u64.to_le_bytes());
 
-        let image = cache_sblock_serialize(&prefix).unwrap();
+        let mut image = Vec::new();
+        cache_sblock_serialize_into(&prefix, &mut image).unwrap();
         assert_eq!(image.len(), prefix.len() + 4);
         assert_eq!(
             u32::from_le_bytes(image[image.len() - 4..].try_into().unwrap()),

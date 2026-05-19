@@ -1,8 +1,10 @@
 use hdf5_pure_rust::hl::plist::dataset_create::VirtualSelectionInfo;
-use hdf5_pure_rust::{DatasetAccess, Error, File, VdsMissingSourcePolicy, VdsView};
+use hdf5_pure_rust::{
+    Dataset, DatasetAccess, Error, File, H5Type, VdsMissingSourcePolicy, VdsView,
+};
 use std::sync::{Mutex, OnceLock};
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 #[allow(dead_code)]
 struct ThreeBytes([u8; 3]);
 
@@ -17,14 +19,39 @@ fn vds_env_lock() -> &'static Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
+fn shape_into(ds: &Dataset, dims: &mut Vec<u64>) {
+    ds.shape_into(dims).unwrap();
+}
+
+fn shape_with_access_into(ds: &Dataset, access: &DatasetAccess, dims: &mut Vec<u64>) {
+    ds.shape_with_access_into(access, dims).unwrap();
+}
+
+fn read_into<T>(ds: &Dataset, vals: &mut [T])
+where
+    T: H5Type,
+{
+    ds.read_into(vals).unwrap();
+}
+
+fn read_into_with_access<T>(ds: &Dataset, access: &DatasetAccess, vals: &mut [T])
+where
+    T: H5Type,
+{
+    ds.read_into_with_access(access, vals).unwrap();
+}
+
 #[test]
 fn test_reference_virtual_dataset_regular_hyperslabs_read() {
     let f = File::open("hdf5/tools/test/testfiles/vds/1_vds.h5").unwrap();
     let ds = f.dataset("vds_dset").unwrap();
     assert!(ds.is_virtual().unwrap());
-    assert_eq!(ds.shape().unwrap(), vec![5, 18, 8]);
+    let mut dims = Vec::new();
+    shape_into(&ds, &mut dims);
+    assert_eq!(dims, vec![5, 18, 8]);
 
-    let vals: Vec<i32> = ds.read::<i32>().unwrap();
+    let mut vals = vec![0; ds.size().unwrap() as usize];
+    read_into(&ds, &mut vals);
     assert_eq!(vals.len(), 5 * 18 * 8);
 
     let row = |plane: usize, y: usize| -> &[i32] {
@@ -43,7 +70,9 @@ fn test_virtual_dataset_all_selection_read() {
     let f = File::open("tests/data/hdf5_ref/vds_all.h5").unwrap();
     let ds = f.dataset("vds_all").unwrap();
     assert!(ds.is_virtual().unwrap());
-    assert_eq!(ds.shape().unwrap(), vec![4, 6]);
+    let mut dims = Vec::new();
+    shape_into(&ds, &mut dims);
+    assert_eq!(dims, vec![4, 6]);
     let plist = ds.create_plist().unwrap();
     assert_eq!(plist.virtual_count(), 1);
     assert_eq!(plist.virtual_filename(0), Some("vds_all_source.h5"));
@@ -58,7 +87,8 @@ fn test_virtual_dataset_all_selection_read() {
     ));
     assert!(!plist.virtual_spatial_tree());
 
-    let vals: Vec<i32> = ds.read::<i32>().unwrap();
+    let mut vals = vec![0; ds.size().unwrap() as usize];
+    read_into(&ds, &mut vals);
     assert_eq!(vals, (0..24).collect::<Vec<_>>());
 }
 
@@ -67,9 +97,12 @@ fn test_virtual_dataset_same_file_source_read() {
     let f = File::open("tests/data/hdf5_ref/vds_same_file.h5").unwrap();
     let ds = f.dataset("vds_same_file").unwrap();
     assert!(ds.is_virtual().unwrap());
-    assert_eq!(ds.shape().unwrap(), vec![3, 4]);
+    let mut dims = Vec::new();
+    shape_into(&ds, &mut dims);
+    assert_eq!(dims, vec![3, 4]);
 
-    let vals: Vec<i32> = ds.read::<i32>().unwrap();
+    let mut vals = vec![0; ds.size().unwrap() as usize];
+    read_into(&ds, &mut vals);
     assert_eq!(vals, (0..12).collect::<Vec<_>>());
 }
 
@@ -78,9 +111,12 @@ fn test_virtual_dataset_mixed_all_and_regular_selection_read() {
     let f = File::open("tests/data/hdf5_ref/vds_mixed_all_regular.h5").unwrap();
     let ds = f.dataset("vds_mixed_all_regular").unwrap();
     assert!(ds.is_virtual().unwrap());
-    assert_eq!(ds.shape().unwrap(), vec![4, 6]);
+    let mut dims = Vec::new();
+    shape_into(&ds, &mut dims);
+    assert_eq!(dims, vec![4, 6]);
 
-    let vals: Vec<i32> = ds.read::<i32>().unwrap();
+    let mut vals = vec![0; ds.size().unwrap() as usize];
+    read_into(&ds, &mut vals);
     let mut expected = vec![0; 4 * 6];
     for row in 0..2 {
         for col in 0..3 {
@@ -95,9 +131,12 @@ fn test_virtual_dataset_fill_value_for_unmapped_regions() {
     let f = File::open("tests/data/hdf5_ref/vds_fill_value.h5").unwrap();
     let ds = f.dataset("vds_fill_value").unwrap();
     assert!(ds.is_virtual().unwrap());
-    assert_eq!(ds.shape().unwrap(), vec![4, 6]);
+    let mut dims = Vec::new();
+    shape_into(&ds, &mut dims);
+    assert_eq!(dims, vec![4, 6]);
 
-    let vals: Vec<i32> = ds.read::<i32>().unwrap();
+    let mut vals = vec![0; ds.size().unwrap() as usize];
+    read_into(&ds, &mut vals);
     let mut expected = vec![-7; 4 * 6];
     for row in 0..2 {
         for col in 0..3 {
@@ -112,9 +151,12 @@ fn test_virtual_dataset_f64_read() {
     let f = File::open("tests/data/hdf5_ref/vds_f64.h5").unwrap();
     let ds = f.dataset("vds_f64").unwrap();
     assert!(ds.is_virtual().unwrap());
-    assert_eq!(ds.shape().unwrap(), vec![3, 4]);
+    let mut dims = Vec::new();
+    shape_into(&ds, &mut dims);
+    assert_eq!(dims, vec![3, 4]);
 
-    let vals: Vec<f64> = ds.read::<f64>().unwrap();
+    let mut vals = vec![0.0; ds.size().unwrap() as usize];
+    read_into(&ds, &mut vals);
     let expected = (0..12)
         .map(|value| (value as f64 / 2.0) + 0.25)
         .collect::<Vec<_>>();
@@ -127,7 +169,8 @@ fn test_virtual_dataset_converts_source_datatype_to_destination() {
     let ds = f.dataset("vds_f64_from_i32").unwrap();
     assert!(ds.is_virtual().unwrap());
 
-    let vals: Vec<f64> = ds.read::<f64>().unwrap();
+    let mut vals = vec![0.0; ds.size().unwrap() as usize];
+    read_into(&ds, &mut vals);
     assert_eq!(vals, vec![1.0, -2.0, 300.0, 4000.0]);
 }
 
@@ -135,8 +178,9 @@ fn test_virtual_dataset_converts_source_datatype_to_destination() {
 fn test_virtual_dataset_rejects_mismatched_read_element_size() {
     let f = File::open("tests/data/hdf5_ref/vds_f64.h5").unwrap();
     let ds = f.dataset("vds_f64").unwrap();
+    let mut vals = vec![ThreeBytes::default(); ds.size().unwrap() as usize];
     let err = ds
-        .read::<ThreeBytes>()
+        .read_into(&mut vals)
         .expect_err("VDS read should reject mismatched destination element sizes");
 
     assert!(matches!(err, Error::InvalidFormat(_)));
@@ -147,7 +191,9 @@ fn test_virtual_dataset_scalar_mapping_read() {
     let f = File::open("tests/data/hdf5_ref/vds_scalar.h5").unwrap();
     let ds = f.dataset("vds_scalar").unwrap();
     assert!(ds.is_virtual().unwrap());
-    assert_eq!(ds.shape().unwrap(), Vec::<u64>::new());
+    let mut dims = Vec::new();
+    shape_into(&ds, &mut dims);
+    assert_eq!(dims, Vec::<u64>::new());
     assert_eq!(ds.size().unwrap(), 1);
 
     let val = ds.read_scalar::<i32>().unwrap();
@@ -159,10 +205,13 @@ fn test_virtual_dataset_zero_sized_mapping_read() {
     let f = File::open("tests/data/hdf5_ref/vds_zero_sized.h5").unwrap();
     let ds = f.dataset("vds_zero_sized").unwrap();
     assert!(ds.is_virtual().unwrap());
-    assert_eq!(ds.shape().unwrap(), vec![0, 4]);
+    let mut dims = Vec::new();
+    shape_into(&ds, &mut dims);
+    assert_eq!(dims, vec![0, 4]);
     assert_eq!(ds.size().unwrap(), 0);
 
-    let vals: Vec<i32> = ds.read::<i32>().unwrap();
+    let mut vals = vec![0; ds.size().unwrap() as usize];
+    read_into(&ds, &mut vals);
     assert!(vals.is_empty());
 }
 
@@ -172,10 +221,13 @@ fn test_virtual_dataset_null_mapping_read() {
     let ds = f.dataset("vds_null").unwrap();
     assert!(ds.is_virtual().unwrap());
     assert!(ds.space().unwrap().is_null());
-    assert_eq!(ds.shape().unwrap(), Vec::<u64>::new());
+    let mut dims = Vec::new();
+    shape_into(&ds, &mut dims);
+    assert_eq!(dims, Vec::<u64>::new());
     assert_eq!(ds.size().unwrap(), 0);
 
-    let vals: Vec<i32> = ds.read::<i32>().unwrap();
+    let mut vals = vec![0; ds.size().unwrap() as usize];
+    read_into(&ds, &mut vals);
     assert!(vals.is_empty());
 }
 
@@ -184,9 +236,12 @@ fn test_virtual_dataset_rank_mismatch_mapping_read() {
     let f = File::open("tests/data/hdf5_ref/vds_rank_mismatch.h5").unwrap();
     let ds = f.dataset("vds_rank_mismatch").unwrap();
     assert!(ds.is_virtual().unwrap());
-    assert_eq!(ds.shape().unwrap(), vec![2, 3]);
+    let mut dims = Vec::new();
+    shape_into(&ds, &mut dims);
+    assert_eq!(dims, vec![2, 3]);
 
-    let vals: Vec<i32> = ds.read::<i32>().unwrap();
+    let mut vals = vec![0; ds.size().unwrap() as usize];
+    read_into(&ds, &mut vals);
     assert_eq!(vals, (0..6).collect::<Vec<_>>());
 }
 
@@ -195,9 +250,12 @@ fn test_virtual_dataset_overlapping_mappings_later_mapping_wins() {
     let f = File::open("tests/data/hdf5_ref/vds_overlap.h5").unwrap();
     let ds = f.dataset("vds_overlap").unwrap();
     assert!(ds.is_virtual().unwrap());
-    assert_eq!(ds.shape().unwrap(), vec![4]);
+    let mut dims = Vec::new();
+    shape_into(&ds, &mut dims);
+    assert_eq!(dims, vec![4]);
 
-    let vals: Vec<i32> = ds.read::<i32>().unwrap();
+    let mut vals = vec![0; ds.size().unwrap() as usize];
+    read_into(&ds, &mut vals);
     assert_eq!(vals, vec![1, 9, 8, 4]);
 }
 
@@ -206,7 +264,9 @@ fn test_virtual_dataset_irregular_hyperslab_read() {
     let f = File::open("tests/data/hdf5_ref/vds_irregular_hyperslab.h5").unwrap();
     let ds = f.dataset("vds_irregular_hyperslab").unwrap();
     assert!(ds.is_virtual().unwrap());
-    assert_eq!(ds.shape().unwrap(), vec![4, 4]);
+    let mut dims = Vec::new();
+    shape_into(&ds, &mut dims);
+    assert_eq!(dims, vec![4, 4]);
     let plist = ds.create_plist().unwrap();
     assert_eq!(plist.virtual_count(), 1);
     assert!(matches!(
@@ -218,7 +278,8 @@ fn test_virtual_dataset_irregular_hyperslab_read() {
         Some(VirtualSelectionInfo::Irregular(blocks)) if blocks.len() == 2
     ));
 
-    let vals: Vec<i32> = ds.read::<i32>().unwrap();
+    let mut vals = vec![0; ds.size().unwrap() as usize];
+    read_into(&ds, &mut vals);
     let mut expected = vec![-2; 4 * 4];
     expected[1] = 1;
     expected[2] = 2;
@@ -232,7 +293,9 @@ fn test_virtual_dataset_point_selection_read() {
     let f = File::open("tests/data/hdf5_ref/vds_point_selection.h5").unwrap();
     let ds = f.dataset("vds_point_selection").unwrap();
     assert!(ds.is_virtual().unwrap());
-    assert_eq!(ds.shape().unwrap(), vec![4, 4]);
+    let mut dims = Vec::new();
+    shape_into(&ds, &mut dims);
+    assert_eq!(dims, vec![4, 4]);
     let plist = ds.create_plist().unwrap();
     assert_eq!(plist.virtual_count(), 1);
     assert!(matches!(
@@ -244,7 +307,8 @@ fn test_virtual_dataset_point_selection_read() {
         Some(VirtualSelectionInfo::Points(points)) if points == &vec![vec![0, 3]]
     ));
 
-    let vals: Vec<i32> = ds.read::<i32>().unwrap();
+    let mut vals = vec![0; ds.size().unwrap() as usize];
+    read_into(&ds, &mut vals);
     let mut expected = vec![-2; 4 * 4];
     expected[3] = 9;
     assert_eq!(vals, expected);
@@ -258,8 +322,9 @@ fn test_virtual_dataset_missing_source_file_fails_without_access_property_policy
 
     let f = File::open(&vds_path).unwrap();
     let ds = f.dataset("vds_all").unwrap();
+    let mut vals = vec![0; ds.size().unwrap() as usize];
     let err = ds
-        .read::<i32>()
+        .read_into(&mut vals)
         .expect_err("missing VDS source should fail without a VDS access policy");
 
     assert!(
@@ -279,8 +344,11 @@ fn test_virtual_dataset_missing_source_file_can_read_fill_values() {
     let f = File::open(&vds_path).unwrap();
     let ds = f.dataset("vds_all").unwrap();
 
-    assert_eq!(ds.shape_with_access(&access).unwrap(), vec![4, 6]);
-    let vals: Vec<i32> = ds.read_with_access(&access).unwrap();
+    let mut dims = Vec::new();
+    shape_with_access_into(&ds, &access, &mut dims);
+    assert_eq!(dims, vec![4, 6]);
+    let mut vals = vec![0; ds.size().unwrap() as usize];
+    read_into_with_access(&ds, &access, &mut vals);
     assert_eq!(vals, vec![0; 24]);
 }
 
@@ -301,7 +369,9 @@ fn test_virtual_dataset_uses_hdf5_vds_prefix_directory() {
 
     std::env::set_var("HDF5_VDS_PREFIX", prefixed_dir.to_str().unwrap());
     let f = File::open(&vds_path).unwrap();
-    let vals: Vec<i32> = f.dataset("vds_all").unwrap().read::<i32>().unwrap();
+    let ds = f.dataset("vds_all").unwrap();
+    let mut vals = vec![0; ds.size().unwrap() as usize];
+    read_into(&ds, &mut vals);
     std::env::remove_var("HDF5_VDS_PREFIX");
 
     assert_eq!(vals, (0..24).collect::<Vec<_>>());
@@ -326,8 +396,11 @@ fn test_virtual_dataset_uses_explicit_access_prefix_directory() {
     let access = DatasetAccess::new().with_virtual_prefix(&prefixed_dir);
     let f = File::open(&vds_path).unwrap();
     let ds = f.dataset("vds_all").unwrap();
-    assert_eq!(ds.shape_with_access(&access).unwrap(), vec![4, 6]);
-    let vals: Vec<i32> = ds.read_with_access(&access).unwrap();
+    let mut dims = Vec::new();
+    shape_with_access_into(&ds, &access, &mut dims);
+    assert_eq!(dims, vec![4, 6]);
+    let mut vals = vec![0; ds.size().unwrap() as usize];
+    read_into_with_access(&ds, &access, &mut vals);
 
     assert_eq!(vals, (0..24).collect::<Vec<_>>());
 }
@@ -349,7 +422,9 @@ fn test_virtual_dataset_uses_hdf5_vds_prefix_origin_expansion() {
 
     std::env::set_var("HDF5_VDS_PREFIX", "${ORIGIN}/prefixed");
     let f = File::open(&vds_path).unwrap();
-    let vals: Vec<i32> = f.dataset("vds_all").unwrap().read::<i32>().unwrap();
+    let ds = f.dataset("vds_all").unwrap();
+    let mut vals = vec![0; ds.size().unwrap() as usize];
+    read_into(&ds, &mut vals);
     std::env::remove_var("HDF5_VDS_PREFIX");
 
     assert_eq!(vals, (0..24).collect::<Vec<_>>());
@@ -375,11 +450,9 @@ fn test_virtual_dataset_access_prefix_expands_origin() {
         .with_virtual_prefix("${ORIGIN}/prefixed")
         .with_virtual_view(VdsView::LastAvailable);
     let f = File::open(&vds_path).unwrap();
-    let vals: Vec<i32> = f
-        .dataset("vds_all")
-        .unwrap()
-        .read_with_access(&access)
-        .unwrap();
+    let ds = f.dataset("vds_all").unwrap();
+    let mut vals = vec![0; ds.size().unwrap() as usize];
+    read_into_with_access(&ds, &access, &mut vals);
 
     assert_eq!(vals, (0..24).collect::<Vec<_>>());
 }

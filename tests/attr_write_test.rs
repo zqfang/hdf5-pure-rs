@@ -1,7 +1,25 @@
 use std::fs;
 
 use hdf5_pure_rust::engine::writer::{AttrSpec, DatasetSpec, DtypeSpec, HdfFileWriter};
-use hdf5_pure_rust::File;
+use hdf5_pure_rust::{Dataset, File, Location, Result};
+
+fn dataset_attr_names(ds: &Dataset) -> Result<Vec<String>> {
+    let mut names = Vec::new();
+    ds.visit_attr_names(|name| {
+        names.push(name.to_string());
+        Ok(())
+    })?;
+    Ok(names)
+}
+
+fn location_attr_names<L: Location>(location: &L) -> Result<Vec<String>> {
+    let mut names = Vec::new();
+    location.visit_attr_names(|name| {
+        names.push(name.to_string());
+        Ok(())
+    })?;
+    Ok(names)
+}
 
 #[test]
 fn test_write_dataset_with_attrs() {
@@ -47,19 +65,18 @@ fn test_write_dataset_with_attrs() {
         let ds = f.dataset("data").unwrap();
 
         // Read dataset
-        let raw = ds.read_raw().unwrap();
-        let values: Vec<f64> = raw
-            .chunks_exact(8)
-            .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
-            .collect();
+        let mut values = vec![0.0; ds.size().unwrap() as usize];
+        ds.read_into(&mut values).unwrap();
         assert_eq!(values, vec![1.0, 2.0, 3.0]);
 
         // Read attribute
-        let attr_names = ds.attr_names().unwrap();
+        let attr_names = dataset_attr_names(&ds).unwrap();
         assert!(attr_names.contains(&"count".to_string()));
 
         let attr = ds.attr("count").unwrap();
-        assert_eq!(attr.read_scalar_i64(), Some(42));
+        let mut value = 0i64;
+        attr.read_into(std::slice::from_mut(&mut value)).unwrap();
+        assert_eq!(value, 42);
     }
 
     // Verify with h5dump
@@ -132,11 +149,12 @@ fn test_write_root_attrs() {
 
     {
         let f = File::open(&path).unwrap();
-        let attr_names = f.attr_names().unwrap();
+        let attr_names = location_attr_names(&f).unwrap();
         assert!(attr_names.contains(&"pi".to_string()));
 
         let attr = f.attr("pi").unwrap();
-        let val = attr.read_scalar_f64().unwrap();
+        let mut val = 0.0f64;
+        attr.read_into(std::slice::from_mut(&mut val)).unwrap();
         assert!((val - 3.14).abs() < 1e-10);
     }
 }
@@ -189,11 +207,16 @@ fn test_write_dataset_with_many_compact_attrs() {
     {
         let f = File::open(&path).unwrap();
         let ds = f.dataset("data").unwrap();
-        let names = ds.attr_names().unwrap();
+        let names = dataset_attr_names(&ds).unwrap();
         assert_eq!(names.len(), 40);
         assert!(names.contains(&"attr_00".to_string()));
         assert!(names.contains(&"attr_39".to_string()));
-        assert_eq!(ds.attr("attr_37").unwrap().read_scalar_i64(), Some(37));
+        let mut value = 0i64;
+        ds.attr("attr_37")
+            .unwrap()
+            .read_into(std::slice::from_mut(&mut value))
+            .unwrap();
+        assert_eq!(value, 37);
     }
 
     let out = std::process::Command::new("h5dump")

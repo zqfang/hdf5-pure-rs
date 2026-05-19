@@ -7,7 +7,9 @@
 mod dblock;
 mod hdr;
 
+use std::fmt::{self, Write};
 use std::io::{Read, Seek};
+use std::slice;
 
 use crate::error::{Error, Result};
 use crate::io::reader::{is_undef_addr, HdfReader, UNDEF_ADDR};
@@ -78,6 +80,21 @@ impl FixedArray {
         self.elements.len()
     }
 
+    /// Borrow the elements currently held by the array.
+    pub fn elements(&self) -> &[FixedArrayElement] {
+        &self.elements
+    }
+
+    /// Iterate over the elements currently held by the array.
+    pub fn iter(&self) -> slice::Iter<'_, FixedArrayElement> {
+        self.elements.iter()
+    }
+
+    /// Consume the array and return its element storage.
+    pub fn into_elements(self) -> Vec<FixedArrayElement> {
+        self.elements
+    }
+
     /// Query the address of the element at `index`.
     pub fn get_addr(&self, index: usize) -> Result<u64> {
         Ok(self
@@ -136,7 +153,7 @@ impl FixedArray {
     }
 
     /// Query the metadata statistics of the array.
-    pub fn get_stats(&self) -> FixedArrayStats {
+    pub fn stats(&self) -> FixedArrayStats {
         FixedArrayStats {
             elements: self.elements.len(),
             allocated_elements: self.elements.capacity(),
@@ -186,21 +203,18 @@ pub fn test_crt_context() -> FixedArrayCreateParams {
 pub fn test_dst_context(_params: FixedArrayCreateParams) {}
 
 /// Fill a vector with `count` undefined-address fixed array elements ("missing" entries).
-pub fn test_fill(count: usize) -> Vec<FixedArrayElement> {
-    let mut elements = Vec::with_capacity(count);
-    append_fill_elements(count, &mut elements);
-    elements
+pub fn test_fill_into(count: usize, elements: &mut Vec<FixedArrayElement>) {
+    append_fill_elements(count, elements);
 }
 
 /// Encode the test creation parameters into a stable little-endian byte stream.
-pub fn test_encode(params: &FixedArrayCreateParams) -> Result<Vec<u8>> {
-    let mut out = Vec::new();
+pub fn test_encode_into(params: &FixedArrayCreateParams, out: &mut Vec<u8>) -> Result<()> {
     out.extend_from_slice(
         &u64_from_usize(params.raw_element_size, "fixed array raw element size")?.to_le_bytes(),
     );
     out.push(params.max_page_elements_bits);
     out.extend_from_slice(&params.elements.to_le_bytes());
-    Ok(out)
+    Ok(())
 }
 
 /// Decode a previously encoded creation-parameter byte stream.
@@ -241,8 +255,12 @@ fn read_u64_le_at(data: &[u8], pos: usize, context: &str) -> Result<u64> {
 }
 
 /// Format the test creation parameters for debug printing.
-pub fn test_debug(params: &FixedArrayCreateParams) -> String {
-    format!(
+pub fn write_test_debug<W: Write + ?Sized>(
+    params: &FixedArrayCreateParams,
+    out: &mut W,
+) -> fmt::Result {
+    write!(
+        out,
         "FixedArrayCreateParams(raw_element_size={}, max_page_elements_bits={}, elements={})",
         params.raw_element_size, params.max_page_elements_bits, params.elements
     )
@@ -254,8 +272,8 @@ pub fn test_crt_dbg_context() -> FixedArrayCreateParams {
 }
 
 /// Retrieve the parameters used to create the fixed array.
-pub fn get_cparam_test(params: &FixedArrayCreateParams) -> FixedArrayCreateParams {
-    params.clone()
+pub fn cparam_test(params: &FixedArrayCreateParams) -> &FixedArrayCreateParams {
+    params
 }
 
 /// Compare two sets of fixed-array creation parameters for equality.
@@ -264,12 +282,42 @@ pub fn cmp_cparam_test(lhs: &FixedArrayCreateParams, rhs: &FixedArrayCreateParam
 }
 
 /// Iterate over the elements of a fixed array, returning the decoded chunk records.
-pub fn read_fixed_array_chunks<R: Read + Seek>(
+pub fn read_fixed_array_chunks_into<R: Read + Seek>(
     reader: &mut HdfReader<R>,
     addr: u64,
     filtered: bool,
     chunk_size_len: usize,
-) -> Result<Vec<FixedArrayElement>> {
+    elements: &mut Vec<FixedArrayElement>,
+) -> Result<()> {
+    let header = read_header(reader, addr)?;
+    let expected_class = if filtered { 1 } else { 0 };
+    if header.class_id != expected_class {
+        return Err(Error::InvalidFormat(format!(
+            "fixed array class {} does not match filtered={filtered}",
+            header.class_id
+        )));
+    }
+
+    elements.clear();
+    if is_undef_addr(header.data_block_addr) {
+        return Ok(());
+    }
+
+    dblock::read_data_block_into(reader, addr, &header, filtered, chunk_size_len, elements)
+}
+
+/// Visit each decoded chunk record in a fixed array.
+pub fn visit_fixed_array_chunks<R, F>(
+    reader: &mut HdfReader<R>,
+    addr: u64,
+    filtered: bool,
+    chunk_size_len: usize,
+    visitor: F,
+) -> Result<()>
+where
+    R: Read + Seek,
+    F: FnMut(FixedArrayElement) -> Result<()>,
+{
     let header = read_header(reader, addr)?;
     let expected_class = if filtered { 1 } else { 0 };
     if header.class_id != expected_class {
@@ -280,10 +328,10 @@ pub fn read_fixed_array_chunks<R: Read + Seek>(
     }
 
     if is_undef_addr(header.data_block_addr) {
-        return Ok(Vec::new());
+        return Ok(());
     }
 
-    dblock::read_data_block(reader, addr, &header, filtered, chunk_size_len)
+    dblock::visit_data_block(reader, addr, &header, filtered, chunk_size_len, visitor)
 }
 
 /// Locate the file offset of an existing fixed-array element.
@@ -375,7 +423,8 @@ pub fn locate_fixed_array_element_with_checksum<R: Read + Seek>(
         )?)?;
         let pages = element_count.div_ceil(page_elements);
         let page_init_size = pages.div_ceil(8);
-        let page_init = reader.read_bytes(page_init_size)?;
+        let mut page_init = vec![0; page_init_size];
+        reader.read_bytes_into(&mut page_init)?;
         let page_index = element_index / page_elements;
         if !bit_is_set(&page_init, page_index) {
             return Err(Error::Unsupported(

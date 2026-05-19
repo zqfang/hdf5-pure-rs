@@ -35,7 +35,8 @@ impl SymbolTableNode {
     pub fn read_at<R: Read + Seek>(reader: &mut HdfReader<R>, addr: u64) -> Result<Self> {
         reader.seek(addr)?;
 
-        let magic = reader.read_bytes(4)?;
+        let mut magic = [0u8; 4];
+        reader.read_bytes_into(&mut magic)?;
         if magic != SNOD_MAGIC {
             return Err(Error::InvalidFormat(
                 "invalid symbol table node magic".into(),
@@ -88,7 +89,12 @@ impl SymbolTableNode {
 
     /// Encode this symbol-table node into its on-disk SNOD image, using the
     /// supplied address and length widths.
-    pub fn cache_node_serialize(&self, sizeof_addr: u8, sizeof_size: u8) -> Result<Vec<u8>> {
+    pub fn cache_node_serialize_into(
+        &self,
+        sizeof_addr: u8,
+        sizeof_size: u8,
+        out: &mut Vec<u8>,
+    ) -> Result<()> {
         validate_width(sizeof_addr, "symbol table address width")?;
         validate_width(sizeof_size, "symbol table size width")?;
         if self.version != 1 {
@@ -102,14 +108,22 @@ impl SymbolTableNode {
                 "symbol table entry count exceeds u16".into(),
             ));
         }
-        let mut out = Vec::with_capacity(self.cache_node_image_len(sizeof_addr, sizeof_size)?);
+        out.clear();
+        out.reserve_exact(self.cache_node_image_len(sizeof_addr, sizeof_size)?);
         out.extend_from_slice(&SNOD_MAGIC);
         out.push(1);
         out.push(0);
         out.extend_from_slice(&(self.entries.len() as u16).to_le_bytes());
         for entry in &self.entries {
-            Self::write_entry(&mut out, entry, sizeof_addr, sizeof_size)?;
+            Self::write_entry(out, entry, sizeof_addr, sizeof_size)?;
         }
+        Ok(())
+    }
+
+    /// Encode this symbol-table node into an owned on-disk SNOD image.
+    pub fn cache_node_serialize(&self, sizeof_addr: u8, sizeof_size: u8) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        self.cache_node_serialize_into(sizeof_addr, sizeof_size, &mut out)?;
         Ok(out)
     }
 
@@ -337,7 +351,8 @@ mod tests {
             ],
         };
 
-        let image = node.cache_node_serialize(4, 4).unwrap();
+        let mut image = Vec::new();
+        node.cache_node_serialize_into(4, 4, &mut image).unwrap();
         assert_eq!(image.len(), node.cache_node_image_len(4, 4).unwrap());
         let mut reader = HdfReader::new(Cursor::new(image));
         reader.set_sizeof_addr(4);
@@ -364,7 +379,8 @@ mod tests {
                 cached_link_offset: None,
             }],
         };
-        assert!(node.cache_node_serialize(4, 4).is_err());
+        let mut image = Vec::new();
+        assert!(node.cache_node_serialize_into(4, 4, &mut image).is_err());
 
         let bad_cache_fields = SymbolTableNode {
             version: 1,
@@ -377,12 +393,16 @@ mod tests {
                 cached_link_offset: None,
             }],
         };
-        assert!(bad_cache_fields.cache_node_serialize(4, 4).is_err());
+        assert!(bad_cache_fields
+            .cache_node_serialize_into(4, 4, &mut image)
+            .is_err());
 
         let invalid_version = SymbolTableNode {
             version: 2,
             entries: Vec::new(),
         };
-        assert!(invalid_version.cache_node_serialize(4, 4).is_err());
+        assert!(invalid_version
+            .cache_node_serialize_into(4, 4, &mut image)
+            .is_err());
     }
 }

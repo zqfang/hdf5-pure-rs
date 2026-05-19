@@ -22,6 +22,7 @@ pub(super) struct MutableExtensibleArrayHeader {
     pub(super) index_block_data_block_addrs: usize,
     pub(super) index_block_super_block_addrs: usize,
     pub(super) super_block_info: Vec<MutableExtensibleArraySuperBlockInfo>,
+    pub(super) derived_super_block_count: usize,
     pub(super) super_block_count: u64,
     pub(super) super_block_size: u64,
     pub(super) data_block_count: u64,
@@ -69,7 +70,7 @@ impl MutableFile {
         )?;
 
         let mut guard = self.inner.lock();
-        let header = Self::read_extensible_array_header(
+        let mut header = Self::read_extensible_array_header(
             &mut guard.reader,
             index_addr,
             write.filtered,
@@ -119,6 +120,7 @@ impl MutableFile {
                 write.chunk_size_len,
             )
         } else {
+            Self::ensure_mutable_extensible_array_super_block_info(&mut header)?;
             drop(guard);
             self.append_extensible_array_spillover_element(
                 index_addr,
@@ -358,11 +360,14 @@ impl MutableFile {
             )?;
             self.write_handle
                 .seek(SeekFrom::Start(data_block_addr_pos))?;
-            self.write_handle.write_all(&Self::encode_uint_le(
+            let mut addr_bytes = [0u8; 8];
+            let addr_bytes = Self::encode_uint_le_into(
                 new_addr,
+                &mut addr_bytes,
                 sa,
                 "extensible array data block address",
-            )?)?;
+            )?;
+            self.write_handle.write_all(addr_bytes)?;
             self.rewrite_extensible_array_index_block_checksum(
                 header,
                 Some((global_data_block_index, new_addr)),
@@ -481,11 +486,14 @@ impl MutableFile {
             )?;
             self.write_handle
                 .seek(SeekFrom::Start(super_block_addr_pos))?;
-            self.write_handle.write_all(&Self::encode_uint_le(
+            let mut addr_bytes = [0u8; 8];
+            let addr_bytes = Self::encode_uint_le_into(
                 new_super_addr,
+                &mut addr_bytes,
                 sa,
                 "extensible array super block address",
-            )?)?;
+            )?;
+            self.write_handle.write_all(addr_bytes)?;
             self.rewrite_extensible_array_index_block_checksum(
                 header,
                 None,
@@ -732,7 +740,8 @@ impl MutableFile {
 
         let super_block_size = self.extensible_array_super_block_size(header, super_info)?;
         let super_block_addr = self.append_aligned_zeros(super_block_size, 8)?;
-        let block = self.encode_extensible_array_super_block(
+        let mut block = Vec::with_capacity(super_block_size);
+        self.encode_extensible_array_super_block_into(
             header_addr,
             header,
             super_info,
@@ -740,6 +749,7 @@ impl MutableFile {
             page_index,
             data_block_addr,
             super_block_size,
+            &mut block,
         )?;
         self.write_handle.seek(SeekFrom::Start(super_block_addr))?;
         self.write_handle.write_all(&block)?;
@@ -751,7 +761,7 @@ impl MutableFile {
     /// checksum). Mirrors the serialize half of libhdf5's
     /// `H5EA__cache_sblock_serialize`.
     #[allow(clippy::too_many_arguments)]
-    fn encode_extensible_array_super_block(
+    fn encode_extensible_array_super_block_into(
         &self,
         header_addr: u64,
         header: &MutableExtensibleArrayHeader,
@@ -760,7 +770,8 @@ impl MutableFile {
         page_index: Option<usize>,
         data_block_addr: u64,
         super_block_size: usize,
-    ) -> Result<Vec<u8>> {
+        block: &mut Vec<u8>,
+    ) -> Result<()> {
         let page_init_size =
             Self::extensible_array_page_init_size(header, super_info.data_block_elements);
         let sa = usize::from(self.superblock.sizeof_addr);
@@ -770,17 +781,23 @@ impl MutableFile {
             super_info.start_index,
             "extensible array super block offset",
         )?;
-        let mut block = Vec::with_capacity(super_block_size);
+        block.clear();
+        if block.capacity() < super_block_size {
+            block.reserve(super_block_size);
+        }
         block.extend_from_slice(b"EASB");
         block.push(0);
         block.push(header.class_id);
-        block.extend_from_slice(&Self::encode_uint_le(
+        let mut encoded = [0u8; 8];
+        block.extend_from_slice(Self::encode_uint_le_into(
             header_addr,
+            &mut encoded,
             sa,
             "extensible array super block header address",
         )?);
-        block.extend_from_slice(&Self::encode_uint_le(
+        block.extend_from_slice(Self::encode_uint_le_into(
             block_offset,
+            &mut encoded,
             array_offset_size,
             "extensible array super block offset",
         )?);
@@ -789,7 +806,8 @@ impl MutableFile {
             page_init_size,
             "extensible array super block page-init size",
         )?;
-        let mut page_init = vec![0u8; page_init_len];
+        let page_init_start = block.len();
+        block.resize(page_init_start + page_init_len, 0);
         if let Some(page_index) = page_index {
             let start = Self::checked_usize_mul(
                 local_data_block_index,
@@ -802,29 +820,37 @@ impl MutableFile {
                 "extensible array super block page-init offset",
             )?;
             Self::set_extensible_array_page_init_bit(
-                page_init.get_mut(start..end).ok_or_else(|| {
-                    Error::InvalidFormat("extensible array page-init slice out of bounds".into())
-                })?,
+                block
+                    .get_mut(page_init_start + start..page_init_start + end)
+                    .ok_or_else(|| {
+                        Error::InvalidFormat(
+                            "extensible array page-init slice out of bounds".into(),
+                        )
+                    })?,
                 page_index,
             )?;
         }
-        block.extend_from_slice(&page_init);
-        let fill_addr =
-            Self::undefined_addr_bytes(sa, "extensible array super block data address")?;
+        let mut fill_addr = [0u8; 8];
+        let fill_addr = Self::undefined_addr_bytes_into(
+            &mut fill_addr,
+            sa,
+            "extensible array super block data address",
+        )?;
         for idx in 0..super_info.data_blocks {
             if idx == local_data_block_index {
-                block.extend_from_slice(&Self::encode_uint_le(
+                block.extend_from_slice(Self::encode_uint_le_into(
                     data_block_addr,
+                    &mut encoded,
                     sa,
                     "extensible array super block data address",
                 )?);
             } else {
-                block.extend_from_slice(&fill_addr);
+                block.extend_from_slice(fill_addr);
             }
         }
         let checksum = checksum_metadata(&block);
         block.extend_from_slice(&checksum.to_le_bytes());
-        Ok(block)
+        Ok(())
     }
 
     fn read_extensible_array_super_block_data_addr(
@@ -893,7 +919,8 @@ impl MutableFile {
             Error::InvalidFormat("extensible array super block checksum span overflow".into())
         })?;
         self.write_handle.flush()?;
-        let mut block = self.read_fresh_bytes(super_block_addr, check_len)?;
+        let mut block = vec![0u8; check_len];
+        self.read_fresh_bytes_into(super_block_addr, &mut block)?;
 
         let page_init_size =
             Self::extensible_array_page_init_size(header, super_info.data_block_elements);
@@ -955,6 +982,7 @@ impl MutableFile {
                 usize::from(self.superblock.sizeof_addr),
                 "extensible array super block address offset",
             )?;
+            let mut encoded_addr = [0u8; 8];
             block
                 .get_mut(pos..end)
                 .ok_or_else(|| {
@@ -962,8 +990,9 @@ impl MutableFile {
                         "extensible array super block address slice out of bounds".into(),
                     )
                 })?
-                .copy_from_slice(&Self::encode_uint_le(
+                .copy_from_slice(Self::encode_uint_le_into(
                     addr,
+                    &mut encoded_addr,
                     usize::from(self.superblock.sizeof_addr),
                     "extensible array super block address",
                 )?);
@@ -1017,7 +1046,8 @@ impl MutableFile {
             )
         })?;
         self.write_handle.flush()?;
-        let mut index_bytes = self.read_fresh_bytes(header.index_block_addr, check_len)?;
+        let mut index_bytes = vec![0u8; check_len];
+        self.read_fresh_bytes_into(header.index_block_addr, &mut index_bytes)?;
         if let Some((data_block_index, data_block_addr)) = data_block_addr {
             let data_block_addr_offset = Self::checked_usize_add(
                 index_prefix_size,
@@ -1040,6 +1070,7 @@ impl MutableFile {
                 sa,
                 "extensible array data block address offset",
             )?;
+            let mut encoded_addr = [0u8; 8];
             index_bytes
                 .get_mut(data_block_addr_offset..end)
                 .ok_or_else(|| {
@@ -1047,8 +1078,9 @@ impl MutableFile {
                         "extensible array data block address slice out of bounds".into(),
                     )
                 })?
-                .copy_from_slice(&Self::encode_uint_le(
+                .copy_from_slice(Self::encode_uint_le_into(
                     data_block_addr,
+                    &mut encoded_addr,
                     sa,
                     "extensible array data block address",
                 )?);
@@ -1082,6 +1114,7 @@ impl MutableFile {
                 sa,
                 "extensible array super block address offset",
             )?;
+            let mut encoded_addr = [0u8; 8];
             index_bytes
                 .get_mut(super_block_addr_offset..end)
                 .ok_or_else(|| {
@@ -1089,8 +1122,9 @@ impl MutableFile {
                         "extensible array super block address slice out of bounds".into(),
                     )
                 })?
-                .copy_from_slice(&Self::encode_uint_le(
+                .copy_from_slice(Self::encode_uint_le_into(
                     super_block_addr,
+                    &mut encoded_addr,
                     sa,
                     "extensible array super block address",
                 )?);
@@ -1147,7 +1181,8 @@ impl MutableFile {
                 Error::InvalidFormat("extensible array header checksum span is too large".into())
             })?;
         self.write_handle.flush()?;
-        let mut header_bytes = self.read_fresh_bytes(header_addr, check_len)?;
+        let mut header_bytes = vec![0u8; check_len];
+        self.read_fresh_bytes_into(header_addr, &mut header_bytes)?;
         if let Some((super_block_count, super_block_size)) = super_block_counts {
             let offset = Self::header_relative_offset(
                 header.super_block_count_pos,
@@ -1276,11 +1311,6 @@ impl MutableFile {
                 "extensible array raw element size {raw_element_size} does not match expected {expected_element_size}"
             )));
         }
-        let super_block_info = Self::build_mutable_extensible_array_super_block_info(
-            parsed.derived_super_block_count,
-            parsed.data_block_min_elements,
-        )?;
-
         Ok(MutableExtensibleArrayHeader {
             class_id,
             raw_element_size,
@@ -1294,7 +1324,8 @@ impl MutableFile {
             index_block_super_blocks: parsed.index_block_super_blocks,
             index_block_data_block_addrs: parsed.index_block_data_block_addrs,
             index_block_super_block_addrs: parsed.index_block_super_block_addrs,
-            super_block_info,
+            super_block_info: Vec::new(),
+            derived_super_block_count: parsed.derived_super_block_count,
             super_block_count: parsed.super_block_count,
             super_block_size: parsed.super_block_size,
             data_block_count: parsed.data_block_count,
@@ -1309,11 +1340,28 @@ impl MutableFile {
         })
     }
 
-    fn build_mutable_extensible_array_super_block_info(
+    fn ensure_mutable_extensible_array_super_block_info(
+        header: &mut MutableExtensibleArrayHeader,
+    ) -> Result<()> {
+        if header.super_block_info.len() == header.derived_super_block_count {
+            return Ok(());
+        }
+        Self::build_mutable_extensible_array_super_block_info_into(
+            header.derived_super_block_count,
+            header.data_block_min_elements,
+            &mut header.super_block_info,
+        )
+    }
+
+    fn build_mutable_extensible_array_super_block_info_into(
         count: usize,
         min_data_block_elements: usize,
-    ) -> Result<Vec<MutableExtensibleArraySuperBlockInfo>> {
-        let mut infos = Vec::with_capacity(count);
+        infos: &mut Vec<MutableExtensibleArraySuperBlockInfo>,
+    ) -> Result<()> {
+        infos.clear();
+        if infos.capacity() < count {
+            infos.reserve(count);
+        }
         let mut start_index = 0u64;
         let mut start_data_block = 0u64;
         for index in 0..count {
@@ -1367,7 +1415,7 @@ impl MutableFile {
                     Error::InvalidFormat("extensible array data block index overflow".into())
                 })?;
         }
-        Ok(infos)
+        Ok(())
     }
 
     pub(super) fn extensible_array_data_block_pages(
@@ -1641,7 +1689,9 @@ impl MutableFile {
         element_index: usize,
     ) -> Result<u64> {
         reader.seek(data_block_addr)?;
-        if reader.read_bytes(4)? != b"EADB" {
+        let mut magic = [0u8; 4];
+        reader.read_bytes_into(&mut magic)?;
+        if magic != *b"EADB" {
             return Err(Error::InvalidFormat(
                 "invalid extensible array data block magic".into(),
             ));
@@ -1698,7 +1748,9 @@ impl MutableFile {
         header: &MutableExtensibleArrayHeader,
     ) -> Result<()> {
         reader.seek(header.index_block_addr)?;
-        if reader.read_bytes(4)? != b"EAIB" {
+        let mut magic = [0u8; 4];
+        reader.read_bytes_into(&mut magic)?;
+        if magic != *b"EAIB" {
             return Err(Error::InvalidFormat(
                 "invalid extensible array index block magic".into(),
             ));
@@ -1791,15 +1843,16 @@ impl MutableFile {
     #[allow(clippy::too_many_arguments)]
     /// Pure encoder for the EADB prefix (+ inline elements when the block
     /// is not paginated). Mirrors the serialize half of libhdf5's
-    /// `H5EA__cache_dblock_serialize`: no I/O, bytes out.
-    fn encode_extensible_array_data_block_prefix(
+    /// `H5EA__cache_dblock_serialize`: no I/O, caller-provided bytes out.
+    fn encode_extensible_array_data_block_prefix_into(
         &self,
         header_addr: u64,
         header: &MutableExtensibleArrayHeader,
         block_offset: u64,
         data_block_elements: usize,
         initial: Option<(usize, u64, u64, bool, usize)>,
-    ) -> Result<Vec<u8>> {
+        prefix: &mut Vec<u8>,
+    ) -> Result<()> {
         let pages = Self::extensible_array_data_block_pages(header, data_block_elements);
         let prefix_size = Self::checked_usize_add(
             4 + 1 + 1,
@@ -1829,36 +1882,49 @@ impl MutableFile {
         )?;
         let sa = usize::from(self.superblock.sizeof_addr);
         let array_offset_size = usize::from(header.array_offset_size);
-        let mut prefix = Vec::with_capacity(capacity);
+        prefix.clear();
+        if prefix.capacity() < capacity {
+            prefix.reserve(capacity);
+        }
         prefix.extend_from_slice(b"EADB");
         prefix.push(0);
         prefix.push(header.class_id);
-        prefix.extend_from_slice(&Self::encode_uint_le(
+        let mut encoded = [0u8; 8];
+        prefix.extend_from_slice(Self::encode_uint_le_into(
             header_addr,
+            &mut encoded,
             sa,
             "extensible array data block header address",
         )?);
-        prefix.extend_from_slice(&Self::encode_uint_le(
+        prefix.extend_from_slice(Self::encode_uint_le_into(
             block_offset,
+            &mut encoded,
             array_offset_size,
             "extensible array data block offset",
         )?);
 
         if pages == 0 {
-            let fill_addr = Self::undefined_addr_bytes(sa, "extensible array data block address")?;
+            let mut fill_addr = [0u8; 8];
+            let fill_addr = Self::undefined_addr_bytes_into(
+                &mut fill_addr,
+                sa,
+                "extensible array data block address",
+            )?;
             for idx in 0..data_block_elements {
                 if let Some((initial_idx, chunk_addr, chunk_size, filtered, chunk_size_len)) =
                     initial
                 {
                     if idx == initial_idx {
-                        prefix.extend_from_slice(&Self::encode_uint_le(
+                        prefix.extend_from_slice(Self::encode_uint_le_into(
                             chunk_addr,
+                            &mut encoded,
                             sa,
                             "extensible array data block chunk address",
                         )?);
                         if filtered {
-                            prefix.extend_from_slice(&Self::encode_uint_le(
+                            prefix.extend_from_slice(Self::encode_uint_le_into(
                                 chunk_size,
+                                &mut encoded,
                                 chunk_size_len,
                                 "extensible array data block chunk size",
                             )?);
@@ -1867,24 +1933,24 @@ impl MutableFile {
                         continue;
                     }
                 }
-                prefix.extend_from_slice(&fill_addr);
+                prefix.extend_from_slice(fill_addr);
                 if initial
                     .map(|(_, _, _, filtered, _)| filtered)
                     .unwrap_or(false)
                 {
                     let chunk_size_len = initial.map(|(_, _, _, _, len)| len).unwrap_or(0);
-                    prefix.extend_from_slice(&vec![0u8; chunk_size_len]);
+                    prefix.extend_from_slice(&[0u8; 8][..chunk_size_len]);
                     prefix.extend_from_slice(&0u32.to_le_bytes());
                 }
             }
         }
         let checksum = checksum_metadata(&prefix);
         prefix.extend_from_slice(&checksum.to_le_bytes());
-        Ok(prefix)
+        Ok(())
     }
 
     /// Allocate + encode + write an extensible-array data block. Composes
-    /// `encode_extensible_array_data_block_prefix` with file I/O. C-side
+    /// `encode_extensible_array_data_block_prefix_into` with file I/O. C-side
     /// analogue: `H5EA__dblock_create`.
     pub(super) fn create_extensible_array_data_block(
         &mut self,
@@ -1898,12 +1964,14 @@ impl MutableFile {
         let data_block_size = self.extensible_array_data_block_size(header, data_block_elements)?;
         let data_block_addr = self.append_aligned_zeros(data_block_size, 8)?;
 
-        let prefix = self.encode_extensible_array_data_block_prefix(
+        let mut prefix = Vec::new();
+        self.encode_extensible_array_data_block_prefix_into(
             header_addr,
             header,
             block_offset,
             data_block_elements,
             initial,
+            &mut prefix,
         )?;
         self.write_handle.seek(SeekFrom::Start(data_block_addr))?;
         self.write_handle.write_all(&prefix)?;
@@ -1938,11 +2006,12 @@ impl MutableFile {
     /// Pure encoder for one extensible-array data-block page (element
     /// records + trailing checksum). Mirrors the per-page serialize path
     /// in libhdf5's `H5EA__cache_dblk_page_serialize`.
-    fn encode_extensible_array_data_block_page(
+    fn encode_extensible_array_data_block_page_into(
         &self,
         header: &MutableExtensibleArrayHeader,
         initial: Option<(usize, u64, u64, bool, usize)>,
-    ) -> Result<Vec<u8>> {
+        page: &mut Vec<u8>,
+    ) -> Result<()> {
         let page_payload = Self::checked_usize_mul(
             header.max_data_block_page_elements,
             header.raw_element_size,
@@ -1950,20 +2019,31 @@ impl MutableFile {
         )?;
         let page_size =
             Self::checked_usize_add(page_payload, 4, "extensible array data block page size")?;
-        let mut page = Vec::with_capacity(page_size);
+        page.clear();
+        if page.capacity() < page_size {
+            page.reserve(page_size);
+        }
         let sa = usize::from(self.superblock.sizeof_addr);
-        let fill_addr = Self::undefined_addr_bytes(sa, "extensible array data block page address")?;
+        let mut fill_addr = [0u8; 8];
+        let fill_addr = Self::undefined_addr_bytes_into(
+            &mut fill_addr,
+            sa,
+            "extensible array data block page address",
+        )?;
+        let mut encoded = [0u8; 8];
         for idx in 0..header.max_data_block_page_elements {
             if let Some((initial_idx, chunk_addr, chunk_size, filtered, chunk_size_len)) = initial {
                 if idx == initial_idx {
-                    page.extend_from_slice(&Self::encode_uint_le(
+                    page.extend_from_slice(Self::encode_uint_le_into(
                         chunk_addr,
+                        &mut encoded,
                         sa,
                         "extensible array data block page chunk address",
                     )?);
                     if filtered {
-                        page.extend_from_slice(&Self::encode_uint_le(
+                        page.extend_from_slice(Self::encode_uint_le_into(
                             chunk_size,
+                            &mut encoded,
                             chunk_size_len,
                             "extensible array data block page chunk size",
                         )?);
@@ -1972,19 +2052,19 @@ impl MutableFile {
                     continue;
                 }
             }
-            page.extend_from_slice(&fill_addr);
+            page.extend_from_slice(fill_addr);
             if initial
                 .map(|(_, _, _, filtered, _)| filtered)
                 .unwrap_or(false)
             {
                 let chunk_size_len = initial.map(|(_, _, _, _, len)| len).unwrap_or(0);
-                page.extend_from_slice(&vec![0u8; chunk_size_len]);
+                page.extend_from_slice(&[0u8; 8][..chunk_size_len]);
                 page.extend_from_slice(&0u32.to_le_bytes());
             }
         }
         let checksum = checksum_metadata(&page);
         page.extend_from_slice(&checksum.to_le_bytes());
-        Ok(page)
+        Ok(())
     }
 
     /// Encode + write one extensible-array data-block page.
@@ -2031,7 +2111,8 @@ impl MutableFile {
             Self::u64_from_usize(page_offset, "extensible array data block page address")?,
             "extensible array data block page address",
         )?;
-        let page = self.encode_extensible_array_data_block_page(header, initial)?;
+        let mut page = Vec::with_capacity(page_size);
+        self.encode_extensible_array_data_block_page_into(header, initial, &mut page)?;
         self.write_handle.seek(SeekFrom::Start(page_addr))?;
         self.write_handle.write_all(&page)?;
         Ok(())
@@ -2187,7 +2268,8 @@ impl MutableFile {
             "extensible array data block checksum span",
         )?;
         self.write_handle.flush()?;
-        let mut bytes = self.read_fresh_bytes(data_block_addr, check_len)?;
+        let mut bytes = vec![0u8; check_len];
+        self.read_fresh_bytes_into(data_block_addr, &mut bytes)?;
         let checksum = checksum_metadata(&bytes);
         let checksum_addr = Self::checked_u64_add(
             data_block_addr,
@@ -2211,7 +2293,8 @@ impl MutableFile {
             "extensible array data block page checksum span",
         )?;
         self.write_handle.flush()?;
-        let bytes = self.read_fresh_bytes(page_addr, check_len)?;
+        let mut bytes = vec![0u8; check_len];
+        self.read_fresh_bytes_into(page_addr, &mut bytes)?;
         let checksum = checksum_metadata(&bytes);
         let checksum_addr = Self::checked_u64_add(
             page_addr,
@@ -2232,12 +2315,14 @@ impl MutableFile {
         chunk_size_len: usize,
     ) -> Result<()> {
         self.write_handle.seek(SeekFrom::Start(element_pos))?;
-        let chunk_addr = Self::encode_uint_le(
+        let mut addr_bytes = [0u8; 8];
+        let chunk_addr = Self::encode_uint_le_into(
             chunk_addr,
+            &mut addr_bytes,
             usize::from(self.superblock.sizeof_addr),
             "extensible array chunk address",
         )?;
-        self.write_handle.write_all(&chunk_addr)?;
+        self.write_handle.write_all(chunk_addr)?;
         if filtered {
             self.write_uint_le(chunk_size, chunk_size_len)?;
             self.write_handle.write_all(&0u32.to_le_bytes())?;
@@ -2252,9 +2337,13 @@ mod tests {
 
     #[test]
     fn mutable_super_block_info_rejects_start_index_product_overflow() {
-        let err =
-            MutableFile::build_mutable_extensible_array_super_block_info(3, usize::MAX / 4 + 1)
-                .unwrap_err();
+        let mut infos = Vec::new();
+        let err = MutableFile::build_mutable_extensible_array_super_block_info_into(
+            3,
+            usize::MAX / 4 + 1,
+            &mut infos,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("start index overflow"));
     }
 

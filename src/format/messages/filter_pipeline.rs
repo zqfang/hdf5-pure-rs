@@ -105,18 +105,13 @@ impl FilterPipelineMessage {
 
             // Name (null-terminated, padded to 8-byte boundary)
             let name = if name_len > 0 {
-                ensure_available(data, pos, name_len, "filter pipeline v1 name")?;
                 let name_bytes = checked_window(data, pos, name_len, "filter pipeline v1 name")?;
                 let null_pos = name_bytes.iter().position(|&b| b == 0).ok_or_else(|| {
                     Error::InvalidFormat("filter pipeline v1 name is not null-terminated".into())
                 })?;
-                let n = decode_utf8_name(
-                    checked_window(name_bytes, 0, null_pos, "filter pipeline v1 name text")?,
-                    "filter pipeline v1 name text",
-                )?;
+                let n = decode_utf8_name(&name_bytes[..null_pos], "filter pipeline v1 name text")?;
                 // Pad to 8-byte boundary
                 let padded = align8(name_len, "filter pipeline v1 name")?;
-                ensure_available(data, pos, padded, "filter pipeline v1 padded name")?;
                 advance_pos(&mut pos, padded, "filter pipeline v1 padded name")?;
                 Some(n)
             } else {
@@ -124,11 +119,8 @@ impl FilterPipelineMessage {
             };
 
             // Client data values
-            let mut client_data = Vec::with_capacity(cd_nelmts);
-            for _ in 0..cd_nelmts {
-                let val = read_u32_le(data, &mut pos, "filter pipeline v1 client data")?;
-                client_data.push(val);
-            }
+            let client_data =
+                read_client_data(data, &mut pos, cd_nelmts, "filter pipeline v1 client data")?;
 
             // Pad cd_nelmts to even number in v1
             if cd_nelmts % 2 != 0 {
@@ -165,7 +157,6 @@ impl FilterPipelineMessage {
                     "filter pipeline v2 name length",
                 )?);
                 if name_len > 0 {
-                    ensure_available(data, pos, name_len, "filter pipeline v2 name")?;
                     let name_bytes =
                         checked_window(data, pos, name_len, "filter pipeline v2 name")?;
                     let null_pos = name_bytes.iter().position(|&b| b == 0).ok_or_else(|| {
@@ -173,10 +164,8 @@ impl FilterPipelineMessage {
                             "filter pipeline v2 name is not null-terminated".into(),
                         )
                     })?;
-                    let n = decode_utf8_name(
-                        checked_window(name_bytes, 0, null_pos, "filter pipeline v2 name text")?,
-                        "filter pipeline v2 name text",
-                    )?;
+                    let n =
+                        decode_utf8_name(&name_bytes[..null_pos], "filter pipeline v2 name text")?;
                     advance_pos(&mut pos, name_len, "filter pipeline v2 name")?;
                     Some(n)
                 } else {
@@ -198,11 +187,8 @@ impl FilterPipelineMessage {
                 )));
             }
 
-            let mut client_data = Vec::with_capacity(cd_nelmts);
-            for _ in 0..cd_nelmts {
-                let val = read_u32_le(data, &mut pos, "filter pipeline v2 client data")?;
-                client_data.push(val);
-            }
+            let client_data =
+                read_client_data(data, &mut pos, cd_nelmts, "filter pipeline v2 client data")?;
 
             filters.push(FilterDesc {
                 id,
@@ -216,6 +202,21 @@ impl FilterPipelineMessage {
             filters,
         })
     }
+}
+
+fn read_client_data(data: &[u8], pos: &mut usize, count: usize, context: &str) -> Result<Vec<u32>> {
+    let byte_len = count
+        .checked_mul(4)
+        .ok_or_else(|| Error::InvalidFormat(format!("{context} byte length overflow")))?;
+    let bytes = checked_window(data, *pos, byte_len, context)?;
+    let mut values = Vec::with_capacity(count);
+    for chunk in bytes.chunks_exact(4) {
+        values.push(u32::from_le_bytes(chunk.try_into().map_err(|_| {
+            Error::InvalidFormat(format!("{context} is truncated"))
+        })?));
+    }
+    advance_pos(pos, byte_len, context)?;
+    Ok(values)
 }
 
 fn ensure_available(data: &[u8], pos: usize, len: usize, context: &str) -> Result<()> {
@@ -247,21 +248,6 @@ fn checked_window<'a>(data: &'a [u8], pos: usize, len: usize, context: &str) -> 
     let end = checked_add_pos(pos, len, context)?;
     data.get(pos..end)
         .ok_or_else(|| Error::InvalidFormat(format!("{context} is truncated")))
-}
-
-fn read_u32_le(data: &[u8], pos: &mut usize, context: &str) -> Result<u32> {
-    ensure_available(data, *pos, 4, context)?;
-    let end = checked_add_pos(*pos, 4, context)?;
-    let bytes = data
-        .get(*pos..end)
-        .ok_or_else(|| Error::InvalidFormat(format!("{context} is truncated")))?;
-    let value = u32::from_le_bytes(
-        bytes
-            .try_into()
-            .map_err(|_| Error::InvalidFormat(format!("{context} is truncated")))?,
-    );
-    advance_pos(pos, 4, context)?;
-    Ok(value)
 }
 
 fn checked_add_pos(pos: usize, len: usize, context: &str) -> Result<usize> {

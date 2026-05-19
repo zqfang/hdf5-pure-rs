@@ -108,9 +108,11 @@ impl LinkMessage {
         }
 
         // Link name
-        ensure_available(data, pos, name_len, "link name")?;
-        let name_end = checked_end(pos, name_len, "link name")?;
-        let name = decode_utf8_text(&data[pos..name_end], "link name")?;
+        let name = decode_utf8_text(
+            checked_window(data, pos, name_len, "link name")?,
+            "link name",
+        )?
+        .to_owned();
         advance_pos(&mut pos, name_len, "link name")?;
 
         // Link value based on type
@@ -136,12 +138,13 @@ impl LinkMessage {
                 if target_len == 0 {
                     return Err(Error::InvalidFormat("invalid soft link length".into()));
                 }
-                ensure_available(data, pos, target_len, "soft link target")?;
-                let target_end = checked_end(pos, target_len, "soft link target")?;
-                soft_link_target = Some(decode_utf8_text(
-                    &data[pos..target_end],
-                    "soft link target",
-                )?);
+                soft_link_target = Some(
+                    decode_utf8_text(
+                        checked_window(data, pos, target_len, "soft link target")?,
+                        "soft link target",
+                    )?
+                    .to_owned(),
+                );
                 advance_pos(&mut pos, target_len, "soft link target")?;
             }
             LinkType::External => {
@@ -155,12 +158,15 @@ impl LinkMessage {
                         "external link info is too short".into(),
                     ));
                 }
-                ensure_available(data, pos, info_len, "external link info")?;
-                let info_end = checked_end(pos, info_len, "external link info")?;
-                let (filename, obj_path) = unpack_external_link_value(&data[pos..info_end])?;
-                trace_external_link_resolve(&filename, &obj_path);
+                let (filename, obj_path) = unpack_external_link_value(checked_window(
+                    data,
+                    pos,
+                    info_len,
+                    "external link info",
+                )?)?;
+                trace_external_link_resolve(filename, obj_path);
 
-                external_link = Some((filename, obj_path));
+                external_link = Some((filename.to_owned(), obj_path.to_owned()));
                 advance_pos(&mut pos, info_len, "external link info")?;
             }
             LinkType::UserDefined(_) => {
@@ -241,13 +247,11 @@ fn advance_pos(pos: &mut usize, len: usize, context: &str) -> Result<()> {
     Ok(())
 }
 
-fn decode_utf8_text(bytes: &[u8], context: &str) -> Result<String> {
-    std::str::from_utf8(bytes)
-        .map(str::to_string)
-        .map_err(|_| Error::InvalidFormat(format!("{context} is not UTF-8")))
+fn decode_utf8_text<'a>(bytes: &'a [u8], context: &str) -> Result<&'a str> {
+    std::str::from_utf8(bytes).map_err(|_| Error::InvalidFormat(format!("{context} is not UTF-8")))
 }
 
-fn unpack_external_link_value(data: &[u8]) -> Result<(String, String)> {
+fn unpack_external_link_value(data: &[u8]) -> Result<(&str, &str)> {
     if data.is_empty() {
         return Err(Error::InvalidFormat(
             "not a valid external link buffer".into(),

@@ -138,11 +138,61 @@ impl ApiContext {
     }
 
     pub fn retrieve_state(&self) -> Self {
-        self.clone()
+        let mut state = Self::default();
+        self.retrieve_state_into(&mut state);
+        state
+    }
+
+    pub fn retrieve_state_into(&self, out: &mut Self) {
+        out.dxpl.clone_from(&self.dxpl);
+        out.dcpl.clone_from(&self.dcpl);
+        out.lcpl.clone_from(&self.lcpl);
+        out.lapl.clone_from(&self.lapl);
+        out.apl.clone_from(&self.apl);
+        out.vol_wrap_ctx.clone_from(&self.vol_wrap_ctx);
+        out.vol_connector_prop.clone_from(&self.vol_connector_prop);
+        out.tag.clone_from(&self.tag);
+        out.ring = self.ring;
+        out.mpi_coll_datatypes.clone_from(&self.mpi_coll_datatypes);
+        out.mpi_file_flushing = self.mpi_file_flushing;
+        out.mpio_rank0_bcast = self.mpio_rank0_bcast;
+        out.btree_split_ratios = self.btree_split_ratios;
+        out.max_temp_buf = self.max_temp_buf;
+        out.tconv_buf.clone_from(&self.tconv_buf);
+        out.bkgr_buf.clone_from(&self.bkgr_buf);
+        out.bkgr_buf_type = self.bkgr_buf_type;
+        out.vec_size = self.vec_size;
+        out.io_xfer_mode = self.io_xfer_mode;
+        out.mpio_coll_opt = self.mpio_coll_opt;
+        out.mpio_local_no_coll_cause = self.mpio_local_no_coll_cause;
+        out.mpio_global_no_coll_cause = self.mpio_global_no_coll_cause;
+        out.mpio_chunk_opt_num = self.mpio_chunk_opt_num;
+        out.mpio_chunk_opt_ratio = self.mpio_chunk_opt_ratio;
+        out.err_detect = self.err_detect;
+        out.filter_cb.clone_from(&self.filter_cb);
+        out.data_transform.clone_from(&self.data_transform);
+        out.dt_conv_cb.clone_from(&self.dt_conv_cb);
+        out.selection_io_mode = self.selection_io_mode;
+        out.no_selection_io_cause = self.no_selection_io_cause;
+        out.actual_selection_io_mode = self.actual_selection_io_mode;
+        out.modify_write_buf = self.modify_write_buf;
+        out.encoding.clone_from(&self.encoding);
+        out.intermediate_group = self.intermediate_group;
+        out.nlinks = self.nlinks;
+        out.dset_min_ohdr_flag = self.dset_min_ohdr_flag;
+        out.ext_file_prefix.clone_from(&self.ext_file_prefix);
+        out.vds_prefix.clone_from(&self.vds_prefix);
+        out.vlen_alloc_info.clone_from(&self.vlen_alloc_info);
+        out.mpio_actual_io_mode = self.mpio_actual_io_mode;
+        out.ohdr_flags = self.ohdr_flags;
     }
 
     pub fn restore_state(&mut self, state: Self) {
         *self = state;
+    }
+
+    pub fn restore_state_from(&mut self, state: &Self) {
+        state.retrieve_state_into(self);
     }
 
     pub fn free_state(self) {}
@@ -159,8 +209,16 @@ impl ApiContext {
         self.dcpl = dcpl.map(Into::into);
     }
 
+    pub fn set_dcpl_str(&mut self, dcpl: Option<&str>) {
+        set_option_string_from_str(&mut self.dcpl, dcpl);
+    }
+
     pub fn set_lcpl<S: Into<String>>(&mut self, lcpl: Option<S>) {
         self.lcpl = lcpl.map(Into::into);
+    }
+
+    pub fn set_lcpl_str(&mut self, lcpl: Option<&str>) {
+        set_option_string_from_str(&mut self.lcpl, lcpl);
     }
 
     pub fn set_lapl(&mut self, lapl: FileAccess) {
@@ -175,8 +233,16 @@ impl ApiContext {
         self.vol_wrap_ctx = ctx.map(Into::into);
     }
 
+    pub fn set_vol_wrap_ctx_str(&mut self, ctx: Option<&str>) {
+        set_option_string_from_str(&mut self.vol_wrap_ctx, ctx);
+    }
+
     pub fn set_vol_connector_prop<S: Into<String>>(&mut self, prop: Option<S>) {
         self.vol_connector_prop = prop.map(Into::into);
+    }
+
+    pub fn set_vol_connector_prop_str(&mut self, prop: Option<&str>) {
+        set_option_string_from_str(&mut self.vol_connector_prop, prop);
     }
 
     pub fn get_dxpl(&self) -> &FileAccess {
@@ -323,12 +389,20 @@ impl ApiContext {
         self.tag = tag.map(Into::into);
     }
 
+    pub fn set_tag_str(&mut self, tag: Option<&str>) {
+        set_option_string_from_str(&mut self.tag, tag);
+    }
+
     pub fn set_ring(&mut self, ring: u8) {
         self.ring = ring;
     }
 
     pub fn set_mpi_coll_datatypes<S: Into<String>>(&mut self, datatypes: Option<S>) {
         self.mpi_coll_datatypes = datatypes.map(Into::into);
+    }
+
+    pub fn set_mpi_coll_datatypes_str(&mut self, datatypes: Option<&str>) {
+        set_option_string_from_str(&mut self.mpi_coll_datatypes, datatypes);
     }
 
     pub fn set_io_xfer_mode(&mut self, mode: IoTransferMode) {
@@ -349,6 +423,10 @@ impl ApiContext {
 
     pub fn set_vlen_alloc_info<S: Into<String>>(&mut self, info: Option<S>) {
         self.vlen_alloc_info = info.map(Into::into);
+    }
+
+    pub fn set_vlen_alloc_info_str(&mut self, info: Option<&str>) {
+        set_option_string_from_str(&mut self.vlen_alloc_info, info);
     }
 
     pub fn set_nlinks(&mut self, nlinks: usize) {
@@ -412,6 +490,19 @@ impl ApiContext {
 
     pub fn pop(stack: &mut Vec<Self>) -> Option<Self> {
         stack.pop()
+    }
+}
+
+fn set_option_string_from_str(slot: &mut Option<String>, value: Option<&str>) {
+    if let Some(value) = value {
+        if let Some(existing) = slot {
+            existing.clear();
+            existing.push_str(value);
+        } else {
+            *slot = Some(value.to_string());
+        }
+    } else {
+        *slot = None;
     }
 }
 

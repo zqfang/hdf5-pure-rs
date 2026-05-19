@@ -20,11 +20,6 @@ struct DecodedRegularHyperslabDim {
     block: u64,
 }
 
-struct DecodedIrregularHyperslabBlock {
-    start: Vec<u64>,
-    end: Vec<u64>,
-}
-
 struct DecodedVirtualSourceNames {
     file_name: String,
     dataset_name: String,
@@ -55,8 +50,6 @@ impl Dataset {
             )));
         }
         let mut mappings = Vec::with_capacity(count);
-        let mut file_names: Vec<String> = Vec::with_capacity(count);
-        let mut dataset_names: Vec<String> = Vec::with_capacity(count);
 
         for _ in 0..count {
             mappings.push(Self::decode_virtual_mapping(
@@ -64,8 +57,7 @@ impl Dataset {
                 &mut pos,
                 version,
                 sizeof_size,
-                &mut file_names,
-                &mut dataset_names,
+                &mappings,
             )?);
         }
 
@@ -77,8 +69,7 @@ impl Dataset {
         pos: &mut usize,
         version: u8,
         sizeof_size: usize,
-        file_names: &mut Vec<String>,
-        dataset_names: &mut Vec<String>,
+        previous_mappings: &[VirtualMapping],
     ) -> Result<VirtualMapping> {
         let flags = Self::decode_virtual_mapping_flags(heap_data, pos, version)?;
         let names = Self::decode_virtual_source_names(
@@ -86,14 +77,11 @@ impl Dataset {
             pos,
             sizeof_size,
             flags,
-            file_names,
-            dataset_names,
+            previous_mappings,
         )?;
         let source_select = Self::decode_virtual_selection(heap_data, pos)?;
         let virtual_select = Self::decode_virtual_selection(heap_data, pos)?;
         trace_vds_source_resolve(&names.file_name, &names.dataset_name);
-        file_names.push(names.file_name.clone());
-        dataset_names.push(names.dataset_name.clone());
         Ok(VirtualMapping {
             file_name: names.file_name,
             dataset_name: names.dataset_name,
@@ -131,8 +119,7 @@ impl Dataset {
         pos: &mut usize,
         sizeof_size: usize,
         flags: u8,
-        file_names: &[String],
-        dataset_names: &[String],
+        previous_mappings: &[VirtualMapping],
     ) -> Result<DecodedVirtualSourceNames> {
         Ok(DecodedVirtualSourceNames {
             file_name: Self::decode_virtual_source_file_name(
@@ -140,14 +127,14 @@ impl Dataset {
                 pos,
                 sizeof_size,
                 flags,
-                file_names,
+                previous_mappings,
             )?,
             dataset_name: Self::decode_virtual_source_dataset_name(
                 heap_data,
                 pos,
                 sizeof_size,
                 flags,
-                dataset_names,
+                previous_mappings,
             )?,
         })
     }
@@ -157,7 +144,7 @@ impl Dataset {
         pos: &mut usize,
         sizeof_size: usize,
         flags: u8,
-        file_names: &[String],
+        previous_mappings: &[VirtualMapping],
     ) -> Result<String> {
         if flags & 0x04 != 0 {
             return Ok(".".to_string());
@@ -167,7 +154,8 @@ impl Dataset {
                 heap_data,
                 pos,
                 sizeof_size,
-                file_names,
+                previous_mappings,
+                virtual_mapping_file_name,
                 "virtual dataset shared file-name index",
                 "invalid shared VDS source file reference",
             );
@@ -180,14 +168,15 @@ impl Dataset {
         pos: &mut usize,
         sizeof_size: usize,
         flags: u8,
-        dataset_names: &[String],
+        previous_mappings: &[VirtualMapping],
     ) -> Result<String> {
         if flags & 0x02 != 0 {
             return Self::decode_virtual_shared_name_ref(
                 heap_data,
                 pos,
                 sizeof_size,
-                dataset_names,
+                previous_mappings,
+                virtual_mapping_dataset_name,
                 "virtual dataset shared dataset-name index",
                 "invalid shared VDS source dataset reference",
             );
@@ -199,14 +188,16 @@ impl Dataset {
         heap_data: &[u8],
         pos: &mut usize,
         sizeof_size: usize,
-        names: &[String],
+        previous_mappings: &[VirtualMapping],
+        name: for<'a> fn(&'a VirtualMapping) -> &'a str,
         index_context: &'static str,
         invalid_context: &'static str,
     ) -> Result<String> {
         let origin = usize_from_u64(read_le_uint_at(heap_data, pos, sizeof_size)?, index_context)?;
-        names
+        previous_mappings
             .get(origin)
-            .cloned()
+            .map(name)
+            .map(str::to_owned)
             .ok_or_else(|| Error::InvalidFormat(invalid_context.into()))
     }
 
@@ -390,8 +381,9 @@ impl Dataset {
         )?;
         let mut blocks = Vec::with_capacity(block_count);
         for _ in 0..block_count {
-            let block = Self::decode_virtual_irregular_hyperslab_block(data, pos, rank, enc_size)?;
-            blocks.push(Self::materialize_virtual_irregular_hyperslab_block(block)?);
+            blocks.push(Self::decode_virtual_irregular_hyperslab_block(
+                data, pos, rank, enc_size,
+            )?);
         }
         Ok(VirtualSelection::Irregular(blocks))
     }
@@ -433,31 +425,38 @@ impl Dataset {
         pos: &mut usize,
         rank: usize,
         enc_size: usize,
-    ) -> Result<DecodedIrregularHyperslabBlock> {
-        Ok(DecodedIrregularHyperslabBlock {
-            start: Self::decode_virtual_hyperslab_vector(data, pos, rank, enc_size, false)?,
-            end: Self::decode_virtual_hyperslab_vector(data, pos, rank, enc_size, false)?,
-        })
-    }
-
-    fn materialize_virtual_irregular_hyperslab_block(
-        block: DecodedIrregularHyperslabBlock,
     ) -> Result<IrregularHyperslabBlock> {
-        let mut extents = Vec::with_capacity(block.start.len());
-        for (start_coord, end_coord) in block.start.iter().zip(&block.end) {
+        let start = Self::decode_virtual_hyperslab_vector(data, pos, rank, enc_size, false)?;
+        let mut extents = Vec::with_capacity(rank);
+        for &start_coord in &start {
+            let end_coord = read_le_uint_at(data, pos, enc_size)?;
             if end_coord < start_coord {
                 return Err(Error::InvalidFormat(
                     "virtual irregular hyperslab end precedes start".into(),
                 ));
             }
-            extents.push(end_coord - start_coord + 1);
+            let extent = end_coord
+                .checked_sub(start_coord)
+                .and_then(|extent| extent.checked_add(1))
+                .ok_or_else(|| {
+                    Error::InvalidFormat("virtual irregular hyperslab extent overflow".into())
+                })?;
+            extents.push(extent);
         }
 
         Ok(IrregularHyperslabBlock {
-            start: block.start,
+            start,
             block: extents,
         })
     }
+}
+
+fn virtual_mapping_file_name(mapping: &VirtualMapping) -> &str {
+    &mapping.file_name
+}
+
+fn virtual_mapping_dataset_name(mapping: &VirtualMapping) -> &str {
+    &mapping.dataset_name
 }
 
 #[cfg(feature = "tracehash")]

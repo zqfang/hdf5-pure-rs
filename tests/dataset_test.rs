@@ -1,21 +1,23 @@
-use hdf5_pure_rust::File;
+use hdf5_pure_rust::{Dataset, File, H5Type};
 
-fn bytes_to_f64_le(data: &[u8]) -> Vec<f64> {
-    data.chunks_exact(8)
-        .map(|chunk| f64::from_le_bytes(chunk.try_into().unwrap()))
-        .collect()
+fn assert_shape(ds: &Dataset, expected: &[u64]) {
+    let space = ds.space().unwrap();
+    assert_eq!(space.shape(), expected);
 }
 
-fn bytes_to_i32_le(data: &[u8]) -> Vec<i32> {
-    data.chunks_exact(4)
-        .map(|chunk| i32::from_le_bytes(chunk.try_into().unwrap()))
-        .collect()
+fn read_dataset_into<T: H5Type + Default>(ds: &Dataset, values: &mut [T]) {
+    ds.read_into(values).unwrap();
 }
 
-fn bytes_to_f32_le(data: &[u8]) -> Vec<f32> {
-    data.chunks_exact(4)
-        .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
-        .collect()
+fn assert_dataset_values<T>(ds: &Dataset, expected: &[T])
+where
+    T: H5Type + Default + PartialEq + std::fmt::Debug,
+{
+    let mut values = (0..ds.size().unwrap())
+        .map(|_| T::default())
+        .collect::<Vec<_>>();
+    read_dataset_into(ds, &mut values);
+    assert_eq!(values, expected);
 }
 
 #[test]
@@ -23,12 +25,10 @@ fn test_read_float64_1d_v0() {
     let f = File::open("tests/data/datasets_v0.h5").unwrap();
     let ds = f.dataset("float64_1d").unwrap();
 
-    assert_eq!(ds.shape().unwrap(), vec![5]);
+    assert_shape(&ds, &[5]);
     assert_eq!(ds.element_size().unwrap(), 8);
 
-    let raw = ds.read_raw().unwrap();
-    let values = bytes_to_f64_le(&raw);
-    assert_eq!(values, vec![1.0, 2.0, 3.0, 4.0, 5.0]);
+    assert_dataset_values::<f64>(&ds, &[1.0, 2.0, 3.0, 4.0, 5.0]);
 }
 
 #[test]
@@ -36,12 +36,10 @@ fn test_read_int32_1d_v0() {
     let f = File::open("tests/data/datasets_v0.h5").unwrap();
     let ds = f.dataset("int32_1d").unwrap();
 
-    assert_eq!(ds.shape().unwrap(), vec![3]);
+    assert_shape(&ds, &[3]);
     assert_eq!(ds.element_size().unwrap(), 4);
 
-    let raw = ds.read_raw().unwrap();
-    let values = bytes_to_i32_le(&raw);
-    assert_eq!(values, vec![10, 20, 30]);
+    assert_dataset_values::<i32>(&ds, &[10, 20, 30]);
 }
 
 #[test]
@@ -49,11 +47,11 @@ fn test_read_scalar_v0() {
     let f = File::open("tests/data/datasets_v0.h5").unwrap();
     let ds = f.dataset("scalar").unwrap();
 
-    assert_eq!(ds.shape().unwrap(), Vec::<u64>::new());
+    assert_shape(&ds, &[]);
     assert_eq!(ds.size().unwrap(), 1);
 
-    let raw = ds.read_raw().unwrap();
-    let value = f64::from_le_bytes(raw[..8].try_into().unwrap());
+    let mut value = 0.0;
+    ds.read_scalar_into(&mut value).unwrap();
     assert_eq!(value, 42.0);
 }
 
@@ -62,11 +60,10 @@ fn test_read_int8_2d_v0() {
     let f = File::open("tests/data/datasets_v0.h5").unwrap();
     let ds = f.dataset("int8_2d").unwrap();
 
-    assert_eq!(ds.shape().unwrap(), vec![2, 3]);
+    assert_shape(&ds, &[2, 3]);
     assert_eq!(ds.element_size().unwrap(), 1);
 
-    let raw = ds.read_raw().unwrap();
-    assert_eq!(raw, vec![1, 2, 3, 4, 5, 6]);
+    assert_dataset_values::<i8>(&ds, &[1, 2, 3, 4, 5, 6]);
 }
 
 #[test]
@@ -74,11 +71,11 @@ fn test_read_chunked_compressed_v0() {
     let f = File::open("tests/data/datasets_v0.h5").unwrap();
     let ds = f.dataset("chunked").unwrap();
 
-    assert_eq!(ds.shape().unwrap(), vec![100]);
+    assert_shape(&ds, &[100]);
     assert_eq!(ds.element_size().unwrap(), 4);
 
-    let raw = ds.read_raw().unwrap();
-    let values = bytes_to_f32_le(&raw);
+    let mut values = vec![0.0f32; ds.size().unwrap() as usize];
+    read_dataset_into(&ds, &mut values);
     assert_eq!(values.len(), 100);
 
     for (i, val) in values.iter().enumerate() {
@@ -91,9 +88,7 @@ fn test_read_float64_1d_v3() {
     let f = File::open("tests/data/datasets_v3.h5").unwrap();
     let ds = f.dataset("float64_1d").unwrap();
 
-    let raw = ds.read_raw().unwrap();
-    let values = bytes_to_f64_le(&raw);
-    assert_eq!(values, vec![1.0, 2.0, 3.0, 4.0, 5.0]);
+    assert_dataset_values::<f64>(&ds, &[1.0, 2.0, 3.0, 4.0, 5.0]);
 }
 
 #[test]
@@ -101,9 +96,7 @@ fn test_read_int32_1d_v3() {
     let f = File::open("tests/data/datasets_v3.h5").unwrap();
     let ds = f.dataset("int32_1d").unwrap();
 
-    let raw = ds.read_raw().unwrap();
-    let values = bytes_to_i32_le(&raw);
-    assert_eq!(values, vec![10, 20, 30]);
+    assert_dataset_values::<i32>(&ds, &[10, 20, 30]);
 }
 
 #[test]
@@ -111,7 +104,7 @@ fn test_read_scalar_v3() {
     let f = File::open("tests/data/datasets_v3.h5").unwrap();
     let ds = f.dataset("scalar").unwrap();
 
-    let raw = ds.read_raw().unwrap();
-    let value = f64::from_le_bytes(raw[..8].try_into().unwrap());
+    let mut value = 0.0;
+    ds.read_scalar_into(&mut value).unwrap();
     assert_eq!(value, 42.0);
 }

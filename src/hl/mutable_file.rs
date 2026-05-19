@@ -9,7 +9,7 @@ use parking_lot::Mutex;
 use crate::error::Result;
 use crate::format::superblock::Superblock;
 use crate::hl::dataset::Dataset;
-use crate::hl::file::FileInner;
+use crate::hl::file::{FileInner, FileIntent};
 use crate::hl::group::Group;
 use crate::io::reader::HdfReader;
 
@@ -23,6 +23,8 @@ mod chunk_btree_v2;
 mod chunk_extensible_array;
 #[path = "mutable_file/chunk_fixed_array.rs"]
 mod chunk_fixed_array;
+#[path = "mutable_file/group_mutation.rs"]
+mod group_mutation;
 #[path = "mutable_file/resize.rs"]
 mod resize;
 #[path = "mutable_file/support.rs"]
@@ -56,6 +58,7 @@ impl MutableFile {
             reader,
             superblock: superblock.clone(),
             path: Some(path.clone()),
+            intent: FileIntent::ReadWrite,
             access_plist: crate::hl::plist::file_access::FileAccess::default(),
             dset_no_attrs_hint: false,
             open_objects: HashMap::new(),
@@ -78,9 +81,12 @@ impl MutableFile {
         Group::open(self.inner.clone(), "/", self.superblock.root_addr)
     }
 
-    /// List member names in the root group.
-    pub fn member_names(&self) -> Result<Vec<String>> {
-        self.root_group()?.member_names()
+    /// Visit member names in the root group.
+    pub fn visit_member_names<F>(&self, visitor: F) -> Result<()>
+    where
+        F: FnMut(&str) -> Result<()>,
+    {
+        self.root_group()?.visit_member_names(visitor)
     }
 
     /// Open a dataset by path.

@@ -1,3 +1,4 @@
+use std::fmt::{self, Write};
 use std::io::{Read, Seek};
 
 use crate::error::{Error, Result};
@@ -42,7 +43,8 @@ impl BTreeV1Node {
     pub fn read_at<R: Read + Seek>(reader: &mut HdfReader<R>, addr: u64) -> Result<Self> {
         reader.seek(addr)?;
 
-        let magic = reader.read_bytes(4)?;
+        let mut magic = [0; 4];
+        reader.read_bytes_into(&mut magic)?;
         if magic != BTREE_MAGIC {
             return Err(Error::InvalidFormat("invalid v1 B-tree magic".into()));
         }
@@ -119,22 +121,63 @@ impl BTreeV1Node {
 
     /// Collect all leaf-level symbol table node addresses from a group B-tree.
     /// Recursively traverses internal nodes to reach leaves.
+    #[deprecated(note = "use collect_symbol_table_addrs_into to reuse caller-provided storage")]
     pub fn collect_symbol_table_addrs<R: Read + Seek>(
         reader: &mut HdfReader<R>,
         btree_addr: u64,
     ) -> Result<Vec<u64>> {
+        let mut addrs = Vec::new();
+        Self::collect_symbol_table_addrs_into(reader, btree_addr, &mut addrs)?;
+        Ok(addrs)
+    }
+
+    /// Collect all leaf-level symbol table node addresses into caller-provided storage.
+    pub fn collect_symbol_table_addrs_into<R: Read + Seek>(
+        reader: &mut HdfReader<R>,
+        btree_addr: u64,
+        out: &mut Vec<u64>,
+    ) -> Result<()> {
+        out.clear();
+        Self::visit_symbol_table_addrs(reader, btree_addr, |addr| out.push(addr))
+    }
+
+    /// Visit all leaf-level symbol table node addresses without building an
+    /// intermediate collection.
+    pub fn visit_symbol_table_addrs<R, F>(
+        reader: &mut HdfReader<R>,
+        btree_addr: u64,
+        mut visit: F,
+    ) -> Result<()>
+    where
+        R: Read + Seek,
+        F: FnMut(u64),
+    {
         let mut visited = Vec::new();
-        Self::collect_symbol_table_addrs_inner(reader, btree_addr, 0, &mut visited)
+        let mut children_by_depth = Vec::new();
+        Self::visit_symbol_table_addrs_inner(
+            reader,
+            btree_addr,
+            0,
+            &mut visited,
+            &mut children_by_depth,
+            &mut visit,
+        )
     }
 
     /// Recursive helper that walks internal B-tree nodes down to leaves while
     /// tracking visited addresses to detect cycles and runaway depth.
-    fn collect_symbol_table_addrs_inner<R: Read + Seek>(
+    fn visit_symbol_table_addrs_inner<R, F>(
         reader: &mut HdfReader<R>,
         btree_addr: u64,
         depth: usize,
         visited: &mut Vec<u64>,
-    ) -> Result<Vec<u64>> {
+        children_by_depth: &mut Vec<Vec<u64>>,
+        visit: &mut F,
+    ) -> Result<()>
+    where
+        R: Read + Seek,
+        F: FnMut(u64),
+    {
         if depth > MAX_GROUP_BTREE_RECURSION {
             return Err(Error::InvalidFormat(
                 "v1 group B-tree recursion depth exceeded".into(),
@@ -152,32 +195,78 @@ impl BTreeV1Node {
         }
         visited.push(btree_addr);
 
-        let node = Self::read_at(reader, btree_addr)?;
+        if children_by_depth.len() <= depth {
+            children_by_depth.push(Vec::new());
+        }
+        let level =
+            Self::read_group_node_children_into(reader, btree_addr, &mut children_by_depth[depth])?;
 
-        let result = if node.node_type != BTreeType::Group {
-            Err(Error::InvalidFormat("expected group B-tree".into()))
-        } else if node.level == 0 {
+        let result = if level == 0 {
             // Leaf node: children are symbol table node addresses
-            Ok(node.children)
+            for &child_addr in &children_by_depth[depth] {
+                visit(child_addr);
+            }
+            Ok(())
         } else {
             // Internal node: recurse into children
-            let mut result = Vec::new();
-            for &child_addr in &node.children {
-                let mut child_addrs = Self::collect_symbol_table_addrs_inner(
+            for index in 0..children_by_depth[depth].len() {
+                let child_addr = children_by_depth[depth][index];
+                Self::visit_symbol_table_addrs_inner(
                     reader,
                     child_addr,
                     depth.checked_add(1).ok_or_else(|| {
                         Error::InvalidFormat("v1 group B-tree recursion depth overflow".into())
                     })?,
                     visited,
+                    children_by_depth,
+                    visit,
                 )?;
-                result.append(&mut child_addrs);
             }
-            Ok(result)
+            Ok(())
         };
 
         visited.pop();
         result
+    }
+
+    fn read_group_node_children_into<R: Read + Seek>(
+        reader: &mut HdfReader<R>,
+        addr: u64,
+        children: &mut Vec<u64>,
+    ) -> Result<u8> {
+        reader.seek(addr)?;
+        children.clear();
+
+        let mut magic = [0; 4];
+        reader.read_bytes_into(&mut magic)?;
+        if magic != BTREE_MAGIC {
+            return Err(Error::InvalidFormat("invalid v1 B-tree magic".into()));
+        }
+
+        let node_type_val = reader.read_u8()?;
+        if node_type_val != 0 {
+            return Err(Error::InvalidFormat("expected group B-tree".into()));
+        }
+
+        let level = reader.read_u8()?;
+        let entries_used = usize::from(reader.read_u16()?);
+        let _left_sibling = reader.read_addr()?;
+        let _right_sibling = reader.read_addr()?;
+
+        children.reserve(entries_used);
+        for _ in 0..entries_used {
+            let _key = reader.read_length()?;
+            let child = reader.read_addr()?;
+            if is_undef_addr(child) {
+                return Err(Error::InvalidFormat(
+                    "v1 group B-tree child address is undefined".into(),
+                ));
+            }
+            children.push(child);
+        }
+        let _final_key = reader.read_length()?;
+
+        Ok(level)
     }
 
     /// Compute the on-disk size of a v1 B-tree node prefix (used by the metadata cache).
@@ -201,9 +290,15 @@ impl BTreeV1Node {
     }
 
     /// Serialize the B-tree node into its on-disk image.
-    pub fn cache_serialize(&self, sizeof_addr: usize, sizeof_size: usize) -> Result<Vec<u8>> {
+    pub fn cache_serialize_into(
+        &self,
+        sizeof_addr: usize,
+        sizeof_size: usize,
+        out: &mut Vec<u8>,
+    ) -> Result<()> {
         self.verify_structure()?;
-        let mut out = Vec::with_capacity(self.cache_image_len(sizeof_addr, sizeof_size)?);
+        out.clear();
+        out.reserve(self.cache_image_len(sizeof_addr, sizeof_size)?);
         out.extend_from_slice(&BTREE_MAGIC);
         out.push(match self.node_type {
             BTreeType::Group => 0,
@@ -212,41 +307,37 @@ impl BTreeV1Node {
         out.push(self.level);
         out.extend_from_slice(&self.entries_used.to_le_bytes());
         write_addr_le(
-            &mut out,
+            out,
             self.left_sibling,
             sizeof_addr,
             "v1 B-tree left sibling",
         )?;
         write_addr_le(
-            &mut out,
+            out,
             self.right_sibling,
             sizeof_addr,
             "v1 B-tree right sibling",
         )?;
         for index in 0..self.children.len() {
-            write_var_le(&mut out, self.keys[index], sizeof_size)?;
+            write_var_le(out, self.keys[index], sizeof_size)?;
             if self.children[index] == UNDEF_ADDR {
                 return Err(Error::InvalidFormat(
                     "v1 B-tree child address is undefined".into(),
                 ));
             }
-            write_addr_le(
-                &mut out,
-                self.children[index],
-                sizeof_addr,
-                "v1 B-tree child",
-            )?;
+            write_addr_le(out, self.children[index], sizeof_addr, "v1 B-tree child")?;
         }
-        write_var_le(&mut out, *self.keys.last().unwrap_or(&0), sizeof_size)?;
-        Ok(out)
+        write_var_le(out, *self.keys.last().unwrap_or(&0), sizeof_size)?;
+        Ok(())
     }
 
     /// Destroy/release an in-core representation of the B-tree node.
     pub fn cache_free_icr(self) {}
 
     /// Format the node for debug printing (B-tree debug dump).
-    pub fn debug(&self) -> String {
-        format!(
+    pub fn write_debug<W: Write + ?Sized>(&self, out: &mut W) -> fmt::Result {
+        write!(
+            out,
             "BTreeV1Node(type={:?}, level={}, entries={}, children={})",
             self.node_type,
             self.level,
@@ -531,7 +622,8 @@ mod tests {
     fn btree_v1_serializes_group_node_prefix() {
         let mut node = BTreeV1Node::create(BTreeType::Group, 0);
         node.insert(0, 0x1122, 8).unwrap();
-        let image = node.cache_serialize(8, 8).unwrap();
+        let mut image = Vec::new();
+        node.cache_serialize_into(8, 8, &mut image).unwrap();
         assert_eq!(&image[..4], b"TREE");
         assert_eq!(image[4], 0);
         assert_eq!(image.len(), node.cache_image_len(8, 8).unwrap());
@@ -541,17 +633,22 @@ mod tests {
     fn btree_v1_cache_serialize_checks_configured_widths() {
         let mut node = BTreeV1Node::create(BTreeType::Group, 0);
         node.insert(0, 0x1122, 8).unwrap();
-        let image = node.cache_serialize(4, 4).unwrap();
+        let mut image = Vec::new();
+        node.cache_serialize_into(4, 4, &mut image).unwrap();
         assert_eq!(&image[8..12], &[0xff; 4]);
         assert_eq!(&image[12..16], &[0xff; 4]);
 
         let mut too_large_child = node.clone();
         too_large_child.children[0] = u64::from(u32::MAX) + 1;
-        assert!(too_large_child.cache_serialize(4, 4).is_err());
+        assert!(too_large_child
+            .cache_serialize_into(4, 4, &mut image)
+            .is_err());
 
         let mut too_large_key = node;
         too_large_key.keys[1] = u64::from(u32::MAX) + 1;
-        assert!(too_large_key.cache_serialize(4, 4).is_err());
+        assert!(too_large_key
+            .cache_serialize_into(4, 4, &mut image)
+            .is_err());
     }
 
     #[test]

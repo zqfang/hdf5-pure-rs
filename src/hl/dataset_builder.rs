@@ -1,10 +1,10 @@
-use std::fs;
+use std::{borrow::Cow, fs};
 
 use crate::engine::writer::{
     CompoundFieldSpec, DatasetSpec, DtypeSpec, FillValueSpec, HdfFileWriter,
 };
 use crate::error::{Error, Result};
-use crate::hl::types::{H5Type, TypeClass};
+use crate::hl::types::{slice_as_bytes, H5Type, TypeClass};
 
 /// Builder for creating datasets with a fluent API.
 pub struct DatasetBuilder<'a> {
@@ -40,6 +40,24 @@ impl OwnedBuilderAttr {
             dtype: self.dtype.clone(),
             data: &self.data,
         }
+    }
+}
+
+fn collect_attr_specs(attrs: &[OwnedBuilderAttr]) -> Vec<crate::engine::writer::AttrSpec<'_>> {
+    let mut out = Vec::with_capacity(attrs.len());
+    out.extend(attrs.iter().map(OwnedBuilderAttr::as_attr_spec));
+    out
+}
+
+fn with_attr_specs<R, F>(attrs: &[OwnedBuilderAttr], f: F) -> Result<R>
+where
+    F: FnOnce(&[crate::engine::writer::AttrSpec<'_>]) -> Result<R>,
+{
+    if attrs.is_empty() {
+        f(&[])
+    } else {
+        let specs = collect_attr_specs(attrs);
+        f(&specs)
     }
 }
 
@@ -123,22 +141,18 @@ impl<'a> DatasetBuilder<'a> {
 
     /// Set a scalar fill value for missing or newly allocated dataset storage.
     pub fn fill_value<T: H5Type>(mut self, value: T) -> Self {
-        let byte_ptr = &value as *const T as *const u8;
-        let bytes = unsafe { std::slice::from_raw_parts(byte_ptr, T::type_size()) };
-        self.fill_value = Some(bytes.to_vec());
+        self.fill_value = Some(slice_as_bytes(std::slice::from_ref(&value)).to_vec());
         self
     }
 
     /// Add a scalar attribute to the dataset being created.
     pub fn attr<T: H5Type>(mut self, name: &str, value: T) -> Result<Self> {
         let dtype = dtype_for_type::<T>()?;
-        let byte_ptr = &value as *const T as *const u8;
-        let data = unsafe { std::slice::from_raw_parts(byte_ptr, T::type_size()) };
         self.push_attr(OwnedBuilderAttr {
             name: name.to_string(),
             shape: Vec::new(),
             dtype,
-            data: data.to_vec(),
+            data: slice_as_bytes(std::slice::from_ref(&value)).to_vec(),
         })?;
         Ok(self)
     }
@@ -150,7 +164,8 @@ impl<'a> DatasetBuilder<'a> {
             .len()
             .checked_mul(T::type_size())
             .ok_or_else(|| Error::InvalidFormat("attribute byte size overflow".into()))?;
-        let data = unsafe { std::slice::from_raw_parts(values.as_ptr() as *const u8, byte_len) };
+        let data = slice_as_bytes(values);
+        debug_assert_eq!(data.len(), byte_len);
         self.push_attr(OwnedBuilderAttr {
             name: name.to_string(),
             shape: vec![usize_to_u64(values.len(), "attribute element count")?],
@@ -221,44 +236,36 @@ impl<'a> DatasetBuilder<'a> {
     /// Write data and create the dataset. Infers shape from data length if not set.
     pub fn write<T: H5Type>(self, data: &[T]) -> Result<()> {
         let dtype = dtype_for_type::<T>()?;
-        let fill_value = self.fill_value.clone();
         let fill = Self::fill_spec(
-            fill_value.as_deref(),
+            self.fill_value.as_deref(),
             dtype.size() as usize,
             self.alloc_time,
             self.fill_time,
         )?;
-        let shape = match self.shape.clone() {
-            Some(shape) => shape,
-            None => vec![usize_to_u64(data.len(), "dataset element count")?],
+        let shape = match self.shape.as_deref() {
+            Some(shape) => Cow::Borrowed(shape),
+            None => Cow::Owned(vec![usize_to_u64(data.len(), "dataset element count")?]),
         };
-        Self::validate_element_count(&shape, data.len())?;
-        let max_shape = self.effective_max_shape(&shape)?;
+        Self::validate_element_count(shape.as_ref(), data.len())?;
+        let max_shape =
+            Self::effective_max_shape(self.resizable, self.max_shape.as_deref(), shape.as_ref())?;
 
-        // Convert data to bytes
-        let byte_ptr = data.as_ptr() as *const u8;
-        let byte_len = data.len() * T::type_size();
-        let data_bytes = unsafe { std::slice::from_raw_parts(byte_ptr, byte_len) };
+        let data_bytes = slice_as_bytes(data);
 
         let spec = DatasetSpec {
             name: &self.name,
-            shape: &shape,
-            max_shape: max_shape.as_deref(),
+            shape: shape.as_ref(),
+            max_shape: max_shape.as_ref().map(|shape| shape.as_ref()),
             dtype,
             data: data_bytes,
         };
-        let attrs: Vec<_> = self
-            .attrs
-            .iter()
-            .map(OwnedBuilderAttr::as_attr_spec)
-            .collect();
-
         if self.compact {
             self.validate_compact_options()?;
-            if attrs.is_empty() {
+            if self.attrs.is_empty() {
                 self.writer
                     .create_compact_dataset_with_fill(&self.parent, &spec, fill)?;
             } else {
+                let attrs = collect_attr_specs(&self.attrs);
                 self.writer.create_compact_dataset_with_attrs_and_fill(
                     &self.parent,
                     &spec,
@@ -271,22 +278,25 @@ impl<'a> DatasetBuilder<'a> {
             || self.shuffle
             || self.fletcher32
         {
-            let chunk_dims = self.chunk_dims.unwrap_or_else(|| shape.clone());
-            self.writer.create_chunked_dataset_with_attrs_and_fill(
-                &self.parent,
-                &spec,
-                &chunk_dims,
-                self.deflate_level,
-                self.shuffle,
-                self.fletcher32,
-                fill,
-                &attrs,
-            )?;
+            let chunk_dims = self.chunk_dims.as_deref().unwrap_or_else(|| shape.as_ref());
+            with_attr_specs(&self.attrs, |attrs| {
+                self.writer.create_chunked_dataset_with_attrs_and_fill(
+                    &self.parent,
+                    &spec,
+                    chunk_dims,
+                    self.deflate_level,
+                    self.shuffle,
+                    self.fletcher32,
+                    fill,
+                    attrs,
+                )
+            })?;
         } else {
-            if attrs.is_empty() {
+            if self.attrs.is_empty() {
                 self.writer
                     .create_dataset_with_fill(&self.parent, &spec, fill)?;
             } else {
+                let attrs = collect_attr_specs(&self.attrs);
                 self.writer.create_dataset_with_attrs_and_fill(
                     &self.parent,
                     &spec,
@@ -319,22 +329,23 @@ impl<'a> DatasetBuilder<'a> {
             )));
         }
 
-        let fill_value = self.fill_value.clone();
         let fill = Self::fill_spec(
-            fill_value.as_deref(),
+            self.fill_value.as_deref(),
             dtype_size,
             self.alloc_time,
             self.fill_time,
         )?;
-        let shape = match self.shape.clone() {
-            Some(shape) => shape,
+        let shape = match self.shape.as_deref() {
+            Some(shape) => Cow::Borrowed(shape),
             None => vec![usize_to_u64(
                 data.len() / dtype_size,
                 "dataset element count",
-            )?],
+            )?]
+            .into(),
         };
-        let max_shape = self.effective_max_shape(&shape)?;
-        let expected_count = shape_element_count(&shape)?;
+        let max_shape =
+            Self::effective_max_shape(self.resizable, self.max_shape.as_deref(), shape.as_ref())?;
+        let expected_count = shape_element_count(shape.as_ref())?;
         let expected_bytes = usize::try_from(expected_count)
             .map_err(|_| Error::InvalidFormat("dataset element count exceeds usize".into()))?
             .checked_mul(dtype_size)
@@ -348,23 +359,18 @@ impl<'a> DatasetBuilder<'a> {
 
         let spec = DatasetSpec {
             name: &self.name,
-            shape: &shape,
-            max_shape: max_shape.as_deref(),
+            shape: shape.as_ref(),
+            max_shape: max_shape.as_ref().map(|shape| shape.as_ref()),
             dtype,
             data,
         };
-        let attrs: Vec<_> = self
-            .attrs
-            .iter()
-            .map(OwnedBuilderAttr::as_attr_spec)
-            .collect();
-
         if self.compact {
             self.validate_compact_options()?;
-            if attrs.is_empty() {
+            if self.attrs.is_empty() {
                 self.writer
                     .create_compact_dataset_with_fill(&self.parent, &spec, fill)?;
             } else {
+                let attrs = collect_attr_specs(&self.attrs);
                 self.writer.create_compact_dataset_with_attrs_and_fill(
                     &self.parent,
                     &spec,
@@ -377,21 +383,24 @@ impl<'a> DatasetBuilder<'a> {
             || self.shuffle
             || self.fletcher32
         {
-            let chunk_dims = self.chunk_dims.unwrap_or_else(|| shape.clone());
-            self.writer.create_chunked_dataset_with_attrs_and_fill(
-                &self.parent,
-                &spec,
-                &chunk_dims,
-                self.deflate_level,
-                self.shuffle,
-                self.fletcher32,
-                fill,
-                &attrs,
-            )?;
-        } else if attrs.is_empty() {
+            let chunk_dims = self.chunk_dims.as_deref().unwrap_or_else(|| shape.as_ref());
+            with_attr_specs(&self.attrs, |attrs| {
+                self.writer.create_chunked_dataset_with_attrs_and_fill(
+                    &self.parent,
+                    &spec,
+                    chunk_dims,
+                    self.deflate_level,
+                    self.shuffle,
+                    self.fletcher32,
+                    fill,
+                    attrs,
+                )
+            })?;
+        } else if self.attrs.is_empty() {
             self.writer
                 .create_dataset_with_fill(&self.parent, &spec, fill)?;
         } else {
+            let attrs = collect_attr_specs(&self.attrs);
             self.writer
                 .create_dataset_with_attrs_and_fill(&self.parent, &spec, &attrs, fill)?;
         }
@@ -416,15 +425,13 @@ impl<'a> DatasetBuilder<'a> {
             ));
         }
         let dtype = dtype_for_type::<T>()?;
-        let fill_value = self.fill_value.clone();
         let fill = Self::fill_spec(
-            fill_value.as_deref(),
+            self.fill_value.as_deref(),
             dtype.size() as usize,
             self.alloc_time,
             self.fill_time,
         )?;
-        let byte_ptr = &value as *const T as *const u8;
-        let data_bytes = unsafe { std::slice::from_raw_parts(byte_ptr, T::type_size()) };
+        let data_bytes = slice_as_bytes(std::slice::from_ref(&value));
 
         let spec = DatasetSpec {
             name: &self.name,
@@ -434,17 +441,13 @@ impl<'a> DatasetBuilder<'a> {
             data: data_bytes,
         };
 
-        let attrs: Vec<_> = self
-            .attrs
-            .iter()
-            .map(OwnedBuilderAttr::as_attr_spec)
-            .collect();
         if self.compact {
             self.validate_compact_options()?;
-            if attrs.is_empty() {
+            if self.attrs.is_empty() {
                 self.writer
                     .create_compact_dataset_with_fill(&self.parent, &spec, fill)?;
             } else {
+                let attrs = collect_attr_specs(&self.attrs);
                 self.writer.create_compact_dataset_with_attrs_and_fill(
                     &self.parent,
                     &spec,
@@ -452,10 +455,11 @@ impl<'a> DatasetBuilder<'a> {
                     fill,
                 )?;
             }
-        } else if attrs.is_empty() {
+        } else if self.attrs.is_empty() {
             self.writer
                 .create_dataset_with_fill(&self.parent, &spec, fill)?;
         } else {
+            let attrs = collect_attr_specs(&self.attrs);
             self.writer
                 .create_dataset_with_attrs_and_fill(&self.parent, &spec, &attrs, fill)?;
         }
@@ -474,14 +478,9 @@ impl<'a> DatasetBuilder<'a> {
 
     /// Write variable-length UTF-8 strings using HDF5 global heap storage.
     pub fn write_vlen_utf8_strings(self, data: &[&str]) -> Result<()> {
-        if self.compact
-            || self.chunk_dims.is_some()
-            || self.deflate_level.is_some()
-            || self.shuffle
-            || self.fletcher32
-        {
+        if self.compact {
             return Err(Error::Unsupported(
-                "variable-length string writer currently supports contiguous storage only".into(),
+                "variable-length string writer does not support compact storage".into(),
             ));
         }
         if self.fill_value.is_some() {
@@ -489,24 +488,43 @@ impl<'a> DatasetBuilder<'a> {
                 "variable-length string fill values are not supported yet".into(),
             ));
         }
-        let shape = match self.shape.clone() {
-            Some(shape) => shape,
-            None => vec![usize_to_u64(data.len(), "dataset element count")?],
+        let shape = match self.shape.as_deref() {
+            Some(shape) => Cow::Borrowed(shape),
+            None => Cow::Owned(vec![usize_to_u64(data.len(), "dataset element count")?]),
         };
-        let max_shape = self.effective_max_shape(&shape)?;
-        let attrs: Vec<_> = self
-            .attrs
-            .iter()
-            .map(OwnedBuilderAttr::as_attr_spec)
-            .collect();
-        self.writer.create_vlen_utf8_string_dataset_with_attrs(
-            &self.parent,
-            &self.name,
-            &shape,
-            data,
-            max_shape.as_deref(),
-            &attrs,
-        )?;
+        let max_shape =
+            Self::effective_max_shape(self.resizable, self.max_shape.as_deref(), shape.as_ref())?;
+        with_attr_specs(&self.attrs, |attrs| {
+            if self.chunk_dims.is_some()
+                || self.deflate_level.is_some()
+                || self.shuffle
+                || self.fletcher32
+            {
+                let chunk_dims = self.chunk_dims.as_deref().unwrap_or_else(|| shape.as_ref());
+                self.writer
+                    .create_chunked_vlen_utf8_string_dataset_with_attrs(
+                        &self.parent,
+                        &self.name,
+                        shape.as_ref(),
+                        data,
+                        max_shape.as_ref().map(|shape| shape.as_ref()),
+                        chunk_dims,
+                        self.deflate_level,
+                        self.shuffle,
+                        self.fletcher32,
+                        attrs,
+                    )
+            } else {
+                self.writer.create_vlen_utf8_string_dataset_with_attrs(
+                    &self.parent,
+                    &self.name,
+                    shape.as_ref(),
+                    data,
+                    max_shape.as_ref().map(|shape| shape.as_ref()),
+                    attrs,
+                )
+            }
+        })?;
         Ok(())
     }
 
@@ -523,19 +541,19 @@ impl<'a> DatasetBuilder<'a> {
                 padding: 1,
             }
         };
-        let fill_value = self.fill_value.clone();
         let fill = Self::fill_spec(
-            fill_value.as_deref(),
+            self.fill_value.as_deref(),
             dtype.size() as usize,
             self.alloc_time,
             self.fill_time,
         )?;
-        let shape = match self.shape.clone() {
-            Some(shape) => shape,
-            None => vec![usize_to_u64(data.len(), "dataset element count")?],
+        let shape = match self.shape.as_deref() {
+            Some(shape) => Cow::Borrowed(shape),
+            None => Cow::Owned(vec![usize_to_u64(data.len(), "dataset element count")?]),
         };
-        let max_shape = self.effective_max_shape(&shape)?;
-        let expected_count = shape_element_count(&shape)?;
+        let max_shape =
+            Self::effective_max_shape(self.resizable, self.max_shape.as_deref(), shape.as_ref())?;
+        let expected_count = shape_element_count(shape.as_ref())?;
         let actual_count = usize_to_u64(data.len(), "dataset element count")?;
         if expected_count != actual_count {
             return Err(Error::InvalidFormat(format!(
@@ -544,10 +562,9 @@ impl<'a> DatasetBuilder<'a> {
             )));
         }
 
-        let data_capacity = data.len().checked_mul(len).ok_or_else(|| {
+        let data_len = data.len().checked_mul(len).ok_or_else(|| {
             Error::InvalidFormat("fixed string dataset payload size overflow".into())
         })?;
-        let mut data_bytes = Vec::with_capacity(data_capacity);
         for value in data {
             let bytes = value.as_bytes();
             if bytes.len() > len {
@@ -556,29 +573,27 @@ impl<'a> DatasetBuilder<'a> {
                     bytes.len()
                 )));
             }
-            data_bytes.extend_from_slice(bytes);
-            data_bytes.resize(data_bytes.len() + (len - bytes.len()), 0);
+        }
+        let mut data_bytes = vec![0; data_len];
+        for (slot, value) in data_bytes.chunks_exact_mut(len).zip(data.iter()) {
+            let bytes = value.as_bytes();
+            slot[..bytes.len()].copy_from_slice(bytes);
         }
 
         let spec = DatasetSpec {
             name: &self.name,
-            shape: &shape,
-            max_shape: max_shape.as_deref(),
+            shape: shape.as_ref(),
+            max_shape: max_shape.as_ref().map(|shape| shape.as_ref()),
             dtype,
             data: &data_bytes,
         };
-        let attrs: Vec<_> = self
-            .attrs
-            .iter()
-            .map(OwnedBuilderAttr::as_attr_spec)
-            .collect();
-
         if self.compact {
             self.validate_compact_options()?;
-            if attrs.is_empty() {
+            if self.attrs.is_empty() {
                 self.writer
                     .create_compact_dataset_with_fill(&self.parent, &spec, fill)?;
             } else {
+                let attrs = collect_attr_specs(&self.attrs);
                 self.writer.create_compact_dataset_with_attrs_and_fill(
                     &self.parent,
                     &spec,
@@ -591,21 +606,24 @@ impl<'a> DatasetBuilder<'a> {
             || self.shuffle
             || self.fletcher32
         {
-            let chunk_dims = self.chunk_dims.unwrap_or_else(|| shape.clone());
-            self.writer.create_chunked_dataset_with_attrs_and_fill(
-                &self.parent,
-                &spec,
-                &chunk_dims,
-                self.deflate_level,
-                self.shuffle,
-                self.fletcher32,
-                fill,
-                &attrs,
-            )?;
-        } else if attrs.is_empty() {
+            let chunk_dims = self.chunk_dims.as_deref().unwrap_or_else(|| shape.as_ref());
+            with_attr_specs(&self.attrs, |attrs| {
+                self.writer.create_chunked_dataset_with_attrs_and_fill(
+                    &self.parent,
+                    &spec,
+                    chunk_dims,
+                    self.deflate_level,
+                    self.shuffle,
+                    self.fletcher32,
+                    fill,
+                    attrs,
+                )
+            })?;
+        } else if self.attrs.is_empty() {
             self.writer
                 .create_dataset_with_fill(&self.parent, &spec, fill)?;
         } else {
+            let attrs = collect_attr_specs(&self.attrs);
             self.writer
                 .create_dataset_with_attrs_and_fill(&self.parent, &spec, &attrs, fill)?;
         }
@@ -647,11 +665,15 @@ impl<'a> DatasetBuilder<'a> {
         }
     }
 
-    fn effective_max_shape(&self, shape: &[u64]) -> Result<Option<Vec<u64>>> {
-        let max_shape = if self.resizable {
-            Some(vec![u64::MAX; shape.len()])
+    fn effective_max_shape<'b>(
+        resizable: bool,
+        max_shape: Option<&'b [u64]>,
+        shape: &[u64],
+    ) -> Result<Option<Cow<'b, [u64]>>> {
+        let max_shape = if resizable {
+            Some(Cow::Owned(vec![u64::MAX; shape.len()]))
         } else {
-            self.max_shape.clone()
+            max_shape.map(Cow::Borrowed)
         };
         let Some(max_shape) = max_shape else {
             return Ok(None);
@@ -735,7 +757,13 @@ pub(crate) fn dtype_for_type<T: H5Type>() -> Result<DtypeSpec> {
         Ok(DtypeSpec::U16)
     } else if id == TypeId::of::<u8>() {
         Ok(DtypeSpec::U8)
-    } else if let Some(fields) = T::compound_fields() {
+    } else {
+        let mut fields = Vec::new();
+        if T::compound_fields_into(&mut fields).is_none() {
+            return Err(Error::Unsupported(format!(
+                "unsupported type with size {size}"
+            )));
+        }
         let mut out = Vec::with_capacity(fields.len());
         for field in fields {
             let dtype = match field.type_class {
@@ -788,10 +816,6 @@ pub(crate) fn dtype_for_type<T: H5Type>() -> Result<DtypeSpec> {
             size: usize_to_u32(T::type_size(), "compound type size")?,
             fields: out,
         })
-    } else {
-        Err(Error::Unsupported(format!(
-            "unsupported type with size {size}"
-        )))
     }
 }
 
@@ -808,10 +832,9 @@ fn fixed_string_attr(values: &[&str], len: usize, utf8: bool) -> Result<(DtypeSp
             padding: 1,
         }
     };
-    let capacity = values.len().checked_mul(len).ok_or_else(|| {
+    let data_len = values.len().checked_mul(len).ok_or_else(|| {
         Error::InvalidFormat("fixed string attribute payload size overflow".into())
     })?;
-    let mut data = Vec::with_capacity(capacity);
     for value in values {
         let bytes = value.as_bytes();
         if bytes.len() > len {
@@ -820,8 +843,11 @@ fn fixed_string_attr(values: &[&str], len: usize, utf8: bool) -> Result<(DtypeSp
                 bytes.len()
             )));
         }
-        data.extend_from_slice(bytes);
-        data.resize(data.len() + (len - bytes.len()), 0);
+    }
+    let mut data = vec![0; data_len];
+    for (slot, value) in data.chunks_exact_mut(len).zip(values.iter()) {
+        let bytes = value.as_bytes();
+        slot[..bytes.len()].copy_from_slice(bytes);
     }
     Ok((dtype, data))
 }

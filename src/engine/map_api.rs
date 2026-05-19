@@ -65,9 +65,15 @@ pub fn H5Mcreate_anon(key_type: impl Into<String>, value_type: impl Into<String>
 }
 
 #[allow(non_snake_case)]
-pub fn H5M__open_api_common(map: &H5Map) -> Result<H5Map> {
+pub fn H5M__open_api_common_ref(map: &H5Map) -> Result<&H5Map> {
     map.ensure_open()?;
-    Ok(map.clone())
+    Ok(map)
+}
+
+#[deprecated(note = "use H5M__open_api_common_ref to borrow the map without cloning")]
+#[allow(non_snake_case)]
+pub fn H5M__open_api_common(map: &H5Map) -> Result<H5Map> {
+    Ok(H5M__open_api_common_ref(map)?.clone())
 }
 
 #[allow(non_snake_case)]
@@ -88,15 +94,27 @@ pub fn H5Mget_val_type(map: &H5Map) -> Result<&str> {
 }
 
 #[allow(non_snake_case)]
-pub fn H5Mget_create_plist(map: &H5Map) -> Result<BTreeMap<String, Vec<u8>>> {
+pub fn H5Mget_create_plist_ref(map: &H5Map) -> Result<&BTreeMap<String, Vec<u8>>> {
     map.ensure_open()?;
-    Ok(map.create_plist.clone())
+    Ok(&map.create_plist)
 }
 
 #[allow(non_snake_case)]
-pub fn H5Mget_access_plist(map: &H5Map) -> Result<BTreeMap<String, Vec<u8>>> {
+pub fn H5Mget_access_plist_ref(map: &H5Map) -> Result<&BTreeMap<String, Vec<u8>>> {
     map.ensure_open()?;
-    Ok(map.access_plist.clone())
+    Ok(&map.access_plist)
+}
+
+#[deprecated(note = "use H5Mget_create_plist_ref to borrow the property list without cloning")]
+#[allow(non_snake_case)]
+pub fn H5Mget_create_plist(map: &H5Map) -> Result<BTreeMap<String, Vec<u8>>> {
+    Ok(H5Mget_create_plist_ref(map)?.clone())
+}
+
+#[deprecated(note = "use H5Mget_access_plist_ref to borrow the property list without cloning")]
+#[allow(non_snake_case)]
+pub fn H5Mget_access_plist(map: &H5Map) -> Result<BTreeMap<String, Vec<u8>>> {
+    Ok(H5Mget_access_plist_ref(map)?.clone())
 }
 
 #[allow(non_snake_case)]
@@ -123,19 +141,37 @@ pub fn H5Mput_async(map: &mut H5Map, key: Vec<u8>, value: Vec<u8>) -> Result<()>
 }
 
 #[allow(non_snake_case)]
-pub fn H5M__get_api_common(map: &H5Map, key: &[u8]) -> Result<Option<Vec<u8>>> {
+pub fn H5M__get_api_common_ref<'a>(map: &'a H5Map, key: &[u8]) -> Result<Option<&'a [u8]>> {
     map.ensure_open()?;
-    Ok(map.entries.get(key).cloned())
+    Ok(map.entries.get(key).map(Vec::as_slice))
 }
 
+#[allow(non_snake_case)]
+pub fn H5Mget_ref<'a>(map: &'a H5Map, key: &[u8]) -> Result<Option<&'a [u8]>> {
+    H5M__get_api_common_ref(map, key)
+}
+
+#[allow(non_snake_case)]
+pub fn H5Mget_async_ref<'a>(map: &'a H5Map, key: &[u8]) -> Result<Option<&'a [u8]>> {
+    H5Mget_ref(map, key)
+}
+
+#[deprecated(note = "use H5M__get_api_common_ref to borrow the value without cloning")]
+#[allow(non_snake_case)]
+pub fn H5M__get_api_common(map: &H5Map, key: &[u8]) -> Result<Option<Vec<u8>>> {
+    Ok(H5M__get_api_common_ref(map, key)?.map(<[u8]>::to_vec))
+}
+
+#[deprecated(note = "use H5Mget_ref to borrow the value without cloning")]
 #[allow(non_snake_case)]
 pub fn H5Mget(map: &H5Map, key: &[u8]) -> Result<Option<Vec<u8>>> {
-    H5M__get_api_common(map, key)
+    Ok(H5Mget_ref(map, key)?.map(<[u8]>::to_vec))
 }
 
+#[deprecated(note = "use H5Mget_async_ref to borrow the value without cloning")]
 #[allow(non_snake_case)]
 pub fn H5Mget_async(map: &H5Map, key: &[u8]) -> Result<Option<Vec<u8>>> {
-    H5Mget(map, key)
+    Ok(H5Mget_async_ref(map, key)?.map(<[u8]>::to_vec))
 }
 
 #[allow(non_snake_case)]
@@ -145,18 +181,77 @@ pub fn H5Mexists(map: &H5Map, key: &[u8]) -> Result<bool> {
 }
 
 #[allow(non_snake_case)]
-pub fn H5Miterate(map: &H5Map) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+pub fn H5M_iter_entries(map: &H5Map) -> Result<impl Iterator<Item = (&[u8], &[u8])> + '_> {
     map.ensure_open()?;
     Ok(map
         .entries
         .iter()
-        .map(|(key, value)| (key.clone(), value.clone()))
-        .collect())
+        .map(|(key, value)| (key.as_slice(), value.as_slice())))
 }
 
 #[allow(non_snake_case)]
+pub fn H5M_iterate_with<F>(map: &H5Map, mut callback: F) -> Result<()>
+where
+    F: FnMut(&[u8], &[u8]) -> Result<()>,
+{
+    map.ensure_open()?;
+    for (key, value) in &map.entries {
+        callback(key, value)?;
+    }
+    Ok(())
+}
+
+#[allow(non_snake_case)]
+pub fn H5Miterate_with<F>(map: &H5Map, callback: F) -> Result<()>
+where
+    F: FnMut(&[u8], &[u8]) -> Result<()>,
+{
+    H5M_iterate_with(map, callback)
+}
+
+#[allow(non_snake_case)]
+pub fn H5M_iterate_into(map: &H5Map, entries: &mut Vec<(Vec<u8>, Vec<u8>)>) -> Result<()> {
+    map.ensure_open()?;
+    entries.reserve(map.entries.len());
+    H5M_iterate_with(map, |key, value| {
+        entries.push((key.to_vec(), value.to_vec()));
+        Ok(())
+    })
+}
+
+#[allow(non_snake_case)]
+pub fn H5Miterate_into(map: &H5Map, entries: &mut Vec<(Vec<u8>, Vec<u8>)>) -> Result<()> {
+    H5M_iterate_into(map, entries)
+}
+
+#[deprecated(
+    note = "use H5M_iter_entries, H5M_iterate_with, or H5M_iterate_into to avoid returning an allocated Vec"
+)]
+#[allow(non_snake_case)]
+pub fn H5M_iterate(map: &H5Map) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    let mut entries = Vec::new();
+    H5M_iterate_into(map, &mut entries)?;
+    Ok(entries)
+}
+
+#[deprecated(
+    note = "use H5M_iter_entries, H5Miterate_with, or H5Miterate_into to avoid returning an allocated Vec"
+)]
+#[allow(non_snake_case)]
+pub fn H5Miterate(map: &H5Map) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    let mut entries = Vec::new();
+    H5Miterate_into(map, &mut entries)?;
+    Ok(entries)
+}
+
+#[deprecated(
+    note = "use H5M_iter_entries, H5Miterate_with, or H5Miterate_into to avoid returning an allocated Vec"
+)]
+#[allow(non_snake_case)]
 pub fn H5Miterate_by_name(map: &H5Map) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-    H5Miterate(map)
+    let mut entries = Vec::new();
+    H5Miterate_into(map, &mut entries)?;
+    Ok(entries)
 }
 
 #[allow(non_snake_case)]
@@ -175,11 +270,23 @@ mod tests {
         H5Mput(&mut map, b"k".to_vec(), b"v".to_vec()).unwrap();
         assert_eq!(H5Mget_count(&map).unwrap(), 1);
         assert!(H5Mexists(&map, b"k").unwrap());
-        assert_eq!(H5Mget(&map, b"k").unwrap(), Some(b"v".to_vec()));
-        assert_eq!(
-            H5Miterate(&map).unwrap(),
-            vec![(b"k".to_vec(), b"v".to_vec())]
-        );
+        assert!(std::ptr::eq(H5M__open_api_common_ref(&map).unwrap(), &map));
+        assert_eq!(H5Mget_ref(&map, b"k").unwrap(), Some(b"v".as_slice()));
+        let entries: Vec<_> = H5M_iter_entries(&map).unwrap().collect();
+        assert_eq!(entries, vec![(b"k".as_slice(), b"v".as_slice())]);
+
+        let mut visited = Vec::new();
+        H5Miterate_with(&map, |key, value| {
+            visited.push((key.to_vec(), value.to_vec()));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(visited, vec![(b"k".to_vec(), b"v".to_vec())]);
+
+        let mut copied = Vec::new();
+        H5M_iterate_into(&map, &mut copied).unwrap();
+        assert_eq!(copied, vec![(b"k".to_vec(), b"v".to_vec())]);
+
         assert_eq!(H5Mdelete(&mut map, b"k").unwrap(), Some(b"v".to_vec()));
         H5Mclose(&mut map);
         assert!(H5Mget_count(&map).is_err());

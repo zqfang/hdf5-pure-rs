@@ -2,7 +2,12 @@ use crate::error::{Error, Result};
 
 /// Verify Fletcher32 checksum and strip it from the data.
 /// The last 4 bytes of the data are the checksum (stored little-endian).
-pub fn verify_and_strip(data: &[u8]) -> Result<Vec<u8>> {
+pub fn verify_and_strip_view(data: &[u8]) -> Result<&[u8]> {
+    let payload = verify_payload(data)?;
+    Ok(payload)
+}
+
+fn verify_payload(data: &[u8]) -> Result<&[u8]> {
     if data.len() < 4 {
         return Err(Error::InvalidFormat(
             "data too short for fletcher32 checksum".into(),
@@ -28,19 +33,28 @@ pub fn verify_and_strip(data: &[u8]) -> Result<Vec<u8>> {
         )));
     }
 
-    Ok(payload.to_vec())
+    Ok(payload)
 }
 
-/// Append an HDF5 Fletcher32 checksum to a filter payload.
-pub fn append_checksum(data: &[u8]) -> Result<Vec<u8>> {
-    let mut out = Vec::with_capacity(
-        data.len()
-            .checked_add(4)
-            .ok_or_else(|| Error::InvalidFormat("fletcher32 output size overflow".into()))?,
-    );
+/// Append an HDF5 Fletcher32 checksum to a filter payload in place.
+pub fn append_checksum_in_place(data: &mut Vec<u8>) -> Result<()> {
+    data.len()
+        .checked_add(4)
+        .ok_or_else(|| Error::InvalidFormat("fletcher32 output size overflow".into()))?;
+    data.extend_from_slice(&fletcher32(data).to_le_bytes());
+    Ok(())
+}
+
+/// Append a filter payload and its HDF5 Fletcher32 checksum to `out`.
+pub fn append_checksum_into(data: &[u8], out: &mut Vec<u8>) -> Result<()> {
+    let additional = data
+        .len()
+        .checked_add(4)
+        .ok_or_else(|| Error::InvalidFormat("fletcher32 output size overflow".into()))?;
+    out.reserve(additional);
     out.extend_from_slice(data);
     out.extend_from_slice(&fletcher32(data).to_le_bytes());
-    Ok(out)
+    Ok(())
 }
 
 /// Compute Fletcher32 checksum matching the HDF5 C library implementation.
@@ -122,7 +136,16 @@ mod tests {
     #[test]
     fn append_checksum_roundtrips_through_verify() {
         let payload = b"fletcher32 write payload";
-        let encoded = append_checksum(payload).unwrap();
-        assert_eq!(verify_and_strip(&encoded).unwrap(), payload);
+        let mut encoded = Vec::new();
+        append_checksum_into(payload, &mut encoded).unwrap();
+        assert_eq!(verify_and_strip_view(&encoded).unwrap(), payload);
+    }
+
+    #[test]
+    fn append_checksum_in_place_roundtrips_through_verify() {
+        let payload = b"fletcher32 in-place write payload";
+        let mut encoded = payload.to_vec();
+        append_checksum_in_place(&mut encoded).unwrap();
+        assert_eq!(verify_and_strip_view(&encoded).unwrap(), payload);
     }
 }

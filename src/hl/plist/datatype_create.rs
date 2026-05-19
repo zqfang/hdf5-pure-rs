@@ -7,7 +7,7 @@ pub struct DatatypeCreate {
 
 impl DatatypeCreate {
     pub(crate) fn from_datatype(dtype: &crate::hl::datatype::Datatype) -> Self {
-        let raw = dtype.raw_message();
+        let raw = dtype.raw_message_ref();
         let (low_pad, high_pad) = match raw.class {
             crate::format::messages::datatype::DatatypeClass::FixedPoint
             | crate::format::messages::datatype::DatatypeClass::BitField => {

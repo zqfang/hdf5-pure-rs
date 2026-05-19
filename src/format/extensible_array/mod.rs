@@ -11,7 +11,9 @@ pub(crate) mod hdr;
 mod iblock;
 mod sblock;
 
+use std::fmt::{self, Write};
 use std::io::{Read, Seek};
+use std::slice;
 
 use crate::error::{Error, Result};
 use crate::io::reader::{is_undef_addr, HdfReader, UNDEF_ADDR};
@@ -19,7 +21,7 @@ use crate::io::reader::{is_undef_addr, HdfReader, UNDEF_ADDR};
 use super::fixed_array;
 use super::fixed_array::FixedArrayElement;
 use hdr::{read_header, ExtensibleArrayHeader};
-use iblock::read_index_block;
+use iblock::read_index_block_into;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ExtensibleArrayStats {
@@ -68,16 +70,26 @@ impl ExtensibleArray {
         self.elements.len()
     }
 
+    /// Borrow the elements currently held by the array.
+    pub fn elements(&self) -> &[FixedArrayElement] {
+        &self.elements
+    }
+
+    /// Iterate over the elements currently held by the array.
+    pub fn iter(&self) -> slice::Iter<'_, FixedArrayElement> {
+        self.elements.iter()
+    }
+
+    /// Consume the array and return its element storage.
+    pub fn into_elements(self) -> Vec<FixedArrayElement> {
+        self.elements
+    }
+
     /// Retrieve a reference to the element at `index`.
     pub fn lookup_elmt(&self, index: usize) -> Result<&FixedArrayElement> {
         self.elements.get(index).ok_or_else(|| {
             Error::InvalidFormat(format!("extensible array index {index} out of bounds"))
         })
-    }
-
-    /// Get a copy of the element at `index`.
-    pub fn get(&self, index: usize) -> Result<FixedArrayElement> {
-        Ok(self.lookup_elmt(index)?.clone())
     }
 
     /// Set an element of the extensible array, growing it by one if `index`
@@ -134,7 +146,7 @@ impl ExtensibleArray {
     }
 
     /// Query the metadata statistics of the array.
-    pub fn get_stats(&self) -> ExtensibleArrayStats {
+    pub fn stats(&self) -> ExtensibleArrayStats {
         ExtensibleArrayStats {
             elements: self.elements.len(),
             allocated_elements: self.elements.capacity(),
@@ -176,8 +188,7 @@ pub struct ExtensibleArrayCreateParams {
 pub fn test_dst_context() {}
 
 /// Encode the test creation parameters into a stable little-endian byte stream.
-pub fn test_encode(params: &ExtensibleArrayCreateParams) -> Result<Vec<u8>> {
-    let mut out = Vec::new();
+pub fn test_encode_into(params: &ExtensibleArrayCreateParams, out: &mut Vec<u8>) -> Result<()> {
     out.extend_from_slice(
         &u64_from_usize(params.raw_element_size, "extensible array raw element size")?
             .to_le_bytes(),
@@ -191,12 +202,16 @@ pub fn test_encode(params: &ExtensibleArrayCreateParams) -> Result<Vec<u8>> {
         .to_le_bytes(),
     );
     out.extend_from_slice(&params.max_index_set.to_le_bytes());
-    Ok(out)
+    Ok(())
 }
 
 /// Display the test creation parameters for debugging.
-pub fn test_debug(params: &ExtensibleArrayCreateParams) -> String {
-    format!(
+pub fn write_test_debug<W: Write + ?Sized>(
+    params: &ExtensibleArrayCreateParams,
+    out: &mut W,
+) -> fmt::Result {
+    write!(
+        out,
         "ExtensibleArrayCreateParams(raw_element_size={}, index_block_elements={}, data_block_min_elements={}, max_index_set={})",
         params.raw_element_size,
         params.index_block_elements,
@@ -219,8 +234,8 @@ pub fn test_crt_dbg_context() -> ExtensibleArrayCreateParams {
 pub fn test_dst_dbg_context(_params: ExtensibleArrayCreateParams) {}
 
 /// Retrieve the parameters used to create the extensible array.
-pub fn get_cparam_test(params: &ExtensibleArrayCreateParams) -> ExtensibleArrayCreateParams {
-    params.clone()
+pub fn cparam_test(params: &ExtensibleArrayCreateParams) -> &ExtensibleArrayCreateParams {
+    params
 }
 
 /// Compare two sets of extensible-array creation parameters for equality.
@@ -232,12 +247,13 @@ pub fn cmp_cparam_test(
 }
 
 /// Iterate over the elements of an extensible array, returning the decoded chunk records.
-pub fn read_extensible_array_chunks<R: Read + Seek>(
+pub fn read_extensible_array_chunks_into<R: Read + Seek>(
     reader: &mut HdfReader<R>,
     addr: u64,
     filtered: bool,
     chunk_size_len: usize,
-) -> Result<Vec<FixedArrayElement>> {
+    elements: &mut Vec<FixedArrayElement>,
+) -> Result<()> {
     let header = read_header(reader, addr)?;
     let expected_class = if filtered { 1 } else { 0 };
     if header.class_id != expected_class {
@@ -247,10 +263,31 @@ pub fn read_extensible_array_chunks<R: Read + Seek>(
         )));
     }
 
+    elements.clear();
     if is_undef_addr(header.index_block_addr) {
-        return Ok(Vec::new());
+        return Ok(());
     }
-    read_index_block(reader, addr, &header, filtered, chunk_size_len)
+    read_index_block_into(reader, addr, &header, filtered, chunk_size_len, elements)
+}
+
+/// Visit each decoded chunk record in an extensible array.
+pub fn visit_extensible_array_chunks<R, F>(
+    reader: &mut HdfReader<R>,
+    addr: u64,
+    filtered: bool,
+    chunk_size_len: usize,
+    mut visitor: F,
+) -> Result<()>
+where
+    R: Read + Seek,
+    F: FnMut(FixedArrayElement) -> Result<()>,
+{
+    let mut elements = Vec::new();
+    read_extensible_array_chunks_into(reader, addr, filtered, chunk_size_len, &mut elements)?;
+    for element in elements {
+        visitor(element)?;
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

@@ -1,6 +1,161 @@
 use hdf5_pure_rust::engine::writer::{CompoundFieldSpec, DtypeSpec};
 use hdf5_pure_rust::hl::types::{FieldDescriptor, H5Type, TypeClass};
-use hdf5_pure_rust::{H5Value, WritableFile};
+use hdf5_pure_rust::{Attribute, Dataset, H5Value, Location, Result, WritableFile};
+
+fn file_has_member(file: &hdf5_pure_rust::File, expected: &str) -> hdf5_pure_rust::Result<bool> {
+    let mut found = false;
+    file.visit_member_names(|name| {
+        if name == expected {
+            found = true;
+        }
+        Ok(())
+    })?;
+    Ok(found)
+}
+
+fn group_member_summary_into(
+    group: &hdf5_pure_rust::Group,
+    expected: &[&str],
+    found: &mut [bool],
+) -> hdf5_pure_rust::Result<usize> {
+    assert_eq!(expected.len(), found.len());
+    found.fill(false);
+    let mut count = 0;
+    group.visit_member_names(|name| {
+        count += 1;
+        for (idx, expected_name) in expected.iter().enumerate() {
+            if name == *expected_name {
+                found[idx] = true;
+            }
+        }
+        Ok(())
+    })?;
+    Ok(count)
+}
+
+fn location_attr_summary_into<L: Location>(
+    location: &L,
+    expected: &[&str],
+    found: &mut [bool],
+) -> Result<usize> {
+    assert_eq!(expected.len(), found.len());
+    found.fill(false);
+    let mut count = 0;
+    location.visit_attr_names(|name| {
+        count += 1;
+        for (idx, expected_name) in expected.iter().enumerate() {
+            if name == *expected_name {
+                found[idx] = true;
+            }
+        }
+        Ok(())
+    })?;
+    Ok(count)
+}
+
+fn assert_dataset_values<T>(ds: &Dataset, expected: &[T]) -> Result<()>
+where
+    T: H5Type + Default + Clone + PartialEq + std::fmt::Debug,
+{
+    let mut values = vec![T::default(); ds.size()? as usize];
+    ds.read_into(&mut values)?;
+    assert_eq!(values, expected);
+    Ok(())
+}
+
+fn assert_dataset_raw(ds: &Dataset, expected: &[u8]) -> Result<()> {
+    let mut raw = vec![0; ds.size()? as usize * ds.element_size()?];
+    ds.read_raw_into(&mut raw)?;
+    assert_eq!(raw, expected);
+    Ok(())
+}
+
+fn dataset_scalar<T>(ds: &Dataset) -> Result<T>
+where
+    T: H5Type + Default,
+{
+    let mut value = T::default();
+    ds.read_scalar_into(&mut value)?;
+    Ok(value)
+}
+
+fn assert_dataset_strings(ds: &Dataset, expected: &[&str]) -> Result<()> {
+    let mut strings = Vec::new();
+    ds.read_strings_into(&mut strings)?;
+    assert_eq!(strings.len(), expected.len());
+    for (actual, expected) in strings.iter().zip(expected) {
+        assert_eq!(actual, expected);
+    }
+    Ok(())
+}
+
+fn assert_dataset_field<T>(ds: &Dataset, field_name: &str, expected: &[T]) -> Result<()>
+where
+    T: H5Type + Default + Clone + PartialEq + std::fmt::Debug,
+{
+    let mut values = vec![T::default(); ds.size()? as usize];
+    ds.read_field_into(field_name, &mut values)?;
+    assert_eq!(values, expected);
+    Ok(())
+}
+
+fn assert_dataset_field_values(ds: &Dataset, field_name: &str, expected: &[H5Value]) -> Result<()> {
+    let mut values = Vec::new();
+    ds.read_field_values_into(field_name, &mut values)?;
+    assert_eq!(values, expected);
+    Ok(())
+}
+
+fn dataset_field_value_count(ds: &Dataset, field_name: &str) -> Result<usize> {
+    let mut count = 0;
+    ds.visit_field_values(field_name, |_| {
+        count += 1;
+        Ok(())
+    })?;
+    Ok(count)
+}
+
+fn dataset_has_filter_id(ds: &Dataset, id: u16) -> Result<bool> {
+    let mut found = false;
+    ds.visit_filters(|filter| {
+        if filter.id == id {
+            found = true;
+        }
+        Ok(())
+    })?;
+    Ok(found)
+}
+
+fn assert_attribute_values<T>(attr: &Attribute, expected: &[T]) -> Result<()>
+where
+    T: H5Type + Default + Clone + PartialEq + std::fmt::Debug,
+{
+    let len = attr.shape().iter().try_fold(1usize, |acc, &dim| {
+        acc.checked_mul(dim as usize)
+            .ok_or_else(|| hdf5_pure_rust::Error::InvalidFormat("attribute shape overflows".into()))
+    })?;
+    let mut values = vec![T::default(); len];
+    attr.read_into(&mut values)?;
+    assert_eq!(values, expected);
+    Ok(())
+}
+
+fn attribute_string(attr: &Attribute) -> Result<String> {
+    let mut value = String::new();
+    attr.read_string_into(&mut value)?;
+    Ok(value)
+}
+
+fn assert_attribute_strings(attr: &Attribute, expected: &[&str]) -> Result<()> {
+    let mut index = 0;
+    attr.visit_strings(|value| {
+        assert_eq!(Some(value), expected.get(index).copied());
+        index += 1;
+        Ok(())
+    })?;
+    assert_eq!(index, expected.len());
+    Ok(())
+}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -21,8 +176,9 @@ unsafe impl H5Type for Point {
         std::mem::size_of::<Point>()
     }
 
-    fn compound_fields() -> Option<Vec<FieldDescriptor>> {
-        Some(vec![
+    fn compound_fields_into(out: &mut Vec<FieldDescriptor>) -> Option<()> {
+        out.clear();
+        out.extend([
             FieldDescriptor {
                 name: "x".to_string(),
                 offset: std::mem::offset_of!(Point, x),
@@ -35,7 +191,8 @@ unsafe impl H5Type for Point {
                 size: std::mem::size_of::<i32>(),
                 type_class: TypeClass::Integer { signed: true },
             },
-        ])
+        ]);
+        Some(())
     }
 }
 
@@ -44,8 +201,9 @@ unsafe impl H5Type for WidePair {
         std::mem::size_of::<WidePair>()
     }
 
-    fn compound_fields() -> Option<Vec<FieldDescriptor>> {
-        Some(vec![
+    fn compound_fields_into(out: &mut Vec<FieldDescriptor>) -> Option<()> {
+        out.clear();
+        out.extend([
             FieldDescriptor {
                 name: "signed".to_string(),
                 offset: std::mem::offset_of!(WidePair, signed),
@@ -58,7 +216,8 @@ unsafe impl H5Type for WidePair {
                 size: std::mem::size_of::<u128>(),
                 type_class: TypeClass::Integer { signed: false },
             },
-        ])
+        ]);
+        Some(())
     }
 }
 
@@ -75,8 +234,7 @@ fn test_writable_file_simple() {
             .unwrap();
         let f = wf.close().unwrap();
         let ds = f.dataset("temperatures").unwrap();
-        let vals: Vec<f64> = ds.read::<f64>().unwrap();
-        assert_eq!(vals, vec![20.0, 21.5, 22.0, 19.8, 23.1]);
+        assert_dataset_values::<f64>(&ds, &[20.0, 21.5, 22.0, 19.8, 23.1]).unwrap();
     }
 }
 
@@ -102,11 +260,8 @@ fn test_writable_file_i128_u128_roundtrip() {
     }
 
     let f = hdf5_pure_rust::File::open(&path).unwrap();
-    assert_eq!(f.dataset("signed").unwrap().read::<i128>().unwrap(), signed);
-    assert_eq!(
-        f.dataset("unsigned").unwrap().read::<u128>().unwrap(),
-        unsigned
-    );
+    assert_dataset_values::<i128>(&f.dataset("signed").unwrap(), &signed).unwrap();
+    assert_dataset_values::<u128>(&f.dataset("unsigned").unwrap(), &unsigned).unwrap();
     assert_eq!(
         f.attr("wide_attr").unwrap().read_scalar::<i128>().unwrap(),
         i128::MIN + 7
@@ -139,26 +294,20 @@ fn test_writable_file_compound_i128_u128_fields_roundtrip() {
 
     let f = hdf5_pure_rust::File::open(&path).unwrap();
     let ds = f.dataset("wide_pairs").unwrap();
-    assert_eq!(
-        ds.read_field::<i128>("signed").unwrap(),
-        data.iter().map(|value| value.signed).collect::<Vec<_>>()
-    );
-    assert_eq!(
-        ds.read_field::<u128>("unsigned").unwrap(),
-        data.iter().map(|value| value.unsigned).collect::<Vec<_>>()
-    );
-    assert_eq!(
-        ds.read_field_values("signed").unwrap(),
-        data.iter()
-            .map(|value| H5Value::Int(value.signed))
-            .collect::<Vec<_>>()
-    );
-    assert_eq!(
-        ds.read_field_values("unsigned").unwrap(),
-        data.iter()
-            .map(|value| H5Value::UInt(value.unsigned))
-            .collect::<Vec<_>>()
-    );
+    let expected_signed = data.iter().map(|value| value.signed).collect::<Vec<_>>();
+    let expected_unsigned = data.iter().map(|value| value.unsigned).collect::<Vec<_>>();
+    let expected_signed_values = data
+        .iter()
+        .map(|value| H5Value::Int(value.signed))
+        .collect::<Vec<_>>();
+    let expected_unsigned_values = data
+        .iter()
+        .map(|value| H5Value::UInt(value.unsigned))
+        .collect::<Vec<_>>();
+    assert_dataset_field::<i128>(&ds, "signed", &expected_signed).unwrap();
+    assert_dataset_field::<u128>(&ds, "unsigned", &expected_unsigned).unwrap();
+    assert_dataset_field_values(&ds, "signed", &expected_signed_values).unwrap();
+    assert_dataset_field_values(&ds, "unsigned", &expected_unsigned_values).unwrap();
 }
 
 #[test]
@@ -248,13 +397,11 @@ fn test_writable_file_with_groups() {
             .unwrap();
         let f = wf.close().unwrap();
 
-        let names = f.member_names().unwrap();
-        assert!(names.contains(&"sensors".to_string()));
+        assert!(file_has_member(&f, "sensors").unwrap());
 
         let g = f.group("sensors").unwrap();
         let ds = g.open_dataset("pressure").unwrap();
-        let vals: Vec<f32> = ds.read::<f32>().unwrap();
-        assert_eq!(vals, vec![1013.25, 1012.0, 1011.5]);
+        assert_dataset_values::<f32>(&ds, &[1013.25, 1012.0, 1011.5]).unwrap();
     }
 }
 
@@ -273,8 +420,9 @@ fn test_writable_group_attr() {
         let f = wf.close().unwrap();
 
         let g = f.group("sensors").unwrap();
-        let names = g.attr_names().unwrap();
-        assert!(names.contains(&"site_id".to_string()));
+        let mut found = [false];
+        location_attr_summary_into(&g, &["site_id"], &mut found).unwrap();
+        assert!(found[0]);
         let value: i64 = g.attr("site_id").unwrap().read_scalar::<i64>().unwrap();
         assert_eq!(value, 17);
     }
@@ -325,10 +473,11 @@ fn test_writable_group_dense_attrs() {
         let f = wf.close().unwrap();
 
         let g = f.group("annotated").unwrap();
-        let names = g.attr_names().unwrap();
-        assert_eq!(names.len(), 16);
-        assert!(names.contains(&"attr_00".to_string()));
-        assert!(names.contains(&"attr_15".to_string()));
+        let mut found = [false, false];
+        let count = location_attr_summary_into(&g, &["attr_00", "attr_15"], &mut found).unwrap();
+        assert_eq!(count, 16);
+        assert!(found[0]);
+        assert!(found[1]);
         assert_eq!(g.attr("attr_12").unwrap().read_scalar_i64(), Some(12));
     }
 }
@@ -348,12 +497,12 @@ fn test_writable_root_and_group_array_attrs() {
 
         let root_attr = f.attr("calibration").unwrap();
         assert_eq!(root_attr.shape(), &[3]);
-        assert_eq!(root_attr.read::<f64>().unwrap(), vec![1.0, 2.5, 4.0]);
+        assert_attribute_values::<f64>(&root_attr, &[1.0, 2.5, 4.0]).unwrap();
 
         let group = f.group("sensors").unwrap();
         let group_attr = group.attr("ids").unwrap();
         assert_eq!(group_attr.shape(), &[4]);
-        assert_eq!(group_attr.read::<i32>().unwrap(), vec![10, 20, 30, 40]);
+        assert_attribute_values::<i32>(&group_attr, &[10, 20, 30, 40]).unwrap();
     }
 }
 
@@ -369,9 +518,15 @@ fn test_writable_fixed_string_attrs() {
         g.add_fixed_utf8_attr("species", "猫", 8).unwrap();
         let f = wf.close().unwrap();
 
-        assert_eq!(f.attr("project").unwrap().read_string(), "hdf");
+        assert_eq!(
+            attribute_string(&f.attr("project").unwrap()).unwrap(),
+            "hdf"
+        );
         let group = f.group("metadata").unwrap();
-        assert_eq!(group.attr("species").unwrap().read_string(), "猫");
+        assert_eq!(
+            attribute_string(&group.attr("species").unwrap()).unwrap(),
+            "猫"
+        );
     }
 }
 
@@ -412,20 +567,36 @@ fn test_writable_rejects_unrepresentable_fixed_string_lengths() {
 }
 
 #[test]
-fn test_writable_rejects_oversized_object_header_message() {
+fn test_writable_routes_oversized_attrs_to_dense_storage() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("api_write_oversized_oh_message.h5");
+    let path = dir.path().join("api_write_oversized_dense_attrs.h5");
+    let large_len = u16::MAX as usize + 1;
 
-    let mut wf = WritableFile::create(&path).unwrap();
-    wf.add_fixed_ascii_attr("large_attr", "x", u16::MAX as usize + 1)
-        .unwrap();
-    wf.new_dataset_builder("data")
-        .write::<i32>(&[1, 2, 3])
-        .unwrap();
-    let err = wf
-        .flush()
-        .expect_err("oversized object-header message should be rejected");
-    assert!(err.to_string().contains("object-header message"));
+    {
+        let mut wf = WritableFile::create(&path).unwrap();
+        let mut group = wf.create_group("metadata").unwrap();
+        group
+            .add_fixed_ascii_attr("large_attr", "x", large_len)
+            .unwrap();
+        wf.new_dataset_builder("data")
+            .fixed_ascii_attr("large_ds_attr", "y", large_len)
+            .unwrap()
+            .write::<i32>(&[1, 2, 3])
+            .unwrap();
+        let f = wf.close().unwrap();
+
+        let group = f.group("metadata").unwrap();
+        assert_eq!(
+            attribute_string(&group.attr("large_attr").unwrap()).unwrap(),
+            "x"
+        );
+        let ds = f.dataset("data").unwrap();
+        assert_dataset_values::<i32>(&ds, &[1, 2, 3]).unwrap();
+        assert_eq!(
+            attribute_string(&ds.attr("large_ds_attr").unwrap()).unwrap(),
+            "y"
+        );
+    }
 }
 
 #[test]
@@ -458,11 +629,11 @@ fn test_writable_fixed_string_array_attrs() {
 
         let stages = f.attr("stages").unwrap();
         assert_eq!(stages.shape(), &[3]);
-        assert_eq!(stages.read_strings().unwrap(), vec!["raw", "qc", "done"]);
+        assert_attribute_strings(&stages, &["raw", "qc", "done"]).unwrap();
 
         let labels = f.group("metadata").unwrap().attr("labels").unwrap();
         assert_eq!(labels.shape(), &[2]);
-        assert_eq!(labels.read_strings().unwrap(), vec!["猫", "å"]);
+        assert_attribute_strings(&labels, &["猫", "å"]).unwrap();
     }
 }
 
@@ -486,7 +657,7 @@ fn test_dataset_builder_scalar_and_array_attrs() {
         assert_eq!(ds.attr("version").unwrap().read_scalar_i64(), Some(2));
         let scale = ds.attr("scale").unwrap();
         assert_eq!(scale.shape(), &[3]);
-        assert_eq!(scale.read::<f64>().unwrap(), vec![1.0, 10.0, 100.0]);
+        assert_attribute_values::<f64>(&scale, &[1.0, 10.0, 100.0]).unwrap();
     }
 }
 
@@ -507,8 +678,8 @@ fn test_dataset_builder_fixed_string_attrs() {
         let f = wf.close().unwrap();
 
         let ds = f.dataset("values").unwrap();
-        assert_eq!(ds.attr("units").unwrap().read_string(), "ms");
-        assert_eq!(ds.attr("label").unwrap().read_string(), "猫");
+        assert_eq!(attribute_string(&ds.attr("units").unwrap()).unwrap(), "ms");
+        assert_eq!(attribute_string(&ds.attr("label").unwrap()).unwrap(), "猫");
     }
 }
 
@@ -529,14 +700,8 @@ fn test_dataset_builder_fixed_string_array_attrs() {
         let f = wf.close().unwrap();
 
         let ds = f.dataset("values").unwrap();
-        assert_eq!(
-            ds.attr("units").unwrap().read_strings().unwrap(),
-            vec!["ms", "s"]
-        );
-        assert_eq!(
-            ds.attr("labels").unwrap().read_strings().unwrap(),
-            vec!["猫", "å"]
-        );
+        assert_attribute_strings(&ds.attr("units").unwrap(), &["ms", "s"]).unwrap();
+        assert_attribute_strings(&ds.attr("labels").unwrap(), &["猫", "å"]).unwrap();
     }
 }
 
@@ -556,7 +721,7 @@ fn test_dataset_builder_compact_attrs() {
         let f = wf.close().unwrap();
 
         let ds = f.dataset("values").unwrap();
-        assert_eq!(ds.read::<i16>().unwrap(), vec![7, 8, 9]);
+        assert_dataset_values::<i16>(&ds, &[7, 8, 9]).unwrap();
         assert_eq!(ds.attr("version").unwrap().read_scalar_i64(), Some(3));
     }
 }
@@ -598,19 +763,19 @@ fn test_dataset_builder_attrs_with_explicit_fill_values() {
             contiguous.attr("version").unwrap().read_scalar_i64(),
             Some(4)
         );
-        assert_eq!(contiguous.read::<i32>().unwrap(), vec![1, 2, 3]);
+        assert_dataset_values::<i32>(&contiguous, &[1, 2, 3]).unwrap();
 
         let compact = f.dataset("compact").unwrap();
         let plist = compact.create_plist().unwrap();
         assert_eq!(plist.fill_value, Some((-2i16).to_le_bytes().to_vec()));
         assert_eq!(compact.attr("version").unwrap().read_scalar_i64(), Some(5));
-        assert_eq!(compact.read::<i16>().unwrap(), vec![7, 8]);
+        assert_dataset_values::<i16>(&compact, &[7, 8]).unwrap();
 
         let scalar = f.dataset("scalar").unwrap();
         let plist = scalar.create_plist().unwrap();
         assert_eq!(plist.fill_value, Some(99u64.to_le_bytes().to_vec()));
         assert_eq!(scalar.attr("version").unwrap().read_scalar_i64(), Some(6));
-        assert_eq!(scalar.read_scalar::<u64>().unwrap(), 42);
+        assert_eq!(dataset_scalar::<u64>(&scalar).unwrap(), 42);
     }
 }
 
@@ -629,18 +794,14 @@ fn test_writable_file_group_with_many_compact_links() {
         let f = wf.close().unwrap();
 
         let group = f.group("many").unwrap();
-        let names = group.member_names().unwrap();
-        assert_eq!(names.len(), 40);
-        assert!(names.contains(&"value_00".to_string()));
-        assert!(names.contains(&"value_39".to_string()));
-        assert_eq!(
-            group
-                .open_dataset("value_37")
-                .unwrap()
-                .read::<i32>()
-                .unwrap(),
-            vec![37]
-        );
+        let mut found = [false, false];
+        let count =
+            group_member_summary_into(&group, &["value_00", "value_39"], &mut found).unwrap();
+        assert_eq!(count, 40);
+        assert!(found[0]);
+        assert!(found[1]);
+        let value_37 = group.open_dataset("value_37").unwrap();
+        assert_dataset_values::<i32>(&value_37, &[37]).unwrap();
     }
 
     let out = std::process::Command::new("h5dump")
@@ -675,11 +836,33 @@ fn test_writable_file_chunked_compressed() {
 
         let ds = f.dataset("data").unwrap();
         assert!(ds.is_chunked().unwrap());
-        let vals: Vec<i32> = ds.read::<i32>().unwrap();
+        let mut vals = vec![0i32; ds.size().unwrap() as usize];
+        ds.read_into(&mut vals).unwrap();
         assert_eq!(vals.len(), 100);
         for (i, v) in vals.iter().enumerate() {
             assert_eq!(*v, i as i32);
         }
+    }
+}
+
+#[test]
+fn test_writable_file_chunked_v1_btree_beyond_two_levels() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("api_write_chunked_deep_btree.h5");
+
+    {
+        let mut wf = WritableFile::create(&path).unwrap();
+        let data: Vec<i32> = (0..4097).collect();
+        wf.new_dataset_builder("data")
+            .shape(&[4097])
+            .chunk(&[1])
+            .write::<i32>(&data)
+            .unwrap();
+        let f = wf.close().unwrap();
+
+        let ds = f.dataset("data").unwrap();
+        assert!(ds.is_chunked().unwrap());
+        assert_dataset_values::<i32>(&ds, &data).unwrap();
     }
 }
 
@@ -701,9 +884,8 @@ fn test_writable_file_chunked_fletcher32() {
 
         let ds = f.dataset("data").unwrap();
         assert!(ds.is_chunked().unwrap());
-        let vals: Vec<i32> = ds.read::<i32>().unwrap();
-        assert_eq!(vals, data);
-        assert!(ds.filters().unwrap().iter().any(|filter| filter.id == 3));
+        assert_dataset_values::<i32>(&ds, &data).unwrap();
+        assert!(dataset_has_filter_id(&ds, 3).unwrap());
     }
 }
 
@@ -761,12 +943,9 @@ fn test_dataset_builder_chunked_attrs() {
 
         let ds = f.dataset("data").unwrap();
         assert!(ds.is_chunked().unwrap());
-        assert_eq!(ds.read::<i32>().unwrap(), data);
+        assert_dataset_values::<i32>(&ds, &data).unwrap();
         assert_eq!(ds.attr("version").unwrap().read_scalar_i64(), Some(7));
-        assert_eq!(
-            ds.attr("scale").unwrap().read::<f64>().unwrap(),
-            vec![1.0, 2.0]
-        );
+        assert_attribute_values::<f64>(&ds.attr("scale").unwrap(), &[1.0, 2.0]).unwrap();
     }
 }
 
@@ -845,7 +1024,7 @@ fn test_dataset_builder_compressed_chunked_attrs_with_fill_value() {
 
         let ds = f.dataset("data").unwrap();
         assert!(ds.is_chunked().unwrap());
-        assert_eq!(ds.read::<i16>().unwrap(), data);
+        assert_dataset_values::<i16>(&ds, &data).unwrap();
         assert_eq!(ds.attr("version").unwrap().read_scalar_i64(), Some(8));
         let plist = ds.create_plist().unwrap();
         assert_eq!(plist.fill_value, Some((-9i16).to_le_bytes().to_vec()));
@@ -865,7 +1044,7 @@ fn test_writable_file_scalar() {
         let f = wf.close().unwrap();
 
         let ds = f.dataset("pi").unwrap();
-        let val: f64 = ds.read_scalar::<f64>().unwrap();
+        let val = dataset_scalar::<f64>(&ds).unwrap();
         assert!((val - std::f64::consts::PI).abs() < 1e-15);
     }
 }
@@ -900,7 +1079,7 @@ fn test_dataset_builder_compact_scalar_and_rejected_scalar_options() {
 
         let f = wf.close().unwrap();
         let ds = f.dataset("compact_scalar").unwrap();
-        assert_eq!(ds.read_scalar::<i32>().unwrap(), 99);
+        assert_eq!(dataset_scalar::<i32>(&ds).unwrap(), 99);
         assert_eq!(ds.attr("version").unwrap().read_scalar_i64(), Some(13));
     }
 }
@@ -919,8 +1098,7 @@ fn test_writable_file_compact() {
         let f = wf.close().unwrap();
 
         let ds = f.dataset("tiny").unwrap();
-        let vals: Vec<u8> = ds.read::<u8>().unwrap();
-        assert_eq!(vals, vec![1, 2, 3, 4, 5]);
+        assert_dataset_values::<u8>(&ds, &[1, 2, 3, 4, 5]).unwrap();
     }
 }
 
@@ -986,7 +1164,7 @@ fn test_writable_file_explicit_fill_value_properties() {
         assert_eq!(plist.fill_time, Some(2));
         assert!(plist.fill_value_defined);
         assert_eq!(plist.fill_value, Some((-7i32).to_le_bytes().to_vec()));
-        assert_eq!(ds.read::<i32>().unwrap(), vec![1, 2, 3]);
+        assert_dataset_values::<i32>(&ds, &[1, 2, 3]).unwrap();
     }
 }
 
@@ -1004,10 +1182,7 @@ fn test_writable_file_compact_fixed_strings() {
         let f = wf.close().unwrap();
 
         let ds = f.dataset("names").unwrap();
-        assert_eq!(
-            ds.read_strings().unwrap(),
-            vec!["red".to_string(), "green".to_string(), "blue".to_string()]
-        );
+        assert_dataset_strings(&ds, &["red", "green", "blue"]).unwrap();
     }
 }
 
@@ -1032,20 +1207,14 @@ fn test_dataset_builder_fixed_string_datasets_with_attrs() {
         let f = wf.close().unwrap();
 
         let contiguous = f.dataset("contiguous").unwrap();
-        assert_eq!(
-            contiguous.read_strings().unwrap(),
-            vec!["red".to_string(), "green".to_string()]
-        );
+        assert_dataset_strings(&contiguous, &["red", "green"]).unwrap();
         assert_eq!(
             contiguous.attr("version").unwrap().read_scalar_i64(),
             Some(10)
         );
 
         let compact = f.dataset("compact").unwrap();
-        assert_eq!(
-            compact.read_strings().unwrap(),
-            vec!["猫".to_string(), "å".to_string()]
-        );
+        assert_dataset_strings(&compact, &["猫", "å"]).unwrap();
         assert_eq!(compact.attr("version").unwrap().read_scalar_i64(), Some(11));
     }
 }
@@ -1070,15 +1239,7 @@ fn test_dataset_builder_chunked_fixed_string_dataset() {
 
         let ds = f.dataset("names").unwrap();
         assert!(ds.is_chunked().unwrap());
-        assert_eq!(
-            ds.read_strings().unwrap(),
-            vec![
-                "red".to_string(),
-                "green".to_string(),
-                "blue".to_string(),
-                "gold".to_string()
-            ]
-        );
+        assert_dataset_strings(&ds, &["red", "green", "blue", "gold"]).unwrap();
         assert_eq!(ds.attr("version").unwrap().read_scalar_i64(), Some(12));
     }
 }
@@ -1097,10 +1258,7 @@ fn test_writable_file_vlen_utf8_strings() {
 
         let ds = f.dataset("names").unwrap();
         assert!(ds.dtype().unwrap().is_vlen());
-        assert_eq!(
-            ds.read_strings().unwrap(),
-            vec!["".to_string(), "猫".to_string(), "alpha".to_string()]
-        );
+        assert_dataset_strings(&ds, &["", "猫", "alpha"]).unwrap();
     }
 
     let out = std::process::Command::new("h5dump")
@@ -1136,6 +1294,123 @@ fn test_writable_file_vlen_utf8_strings() {
 }
 
 #[test]
+fn test_writable_file_chunked_filtered_vlen_utf8_strings() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("api_write_chunked_vlen_strings.h5");
+
+    {
+        let mut wf = WritableFile::create(&path).unwrap();
+        wf.new_dataset_builder("names")
+            .shape(&[5])
+            .chunk(&[2])
+            .shuffle()
+            .deflate(3)
+            .attr("version", 13i64)
+            .unwrap()
+            .write_vlen_utf8_strings(&["", "猫", "alpha", "beta", "delta"])
+            .unwrap();
+        let f = wf.close().unwrap();
+
+        let ds = f.dataset("names").unwrap();
+        assert!(ds.dtype().unwrap().is_vlen());
+        assert!(ds.is_chunked().unwrap());
+        assert!(dataset_has_filter_id(&ds, 1).unwrap());
+        assert!(dataset_has_filter_id(&ds, 2).unwrap());
+        assert_dataset_strings(&ds, &["", "猫", "alpha", "beta", "delta"]).unwrap();
+        assert_eq!(ds.attr("version").unwrap().read_scalar_i64(), Some(13));
+    }
+
+    let out = std::process::Command::new("timeout")
+        .arg("10")
+        .arg("h5dump")
+        .arg("-pH")
+        .arg("-d")
+        .arg("names")
+        .arg(&path)
+        .output();
+    if let Ok(out) = out {
+        assert!(
+            out.status.success(),
+            "h5dump -pH failed or timed out on chunked vlen string fixture: status={:?}, stderr={}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.contains("STRSIZE H5T_VARIABLE"));
+        assert!(stdout.contains("CHUNKED"));
+        assert!(stdout.contains("DEFLATE"));
+        assert!(stdout.contains("SHUFFLE"));
+    }
+}
+
+#[test]
+fn test_writable_file_chunked_vlen_utf8_strings_with_fletcher32() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir
+        .path()
+        .join("api_write_chunked_vlen_strings_fletcher32.h5");
+
+    {
+        let mut wf = WritableFile::create(&path).unwrap();
+        wf.new_dataset_builder("names")
+            .shape(&[3])
+            .chunk(&[1])
+            .fletcher32()
+            .write_vlen_utf8_strings(&["alpha", "", "猫"])
+            .unwrap();
+        let f = wf.close().unwrap();
+
+        let ds = f.dataset("names").unwrap();
+        assert!(ds.dtype().unwrap().is_vlen());
+        assert!(ds.is_chunked().unwrap());
+        assert!(dataset_has_filter_id(&ds, 3).unwrap());
+        assert_dataset_strings(&ds, &["alpha", "", "猫"]).unwrap();
+    }
+}
+
+#[test]
+fn test_writable_file_vlen_utf8_strings_still_reject_fill_values() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("api_write_vlen_string_fill_rejected.h5");
+
+    let mut wf = WritableFile::create(&path).unwrap();
+    let err = wf
+        .new_dataset_builder("names")
+        .shape(&[2])
+        .chunk(&[1])
+        .fill_value::<u64>(0)
+        .write_vlen_utf8_strings(&["alpha", "beta"])
+        .expect_err("vlen string fill values are not implemented yet");
+    assert!(err.to_string().contains("fill values are not supported"));
+}
+
+#[test]
+fn test_writable_file_vlen_utf8_strings_split_global_heap_collections() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("api_write_many_vlen_strings.h5");
+    let values: Vec<String> = (0..=u16::MAX).map(|i| format!("kmer-{i}")).collect();
+    let refs: Vec<&str> = values.iter().map(String::as_str).collect();
+
+    {
+        let mut wf = WritableFile::create(&path).unwrap();
+        wf.new_dataset_builder("kmers")
+            .write_vlen_utf8_strings(&refs)
+            .unwrap();
+        let f = wf.close().unwrap();
+
+        let ds = f.dataset("kmers").unwrap();
+        assert!(ds.dtype().unwrap().is_vlen());
+        let strings = ds.read_strings().unwrap();
+        assert_eq!(strings.len(), refs.len());
+        assert_eq!(strings.first().map(String::as_str), Some("kmer-0"));
+        assert_eq!(
+            strings.get(u16::MAX as usize).map(String::as_str),
+            Some("kmer-65535")
+        );
+    }
+}
+
+#[test]
 fn test_dataset_builder_vlen_utf8_strings_with_attrs() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("api_write_vlen_string_attrs.h5");
@@ -1153,12 +1428,9 @@ fn test_dataset_builder_vlen_utf8_strings_with_attrs() {
 
         let ds = f.dataset("names").unwrap();
         assert!(ds.dtype().unwrap().is_vlen());
-        assert_eq!(
-            ds.read_strings().unwrap(),
-            vec!["".to_string(), "alpha".to_string(), "猫".to_string()]
-        );
+        assert_dataset_strings(&ds, &["", "alpha", "猫"]).unwrap();
         assert_eq!(ds.attr("version").unwrap().read_scalar_i64(), Some(9));
-        assert_eq!(ds.attr("label").unwrap().read_string(), "猫");
+        assert_eq!(attribute_string(&ds.attr("label").unwrap()).unwrap(), "猫");
     }
 }
 
@@ -1176,8 +1448,8 @@ fn test_writable_file_compact_compound() {
         let f = wf.close().unwrap();
 
         let ds = f.dataset("points").unwrap();
-        assert_eq!(ds.read_field::<f64>("x").unwrap(), vec![1.5, 2.5]);
-        assert_eq!(ds.read_field::<i32>("label").unwrap(), vec![10, 20]);
+        assert_dataset_field::<f64>(&ds, "x", &[1.5, 2.5]).unwrap();
+        assert_dataset_field::<i32>(&ds, "label", &[10, 20]).unwrap();
     }
 }
 
@@ -1275,27 +1547,26 @@ fn test_dataset_builder_write_raw_with_explicit_complex_dtype() {
 
         let status = f.dataset("status").unwrap();
         assert!(status.dtype().unwrap().is_enum());
-        assert_eq!(status.read::<u16>().unwrap(), vec![0, 1, 2]);
+        assert_dataset_values::<u16>(&status, &[0, 1, 2]).unwrap();
 
         let opaque = f.dataset("opaque").unwrap();
-        assert_eq!(
-            opaque.dtype().unwrap().opaque_tag().as_deref(),
-            Some("payload")
-        );
-        assert_eq!(opaque.read_raw().unwrap(), b"abcdwxyz");
+        assert_eq!(opaque.dtype().unwrap().opaque_tag_str(), Some("payload"));
+        assert_dataset_raw(&opaque, b"abcdwxyz").unwrap();
 
         let cells = f.dataset("cells").unwrap();
-        let (dims, base) = cells.dtype().unwrap().array_dims_base().unwrap();
+        let cells_dtype = cells.dtype().unwrap();
+        let dims = cells_dtype
+            .array_dims_iter()
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        let base = cells_dtype.array_base().unwrap();
         assert_eq!(dims, vec![2, 3]);
         assert_eq!(base.size(), 2);
-        assert_eq!(cells.read_raw().unwrap(), array_data);
+        assert_dataset_raw(&cells, &array_data).unwrap();
 
-        let nested_values = f
-            .dataset("nested")
-            .unwrap()
-            .read_field_values("nested")
-            .unwrap();
-        assert_eq!(nested_values.len(), 2);
+        let nested = f.dataset("nested").unwrap();
+        assert_eq!(dataset_field_value_count(&nested, "nested").unwrap(), 2);
     }
 }
 

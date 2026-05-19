@@ -1,4 +1,5 @@
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
 use crate::format::messages::data_layout::LayoutClass;
@@ -16,14 +17,131 @@ pub(super) struct VirtualMapping {
     pub(super) virtual_select: VirtualSelection,
 }
 
-pub(super) struct VirtualSourceData {
-    pub(super) info: DatasetInfo,
-    pub(super) raw: Vec<u8>,
+struct VirtualSourceCacheEntry {
+    dataset: Dataset,
+    info: DatasetInfo,
+    raw: Option<Vec<u8>>,
 }
 
-pub(super) struct VirtualPointMap {
-    pub(super) source_points: Vec<Vec<u64>>,
-    pub(super) virtual_points: Vec<Vec<u64>>,
+struct VirtualSourceCache {
+    indexes: HashMap<PathBuf, Vec<VirtualSourceCacheDatasetIndex>>,
+    entries: Vec<VirtualSourceCacheEntry>,
+}
+
+struct VirtualSourceCacheDatasetIndex {
+    dataset_name: String,
+    index: usize,
+}
+
+impl VirtualSourceCache {
+    fn new() -> Self {
+        Self {
+            indexes: HashMap::new(),
+            entries: Vec::new(),
+        }
+    }
+
+    fn source_info(
+        &mut self,
+        file_path: Option<&Path>,
+        mapping: &VirtualMapping,
+        access: &DatasetAccess,
+    ) -> Result<&DatasetInfo> {
+        let index = self.source_index(file_path, mapping, access)?;
+        Ok(&self.entries[index].info)
+    }
+
+    fn source_raw(
+        &mut self,
+        file_path: Option<&Path>,
+        mapping: &VirtualMapping,
+        dest_info: &DatasetInfo,
+        access: &DatasetAccess,
+    ) -> Result<(&DatasetInfo, &[u8])> {
+        let index = self.source_index(file_path, mapping, access)?;
+        let entry = &mut self.entries[index];
+        if entry.raw.is_none() {
+            let (_, _, source_bytes) = Dataset::raw_read_size(&entry.info)?;
+            let mut source_raw = vec![0; source_bytes];
+            entry
+                .dataset
+                .read_raw_into_with_access(access, &mut source_raw)?;
+            entry.raw = Some(crate::hl::conversion::convert_between_datatypes(
+                &source_raw,
+                &entry.info.datatype,
+                &dest_info.datatype,
+            )?);
+        }
+        let raw = entry
+            .raw
+            .as_deref()
+            .expect("virtual source raw data must be cached after read");
+        Ok((&entry.info, raw))
+    }
+
+    fn source_index(
+        &mut self,
+        file_path: Option<&Path>,
+        mapping: &VirtualMapping,
+        access: &DatasetAccess,
+    ) -> Result<usize> {
+        let source_path =
+            Dataset::resolve_virtual_source_path(file_path, &mapping.file_name, access)?;
+        if let Some(indexes) = self.indexes.get(&source_path) {
+            if let Some(index) = indexes
+                .iter()
+                .find(|entry| entry.dataset_name == mapping.dataset_name.as_str())
+                .map(|entry| entry.index)
+            {
+                return Ok(index);
+            }
+        }
+
+        let source = crate::hl::file::File::open(&source_path)?;
+        let dataset = source.dataset(&mapping.dataset_name)?;
+        let info = dataset.info()?;
+        let index = self.entries.len();
+        self.entries.push(VirtualSourceCacheEntry {
+            dataset,
+            info,
+            raw: None,
+        });
+        self.indexes
+            .entry(source_path)
+            .or_default()
+            .push(VirtualSourceCacheDatasetIndex {
+                dataset_name: mapping.dataset_name.clone(),
+                index,
+            });
+        Ok(index)
+    }
+}
+
+enum VirtualSourceElementIndexes<'a> {
+    All { len: usize },
+    Borrowed(&'a [Vec<u64>]),
+    Owned(Vec<usize>),
+}
+
+impl VirtualSourceElementIndexes<'_> {
+    fn len(&self) -> usize {
+        match self {
+            Self::All { len } => *len,
+            Self::Borrowed(points) => points.len(),
+            Self::Owned(indexes) => indexes.len(),
+        }
+    }
+
+    fn linear_index(&self, index: usize, strides: &[usize]) -> Result<Option<usize>> {
+        match self {
+            Self::All { len } => Ok((index < *len).then_some(index)),
+            Self::Borrowed(points) => points
+                .get(index)
+                .map(|point| Dataset::linear_index(point, strides))
+                .transpose(),
+            Self::Owned(indexes) => Ok(indexes.get(index).copied()),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -49,12 +167,14 @@ pub(super) struct IrregularHyperslabBlock {
 }
 
 impl Dataset {
-    pub(crate) fn virtual_mapping_infos_with_info(
+    pub(crate) fn virtual_mapping_infos_with_info_into(
         &self,
         info: &DatasetInfo,
-    ) -> Result<Vec<VirtualMappingInfo>> {
+        out: &mut Vec<VirtualMappingInfo>,
+    ) -> Result<()> {
+        out.clear();
         if info.layout.layout_class != LayoutClass::Virtual {
-            return Ok(Vec::new());
+            return Ok(());
         }
         let mut guard = self.inner.lock();
         let heap_addr = info.layout.virtual_heap_addr.ok_or_else(|| {
@@ -63,21 +183,25 @@ impl Dataset {
         let heap_index = info.layout.virtual_heap_index.ok_or_else(|| {
             Error::InvalidFormat("virtual dataset missing global heap index".into())
         })?;
-        let heap_data = crate::format::global_heap::read_global_heap_object(
+        let mut heap_data = Vec::new();
+        crate::format::global_heap::read_global_heap_object_into(
             &mut guard.reader,
             &crate::format::global_heap::GlobalHeapRef {
                 collection_addr: heap_addr,
                 object_index: heap_index,
             },
+            &mut heap_data,
         )?;
         let sizeof_size = usize::from(guard.reader.sizeof_size());
         drop(guard);
 
         let mappings = Self::decode_virtual_mappings(&heap_data, sizeof_size)?;
-        Ok(mappings
-            .into_iter()
-            .map(Self::virtual_mapping_info_from_mapping)
-            .collect())
+        out.extend(
+            mappings
+                .into_iter()
+                .map(Self::virtual_mapping_info_from_mapping),
+        );
+        Ok(())
     }
 
     fn virtual_mapping_info_from_mapping(mapping: VirtualMapping) -> VirtualMappingInfo {
@@ -124,18 +248,27 @@ impl Dataset {
             Error::InvalidFormat("virtual dataset missing global heap index".into())
         })?;
         let path = guard.path.clone();
-        let heap_data = crate::format::global_heap::read_global_heap_object(
+        let mut heap_data = Vec::new();
+        crate::format::global_heap::read_global_heap_object_into(
             &mut guard.reader,
             &crate::format::global_heap::GlobalHeapRef {
                 collection_addr: heap_addr,
                 object_index: heap_index,
             },
+            &mut heap_data,
         )?;
         let sizeof_size = usize::from(guard.reader.sizeof_size());
         drop(guard);
 
         let mappings = Self::decode_virtual_mappings(&heap_data, sizeof_size)?;
-        Self::virtual_output_dims(&mappings, path.as_deref(), info, access)
+        let mut source_cache = VirtualSourceCache::new();
+        Self::virtual_output_dims_with_cache(
+            &mappings,
+            path.as_deref(),
+            info,
+            access,
+            &mut source_cache,
+        )
     }
 
     pub(super) fn read_virtual_dataset(
@@ -148,39 +281,109 @@ impl Dataset {
         let mappings = Self::decode_virtual_mappings(heap_data, sizeof_size)?;
         let element_size = usize_from_u64(u64::from(info.datatype.size), "datatype size")?;
 
-        let output_dims = Self::virtual_output_dims(&mappings, file_path, info, access)?;
+        let mut source_cache = VirtualSourceCache::new();
+        let output_dims = Self::virtual_output_dims_with_cache(
+            &mappings,
+            file_path,
+            info,
+            access,
+            &mut source_cache,
+        )?;
         let total_elements = usize_from_u64(
             Self::dataspace_element_count(info.dataspace.space_type, &output_dims)?,
             "virtual dataset element count",
         )?;
         let mut output = Self::filled_data(total_elements, element_size, info)?;
+        Self::populate_virtual_dataset_output(
+            mappings,
+            file_path,
+            info,
+            access,
+            &output_dims,
+            element_size,
+            &mut output,
+            &mut source_cache,
+        )?;
+        Ok(output)
+    }
+
+    pub(super) fn read_virtual_dataset_into(
+        heap_data: &[u8],
+        sizeof_size: usize,
+        file_path: Option<&Path>,
+        info: &DatasetInfo,
+        access: &DatasetAccess,
+        output: &mut [u8],
+    ) -> Result<()> {
+        let mappings = Self::decode_virtual_mappings(heap_data, sizeof_size)?;
+        let element_size = usize_from_u64(u64::from(info.datatype.size), "datatype size")?;
+
+        let mut source_cache = VirtualSourceCache::new();
+        let output_dims = Self::virtual_output_dims_with_cache(
+            &mappings,
+            file_path,
+            info,
+            access,
+            &mut source_cache,
+        )?;
+        let total_elements = usize_from_u64(
+            Self::dataspace_element_count(info.dataspace.space_type, &output_dims)?,
+            "virtual dataset element count",
+        )?;
+        let expected = total_elements
+            .checked_mul(element_size)
+            .ok_or_else(|| Error::InvalidFormat("virtual dataset byte size overflow".into()))?;
+        if output.len() != expected {
+            return Err(Error::InvalidFormat(format!(
+                "raw output buffer has {} bytes, expected {expected}",
+                output.len()
+            )));
+        }
+        Self::filled_data_into(total_elements, element_size, info, output)?;
+        Self::populate_virtual_dataset_output(
+            mappings,
+            file_path,
+            info,
+            access,
+            &output_dims,
+            element_size,
+            output,
+            &mut source_cache,
+        )
+    }
+
+    fn populate_virtual_dataset_output(
+        mappings: Vec<VirtualMapping>,
+        file_path: Option<&Path>,
+        info: &DatasetInfo,
+        access: &DatasetAccess,
+        output_dims: &[u64],
+        element_size: usize,
+        output: &mut [u8],
+        source_cache: &mut VirtualSourceCache,
+    ) -> Result<()> {
         let virtual_strides = Self::row_major_strides(&output_dims)?;
 
         for mapping in mappings {
-            let source = match Self::open_virtual_source_dataset(file_path, &mapping, info, access)
-            {
-                Ok(source) => source,
-                Err(err) if Self::should_fill_missing_virtual_source(&err, access) => {
-                    continue;
-                }
-                Err(err) => return Err(err),
-            };
-            let point_map = Self::materialize_virtual_point_map(
-                &mapping,
-                &source.info.dataspace.dims,
-                &output_dims,
-            )?;
+            let (source_info, source_raw) =
+                match source_cache.source_raw(file_path, &mapping, info, access) {
+                    Ok(source) => source,
+                    Err(err) if Self::should_fill_missing_virtual_source(&err, access) => {
+                        continue;
+                    }
+                    Err(err) => return Err(err),
+                };
             Self::copy_virtual_mapping(
-                &source.raw,
-                &source.info.dataspace.dims,
+                &mapping,
+                source_raw,
+                &source_info.dataspace.dims,
                 &virtual_strides,
-                &point_map,
+                output_dims,
                 element_size,
-                &mut output,
+                output,
             )?;
         }
-
-        Ok(output)
+        Ok(())
     }
 
     fn should_fill_missing_virtual_source(err: &Error, access: &DatasetAccess) -> bool {
@@ -188,98 +391,133 @@ impl Dataset {
             && matches!(err, Error::Io(io_err) if io_err.kind() == std::io::ErrorKind::NotFound)
     }
 
-    fn open_virtual_source_dataset(
-        file_path: Option<&Path>,
-        mapping: &VirtualMapping,
-        dest_info: &DatasetInfo,
-        access: &DatasetAccess,
-    ) -> Result<VirtualSourceData> {
-        let source_file = Self::resolve_virtual_source_path(file_path, &mapping.file_name, access)?;
-        let source = crate::hl::file::File::open(&source_file)?;
-        let source_ds = source.dataset(&mapping.dataset_name)?;
-        let source_info = source_ds.info()?;
-        let source_raw = source_ds.read_raw_with_access(access)?;
-        let source_raw = crate::hl::conversion::convert_between_datatypes(
-            &source_raw,
-            &source_info.datatype,
-            &dest_info.datatype,
-        )?;
-        Ok(VirtualSourceData {
-            info: source_info,
-            raw: source_raw,
-        })
-    }
-
-    fn materialize_virtual_point_map(
-        mapping: &VirtualMapping,
-        source_dims: &[u64],
-        output_dims: &[u64],
-    ) -> Result<VirtualPointMap> {
-        let source_points =
-            Self::materialize_virtual_selection_points(&mapping.source_select, source_dims)?;
-        let virtual_points =
-            Self::materialize_virtual_selection_points(&mapping.virtual_select, output_dims)?;
-        if source_points.len() != virtual_points.len() {
-            return Err(Error::InvalidFormat(
-                "virtual dataset source and destination selections differ in size".into(),
-            ));
-        }
-        Ok(VirtualPointMap {
-            source_points,
-            virtual_points,
-        })
-    }
-
     fn copy_virtual_mapping(
+        mapping: &VirtualMapping,
         source_raw: &[u8],
         source_dims: &[u64],
         virtual_strides: &[usize],
-        point_map: &VirtualPointMap,
+        output_dims: &[u64],
         element_size: usize,
         output: &mut [u8],
     ) -> Result<()> {
         let source_strides = Self::row_major_strides(source_dims)?;
-        for (src, dst) in point_map
-            .source_points
-            .iter()
-            .zip(point_map.virtual_points.iter())
-        {
-            let src_index = Self::linear_index(src, &source_strides)?;
+        let source_indexes = Self::virtual_source_element_indexes(
+            &mapping.source_select,
+            source_dims,
+            &source_strides,
+        )?;
+        let mut copied_points = 0usize;
+        Self::visit_virtual_selection_points(&mapping.virtual_select, output_dims, |dst| {
+            let src_index = source_indexes
+                .linear_index(copied_points, &source_strides)?
+                .ok_or_else(|| {
+                    Error::InvalidFormat(
+                        "virtual dataset source and destination selections differ in size".into(),
+                    )
+                })?;
             let dst_index = Self::linear_index(dst, virtual_strides)?;
-            let src_start = src_index.checked_mul(element_size).ok_or_else(|| {
-                Error::InvalidFormat("virtual source byte offset overflow".into())
-            })?;
-            let dst_start = dst_index.checked_mul(element_size).ok_or_else(|| {
-                Error::InvalidFormat("virtual destination byte offset overflow".into())
-            })?;
-            let Some(src) = checked_byte_window(
-                source_raw,
-                src_start,
-                element_size,
-                "virtual source byte range",
-            )?
-            else {
-                continue;
-            };
-            let Some(dst) = checked_byte_window_mut(
-                output,
-                dst_start,
-                element_size,
-                "virtual destination byte range",
-            )?
-            else {
-                continue;
-            };
-            dst.copy_from_slice(src);
+            copied_points += 1;
+            Self::copy_virtual_element(source_raw, src_index, dst_index, element_size, output)
+        })?;
+        if copied_points != source_indexes.len() {
+            return Err(Error::InvalidFormat(
+                "virtual dataset source and destination selections differ in size".into(),
+            ));
         }
         Ok(())
     }
 
+    fn virtual_source_element_indexes<'a>(
+        selection: &'a VirtualSelection,
+        dims: &[u64],
+        strides: &[usize],
+    ) -> Result<VirtualSourceElementIndexes<'a>> {
+        match selection {
+            VirtualSelection::All => Ok(VirtualSourceElementIndexes::All {
+                len: usize_from_u64(
+                    dims.iter().try_fold(1u64, |total, dim| {
+                        total.checked_mul(*dim).ok_or_else(|| {
+                            Error::InvalidFormat("virtual source element count overflow".into())
+                        })
+                    })?,
+                    "virtual source element count",
+                )?,
+            }),
+            VirtualSelection::Points(points) => {
+                Self::validate_virtual_point_coords(points, dims)?;
+                Ok(VirtualSourceElementIndexes::Borrowed(points))
+            }
+            _ => Ok(VirtualSourceElementIndexes::Owned(
+                Self::materialize_virtual_selection_linear_indexes(selection, dims, strides)?,
+            )),
+        }
+    }
+
+    fn materialize_virtual_selection_linear_indexes(
+        selection: &VirtualSelection,
+        dims: &[u64],
+        strides: &[usize],
+    ) -> Result<Vec<usize>> {
+        let mut indexes = Vec::new();
+        Self::visit_virtual_selection_points(selection, dims, |point| {
+            indexes.push(Self::linear_index(point, strides)?);
+            Ok(())
+        })?;
+        Ok(indexes)
+    }
+
+    fn copy_virtual_element(
+        source_raw: &[u8],
+        src_index: usize,
+        dst_index: usize,
+        element_size: usize,
+        output: &mut [u8],
+    ) -> Result<()> {
+        let src_start = src_index
+            .checked_mul(element_size)
+            .ok_or_else(|| Error::InvalidFormat("virtual source byte offset overflow".into()))?;
+        let dst_start = dst_index.checked_mul(element_size).ok_or_else(|| {
+            Error::InvalidFormat("virtual destination byte offset overflow".into())
+        })?;
+        let Some(src) = checked_byte_window(
+            source_raw,
+            src_start,
+            element_size,
+            "virtual source byte range",
+        )?
+        else {
+            return Ok(());
+        };
+        let Some(dst) = checked_byte_window_mut(
+            output,
+            dst_start,
+            element_size,
+            "virtual destination byte range",
+        )?
+        else {
+            return Ok(());
+        };
+        dst.copy_from_slice(src);
+        Ok(())
+    }
+
+    #[cfg(test)]
     pub(super) fn virtual_output_dims(
         mappings: &[VirtualMapping],
         file_path: Option<&Path>,
         info: &DatasetInfo,
         access: &DatasetAccess,
+    ) -> Result<Vec<u64>> {
+        let mut source_cache = VirtualSourceCache::new();
+        Self::virtual_output_dims_with_cache(mappings, file_path, info, access, &mut source_cache)
+    }
+
+    fn virtual_output_dims_with_cache(
+        mappings: &[VirtualMapping],
+        file_path: Option<&Path>,
+        info: &DatasetInfo,
+        access: &DatasetAccess,
+        source_cache: &mut VirtualSourceCache,
     ) -> Result<Vec<u64>> {
         let mut output_dims = info.dataspace.dims.clone();
         if output_dims.iter().all(|&dim| dim != 0) {
@@ -287,10 +525,8 @@ impl Dataset {
         }
         let mut unlimited_extents: Vec<Option<(u64, u64)>> = vec![None; output_dims.len()];
         for mapping in mappings {
-            let source_file =
-                Self::resolve_virtual_source_path(file_path, &mapping.file_name, access)?;
-            let source = match crate::hl::file::File::open(&source_file) {
-                Ok(source) => source,
+            let source_info = match source_cache.source_info(file_path, mapping, access) {
+                Ok(source_info) => source_info,
                 Err(err) if Self::should_fill_missing_virtual_source(&err, access) => {
                     for dim in 0..output_dims.len() {
                         if output_dims[dim] != 0 {
@@ -313,7 +549,6 @@ impl Dataset {
                 }
                 Err(err) => return Err(err),
             };
-            let source_info = source.dataset(&mapping.dataset_name)?.info()?;
             for dim in 0..output_dims.len() {
                 if output_dims[dim] != 0 {
                     continue;
@@ -478,6 +713,7 @@ impl Dataset {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn materialize_virtual_selection_points(
         selection: &VirtualSelection,
         dims: &[u64],
@@ -505,6 +741,46 @@ impl Dataset {
         }
     }
 
+    fn visit_virtual_selection_points<F>(
+        selection: &VirtualSelection,
+        dims: &[u64],
+        mut visit: F,
+    ) -> Result<()>
+    where
+        F: FnMut(&[u64]) -> Result<()>,
+    {
+        match selection {
+            VirtualSelection::All => {
+                let mut current = vec![0u64; dims.len()];
+                Self::visit_all_selection_points(dims, 0, &mut current, &mut visit)
+            }
+            VirtualSelection::Points(points) => {
+                Self::validate_virtual_point_coords(points, dims)?;
+                for point in points {
+                    visit(point)?;
+                }
+                Ok(())
+            }
+            VirtualSelection::Regular(selection) => {
+                let mut current = vec![0u64; dims.len()];
+                Self::visit_regular_hyperslab_points(selection, dims, 0, &mut current, &mut visit)
+            }
+            VirtualSelection::Irregular(blocks) => {
+                let mut current = vec![0u64; dims.len()];
+                for block in blocks {
+                    if block.start.len() != dims.len() || block.block.len() != dims.len() {
+                        return Err(Error::InvalidFormat(
+                            "virtual hyperslab rank does not match dataspace".into(),
+                        ));
+                    }
+                    Self::visit_irregular_block_points(block, dims, 0, &mut current, &mut visit)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    #[cfg(test)]
     fn materialize_regular_hyperslab_points(
         selection: &RegularHyperslab,
         dims: &[u64],
@@ -518,6 +794,25 @@ impl Dataset {
         let mut current = vec![0u64; dims.len()];
         Self::push_hyperslab_points(selection, dims, 0, &mut current, &mut points)?;
         Ok(points)
+    }
+
+    fn visit_all_selection_points<F>(
+        dims: &[u64],
+        dim: usize,
+        current: &mut [u64],
+        visit: &mut F,
+    ) -> Result<()>
+    where
+        F: FnMut(&[u64]) -> Result<()>,
+    {
+        if dim == dims.len() {
+            return visit(current);
+        }
+        for coord in 0..dims[dim] {
+            current[dim] = coord;
+            Self::visit_all_selection_points(dims, dim + 1, current, visit)?;
+        }
+        Ok(())
     }
 
     pub(super) fn virtual_selection_start(selection: &VirtualSelection, dim: usize) -> u64 {
@@ -610,6 +905,7 @@ impl Dataset {
         }
     }
 
+    #[cfg(test)]
     fn push_hyperslab_points(
         selection: &RegularHyperslab,
         dims: &[u64],
@@ -655,6 +951,58 @@ impl Dataset {
         Ok(())
     }
 
+    fn visit_regular_hyperslab_points<F>(
+        selection: &RegularHyperslab,
+        dims: &[u64],
+        dim: usize,
+        current: &mut [u64],
+        visit: &mut F,
+    ) -> Result<()>
+    where
+        F: FnMut(&[u64]) -> Result<()>,
+    {
+        if selection.start.len() != dims.len() {
+            return Err(Error::InvalidFormat(
+                "virtual hyperslab rank does not match dataspace".into(),
+            ));
+        }
+        if dim == dims.len() {
+            return visit(current);
+        }
+        let start = selection.start[dim];
+        let stride = selection.stride[dim].max(1);
+        let count = if selection.count[dim] == u64::MAX {
+            let remaining = Self::virtual_hyperslab_remaining(dims[dim], start)?;
+            Self::ceil_div_u64(remaining, stride, "virtual hyperslab point count")?
+        } else {
+            selection.count[dim]
+        };
+        let block = if selection.block[dim] == u64::MAX {
+            Self::virtual_hyperslab_remaining(dims[dim], start)?
+        } else {
+            selection.block[dim]
+        };
+
+        for count_idx in 0..count {
+            let base = count_idx
+                .checked_mul(stride)
+                .and_then(|offset| start.checked_add(offset))
+                .ok_or_else(|| {
+                    Error::InvalidFormat("virtual hyperslab coordinate overflow".into())
+                })?;
+            for block_idx in 0..block {
+                let coord = base.checked_add(block_idx).ok_or_else(|| {
+                    Error::InvalidFormat("virtual hyperslab coordinate overflow".into())
+                })?;
+                if coord < dims[dim] {
+                    current[dim] = coord;
+                    Self::visit_regular_hyperslab_points(selection, dims, dim + 1, current, visit)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn virtual_hyperslab_remaining(dim_extent: u64, start: u64) -> Result<u64> {
         dim_extent.checked_sub(start).ok_or_else(|| {
             Error::InvalidFormat("virtual regular hyperslab start exceeds dataspace extent".into())
@@ -675,6 +1023,7 @@ impl Dataset {
             .ok_or_else(|| Error::InvalidFormat(format!("{context} overflow")))
     }
 
+    #[cfg(test)]
     fn materialize_irregular_hyperslab_points(
         blocks: &[IrregularHyperslabBlock],
         dims: &[u64],
@@ -692,6 +1041,7 @@ impl Dataset {
         Ok(points)
     }
 
+    #[cfg(test)]
     fn push_irregular_block_points(
         block: &IrregularHyperslabBlock,
         dims: &[u64],
@@ -710,6 +1060,31 @@ impl Dataset {
             if coord < dims[dim] {
                 current[dim] = coord;
                 Self::push_irregular_block_points(block, dims, dim + 1, current, points)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn visit_irregular_block_points<F>(
+        block: &IrregularHyperslabBlock,
+        dims: &[u64],
+        dim: usize,
+        current: &mut [u64],
+        visit: &mut F,
+    ) -> Result<()>
+    where
+        F: FnMut(&[u64]) -> Result<()>,
+    {
+        if dim == dims.len() {
+            return visit(current);
+        }
+        for offset in 0..block.block[dim] {
+            let coord = block.start[dim].checked_add(offset).ok_or_else(|| {
+                Error::InvalidFormat("virtual irregular hyperslab coordinate overflow".into())
+            })?;
+            if coord < dims[dim] {
+                current[dim] = coord;
+                Self::visit_irregular_block_points(block, dims, dim + 1, current, visit)?;
             }
         }
         Ok(())

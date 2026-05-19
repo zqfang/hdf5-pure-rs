@@ -50,14 +50,16 @@ fn write_dataset(
 fn read_dataset(path: &PathBuf, dataset_name: &str) -> hdf5_pure_rust::Result<f64> {
     let file = File::open(path)?;
     let dataset = file.dataset(dataset_name)?;
-    let values: Vec<f64> = dataset.read()?;
+    let mut values = vec![0.0; dataset.size()? as usize];
+    dataset.read_into(&mut values)?;
     Ok(values.iter().copied().sum())
 }
 
 fn read_dataset_raw(path: &PathBuf, dataset_name: &str) -> hdf5_pure_rust::Result<f64> {
     let file = File::open(path)?;
     let dataset = file.dataset(dataset_name)?;
-    let raw = dataset.read_raw()?;
+    let mut raw = vec![0; dataset.size()? as usize * dataset.element_size()?];
+    dataset.read_raw_into(&mut raw)?;
     Ok(raw.iter().map(|&b| b as f64).sum())
 }
 

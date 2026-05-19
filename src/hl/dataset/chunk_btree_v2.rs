@@ -4,8 +4,16 @@ use crate::error::{Error, Result};
 use crate::filters;
 use crate::io::reader::HdfReader;
 
-use super::chunk_read::ChunkReadContext;
+use super::chunk_read::{BorrowedChunkPayloadRead, ChunkReadContext};
 use super::{read_le_u32_at, read_le_uint_at, usize_from_u64, Dataset, DatasetInfo};
+
+struct DecodedBTreeV2Chunk {
+    coords: Vec<u64>,
+    addr: u64,
+    nbytes: u64,
+    read_size: usize,
+    filter_mask: u32,
+}
 
 impl Dataset {
     pub(super) fn read_chunked_btree_v2<R: Read + Seek>(
@@ -13,6 +21,24 @@ impl Dataset {
         info: &DatasetInfo,
         chunk_ctx: &ChunkReadContext<'_>,
     ) -> Result<Vec<u8>> {
+        let mut output = Self::scratch_output(chunk_ctx.total_bytes);
+        Self::read_chunked_btree_v2_into(reader, info, chunk_ctx, &mut output)?;
+        Ok(output)
+    }
+
+    pub(super) fn read_chunked_btree_v2_into<R: Read + Seek>(
+        reader: &mut HdfReader<R>,
+        info: &DatasetInfo,
+        chunk_ctx: &ChunkReadContext<'_>,
+        output: &mut [u8],
+    ) -> Result<()> {
+        if output.len() != chunk_ctx.total_bytes {
+            return Err(Error::InvalidFormat(format!(
+                "v2-B-tree chunk output buffer has {} bytes, expected {}",
+                output.len(),
+                chunk_ctx.total_bytes
+            )));
+        }
         let filtered = info
             .filter_pipeline
             .as_ref()
@@ -27,85 +53,232 @@ impl Dataset {
         } else {
             0
         };
-        let records = crate::format::btree_v2::collect_all_records(reader, chunk_ctx.idx_addr)?;
-        let mut output = Self::filled_data(
+        let mut records = Vec::new();
+        crate::format::btree_v2::collect_all_records_into(
+            reader,
+            chunk_ctx.idx_addr,
+            &mut records,
+        )?;
+        Self::filled_data_into(
             chunk_ctx.total_bytes / chunk_ctx.element_size,
             chunk_ctx.element_size,
             info,
+            output,
         )?;
         let mut compressed_scratch = Vec::new();
+        let mut raw_scratch = Vec::new();
 
-        for record in records {
-            let (addr, nbytes, filter_mask, scaled) = Self::decode_btree_v2_chunk_record(
-                &record,
+        if !(Self::btree_v2_uses_unfiltered_coalescing(info)
+            && chunk_ctx.data_dims.len() == 1
+            && chunk_ctx.chunk_dims.len() == 1)
+        {
+            let mut coords = Vec::with_capacity(chunk_ctx.data_dims.len());
+            let mut filtered_scratch = Vec::new();
+            for record in &records {
+                let (addr, nbytes, filter_mask) = Self::decode_btree_v2_chunk_record_into(
+                    record,
+                    filtered,
+                    chunk_size_len,
+                    usize::from(reader.sizeof_addr()),
+                    chunk_ctx.data_dims.len(),
+                    chunk_ctx.chunk_bytes,
+                    &mut coords,
+                )?;
+                Self::trace_btree2_chunk_lookup(
+                    chunk_ctx.idx_addr,
+                    &coords,
+                    addr,
+                    nbytes,
+                    filter_mask,
+                );
+                if crate::io::reader::is_undef_addr(addr) {
+                    continue;
+                }
+                Self::scale_btree_v2_chunk_coords(&mut coords, chunk_ctx.chunk_dims)?;
+                let read_size = usize_from_u64(nbytes, "v2-B-tree chunk size")?;
+                if Self::try_read_full_chunk_1d_into_output(
+                    reader,
+                    info,
+                    chunk_ctx,
+                    &coords,
+                    addr,
+                    read_size,
+                    filter_mask,
+                    output,
+                    &mut compressed_scratch,
+                )? {
+                    continue;
+                }
+                Self::read_btree_v2_chunk_payload_into_scratch(
+                    reader,
+                    addr,
+                    nbytes,
+                    read_size,
+                    &mut raw_scratch,
+                )?;
+
+                if let Some(ref pipeline) = info.filter_pipeline {
+                    if !pipeline.filters.is_empty() {
+                        filters::apply_pipeline_reverse_with_mask_expected_into(
+                            &raw_scratch,
+                            pipeline,
+                            chunk_ctx.element_size,
+                            filter_mask,
+                            chunk_ctx.chunk_bytes,
+                            &mut filtered_scratch,
+                        )?;
+                        Self::copy_chunk_to_output(
+                            &filtered_scratch,
+                            &coords,
+                            chunk_ctx.data_dims,
+                            chunk_ctx.chunk_dims,
+                            chunk_ctx.element_size,
+                            output,
+                        )?;
+                        continue;
+                    }
+                }
+
+                Self::copy_chunk_to_output(
+                    &raw_scratch,
+                    &coords,
+                    chunk_ctx.data_dims,
+                    chunk_ctx.chunk_dims,
+                    chunk_ctx.element_size,
+                    output,
+                )?;
+            }
+            return Ok(());
+        }
+
+        let mut chunks = Vec::with_capacity(records.len());
+        for record in &records {
+            let (addr, nbytes, filter_mask, mut coords) = Self::decode_btree_v2_chunk_record(
+                record,
                 filtered,
                 chunk_size_len,
                 usize::from(reader.sizeof_addr()),
                 chunk_ctx.data_dims.len(),
                 chunk_ctx.chunk_bytes,
             )?;
-            Self::trace_btree2_chunk_lookup(chunk_ctx.idx_addr, &scaled, addr, nbytes, filter_mask);
+            Self::trace_btree2_chunk_lookup(chunk_ctx.idx_addr, &coords, addr, nbytes, filter_mask);
             if crate::io::reader::is_undef_addr(addr) {
                 continue;
             }
 
-            let coords: Vec<u64> = scaled
-                .iter()
-                .zip(chunk_ctx.chunk_dims)
-                .map(|(&coord, &chunk)| {
-                    coord.checked_mul(chunk).ok_or_else(|| {
-                        Error::InvalidFormat("v2-B-tree chunk coordinate overflow".into())
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?;
+            Self::scale_btree_v2_chunk_coords(&mut coords, chunk_ctx.chunk_dims)?;
             let read_size = usize_from_u64(nbytes, "v2-B-tree chunk size")?;
+            chunks.push(DecodedBTreeV2Chunk {
+                coords,
+                addr,
+                nbytes,
+                read_size,
+                filter_mask,
+            });
+        }
+
+        let handled = {
+            Self::try_read_coalesced_borrowed_unfiltered_chunks_1d(
+                reader,
+                info,
+                chunk_ctx,
+                chunks.len(),
+                chunks.iter().map(|chunk| {
+                    Ok(BorrowedChunkPayloadRead {
+                        coords: &chunk.coords,
+                        addr: chunk.addr,
+                        read_size: chunk.read_size,
+                        filter_mask: chunk.filter_mask,
+                    })
+                }),
+                output,
+            )?
+        };
+
+        for (chunk_index, chunk) in chunks.iter().enumerate() {
+            if handled.get(chunk_index).copied().unwrap_or(false) {
+                continue;
+            }
             if Self::try_read_full_chunk_1d_into_output(
                 reader,
                 info,
                 chunk_ctx,
-                &coords,
-                addr,
-                read_size,
-                filter_mask,
-                &mut output,
+                &chunk.coords,
+                chunk.addr,
+                chunk.read_size,
+                chunk.filter_mask,
+                output,
                 &mut compressed_scratch,
             )? {
                 continue;
             }
-            reader.seek(addr).map_err(|err| {
-                Error::InvalidFormat(format!(
-                    "failed to seek to v2-B-tree chunk address {addr}: {err}"
-                ))
-            })?;
-            let mut raw = reader.read_bytes(read_size).map_err(|err| {
-                Error::InvalidFormat(format!(
-                    "failed to read v2-B-tree chunk at address {addr} with size {nbytes}: {err}"
-                ))
-            })?;
+            Self::read_btree_v2_chunk_payload_into_scratch(
+                reader,
+                chunk.addr,
+                chunk.nbytes,
+                chunk.read_size,
+                &mut raw_scratch,
+            )?;
 
             if let Some(ref pipeline) = info.filter_pipeline {
                 if !pipeline.filters.is_empty() {
-                    raw = filters::apply_pipeline_reverse_with_mask_expected(
-                        &raw,
+                    raw_scratch = filters::apply_pipeline_reverse_with_mask_expected(
+                        &raw_scratch,
                         pipeline,
                         chunk_ctx.element_size,
-                        filter_mask,
+                        chunk.filter_mask,
                         chunk_ctx.chunk_bytes,
                     )?;
                 }
             }
 
             Self::copy_chunk_to_output(
-                &raw,
-                &coords,
+                &raw_scratch,
+                &chunk.coords,
                 chunk_ctx.data_dims,
                 chunk_ctx.chunk_dims,
                 chunk_ctx.element_size,
-                &mut output,
+                output,
             )?;
         }
 
-        Ok(output)
+        Ok(())
+    }
+
+    fn scale_btree_v2_chunk_coords(coords: &mut [u64], chunk_dims: &[u64]) -> Result<()> {
+        for (coord, &chunk) in coords.iter_mut().zip(chunk_dims) {
+            *coord = (*coord).checked_mul(chunk).ok_or_else(|| {
+                Error::InvalidFormat("v2-B-tree chunk coordinate overflow".into())
+            })?;
+        }
+        Ok(())
+    }
+
+    fn read_btree_v2_chunk_payload_into_scratch<R: Read + Seek>(
+        reader: &mut HdfReader<R>,
+        addr: u64,
+        nbytes: u64,
+        read_size: usize,
+        scratch: &mut Vec<u8>,
+    ) -> Result<()> {
+        reader.seek(addr).map_err(|err| {
+            Error::InvalidFormat(format!(
+                "failed to seek to v2-B-tree chunk address {addr}: {err}",
+            ))
+        })?;
+        scratch.resize(read_size, 0);
+        reader.read_bytes_into(scratch).map_err(|err| {
+            Error::InvalidFormat(format!(
+                "failed to read v2-B-tree chunk at address {addr} with size {nbytes}: {err}"
+            ))
+        })
+    }
+
+    fn btree_v2_uses_unfiltered_coalescing(info: &DatasetInfo) -> bool {
+        info.filter_pipeline
+            .as_ref()
+            .map(|pipeline| pipeline.filters.is_empty())
+            .unwrap_or(true)
     }
 
     #[cfg(feature = "tracehash")]
@@ -184,6 +357,28 @@ impl Dataset {
         ndims: usize,
         chunk_bytes: usize,
     ) -> Result<(u64, u64, u32, Vec<u64>)> {
+        let mut scaled = Vec::with_capacity(ndims);
+        let (addr, nbytes, filter_mask) = Self::decode_btree_v2_chunk_record_into(
+            record,
+            filtered,
+            chunk_size_len,
+            sizeof_addr,
+            ndims,
+            chunk_bytes,
+            &mut scaled,
+        )?;
+        Ok((addr, nbytes, filter_mask, scaled))
+    }
+
+    pub(super) fn decode_btree_v2_chunk_record_into(
+        record: &[u8],
+        filtered: bool,
+        chunk_size_len: usize,
+        sizeof_addr: usize,
+        ndims: usize,
+        chunk_bytes: usize,
+        scaled: &mut Vec<u64>,
+    ) -> Result<(u64, u64, u32)> {
         let mut pos = 0usize;
         let addr = read_le_uint_at(record, &mut pos, sizeof_addr)?;
 
@@ -205,15 +400,15 @@ impl Dataset {
             )
         };
 
-        let mut scaled = Vec::with_capacity(ndims);
+        scaled.clear();
+        scaled.reserve(ndims);
         for _ in 0..ndims {
-            let coord = read_le_uint_at(record, &mut pos, 8)?;
-            scaled.push(coord);
+            scaled.push(read_le_uint_at(record, &mut pos, 8)?);
         }
 
-        Self::trace_btree2_record_decode(record, addr, nbytes, filter_mask, &scaled);
+        Self::trace_btree2_record_decode(record, addr, nbytes, filter_mask, scaled);
 
-        Ok((addr, nbytes, filter_mask, scaled))
+        Ok((addr, nbytes, filter_mask))
     }
 }
 

@@ -47,7 +47,7 @@ impl ObjectHeader {
             .checked_add(chunk_data_size)
             .ok_or_else(|| Error::InvalidFormat("object header v1 chunk size overflow".into()))?;
 
-        let mut messages = Vec::new();
+        let mut messages = Vec::with_capacity(usize::from(num_messages));
         let mut continuations = Vec::new();
         let mut chunk_ranges = vec![(header_start, chunk_end)];
 
@@ -62,6 +62,7 @@ impl ObjectHeader {
         )?;
 
         // Process continuation chunks
+        let mut continuation_scratch = Vec::new();
         for (cont_addr, cont_len) in continuations {
             read_v1_continuation(
                 reader,
@@ -70,6 +71,7 @@ impl ObjectHeader {
                 &mut messages,
                 &mut chunk_ranges,
                 1,
+                &mut continuation_scratch,
             )?;
         }
 
@@ -170,9 +172,19 @@ impl ObjectHeader {
             .map_err(|_| {
                 Error::InvalidFormat("object header checksum span exceeds usize".into())
             })?;
+        let file_len = reader.len()?;
+        if checksum_pos
+            .checked_add(4)
+            .is_none_or(|checksum_end| checksum_end > file_len)
+        {
+            return Err(Error::InvalidFormat(
+                "object header v2 checksum range exceeds file size".into(),
+            ));
+        }
         reader.seek(header_addr)?;
-        let check_data = reader.read_bytes(check_len)?;
-        let computed = checksum_metadata(&check_data);
+        let mut checksum_scratch = vec![0u8; check_len];
+        reader.read_bytes_into(&mut checksum_scratch)?;
+        let computed = checksum_metadata(&checksum_scratch);
 
         if stored_checksum != computed {
             return Err(Error::InvalidFormat(format!(
@@ -202,6 +214,7 @@ impl ObjectHeader {
         )?;
 
         // Process continuation chunks
+        let mut continuation_scratch = Vec::new();
         for (cont_addr, cont_len) in continuations {
             read_v2_continuation(
                 reader,
@@ -211,6 +224,8 @@ impl ObjectHeader {
                 &mut messages,
                 &mut chunk_ranges,
                 1,
+                &mut continuation_scratch,
+                &mut checksum_scratch,
             )?;
         }
 

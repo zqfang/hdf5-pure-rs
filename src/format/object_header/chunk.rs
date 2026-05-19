@@ -20,6 +20,7 @@ pub(super) fn read_v1_continuation<R: Read + Seek>(
     messages: &mut Vec<RawMessage>,
     chunk_ranges: &mut Vec<(u64, u64)>,
     chunk_index: u16,
+    continuations: &mut Vec<(u64, u64)>,
 ) -> Result<()> {
     reader.seek(addr)?;
 
@@ -27,18 +28,19 @@ pub(super) fn read_v1_continuation<R: Read + Seek>(
     let chunk_end = addr
         .checked_add(length)
         .ok_or_else(|| Error::InvalidFormat("object header continuation range overflow".into()))?;
-    let mut continuations = Vec::new();
+    continuations.clear();
     read_v1_messages(
         reader,
         chunk_end,
         0,
         messages,
-        &mut continuations,
+        continuations,
         chunk_ranges,
         chunk_index,
     )?;
 
-    for (cont_addr, cont_len) in continuations {
+    let nested_continuations = std::mem::take(continuations);
+    for &(cont_addr, cont_len) in &nested_continuations {
         read_v1_continuation(
             reader,
             cont_addr,
@@ -46,8 +48,10 @@ pub(super) fn read_v1_continuation<R: Read + Seek>(
             messages,
             chunk_ranges,
             next_chunk_index(chunk_index)?,
+            continuations,
         )?;
     }
+    *continuations = nested_continuations;
 
     Ok(())
 }
@@ -60,11 +64,14 @@ pub(super) fn read_v2_continuation<R: Read + Seek>(
     messages: &mut Vec<RawMessage>,
     chunk_ranges: &mut Vec<(u64, u64)>,
     chunk_index: u16,
+    continuations: &mut Vec<(u64, u64)>,
+    checksum_scratch: &mut Vec<u8>,
 ) -> Result<()> {
     reader.seek(addr)?;
 
     // V2 continuation chunks start with "OCHK" magic
-    let magic = reader.read_bytes(4)?;
+    let mut magic = [0u8; 4];
+    reader.read_bytes_into(&mut magic)?;
     if magic != OCHK_MAGIC {
         return Err(Error::InvalidFormat(
             "invalid continuation chunk magic".into(),
@@ -78,13 +85,13 @@ pub(super) fn read_v2_continuation<R: Read + Seek>(
         .and_then(|end| end.checked_sub(4))
         .ok_or_else(|| Error::InvalidFormat("object header continuation range overflow".into()))?; // minus checksum
 
-    let mut continuations = Vec::new();
+    continuations.clear();
     read_v2_messages(
         reader,
         data_end,
         has_crt_order,
         messages,
-        &mut continuations,
+        continuations,
         chunk_ranges,
         chunk_index,
     )?;
@@ -96,8 +103,9 @@ pub(super) fn read_v2_continuation<R: Read + Seek>(
         Error::InvalidFormat("continuation chunk checksum span exceeds usize".into())
     })?;
     reader.seek(addr)?;
-    let check_data = reader.read_bytes(check_len)?;
-    let computed = checksum_metadata(&check_data);
+    checksum_scratch.resize(check_len, 0);
+    reader.read_bytes_into(checksum_scratch)?;
+    let computed = checksum_metadata(checksum_scratch);
 
     if stored_checksum != computed {
         return Err(Error::InvalidFormat(
@@ -106,7 +114,8 @@ pub(super) fn read_v2_continuation<R: Read + Seek>(
     }
 
     // Process nested continuations
-    for (cont_addr, cont_len) in continuations {
+    let nested_continuations = std::mem::take(continuations);
+    for &(cont_addr, cont_len) in &nested_continuations {
         read_v2_continuation(
             reader,
             cont_addr,
@@ -115,8 +124,11 @@ pub(super) fn read_v2_continuation<R: Read + Seek>(
             messages,
             chunk_ranges,
             next_chunk_index(chunk_index)?,
+            continuations,
+            checksum_scratch,
         )?;
     }
+    *continuations = nested_continuations;
 
     Ok(())
 }

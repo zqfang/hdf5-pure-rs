@@ -232,6 +232,11 @@ impl ErrorEventSet {
         }
     }
 
+    /// Borrow queued events in insertion order.
+    pub fn events(&self) -> impl Iterator<Item = &ErrorEvent> {
+        self.events.iter()
+    }
+
     /// Remove an event by index.
     pub fn list_remove(&mut self, index: usize) -> Option<ErrorEvent> {
         if index < self.events.len() {
@@ -256,22 +261,25 @@ impl ErrorEventSet {
         self.list_append(ErrorEvent::event_new(request));
     }
 
-    /// Internal request getter callback alias.
-    pub fn get_requests_cb(&self) -> Vec<String> {
-        self.get_requests()
+    /// Iterate over request names in insertion order.
+    pub fn requests(&self) -> impl Iterator<Item = &str> {
+        self.events.iter().map(|event| event.request.as_str())
     }
 
-    /// Internal request getter alias.
-    pub fn get_requests_internal(&self) -> Vec<String> {
-        self.get_requests()
+    /// Visit request names in insertion order.
+    pub fn get_requests_with<F>(&self, mut callback: F)
+    where
+        F: FnMut(&str),
+    {
+        for request in self.requests() {
+            callback(request);
+        }
     }
 
     /// Return request names in insertion order.
+    #[deprecated(note = "use requests() or get_requests_with() to avoid allocating a Vec<String>")]
     pub fn get_requests(&self) -> Vec<String> {
-        self.events
-            .iter()
-            .map(|event| event.request.clone())
-            .collect()
+        self.requests().map(str::to_owned).collect()
     }
 
     /// Return number of events.
@@ -322,17 +330,27 @@ impl ErrorEventSet {
             .count()
     }
 
-    /// Internal failed-event information getter.
-    pub fn get_err_info_internal(&self) -> Vec<String> {
-        self.get_err_info()
+    /// Iterate over failed-event messages.
+    pub fn err_info(&self) -> impl Iterator<Item = &str> {
+        self.events
+            .iter()
+            .filter_map(|event| event.error.as_deref())
+    }
+
+    /// Visit failed-event messages.
+    pub fn get_err_info_with<F>(&self, mut callback: F)
+    where
+        F: FnMut(&str),
+    {
+        for error in self.err_info() {
+            callback(error);
+        }
     }
 
     /// Return failed-event messages.
+    #[deprecated(note = "use err_info() or get_err_info_with() to avoid allocating a Vec<String>")]
     pub fn get_err_info(&self) -> Vec<String> {
-        self.events
-            .iter()
-            .filter_map(|event| event.error.clone())
-            .collect()
+        self.err_info().map(str::to_owned).collect()
     }
 
     /// Internal close-failed callback alias.
@@ -486,28 +504,51 @@ impl ErrorStack {
         self.clear2();
     }
 
-    /// Print stack to a string.
-    pub fn print(&self) -> String {
-        self.entries
-            .iter()
-            .map(|entry| entry.description.as_str())
-            .collect::<Vec<_>>()
-            .join("\n")
+    /// Borrow stack entries from oldest to newest.
+    pub fn entries(&self) -> impl Iterator<Item = &ErrorStackEntry> {
+        self.entries.iter()
     }
 
-    /// Internal print alias.
-    pub fn print_internal(&self) -> String {
-        self.print()
+    /// Write stack descriptions to a caller-provided formatter.
+    pub fn print_into<W>(&self, writer: &mut W) -> fmt::Result
+    where
+        W: fmt::Write + ?Sized,
+    {
+        for (index, entry) in self.entries.iter().enumerate() {
+            if index > 0 {
+                writer.write_char('\n')?;
+            }
+            writer.write_str(&entry.description)?;
+        }
+        Ok(())
+    }
+
+    /// Visit printable stack descriptions from oldest to newest.
+    pub fn print_with<F>(&self, mut callback: F)
+    where
+        F: FnMut(&str),
+    {
+        for entry in &self.entries {
+            callback(&entry.description);
+        }
+    }
+
+    /// Print stack to a string.
+    #[deprecated(note = "use print_into() or print_with() to avoid allocating a String")]
+    pub fn print(&self) -> String {
+        let mut output = String::new();
+        self.print_into(&mut output)
+            .expect("writing to String cannot fail");
+        output
     }
 
     /// Version-2 print alias.
+    #[deprecated(note = "use print_into() or print_with() to avoid allocating a String")]
     pub fn print2(&self) -> String {
-        self.print()
-    }
-
-    /// Dump API stack alias.
-    pub fn dump_api_stack(&self) -> String {
-        self.print()
+        let mut output = String::new();
+        self.print_into(&mut output)
+            .expect("writing to String cannot fail");
+        output
     }
 
     /// Walk entries from oldest to newest.
@@ -621,10 +662,12 @@ mod error_stack_tests {
         assert_eq!(stack.get_num(), 1);
         assert_eq!(stack.get_major(), Some("io"));
         assert_eq!(stack.get_minor(), Some("open"));
-        assert_eq!(stack.print2(), "failed");
+        let mut printed = String::new();
+        stack.print_into(&mut printed).unwrap();
+        assert_eq!(printed, "failed");
 
         let mut walked = Vec::new();
-        stack.walk1(|entry| walked.push(entry.description.clone()));
+        stack.print_with(|description| walked.push(description.to_owned()));
         assert_eq!(walked, vec!["failed"]);
 
         let copy = stack.get_current_stack();
@@ -659,10 +702,13 @@ mod error_stack_tests {
         assert_eq!(set.list_count(), 3);
         assert_eq!(set.get_count(), 3);
         assert_eq!(set.get_op_counter(), 3);
-        assert_eq!(set.get_requests(), vec!["read", "write", "flush"]);
+        assert_eq!(
+            set.requests().collect::<Vec<_>>(),
+            vec!["read", "write", "flush"]
+        );
         assert!(set.get_err_status());
         assert_eq!(set.get_err_count(), 1);
-        assert_eq!(set.get_err_info(), vec!["disk"]);
+        assert_eq!(set.err_info().collect::<Vec<_>>(), vec!["disk"]);
 
         let mut visited = Vec::new();
         set.list_iterate(|event| visited.push(event.request.clone()));
@@ -670,13 +716,33 @@ mod error_stack_tests {
 
         assert_eq!(set.wait(), 1);
         set.close_failed_cb();
-        assert_eq!(set.get_requests_cb(), vec!["read", "flush"]);
+        let mut requests = Vec::new();
+        set.get_requests_with(|request| requests.push(request.to_owned()));
+        assert_eq!(requests, vec!["read", "flush"]);
         assert_eq!(set.cancel(), 0);
         assert_eq!(
             set.list_remove(1).map(|event| event.request),
             Some("flush".into())
         );
         set.term_package();
-        assert_eq!(set.get_requests_internal().len(), 0);
+        assert_eq!(set.requests().count(), 0);
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn deprecated_allocating_error_wrappers_remain_callable() {
+        let mut set = ErrorEventSet::create();
+        set.insert_request("read");
+        assert_eq!(set.get_requests(), vec!["read"]);
+
+        let mut failed = ErrorEvent::event_new("write");
+        failed.handle_fail("disk");
+        set.list_append(failed);
+        assert_eq!(set.get_err_info(), vec!["disk"]);
+
+        let mut stack = ErrorStack::init();
+        stack.push_stack(ErrorStackEntry::new("major", "io", "open", "failed"));
+        assert_eq!(stack.print(), "failed");
+        assert_eq!(stack.print2(), "failed");
     }
 }

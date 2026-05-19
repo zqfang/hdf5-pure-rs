@@ -4,7 +4,7 @@
 use std::path::PathBuf;
 
 use hdf5_pure_rust::hl::types::{FieldDescriptor, H5Type, TypeClass};
-use hdf5_pure_rust::{File, MutableFile, WritableFile};
+use hdf5_pure_rust::{Dataset, File, MutableFile, WritableFile};
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -18,8 +18,9 @@ unsafe impl H5Type for Point {
         std::mem::size_of::<Point>()
     }
 
-    fn compound_fields() -> Option<Vec<FieldDescriptor>> {
-        Some(vec![
+    fn compound_fields_into(out: &mut Vec<FieldDescriptor>) -> Option<()> {
+        out.clear();
+        out.extend([
             FieldDescriptor {
                 name: "x".to_string(),
                 offset: std::mem::offset_of!(Point, x),
@@ -32,7 +33,8 @@ unsafe impl H5Type for Point {
                 size: std::mem::size_of::<i32>(),
                 type_class: TypeClass::Integer { signed: true },
             },
-        ])
+        ]);
+        Some(())
     }
 }
 
@@ -40,6 +42,13 @@ fn tmp(name: &str) -> (tempfile::TempDir, PathBuf) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join(format!("t10_{name}.h5"));
     (dir, path)
+}
+
+fn assert_shape(ds: &Dataset, expected: &[u64]) -> hdf5_pure_rust::Result<()> {
+    let mut dims = Vec::new();
+    ds.shape_into(&mut dims)?;
+    assert_eq!(dims, expected);
+    Ok(())
 }
 
 // T10a: Write + h5dump verify -- all layout types
@@ -222,17 +231,37 @@ fn t10c_roundtrip_all_types() {
     }
     {
         let f = File::open(&p).unwrap();
-        assert_eq!(
-            f.dataset("f64").unwrap().read::<f64>().unwrap(),
-            vec![1.0, 2.0]
-        );
-        assert_eq!(
-            f.dataset("f32").unwrap().read::<f32>().unwrap(),
-            vec![3.0, 4.0]
-        );
-        assert_eq!(f.dataset("i32").unwrap().read::<i32>().unwrap(), vec![5, 6]);
-        assert_eq!(f.dataset("i64").unwrap().read::<i64>().unwrap(), vec![7, 8]);
-        assert_eq!(f.dataset("u8").unwrap().read::<u8>().unwrap(), vec![9, 10]);
+        let mut f64_values = [0.0f64; 2];
+        f.dataset("f64")
+            .unwrap()
+            .read_into(&mut f64_values)
+            .unwrap();
+        assert_eq!(f64_values, [1.0, 2.0]);
+
+        let mut f32_values = [0.0f32; 2];
+        f.dataset("f32")
+            .unwrap()
+            .read_into(&mut f32_values)
+            .unwrap();
+        assert_eq!(f32_values, [3.0, 4.0]);
+
+        let mut i32_values = [0i32; 2];
+        f.dataset("i32")
+            .unwrap()
+            .read_into(&mut i32_values)
+            .unwrap();
+        assert_eq!(i32_values, [5, 6]);
+
+        let mut i64_values = [0i64; 2];
+        f.dataset("i64")
+            .unwrap()
+            .read_into(&mut i64_values)
+            .unwrap();
+        assert_eq!(i64_values, [7, 8]);
+
+        let mut u8_values = [0u8; 2];
+        f.dataset("u8").unwrap().read_into(&mut u8_values).unwrap();
+        assert_eq!(u8_values, [9, 10]);
     }
 }
 
@@ -252,7 +281,8 @@ fn t10d_deflate_only() {
         wf.flush().unwrap();
     }
     let f = File::open(&p).unwrap();
-    let vals: Vec<f32> = f.dataset("d").unwrap().read::<f32>().unwrap();
+    let mut vals = vec![0.0f32; 100];
+    f.dataset("d").unwrap().read_into(&mut vals).unwrap();
     for (i, v) in vals.iter().enumerate() {
         assert_eq!(*v, i as f32);
     }
@@ -273,7 +303,8 @@ fn t10d_shuffle_deflate() {
         wf.flush().unwrap();
     }
     let f = File::open(&p).unwrap();
-    let vals: Vec<i32> = f.dataset("d").unwrap().read::<i32>().unwrap();
+    let mut vals = vec![0i32; 100];
+    f.dataset("d").unwrap().read_into(&mut vals).unwrap();
     for (i, v) in vals.iter().enumerate() {
         assert_eq!(*v, i as i32);
     }
@@ -295,7 +326,8 @@ fn t10d_many_chunk_deflate_two_level_btree() {
     }
 
     let f = File::open(&p).unwrap();
-    let vals: Vec<i32> = f.dataset("d").unwrap().read::<i32>().unwrap();
+    let mut vals = vec![0i32; data.len()];
+    f.dataset("d").unwrap().read_into(&mut vals).unwrap();
     assert_eq!(vals, data);
 
     let out = std::process::Command::new("python3")
@@ -332,9 +364,13 @@ fn t10e_scalar_attrs() {
         wf.flush().unwrap();
     }
     let f = File::open(&p).unwrap();
-    assert_eq!(f.attr("count").unwrap().read_scalar::<i64>().unwrap(), 42);
-    let pi = f.attr("pi").unwrap().read_scalar::<f64>().unwrap();
-    assert!((pi - std::f64::consts::PI).abs() < 1e-15);
+    let mut count = [0i64; 1];
+    f.attr("count").unwrap().read_into(&mut count).unwrap();
+    assert_eq!(count[0], 42);
+
+    let mut pi = [0.0f64; 1];
+    f.attr("pi").unwrap().read_into(&mut pi).unwrap();
+    assert!((pi[0] - std::f64::consts::PI).abs() < 1e-15);
 }
 
 // T10f: MutableFile round-trip
@@ -359,8 +395,9 @@ fn t10f_resize_roundtrip() {
     {
         let f = File::open(&p).unwrap();
         let ds = f.dataset("d").unwrap();
-        assert_eq!(ds.shape().unwrap(), vec![5]);
-        let vals: Vec<f64> = ds.read::<f64>().unwrap();
-        assert_eq!(vals, vec![1.0, 2.0, 3.0, 4.0, 5.0]);
+        assert_shape(&ds, &[5]).unwrap();
+        let mut vals = [0.0f64; 5];
+        ds.read_into(&mut vals).unwrap();
+        assert_eq!(vals, [1.0, 2.0, 3.0, 4.0, 5.0]);
     }
 }

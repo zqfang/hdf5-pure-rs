@@ -2,7 +2,60 @@ use std::fs;
 
 use hdf5_pure_rust::engine::writer::{CompoundFieldSpec, DatasetSpec, DtypeSpec, HdfFileWriter};
 use hdf5_pure_rust::hl::value::H5Value;
-use hdf5_pure_rust::File;
+use hdf5_pure_rust::{Dataset, File, Group, H5Type, Result};
+
+fn file_has_member(file: &File, expected: &str) -> Result<bool> {
+    let mut found = false;
+    file.visit_member_names(|name| {
+        found |= name == expected;
+        Ok(())
+    })?;
+    Ok(found)
+}
+
+fn group_has_member(group: &Group, expected: &str) -> Result<bool> {
+    let mut found = false;
+    group.visit_member_names(|name| {
+        found |= name == expected;
+        Ok(())
+    })?;
+    Ok(found)
+}
+
+fn assert_dataset_shape(ds: &Dataset, expected: &[u64]) -> Result<()> {
+    let mut shape = Vec::new();
+    ds.shape_into(&mut shape)?;
+    assert_eq!(shape.as_slice(), expected);
+    Ok(())
+}
+
+fn assert_dataset_values<T>(ds: &Dataset, expected: &[T]) -> Result<()>
+where
+    T: H5Type + Default + Clone + PartialEq + std::fmt::Debug,
+{
+    let mut values = vec![T::default(); ds.size()? as usize];
+    ds.read_into(&mut values)?;
+    assert_eq!(values.as_slice(), expected);
+    Ok(())
+}
+
+fn assert_dataset_raw(ds: &Dataset, expected: &[u8]) -> Result<()> {
+    let mut raw = vec![0; ds.size()? as usize * ds.element_size()?];
+    ds.read_raw_into(&mut raw)?;
+    assert_eq!(raw.as_slice(), expected);
+    Ok(())
+}
+
+fn assert_dataset_field_values(ds: &Dataset, field_name: &str, expected: &[H5Value]) -> Result<()> {
+    let mut index = 0;
+    ds.visit_field_values(field_name, |value| {
+        assert_eq!(Some(&value), expected.get(index));
+        index += 1;
+        Ok(())
+    })?;
+    assert_eq!(index, expected.len());
+    Ok(())
+}
 
 #[test]
 fn test_write_and_read_back_simple() {
@@ -41,20 +94,13 @@ fn test_write_and_read_back_simple() {
         assert_eq!(sb.version, 2);
         assert_eq!(sb.sizeof_addr, 8);
 
-        let names = f.member_names().unwrap();
-        println!("Written file members: {names:?}");
-        assert!(names.contains(&"mydata".to_string()));
+        assert!(file_has_member(&f, "mydata").unwrap());
 
         let ds = f.dataset("mydata").unwrap();
-        assert_eq!(ds.shape().unwrap(), vec![5]);
+        assert_dataset_shape(&ds, &[5]).unwrap();
         assert_eq!(ds.element_size().unwrap(), 8);
 
-        let raw = ds.read_raw().unwrap();
-        let values: Vec<f64> = raw
-            .chunks_exact(8)
-            .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
-            .collect();
-        assert_eq!(values, vec![1.0, 2.0, 3.0, 4.0, 5.0]);
+        assert_dataset_values::<f64>(&ds, &[1.0, 2.0, 3.0, 4.0, 5.0]).unwrap();
     }
 }
 
@@ -131,25 +177,14 @@ fn test_write_multiple_datasets() {
 
     {
         let f = File::open(&path).unwrap();
-        let names = f.member_names().unwrap();
-        assert!(names.contains(&"floats".to_string()));
-        assert!(names.contains(&"ints".to_string()));
+        assert!(file_has_member(&f, "floats").unwrap());
+        assert!(file_has_member(&f, "ints").unwrap());
 
         let ds1 = f.dataset("floats").unwrap();
-        let raw1 = ds1.read_raw().unwrap();
-        let vals1: Vec<f64> = raw1
-            .chunks_exact(8)
-            .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
-            .collect();
-        assert_eq!(vals1, vec![1.0, 2.0, 3.0]);
+        assert_dataset_values::<f64>(&ds1, &[1.0, 2.0, 3.0]).unwrap();
 
         let ds2 = f.dataset("ints").unwrap();
-        let raw2 = ds2.read_raw().unwrap();
-        let vals2: Vec<i32> = raw2
-            .chunks_exact(4)
-            .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
-            .collect();
-        assert_eq!(vals2, vec![10, 20, 30, 40]);
+        assert_dataset_values::<i32>(&ds2, &[10, 20, 30, 40]).unwrap();
     }
 }
 
@@ -183,16 +218,13 @@ fn test_write_with_group() {
 
     {
         let f = File::open(&path).unwrap();
-        let names = f.member_names().unwrap();
-        assert!(names.contains(&"subgroup".to_string()));
+        assert!(file_has_member(&f, "subgroup").unwrap());
 
         let g = f.group("subgroup").unwrap();
-        let g_names = g.member_names().unwrap();
-        assert!(g_names.contains(&"tiny".to_string()));
+        assert!(group_has_member(&g, "tiny").unwrap());
 
         let ds = f.dataset("subgroup/tiny").unwrap();
-        let raw = ds.read_raw().unwrap();
-        assert_eq!(raw, vec![42]);
+        assert_dataset_raw(&ds, &[42]).unwrap();
     }
 }
 
@@ -320,35 +352,42 @@ fn test_write_enum_opaque_array_and_nested_compound_datatypes() {
     let enum_dtype = enum_ds.dtype().unwrap();
     assert!(enum_dtype.is_enum());
     assert_eq!(
-        enum_dtype.enum_members().unwrap(),
+        enum_dtype
+            .enum_members_iter()
+            .unwrap()
+            .map(|member| member.map(|member| (member.name.to_string(), member.value)))
+            .collect::<Result<Vec<_>>>()
+            .unwrap(),
         vec![
             ("zero".to_string(), 0),
             ("one".to_string(), 1),
             ("two".to_string(), 2)
         ]
     );
-    assert_eq!(enum_ds.read::<u16>().unwrap(), vec![0, 1, 2]);
+    assert_dataset_values::<u16>(&enum_ds, &[0, 1, 2]).unwrap();
 
     let opaque_ds = f.dataset("opaque").unwrap();
     let opaque_dtype = opaque_ds.dtype().unwrap();
-    assert_eq!(
-        opaque_dtype.opaque_tag().as_deref(),
-        Some("hdf5-pure-rust blob")
-    );
-    assert_eq!(opaque_ds.read_raw().unwrap(), b"abcdwxyz");
+    assert_eq!(opaque_dtype.opaque_tag_str(), Some("hdf5-pure-rust blob"));
+    assert_dataset_raw(&opaque_ds, b"abcdwxyz").unwrap();
 
     let array_ds = f.dataset("matrix_cells").unwrap();
     let array_dtype = array_ds.dtype().unwrap();
-    let (dims, base) = array_dtype.array_dims_base().unwrap();
+    let dims = array_dtype
+        .array_dims_iter()
+        .unwrap()
+        .collect::<Result<Vec<_>>>()
+        .unwrap();
+    let base = array_dtype.array_base().unwrap();
     assert_eq!(dims, vec![2, 3]);
     assert_eq!(base.size(), 2);
-    assert_eq!(array_ds.read_raw().unwrap(), array_data);
+    assert_dataset_raw(&array_ds, &array_data).unwrap();
 
     let compound_ds = f.dataset("nested_compound").unwrap();
-    let nested_values = compound_ds.read_field_values("nested").unwrap();
-    assert_eq!(
-        nested_values,
-        vec![
+    assert_dataset_field_values(
+        &compound_ds,
+        "nested",
+        &[
             H5Value::Compound(vec![
                 ("a".to_string(), H5Value::Int(10)),
                 ("b".to_string(), H5Value::Float(1.25)),
@@ -357,8 +396,9 @@ fn test_write_enum_opaque_array_and_nested_compound_datatypes() {
                 ("a".to_string(), H5Value::Int(20)),
                 ("b".to_string(), H5Value::Float(2.5)),
             ]),
-        ]
-    );
+        ],
+    )
+    .unwrap();
 
     for dataset in ["/status", "/opaque", "/matrix_cells", "/nested_compound"] {
         let output = std::process::Command::new("h5dump")

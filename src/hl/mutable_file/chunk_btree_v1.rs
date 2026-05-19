@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::io::{Seek, SeekFrom, Write};
 
 use crate::error::{Error, Result};
@@ -29,7 +30,9 @@ impl MutableFile {
 
         let mut guard = self.inner.lock();
         guard.reader.seek(btree_addr)?;
-        if guard.reader.read_bytes(4)? != [b'T', b'R', b'E', b'E'] {
+        let mut magic = [0u8; 4];
+        guard.reader.read_bytes_into(&mut magic)?;
+        if magic != [b'T', b'R', b'E', b'E'] {
             return Err(Error::InvalidFormat("invalid chunk B-tree magic".into()));
         }
         let node_type = guard.reader.read_u8()?;
@@ -41,68 +44,184 @@ impl MutableFile {
             )));
         }
         if level != 0 {
+            let existing_entry_pos = Self::locate_chunk_btree_entry_position(
+                &mut guard.reader,
+                btree_addr,
+                ndims,
+                sa,
+                chunk_coords,
+                Some(level),
+            )?;
             drop(guard);
-            let mut entries = self.collect_chunk_btree_entries(btree_addr, ndims)?;
-            if let Some(entry) = entries
-                .iter_mut()
-                .find(|entry| entry.coords.as_slice() == chunk_coords)
-            {
-                entry.chunk_size = chunk_size;
-                entry.filter_mask = 0;
-                entry.child_addr = chunk_addr;
-            } else {
-                entries.push(ChunkBTreeEntry {
-                    coords: chunk_coords.to_vec(),
-                    chunk_size,
-                    filter_mask: 0,
-                    child_addr: chunk_addr,
-                });
+            if let Some(entry_pos) = existing_entry_pos {
+                self.write_btree_entry(entry_pos, chunk_coords, chunk_size, chunk_addr, sa)?;
+                return Ok(());
             }
-            entries.sort_by(|a, b| a.coords.cmp(&b.coords));
-            self.rebuild_chunk_btree_from_entries(btree_addr, &entries, element_size, sa)?;
+
+            let mut entries = self.collect_chunk_btree_entries(btree_addr, ndims)?;
+            match Self::find_chunk_btree_entry_index(&entries, chunk_coords) {
+                Ok(index) => {
+                    let entry = &mut entries[index];
+                    entry.chunk_size = chunk_size;
+                    entry.filter_mask = 0;
+                    entry.child_addr = chunk_addr;
+                }
+                Err(index) => entries.insert(
+                    index,
+                    ChunkBTreeEntry {
+                        coords: chunk_coords.to_vec(),
+                        chunk_size,
+                        filter_mask: 0,
+                        child_addr: chunk_addr,
+                    },
+                ),
+            }
+            self.rebuild_chunk_btree_from_entries(btree_addr, entries, element_size, sa)?;
             return Ok(());
         }
-        let entries = Self::read_chunk_btree_leaf_entries(
+        let existing_entry_pos = Self::locate_chunk_btree_leaf_entry_position(
+            &mut guard.reader,
+            btree_addr,
+            ndims,
+            entries_used,
+            sa,
+            chunk_coords,
+        )?;
+        if let Some(entry_pos) = existing_entry_pos {
+            drop(guard);
+            self.write_btree_entry(entry_pos, chunk_coords, chunk_size, chunk_addr, sa)?;
+            return Ok(());
+        }
+        let mut entries = Self::read_chunk_btree_leaf_entries(
             &mut guard.reader,
             btree_addr,
             ndims,
             entries_used,
             sa,
         )?;
+        let entry_lookup = Self::find_chunk_btree_entry_index(&entries, chunk_coords);
         drop(guard);
 
-        if let Some((entry_pos, _)) =
-            Self::find_chunk_btree_entry_position(&entries, btree_addr, ndims, sa, chunk_coords)?
-        {
-            self.write_btree_entry(entry_pos, chunk_coords, chunk_size, chunk_addr, sa)?;
-            return Ok(());
+        match entry_lookup {
+            Ok(entry_idx) => {
+                let (entries_start, entry_size) =
+                    Self::chunk_btree_leaf_layout(btree_addr, ndims, sa)?;
+                let entry_pos = Self::chunk_btree_entry_pos(entries_start, entry_idx, entry_size)?;
+                self.write_btree_entry(entry_pos, chunk_coords, chunk_size, chunk_addr, sa)?;
+                return Ok(());
+            }
+            Err(insert_idx) if entries_used < CHUNK_BTREE_MAX_LEAF_ENTRIES => {
+                entries.insert(
+                    insert_idx,
+                    ChunkBTreeEntry {
+                        coords: chunk_coords.to_vec(),
+                        chunk_size,
+                        filter_mask: 0,
+                        child_addr: chunk_addr,
+                    },
+                );
+                self.write_chunk_btree_node(btree_addr, 0, &entries, element_size, sa)?;
+                return Ok(());
+            }
+            Err(insert_idx) => {
+                entries.insert(
+                    insert_idx,
+                    ChunkBTreeEntry {
+                        coords: chunk_coords.to_vec(),
+                        chunk_size,
+                        filter_mask: 0,
+                        child_addr: chunk_addr,
+                    },
+                );
+                self.rebuild_chunk_btree_from_entries(btree_addr, entries, element_size, sa)?;
+                return Ok(());
+            }
+        }
+    }
+
+    fn find_chunk_btree_entry_index(
+        entries: &[ChunkBTreeEntry],
+        chunk_coords: &[u64],
+    ) -> std::result::Result<usize, usize> {
+        entries.binary_search_by(|entry| entry.coords.as_slice().cmp(chunk_coords))
+    }
+
+    fn locate_chunk_btree_entry_position<R: std::io::Read + Seek>(
+        reader: &mut HdfReader<R>,
+        node_addr: u64,
+        ndims: usize,
+        sizeof_addr: usize,
+        chunk_coords: &[u64],
+        expected_level: Option<u8>,
+    ) -> Result<Option<u64>> {
+        reader.seek(node_addr)?;
+        let mut magic = [0u8; 4];
+        reader.read_bytes_into(&mut magic)?;
+        if magic != [b'T', b'R', b'E', b'E'] {
+            return Err(Error::InvalidFormat("invalid chunk B-tree magic".into()));
+        }
+        let node_type = reader.read_u8()?;
+        if node_type != 1 {
+            return Err(Error::InvalidFormat(format!(
+                "expected raw-data chunk B-tree, got type {node_type}"
+            )));
+        }
+        let level = reader.read_u8()?;
+        if let Some(expected_level) = expected_level {
+            if level != expected_level {
+                return Err(Error::InvalidFormat(format!(
+                    "chunk B-tree child level {level} does not match expected {expected_level}"
+                )));
+            }
+        }
+        let entries_used = usize::from(reader.read_u16()?);
+        if entries_used > CHUNK_BTREE_MAX_LEAF_ENTRIES {
+            return Err(Error::InvalidFormat(format!(
+                "chunk B-tree node entry count {entries_used} exceeds v1 node capacity"
+            )));
+        }
+        let _left_sibling = reader.read_addr()?;
+        let _right_sibling = reader.read_addr()?;
+
+        if level == 0 {
+            return Self::locate_chunk_btree_leaf_entry_position(
+                reader,
+                node_addr,
+                ndims,
+                entries_used,
+                sizeof_addr,
+                chunk_coords,
+            );
         }
 
-        if entries_used >= CHUNK_BTREE_MAX_LEAF_ENTRIES {
-            let mut entries = entries;
-            entries.push(ChunkBTreeEntry {
-                coords: chunk_coords.to_vec(),
-                chunk_size,
-                filter_mask: 0,
-                child_addr: chunk_addr,
-            });
-            entries.sort_by(|a, b| a.coords.cmp(&b.coords));
-            self.rebuild_chunk_btree_from_entries(btree_addr, &entries, element_size, sa)?;
-            return Ok(());
+        let mut child_addr = None;
+        for _ in 0..entries_used {
+            let _chunk_size = reader.read_u32()?;
+            let _filter_mask = reader.read_u32()?;
+            let key_order = Self::read_chunk_btree_coords_cmp(reader, ndims, chunk_coords)?;
+            let _extra = reader.read_u64()?;
+            let entry_child_addr = reader.read_addr()?;
+            if key_order != Ordering::Greater {
+                child_addr = Some(entry_child_addr);
+            }
         }
 
-        self.append_chunk_btree_leaf_entry(
-            btree_addr,
+        let Some(child_addr) = child_addr else {
+            return Ok(None);
+        };
+        if crate::io::reader::is_undef_addr(child_addr) {
+            return Err(Error::InvalidFormat(
+                "chunk B-tree child address is undefined".into(),
+            ));
+        }
+        Self::locate_chunk_btree_entry_position(
+            reader,
+            child_addr,
             ndims,
-            entries_used,
+            sizeof_addr,
             chunk_coords,
-            chunk_size,
-            chunk_addr,
-            element_size,
-            sa,
-        )?;
-
-        Ok(())
+            Some(level - 1),
+        )
     }
 
     fn chunk_btree_checked_usize_add(lhs: usize, rhs: usize, context: &str) -> Result<usize> {
@@ -211,72 +330,52 @@ impl MutableFile {
         Ok(entries)
     }
 
-    fn find_chunk_btree_entry_position(
-        entries: &[ChunkBTreeEntry],
-        node_addr: u64,
+    fn read_chunk_btree_coords_cmp<R: std::io::Read + Seek>(
+        reader: &mut HdfReader<R>,
         ndims: usize,
-        sizeof_addr: usize,
         chunk_coords: &[u64],
-    ) -> Result<Option<(u64, usize)>> {
-        let (entries_start, entry_size) =
-            Self::chunk_btree_leaf_layout(node_addr, ndims, sizeof_addr)?;
-        let Some(entry_idx) = entries
-            .iter()
-            .position(|entry| entry.coords.as_slice() == chunk_coords)
-        else {
-            return Ok(None);
-        };
-        Ok(Some((
-            Self::chunk_btree_entry_pos(entries_start, entry_idx, entry_size)?,
-            entry_idx,
-        )))
+    ) -> Result<Ordering> {
+        let mut ordering = Ordering::Equal;
+        for dim_idx in 0..ndims {
+            let coord = reader.read_u64()?;
+            if ordering == Ordering::Equal {
+                ordering = match chunk_coords.get(dim_idx) {
+                    Some(target) => coord.cmp(target),
+                    None => Ordering::Greater,
+                };
+            }
+        }
+        if ordering == Ordering::Equal && chunk_coords.len() > ndims {
+            Ok(Ordering::Less)
+        } else {
+            Ok(ordering)
+        }
     }
 
-    fn append_chunk_btree_leaf_entry(
-        &mut self,
+    fn locate_chunk_btree_leaf_entry_position<R: std::io::Read + Seek>(
+        reader: &mut HdfReader<R>,
         node_addr: u64,
         ndims: usize,
         entries_used: usize,
-        chunk_coords: &[u64],
-        chunk_size: u32,
-        chunk_addr: u64,
-        element_size: u32,
         sizeof_addr: usize,
-    ) -> Result<()> {
+        chunk_coords: &[u64],
+    ) -> Result<Option<u64>> {
         let (entries_start, entry_size) =
             Self::chunk_btree_leaf_layout(node_addr, ndims, sizeof_addr)?;
-        self.write_handle
-            .seek(SeekFrom::Start(Self::chunk_btree_checked_u64_add(
-                node_addr,
-                6,
-                "chunk B-tree entry-count field",
-            )?))?;
-        self.write_handle.write_all(
-            &(u16::try_from(Self::chunk_btree_checked_usize_add(
-                entries_used,
-                1,
-                "chunk B-tree entry count",
-            )?)
-            .map_err(|_| Error::InvalidFormat("chunk B-tree entry count exceeds u16".into()))?)
-            .to_le_bytes(),
-        )?;
-
-        let new_entry_pos = Self::chunk_btree_entry_pos(entries_start, entries_used, entry_size)?;
-        self.write_btree_entry(
-            new_entry_pos,
-            chunk_coords,
-            chunk_size,
-            chunk_addr,
-            sizeof_addr,
-        )?;
-
-        let final_key_pos = Self::chunk_btree_entry_pos(
-            entries_start,
-            Self::chunk_btree_checked_usize_add(entries_used, 1, "chunk B-tree final key index")?,
-            entry_size,
-        )?;
-        self.write_btree_final_key(final_key_pos, chunk_coords, element_size)?;
-        Ok(())
+        for entry_idx in 0..entries_used {
+            let key_pos = Self::chunk_btree_entry_pos(entries_start, entry_idx, entry_size)?;
+            reader.seek(key_pos)?;
+            let _chunk_size = reader.read_u32()?;
+            let _filter_mask = reader.read_u32()?;
+            let matches =
+                Self::read_chunk_btree_coords_cmp(reader, ndims, chunk_coords)? == Ordering::Equal;
+            let _extra = reader.read_u64()?;
+            let _child_addr = reader.read_addr()?;
+            if matches {
+                return Ok(Some(key_pos));
+            }
+        }
+        Ok(None)
     }
 
     fn collect_chunk_btree_entries(
@@ -295,7 +394,9 @@ impl MutableFile {
         expected_level: Option<u8>,
     ) -> Result<Vec<ChunkBTreeEntry>> {
         reader.seek(node_addr)?;
-        if reader.read_bytes(4)? != [b'T', b'R', b'E', b'E'] {
+        let mut magic = [0u8; 4];
+        reader.read_bytes_into(&mut magic)?;
+        if magic != [b'T', b'R', b'E', b'E'] {
             return Err(Error::InvalidFormat("invalid chunk B-tree magic".into()));
         }
         let node_type = reader.read_u8()?;
@@ -346,7 +447,7 @@ impl MutableFile {
                     "write_chunk cannot collect v1 chunk B-trees deeper than two levels".into(),
                 ));
             }
-            let mut child_addrs = Vec::with_capacity(entries_used);
+            let mut entries = Vec::new();
             for _ in 0..entries_used {
                 let _chunk_size = reader.read_u32()?;
                 let _filter_mask = reader.read_u32()?;
@@ -358,16 +459,13 @@ impl MutableFile {
                 for _ in 0..key_words {
                     let _ = reader.read_u64()?;
                 }
-                child_addrs.push(reader.read_addr()?);
-            }
-
-            let mut entries = Vec::new();
-            for child_addr in child_addrs {
+                let child_addr = reader.read_addr()?;
                 if crate::io::reader::is_undef_addr(child_addr) {
                     return Err(Error::InvalidFormat(
                         "chunk B-tree child address is undefined".into(),
                     ));
                 }
+                let next_entry_pos = reader.position()?;
                 let child_entries = Self::collect_chunk_btree_entries_with_reader(
                     reader,
                     child_addr,
@@ -387,6 +485,7 @@ impl MutableFile {
                 }
                 entries.reserve(child_entries.len());
                 entries.extend(child_entries);
+                reader.seek(next_entry_pos)?;
             }
             Ok(entries)
         }
@@ -395,7 +494,7 @@ impl MutableFile {
     fn rebuild_chunk_btree_from_entries(
         &mut self,
         root_addr: u64,
-        entries: &[ChunkBTreeEntry],
+        mut entries: Vec<ChunkBTreeEntry>,
         element_size: u32,
         sizeof_addr: usize,
     ) -> Result<()> {
@@ -406,7 +505,15 @@ impl MutableFile {
         let node_size = Self::chunk_btree_node_size(ndims, sizeof_addr)?;
 
         if entries.len() <= 64 {
-            self.write_chunk_btree_node(root_addr, 0, entries, element_size, sizeof_addr)?;
+            let mut scratch = Vec::new();
+            self.write_chunk_btree_node_with_buf(
+                root_addr,
+                0,
+                &entries,
+                element_size,
+                sizeof_addr,
+                &mut scratch,
+            )?;
             return Ok(());
         }
 
@@ -418,17 +525,33 @@ impl MutableFile {
         }
 
         let mut root_entries = Vec::with_capacity(leaf_count);
-        for leaf_entries in entries.chunks(64) {
+        let mut scratch = Vec::new();
+        for leaf_entries in entries.chunks_mut(64) {
             let leaf_addr = self.append_aligned_zeros(node_size, 8)?;
-            self.write_chunk_btree_node(leaf_addr, 0, leaf_entries, element_size, sizeof_addr)?;
+            self.write_chunk_btree_node_with_buf(
+                leaf_addr,
+                0,
+                leaf_entries,
+                element_size,
+                sizeof_addr,
+                &mut scratch,
+            )?;
+            let coords = std::mem::take(&mut leaf_entries[0].coords);
             root_entries.push(ChunkBTreeEntry {
-                coords: leaf_entries[0].coords.clone(),
+                coords,
                 chunk_size: leaf_entries[0].chunk_size,
                 filter_mask: leaf_entries[0].filter_mask,
                 child_addr: leaf_addr,
             });
         }
-        self.write_chunk_btree_node(root_addr, 1, &root_entries, element_size, sizeof_addr)?;
+        self.write_chunk_btree_node_with_buf(
+            root_addr,
+            1,
+            &root_entries,
+            element_size,
+            sizeof_addr,
+            &mut scratch,
+        )?;
 
         Ok(())
     }
@@ -457,13 +580,14 @@ impl MutableFile {
     /// up to 64 (key, child) pairs, trailing key, zero-padded to
     /// `chunk_btree_node_size`). Mirrors libhdf5's `H5B__cache_serialize`
     /// for chunk-index B-trees.
-    fn encode_chunk_btree_node(
+    fn encode_chunk_btree_node_into(
         &self,
         level: u8,
         entries: &[ChunkBTreeEntry],
         element_size: u32,
         sizeof_addr: usize,
-    ) -> Result<Vec<u8>> {
+        buf: &mut Vec<u8>,
+    ) -> Result<()> {
         if entries.len() > 64 {
             return Err(Error::InvalidFormat(
                 "chunk B-tree node entry count exceeds v1 node capacity".into(),
@@ -474,14 +598,20 @@ impl MutableFile {
             .map(|entry| entry.coords.len())
             .ok_or_else(|| Error::InvalidFormat("cannot write empty chunk B-tree node".into()))?;
         let node_size = Self::chunk_btree_node_size(ndims, sizeof_addr)?;
-        let mut buf = Vec::with_capacity(node_size);
+        buf.clear();
+        buf.reserve(node_size);
         buf.extend_from_slice(b"TREE");
         buf.push(1);
         buf.push(level);
         buf.extend_from_slice(
             &Self::usize_to_u16(entries.len(), "chunk B-tree entry count")?.to_le_bytes(),
         );
-        let undef = Self::undefined_addr_bytes(sizeof_addr, "chunk B-tree sibling address")?;
+        let mut addr_buf = [0u8; 8];
+        let undef = Self::undefined_addr_bytes_into(
+            &mut addr_buf,
+            sizeof_addr,
+            "chunk B-tree sibling address",
+        )?;
         buf.extend_from_slice(&undef);
         buf.extend_from_slice(&undef);
 
@@ -492,8 +622,9 @@ impl MutableFile {
                 buf.extend_from_slice(&coord.to_le_bytes());
             }
             buf.extend_from_slice(&0u64.to_le_bytes());
-            buf.extend_from_slice(&Self::encode_uint_le(
+            buf.extend_from_slice(Self::encode_uint_le_into(
                 entry.child_addr,
+                &mut addr_buf,
                 sizeof_addr,
                 "chunk B-tree child address",
             )?);
@@ -507,6 +638,18 @@ impl MutableFile {
         }
         buf.extend_from_slice(&u64::from(element_size).to_le_bytes());
         buf.resize(node_size, 0);
+        Ok(())
+    }
+
+    fn encode_chunk_btree_node(
+        &self,
+        level: u8,
+        entries: &[ChunkBTreeEntry],
+        element_size: u32,
+        sizeof_addr: usize,
+    ) -> Result<Vec<u8>> {
+        let mut buf = Vec::new();
+        self.encode_chunk_btree_node_into(level, entries, element_size, sizeof_addr, &mut buf)?;
         Ok(buf)
     }
 
@@ -525,6 +668,21 @@ impl MutableFile {
         Ok(())
     }
 
+    fn write_chunk_btree_node_with_buf(
+        &mut self,
+        pos: u64,
+        level: u8,
+        entries: &[ChunkBTreeEntry],
+        element_size: u32,
+        sizeof_addr: usize,
+        buf: &mut Vec<u8>,
+    ) -> Result<()> {
+        self.encode_chunk_btree_node_into(level, entries, element_size, sizeof_addr, buf)?;
+        self.write_handle.seek(SeekFrom::Start(pos))?;
+        self.write_handle.write_all(buf)?;
+        Ok(())
+    }
+
     fn write_btree_entry(
         &mut self,
         pos: u64,
@@ -540,29 +698,15 @@ impl MutableFile {
             self.write_handle.write_all(&coord.to_le_bytes())?;
         }
         self.write_handle.write_all(&0u64.to_le_bytes())?;
-        self.write_handle.write_all(&Self::encode_uint_le(
+        let mut addr_buf = [0u8; 8];
+        let addr_bytes = Self::encode_uint_le_into(
             chunk_addr,
+            &mut addr_buf,
             sizeof_addr,
             "chunk B-tree child address",
-        )?)?;
+        )?;
+        self.write_handle.write_all(addr_bytes)?;
 
-        Ok(())
-    }
-
-    fn write_btree_final_key(
-        &mut self,
-        pos: u64,
-        chunk_coords: &[u64],
-        element_size: u32,
-    ) -> Result<()> {
-        self.write_handle.seek(SeekFrom::Start(pos))?;
-        self.write_handle.write_all(&0u32.to_le_bytes())?;
-        self.write_handle.write_all(&0u32.to_le_bytes())?;
-        for &coord in chunk_coords {
-            self.write_handle.write_all(&coord.to_le_bytes())?;
-        }
-        self.write_handle
-            .write_all(&u64::from(element_size).to_le_bytes())?;
         Ok(())
     }
 }

@@ -34,7 +34,8 @@ fn bench_chunked_reads(c: &mut Criterion) {
         b.iter(|| {
             let file = File::open(&path).unwrap();
             let dataset = file.dataset("data").unwrap();
-            let values: Vec<f64> = dataset.read().unwrap();
+            let mut values = vec![0.0; dataset.size().unwrap() as usize];
+            dataset.read_into(&mut values).unwrap();
             black_box(values);
         })
     });
@@ -48,7 +49,8 @@ fn bench_filtered_reads(c: &mut Criterion) {
         b.iter(|| {
             let file = File::open(&path).unwrap();
             let dataset = file.dataset("data").unwrap();
-            let values: Vec<f64> = dataset.read().unwrap();
+            let mut values = vec![0.0; dataset.size().unwrap() as usize];
+            dataset.read_into(&mut values).unwrap();
             black_box(values);
         })
     });
@@ -60,7 +62,14 @@ fn bench_dense_group_traversal(c: &mut Criterion) {
         b.iter(|| {
             let file = File::open("tests/data/hdf5_ref/dense_group_cases.h5").unwrap();
             let group = file.group("name_index_deep").unwrap();
-            black_box(group.member_names().unwrap());
+            let mut names = Vec::new();
+            group
+                .visit_member_names(|name| {
+                    names.push(name.to_string());
+                    Ok(())
+                })
+                .unwrap();
+            black_box(names);
         })
     });
 }
@@ -70,7 +79,8 @@ fn bench_vds_read(c: &mut Criterion) {
         b.iter(|| {
             let file = File::open("tests/data/hdf5_ref/vds_all.h5").unwrap();
             let dataset = file.dataset("vds_all").unwrap();
-            let values: Vec<i32> = dataset.read().unwrap();
+            let mut values = vec![0; dataset.size().unwrap() as usize];
+            dataset.read_into(&mut values).unwrap();
             black_box(values);
         })
     });

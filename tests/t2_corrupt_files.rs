@@ -1,9 +1,25 @@
 //! Phase T2: Corrupt/malformed file tests.
 //! Verify graceful error handling -- no panics, no UB.
 
-use hdf5_pure_rust::File;
+use hdf5_pure_rust::{Dataset, File};
 
 const REF_DIR: &str = "tests/data/hdf5_ref";
+
+fn try_raw_read(ds: &Dataset) {
+    const MAX_PROBE_RAW_BYTES: usize = 1024 * 1024;
+
+    if let Ok(size) = ds.size() {
+        if let Ok(element_size) = ds.element_size() {
+            if let Some(raw_len) = (size as usize).checked_mul(element_size) {
+                if raw_len > MAX_PROBE_RAW_BYTES {
+                    return;
+                }
+                let mut raw = vec![0; raw_len];
+                let _ = ds.read_raw_into(&mut raw);
+            }
+        }
+    }
+}
 
 /// Try to open and fully explore a file. Returns Ok if no panics.
 fn try_full_explore(filename: &str) -> Result<(), String> {
@@ -14,22 +30,28 @@ fn try_full_explore(filename: &str) -> Result<(), String> {
     };
 
     // Try to list members (may fail gracefully)
-    let _ = f.member_names();
+    let mut names = Vec::new();
+    let _ = f.visit_member_names(|name| {
+        names.push(name.to_string());
+        Ok(())
+    });
 
     // Try to list attributes
-    let _ = f.attr_names();
+    let mut attr_names = Vec::new();
+    let _ = f.attr_names_into(&mut attr_names);
 
     // Try to navigate into groups/datasets
-    if let Ok(names) = f.member_names() {
+    if !names.is_empty() {
         for name in &names {
             let root = f.root_group().unwrap();
             // Try opening as group
             let _ = root.open_group(name);
             // Try opening as dataset
             if let Ok(ds) = root.open_dataset(name) {
-                let _ = ds.shape();
+                let mut shape = Vec::new();
+                let _ = ds.shape_into(&mut shape);
                 let _ = ds.dtype();
-                let _ = ds.read_raw();
+                try_raw_read(&ds);
             }
         }
     }

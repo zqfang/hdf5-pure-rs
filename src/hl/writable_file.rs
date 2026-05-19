@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use crate::engine::writer::{AttrSpec, HdfFileWriter};
 use crate::error::{Error, Result};
 use crate::hl::dataset_builder::DatasetBuilder;
-use crate::hl::types::H5Type;
+use crate::hl::types::{slice_as_bytes, H5Type};
 
 /// A writable HDF5 file under construction.
 ///
@@ -29,7 +29,7 @@ impl WritableFile {
         Ok(Self {
             writer,
             path,
-            current_group: "/".to_string(),
+            current_group: String::from("/"),
         })
     }
 
@@ -48,7 +48,9 @@ impl WritableFile {
     /// Create a subgroup in the root group.
     pub fn create_group(&mut self, name: &str) -> Result<WritableGroup<'_>> {
         self.writer.create_group("/", name)?;
-        let full_path = format!("/{name}");
+        let mut full_path = String::with_capacity(name.len() + 1);
+        full_path.push('/');
+        full_path.push_str(name);
         Ok(WritableGroup {
             writer: &mut self.writer,
             path: full_path,
@@ -63,8 +65,7 @@ impl WritableFile {
     /// Add an attribute to the root group.
     pub fn add_attr<T: H5Type>(&mut self, name: &str, value: T) -> Result<()> {
         let dtype = crate::hl::dataset_builder::dtype_for_type::<T>()?;
-        let byte_ptr = &value as *const T as *const u8;
-        let data = unsafe { std::slice::from_raw_parts(byte_ptr, T::type_size()) };
+        let data = slice_as_bytes(std::slice::from_ref(&value));
         self.writer.add_root_attr(&AttrSpec {
             name,
             shape: &[],
@@ -80,7 +81,8 @@ impl WritableFile {
             .len()
             .checked_mul(T::type_size())
             .ok_or_else(|| Error::InvalidFormat("attribute byte size overflow".into()))?;
-        let data = unsafe { std::slice::from_raw_parts(values.as_ptr() as *const u8, byte_len) };
+        let data = slice_as_bytes(values);
+        debug_assert_eq!(data.len(), byte_len);
         let shape = [usize_to_u64(values.len(), "attribute element count")?];
         self.writer.add_root_attr(&AttrSpec {
             name,
@@ -184,7 +186,10 @@ impl<'a> WritableGroup<'a> {
     /// Create a subgroup.
     pub fn create_group(&mut self, name: &str) -> Result<WritableGroup<'_>> {
         self.writer.create_group(&self.path, name)?;
-        let full_path = format!("{}/{name}", self.path);
+        let mut full_path = String::with_capacity(self.path.len() + name.len() + 1);
+        full_path.push_str(&self.path);
+        full_path.push('/');
+        full_path.push_str(name);
         Ok(WritableGroup {
             writer: self.writer,
             path: full_path,
@@ -199,8 +204,7 @@ impl<'a> WritableGroup<'a> {
     /// Add an attribute to this group.
     pub fn add_attr<T: H5Type>(&mut self, name: &str, value: T) -> Result<()> {
         let dtype = crate::hl::dataset_builder::dtype_for_type::<T>()?;
-        let byte_ptr = &value as *const T as *const u8;
-        let data = unsafe { std::slice::from_raw_parts(byte_ptr, T::type_size()) };
+        let data = slice_as_bytes(std::slice::from_ref(&value));
         self.writer.add_group_attr(
             &self.path,
             &AttrSpec {
@@ -219,7 +223,8 @@ impl<'a> WritableGroup<'a> {
             .len()
             .checked_mul(T::type_size())
             .ok_or_else(|| Error::InvalidFormat("attribute byte size overflow".into()))?;
-        let data = unsafe { std::slice::from_raw_parts(values.as_ptr() as *const u8, byte_len) };
+        let data = slice_as_bytes(values);
+        debug_assert_eq!(data.len(), byte_len);
         let shape = [usize_to_u64(values.len(), "attribute element count")?];
         self.writer.add_group_attr(
             &self.path,
@@ -334,10 +339,9 @@ fn fixed_string_attr(
             padding: 1,
         }
     };
-    let capacity = values.len().checked_mul(len).ok_or_else(|| {
+    let data_len = values.len().checked_mul(len).ok_or_else(|| {
         Error::InvalidFormat("fixed string attribute payload size overflow".into())
     })?;
-    let mut data = Vec::with_capacity(capacity);
     for value in values {
         let bytes = value.as_bytes();
         if bytes.len() > len {
@@ -346,8 +350,11 @@ fn fixed_string_attr(
                 bytes.len()
             )));
         }
-        data.extend_from_slice(bytes);
-        data.resize(data.len() + (len - bytes.len()), 0);
+    }
+    let mut data = vec![0; data_len];
+    for (slot, value) in data.chunks_exact_mut(len).zip(values.iter()) {
+        let bytes = value.as_bytes();
+        slot[..bytes.len()].copy_from_slice(bytes);
     }
     Ok((dtype, data))
 }

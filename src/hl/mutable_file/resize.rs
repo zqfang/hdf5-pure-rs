@@ -46,7 +46,12 @@ impl MutableFile {
         let (msg_data_offset, msg_data_len, oh_start, oh_check_len) =
             self.find_message_in_oh(ds_addr, object_header::MSG_DATASPACE)?;
 
-        let new_ds_bytes = Self::encode_dataspace_v2(new_dims, info.dataspace.max_dims.as_deref())?;
+        let mut new_ds_bytes = Vec::with_capacity(msg_data_len);
+        Self::encode_dataspace_v2_into(
+            new_dims,
+            info.dataspace.max_dims.as_deref(),
+            &mut new_ds_bytes,
+        )?;
 
         if new_ds_bytes.len() != msg_data_len {
             return Err(Error::InvalidFormat(format!(
@@ -76,7 +81,8 @@ impl MutableFile {
         let reader = &mut guard.reader;
         reader.seek(oh_addr)?;
 
-        let first_bytes = reader.read_bytes(4)?;
+        let mut first_bytes = [0u8; 4];
+        reader.read_bytes_into(&mut first_bytes)?;
         if first_bytes != [b'O', b'H', b'D', b'R'] {
             return Err(Error::InvalidFormat(
                 "expected v2 object header for resize".into(),
@@ -153,7 +159,11 @@ impl MutableFile {
     }
 
     /// Encode a v2 dataspace message with the given dims and optional max_dims.
-    fn encode_dataspace_v2(dims: &[u64], max_dims: Option<&[u64]>) -> Result<Vec<u8>> {
+    fn encode_dataspace_v2_into(
+        dims: &[u64],
+        max_dims: Option<&[u64]>,
+        buf: &mut Vec<u8>,
+    ) -> Result<()> {
         if let Some(max) = max_dims {
             if max.len() != dims.len() {
                 return Err(Error::InvalidFormat(format!(
@@ -163,11 +173,25 @@ impl MutableFile {
                 )));
             }
         }
-        let mut buf = Vec::new();
         let has_max = max_dims.is_some();
+        let rank = Self::usize_to_u8(dims.len(), "dataspace rank")?;
+        let payload_dims = dims
+            .len()
+            .checked_mul(if has_max { 2 } else { 1 })
+            .ok_or_else(|| Error::InvalidFormat("dataspace message size overflow".into()))?;
+        let capacity =
+            4usize
+                .checked_add(payload_dims.checked_mul(8).ok_or_else(|| {
+                    Error::InvalidFormat("dataspace message size overflow".into())
+                })?)
+                .ok_or_else(|| Error::InvalidFormat("dataspace message size overflow".into()))?;
 
+        buf.clear();
+        if buf.capacity() < capacity {
+            buf.reserve_exact(capacity - buf.capacity());
+        }
         buf.push(2);
-        buf.push(Self::usize_to_u8(dims.len(), "dataspace rank")?);
+        buf.push(rank);
         buf.push(if has_max { 0x01 } else { 0x00 });
         buf.push(1);
 
@@ -181,7 +205,7 @@ impl MutableFile {
             }
         }
 
-        Ok(buf)
+        Ok(())
     }
 }
 
@@ -192,13 +216,15 @@ mod tests {
     #[test]
     fn resize_dataspace_encoder_rejects_rank_narrowing_and_mismatch() {
         let dims = vec![1u64; usize::from(u8::MAX) + 1];
-        let err = MutableFile::encode_dataspace_v2(&dims, None).unwrap_err();
+        let mut buf = Vec::new();
+        let err = MutableFile::encode_dataspace_v2_into(&dims, None, &mut buf).unwrap_err();
         assert!(
             err.to_string().contains("dataspace rank"),
             "unexpected error: {err}"
         );
 
-        let err = MutableFile::encode_dataspace_v2(&[1, 2], Some(&[10])).unwrap_err();
+        let err =
+            MutableFile::encode_dataspace_v2_into(&[1, 2], Some(&[10]), &mut buf).unwrap_err();
         assert!(
             err.to_string().contains("dataspace max rank"),
             "unexpected error: {err}"

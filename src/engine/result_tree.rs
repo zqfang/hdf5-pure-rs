@@ -25,17 +25,18 @@ impl ResultTree {
 
     /// Add a range to a result set.
     pub fn result_set_add(&mut self, range: ResultRange) {
-        self.ranges.push(range);
-        self.ranges.sort_by_key(|range| (range.start, range.end));
+        let key = (range.start, range.end);
+        let index = self
+            .ranges
+            .partition_point(|existing| (existing.start, existing.end) <= key);
+        self.ranges.insert(index, range);
     }
 
-    /// Bulk-load ranges.
-    pub fn bulk_load(ranges: Vec<ResultRange>) -> Self {
-        let mut tree = Self::create();
-        for range in ranges {
-            tree.result_set_add(range);
-        }
-        tree
+    /// Bulk-load ranges from any iterator.
+    pub fn bulk_load_iter(ranges: impl IntoIterator<Item = ResultRange>) -> Self {
+        let mut ranges: Vec<_> = ranges.into_iter().collect();
+        ranges.sort_by_key(|range| (range.start, range.end));
+        Self { ranges }
     }
 
     /// Create an empty result tree.
@@ -43,22 +44,32 @@ impl ResultTree {
         Self::default()
     }
 
-    /// Recursive search helper.
-    pub fn search_recurse(&self, query: ResultRange) -> Vec<ResultRange> {
-        self.ranges
-            .iter()
-            .copied()
-            .filter(|range| range.intersects(query))
-            .collect()
+    /// Iterate over all ranges in sorted order.
+    pub fn iter(&self) -> impl Iterator<Item = ResultRange> + '_ {
+        self.ranges.iter().copied()
     }
 
-    /// Search for ranges intersecting `query`.
-    pub fn search(&self, query: ResultRange) -> Vec<ResultRange> {
-        self.search_recurse(query)
+    /// Iterate over ranges intersecting `query`.
+    pub fn search_iter(&self, query: ResultRange) -> impl Iterator<Item = ResultRange> + '_ {
+        self.iter().filter(move |range| range.intersects(query))
     }
 
-    /// Free search results.
-    pub fn free_results(_results: Vec<ResultRange>) {}
+    /// Append ranges intersecting `query` to caller-provided storage.
+    pub fn search_into(&self, query: ResultRange, out: &mut Vec<ResultRange>) -> usize {
+        let start_len = out.len();
+        out.extend(self.search_iter(query));
+        out.len() - start_len
+    }
+
+    /// Visit ranges intersecting `query`.
+    pub fn search_visit<F>(&self, query: ResultRange, mut visitor: F)
+    where
+        F: FnMut(ResultRange),
+    {
+        for range in self.search_iter(query) {
+            visitor(range);
+        }
+    }
 
     /// Copy a node/range.
     pub fn node_copy(range: ResultRange) -> ResultRange {
@@ -103,15 +114,27 @@ mod tests {
         let mut tree = ResultTree::create();
         tree.result_set_add(a);
         tree.result_set_add(b);
-        assert_eq!(tree.search(ResultRange { start: 1, end: 1 }), vec![a]);
+        assert_eq!(tree.iter().collect::<Vec<_>>(), vec![a, b]);
         assert_eq!(
-            tree.search_recurse(ResultRange { start: 11, end: 11 }),
-            vec![b]
+            tree.search_iter(ResultRange { start: 1, end: 1 })
+                .collect::<Vec<_>>(),
+            vec![a]
         );
+
+        let mut found = Vec::new();
+        assert_eq!(
+            tree.search_into(ResultRange { start: 11, end: 11 }, &mut found),
+            1
+        );
+        assert_eq!(found, vec![b]);
+
+        found.clear();
+        tree.search_visit(ResultRange { start: 0, end: 20 }, |range| found.push(range));
+        assert_eq!(found, vec![a, b]);
+
         let copy = tree.copy();
         assert_eq!(copy, tree);
-        ResultTree::free_results(copy.search(ResultRange { start: 0, end: 20 }));
-        ResultTree::bulk_load(vec![a, b]).free();
+        ResultTree::bulk_load_iter([a, b]).free();
         assert_eq!(ResultTree::node_copy(a), a);
     }
 }

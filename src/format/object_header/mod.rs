@@ -13,6 +13,7 @@ mod msg;
 use std::io::{Read, Seek};
 
 use crate::error::{Error, Result};
+use crate::format::checksum::checksum_metadata;
 use crate::io::reader::HdfReader;
 
 /// Magic number for v2 object headers: "OHDR"
@@ -110,6 +111,29 @@ pub struct ObjectHeader {
     pub messages: Vec<RawMessage>,
 }
 
+/// Message input for v2 object-header encoding.
+#[derive(Debug, Clone, Copy)]
+pub struct ObjectHeaderMessageRef<'a> {
+    /// Message type ID. V2 compact object headers store this in one byte.
+    pub msg_type: u16,
+    /// Message flags.
+    pub flags: u8,
+    /// Creation order index, present only when the object header tracks it.
+    pub creation_index: Option<u16>,
+    /// Raw message payload bytes.
+    pub data: &'a [u8],
+}
+
+/// Encoded v2 object header and any continuation chunks it references.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EncodedV2ObjectHeader {
+    /// The object-header prefix plus chunk 0 and checksum.
+    pub prefix: Vec<u8>,
+    /// Continuation chunks as `(address, image)` pairs. Each image includes
+    /// the OCHK magic and trailing checksum.
+    pub continuation_chunks: Vec<(u64, Vec<u8>)>,
+}
+
 impl ObjectHeader {
     /// Read an object header at the given file address. Mirrors the
     /// dispatcher in libhdf5's `H5O_protect`: peek at the first 4 bytes
@@ -118,7 +142,8 @@ impl ObjectHeader {
     pub fn read_at<R: Read + Seek>(reader: &mut HdfReader<R>, addr: u64) -> Result<Self> {
         reader.seek(addr)?;
 
-        let first_bytes = reader.read_bytes(4)?;
+        let mut first_bytes = [0u8; 4];
+        reader.read_bytes_into(&mut first_bytes)?;
 
         let result = if first_bytes == OHDR_MAGIC {
             Self::read_v2(reader, addr)
@@ -130,21 +155,25 @@ impl ObjectHeader {
 
         #[cfg(feature = "tracehash")]
         if let Ok(header) = &result {
-            let traced_messages: Vec<_> = header
+            let mut th = tracehash::th_call!("hdf5.object_header.read");
+            th.input_u64(addr);
+            let message_count = header
                 .messages
                 .iter()
                 .filter(|message| message.chunk_index == 0)
-                .collect();
-            let mut th = tracehash::th_call!("hdf5.object_header.read");
-            th.input_u64(addr);
-            let Ok(message_count) = u64::try_from(traced_messages.len()) else {
+                .count();
+            let Ok(message_count) = u64::try_from(message_count) else {
                 return result;
             };
             th.output_u64(u64::from(header.version));
             th.output_u64(u64::from(header.flags));
             th.output_u64(u64::from(header.refcount));
             th.output_u64(message_count);
-            for message in traced_messages {
+            for message in header
+                .messages
+                .iter()
+                .filter(|message| message.chunk_index == 0)
+            {
                 let Ok(data_len) = u64::try_from(message.data.len()) else {
                     return result;
                 };
@@ -156,6 +185,302 @@ impl ObjectHeader {
 
         result
     }
+}
+
+/// Encode a v2 object header, splitting messages across continuation chunks
+/// when they do not fit in chunk 0. This mirrors the HDF5 object-header chunk
+/// model: chunk 0 stores regular messages plus a HEADER_CONTINUATION message;
+/// each continuation chunk starts with OCHK, stores more messages, and carries
+/// its own checksum.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_v2_with_continuations(
+    messages: &[ObjectHeaderMessageRef<'_>],
+    flags: u8,
+    continuation_addrs: &[u64],
+    chunk0_data_limit: usize,
+    continuation_data_limit: usize,
+    sizeof_addr: u8,
+    sizeof_size: u8,
+) -> Result<EncodedV2ObjectHeader> {
+    if flags & !HDR_V2_KNOWN_FLAGS != 0 {
+        return Err(Error::InvalidFormat(format!(
+            "object header v2 flags contain reserved bits: {flags:#04x}"
+        )));
+    }
+    let has_crt_order = flags & HDR_ATTR_CRT_ORDER_TRACKED != 0;
+    let mut encoded_messages = Vec::with_capacity(messages.len());
+    for message in messages {
+        encoded_messages.push(encode_v2_message(message, has_crt_order)?);
+    }
+
+    let continuation_payload_len = checked_usize_add(
+        usize::from(sizeof_addr),
+        usize::from(sizeof_size),
+        "object header continuation payload",
+    )?;
+    let continuation_message_len = checked_usize_add(
+        v2_message_header_len(has_crt_order),
+        continuation_payload_len,
+        "object header continuation message",
+    )?;
+
+    let chunk_payloads = pack_v2_message_chunks(
+        &encoded_messages,
+        chunk0_data_limit,
+        continuation_data_limit,
+        continuation_message_len,
+    )?;
+    let continuation_count = chunk_payloads.len().saturating_sub(1);
+    if continuation_addrs.len() != continuation_count {
+        return Err(Error::InvalidFormat(format!(
+            "object header encoder needs {continuation_count} continuation addresses, got {}",
+            continuation_addrs.len()
+        )));
+    }
+
+    let mut chunk0_data = chunk_payloads[0].clone();
+    if continuation_count > 0 {
+        append_v2_continuation_message(
+            &mut chunk0_data,
+            continuation_addrs[0],
+            continuation_chunk_file_len(final_continuation_data_len(
+                &chunk_payloads,
+                1,
+                continuation_message_len,
+            )?)?,
+            has_crt_order,
+            sizeof_addr,
+            sizeof_size,
+        )?;
+    }
+
+    let chunk0_size_len = chunk0_size_len(chunk0_data.len())?;
+    let chunk0_flag = match chunk0_size_len {
+        1 => 0,
+        2 => 1,
+        4 => 2,
+        8 => 3,
+        _ => unreachable!(),
+    };
+    let oh_flags = flags | chunk0_flag;
+    let mut prefix = Vec::new();
+    prefix.extend_from_slice(&OHDR_MAGIC);
+    prefix.push(2);
+    prefix.push(oh_flags);
+    write_le_uint_width(&mut prefix, chunk0_data.len() as u64, chunk0_size_len)?;
+    prefix.extend_from_slice(&chunk0_data);
+    let checksum = checksum_metadata(&prefix);
+    prefix.extend_from_slice(&checksum.to_le_bytes());
+
+    let mut continuation_chunks = Vec::with_capacity(continuation_count);
+    for idx in 0..continuation_count {
+        let mut chunk_data = chunk_payloads[idx + 1].clone();
+        if idx + 1 < continuation_count {
+            append_v2_continuation_message(
+                &mut chunk_data,
+                continuation_addrs[idx + 1],
+                continuation_chunk_file_len(final_continuation_data_len(
+                    &chunk_payloads,
+                    idx + 2,
+                    continuation_message_len,
+                )?)?,
+                has_crt_order,
+                sizeof_addr,
+                sizeof_size,
+            )?;
+        }
+        let mut image = Vec::new();
+        image.extend_from_slice(&OCHK_MAGIC);
+        image.extend_from_slice(&chunk_data);
+        let checksum = checksum_metadata(&image);
+        image.extend_from_slice(&checksum.to_le_bytes());
+        continuation_chunks.push((continuation_addrs[idx], image));
+    }
+
+    Ok(EncodedV2ObjectHeader {
+        prefix,
+        continuation_chunks,
+    })
+}
+
+fn encode_v2_message(message: &ObjectHeaderMessageRef<'_>, has_crt_order: bool) -> Result<Vec<u8>> {
+    if u8::try_from(message.msg_type).is_err() {
+        return Err(Error::InvalidFormat(format!(
+            "object-header message type {:#06x} exceeds v2 compact encoding",
+            message.msg_type
+        )));
+    }
+    if u16::try_from(message.data.len()).is_err() {
+        return Err(Error::InvalidFormat(format!(
+            "object-header message {:#06x} exceeds v2 message size",
+            message.msg_type
+        )));
+    }
+    let mut out = Vec::with_capacity(
+        v2_message_header_len(has_crt_order)
+            .checked_add(message.data.len())
+            .ok_or_else(|| Error::InvalidFormat("object header message size overflow".into()))?,
+    );
+    out.push(message.msg_type as u8);
+    out.extend_from_slice(&(message.data.len() as u16).to_le_bytes());
+    out.push(message.flags);
+    if has_crt_order {
+        let creation_index = message.creation_index.ok_or_else(|| {
+            Error::InvalidFormat("object header message is missing creation order".into())
+        })?;
+        out.extend_from_slice(&creation_index.to_le_bytes());
+    } else if message.creation_index.is_some() {
+        return Err(Error::InvalidFormat(
+            "object header message has creation order but header does not track it".into(),
+        ));
+    }
+    out.extend_from_slice(message.data);
+    Ok(out)
+}
+
+fn pack_v2_message_chunks(
+    encoded_messages: &[Vec<u8>],
+    chunk0_data_limit: usize,
+    continuation_data_limit: usize,
+    continuation_message_len: usize,
+) -> Result<Vec<Vec<u8>>> {
+    let mut chunks = Vec::new();
+    let mut index = 0usize;
+    loop {
+        let limit = if chunks.is_empty() {
+            chunk0_data_limit
+        } else {
+            continuation_data_limit
+        };
+        let remaining_size =
+            encoded_messages[index..]
+                .iter()
+                .try_fold(0usize, |sum, message| {
+                    sum.checked_add(message.len()).ok_or_else(|| {
+                        Error::InvalidFormat("object header chunk size overflow".into())
+                    })
+                })?;
+        if remaining_size <= limit {
+            let mut chunk = Vec::with_capacity(remaining_size);
+            for message in &encoded_messages[index..] {
+                chunk.extend_from_slice(message);
+            }
+            chunks.push(chunk);
+            break;
+        }
+
+        if limit < continuation_message_len {
+            return Err(Error::InvalidFormat(
+                "object header chunk cannot fit continuation message".into(),
+            ));
+        }
+        let payload_limit = limit - continuation_message_len;
+        let mut chunk = Vec::new();
+        while index < encoded_messages.len()
+            && chunk.len().saturating_add(encoded_messages[index].len()) <= payload_limit
+        {
+            chunk.extend_from_slice(&encoded_messages[index]);
+            index += 1;
+        }
+        if chunk.is_empty() && chunks.is_empty() {
+            chunks.push(chunk);
+            continue;
+        }
+        if chunk.is_empty() {
+            return Err(Error::InvalidFormat(
+                "object header message cannot fit before a required continuation message".into(),
+            ));
+        }
+        chunks.push(chunk);
+    }
+    Ok(chunks)
+}
+
+fn append_v2_continuation_message(
+    out: &mut Vec<u8>,
+    addr: u64,
+    size: u64,
+    has_crt_order: bool,
+    sizeof_addr: u8,
+    sizeof_size: u8,
+) -> Result<()> {
+    let mut payload = Vec::new();
+    write_le_uint_width(&mut payload, addr, usize::from(sizeof_addr))?;
+    write_le_uint_width(&mut payload, size, usize::from(sizeof_size))?;
+    let message = ObjectHeaderMessageRef {
+        msg_type: MSG_HEADER_CONTINUATION,
+        flags: 0,
+        creation_index: has_crt_order.then_some(0),
+        data: &payload,
+    };
+    out.extend_from_slice(&encode_v2_message(&message, has_crt_order)?);
+    Ok(())
+}
+
+fn continuation_chunk_file_len(data_len: usize) -> Result<u64> {
+    let total = checked_usize_add(4, data_len, "object header continuation chunk")?;
+    let total = checked_usize_add(total, 4, "object header continuation checksum")?;
+    u64::try_from(total)
+        .map_err(|_| Error::InvalidFormat("object header continuation chunk too large".into()))
+}
+
+fn final_continuation_data_len(
+    chunk_payloads: &[Vec<u8>],
+    chunk_index: usize,
+    continuation_message_len: usize,
+) -> Result<usize> {
+    let mut len = chunk_payloads
+        .get(chunk_index)
+        .ok_or_else(|| Error::InvalidFormat("object header continuation chunk missing".into()))?
+        .len();
+    if chunk_index + 1 < chunk_payloads.len() {
+        len = checked_usize_add(
+            len,
+            continuation_message_len,
+            "object header continuation data",
+        )?;
+    }
+    Ok(len)
+}
+
+fn chunk0_size_len(chunk_data_size: usize) -> Result<usize> {
+    if chunk_data_size <= u8::MAX as usize {
+        Ok(1)
+    } else if chunk_data_size <= u16::MAX as usize {
+        Ok(2)
+    } else if chunk_data_size <= u32::MAX as usize {
+        Ok(4)
+    } else {
+        Ok(8)
+    }
+}
+
+fn v2_message_header_len(has_crt_order: bool) -> usize {
+    if has_crt_order {
+        6
+    } else {
+        4
+    }
+}
+
+fn checked_usize_add(lhs: usize, rhs: usize, context: &str) -> Result<usize> {
+    lhs.checked_add(rhs)
+        .ok_or_else(|| Error::InvalidFormat(format!("{context} size overflow")))
+}
+
+fn write_le_uint_width(out: &mut Vec<u8>, value: u64, width: usize) -> Result<()> {
+    if width == 0 || width > 8 {
+        return Err(Error::InvalidFormat(format!(
+            "unsupported integer width: {width}"
+        )));
+    }
+    if width < 8 && value >= (1u64 << (width * 8)) {
+        return Err(Error::InvalidFormat(
+            "integer value does not fit configured width".into(),
+        ));
+    }
+    out.extend_from_slice(&value.to_le_bytes()[..width]);
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -200,6 +525,7 @@ mod tests {
     use super::*;
     use std::fs::File;
     use std::io::BufReader;
+    use std::io::Cursor;
 
     #[test]
     fn test_parse_v0_root_object_header() {
@@ -256,5 +582,74 @@ mod tests {
             has_links,
             "v2 root group should have link or link info messages"
         );
+    }
+
+    #[test]
+    fn encode_v2_with_continuations_roundtrips_nested_chunks() {
+        let payloads = [
+            b"a", b"b", b"c", b"d", b"e", b"f", b"g", b"h", b"i", b"j", b"k", b"l",
+        ];
+        let messages = payloads.map(|data| ObjectHeaderMessageRef {
+            msg_type: MSG_OBJ_COMMENT,
+            flags: 0,
+            creation_index: None,
+            data,
+        });
+        let continuation_addrs = [64, 128, 192, 256, 320, 384, 448];
+        let encoded =
+            encode_v2_with_continuations(&messages, 0, &continuation_addrs, 25, 25, 8, 8).unwrap();
+
+        assert_eq!(encoded.continuation_chunks.len(), continuation_addrs.len());
+        assert!(encoded
+            .prefix
+            .iter()
+            .any(|byte| *byte == MSG_HEADER_CONTINUATION as u8));
+        assert!(encoded.continuation_chunks[0]
+            .1
+            .iter()
+            .any(|byte| *byte == MSG_HEADER_CONTINUATION as u8));
+
+        let mut file = vec![0u8; 512];
+        file[..encoded.prefix.len()].copy_from_slice(&encoded.prefix);
+        for (addr, image) in &encoded.continuation_chunks {
+            let start = usize::try_from(*addr).unwrap();
+            file[start..start + image.len()].copy_from_slice(image);
+        }
+
+        let mut reader = HdfReader::new(Cursor::new(file));
+        let header = ObjectHeader::read_at(&mut reader, 0).unwrap();
+        assert_eq!(header.version, 2);
+        assert_eq!(header.messages.len(), messages.len());
+        assert_eq!(
+            header
+                .messages
+                .iter()
+                .map(|message| message.data.as_slice())
+                .collect::<Vec<_>>(),
+            payloads
+                .iter()
+                .map(|payload| &payload[..])
+                .collect::<Vec<_>>()
+        );
+        assert!(header
+            .messages
+            .iter()
+            .any(|message| message.chunk_index > 1));
+    }
+
+    #[test]
+    fn encode_v2_with_continuations_requires_exact_addresses() {
+        let messages = [
+            b"a", b"b", b"c", b"d", b"e", b"f", b"g", b"h", b"i", b"j", b"k", b"l",
+        ]
+        .map(|data| ObjectHeaderMessageRef {
+            msg_type: MSG_OBJ_COMMENT,
+            flags: 0,
+            creation_index: None,
+            data,
+        });
+
+        let err = encode_v2_with_continuations(&messages, 0, &[], 25, 25, 8, 8).unwrap_err();
+        assert!(err.to_string().contains("continuation addresses"));
     }
 }

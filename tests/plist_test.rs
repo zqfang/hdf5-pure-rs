@@ -35,11 +35,13 @@ fn test_dataset_create_plist_chunked_compressed() {
     assert_eq!(plist.chunk_dims.as_ref().unwrap(), &[10]);
     assert_eq!(ds.space_status().unwrap(), DatasetSpaceStatus::Allocated);
     assert_eq!(ds.num_chunks().unwrap(), 10);
-    let first_chunk = ds.chunk_info(0).unwrap();
+    let mut chunks = Vec::new();
+    ds.chunk_infos_into(&mut chunks).unwrap();
+    let first_chunk = chunks.first().unwrap();
     assert_eq!(first_chunk.offset, vec![0]);
     assert!(first_chunk.addr > 0);
     assert!(first_chunk.size > 0);
-    assert!(ds.chunk_info(10).is_err());
+    assert_eq!(chunks.len(), 10);
 }
 
 #[test]
@@ -280,7 +282,9 @@ fn test_dataset_metadata_queries() {
     let ds = f.dataset("chunked").unwrap();
     assert!(ds.is_chunked().unwrap());
     assert_eq!(ds.offset().unwrap(), None);
-    assert_eq!(ds.chunk().unwrap(), Some(vec![10]));
+    let mut chunk = Vec::new();
+    assert!(ds.chunk_into(&mut chunk).unwrap());
+    assert_eq!(chunk, vec![10]);
 
     let dtype = ds.dtype().unwrap();
     assert!(dtype.is_float());

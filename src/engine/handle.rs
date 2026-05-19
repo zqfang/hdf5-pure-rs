@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 
@@ -296,12 +297,19 @@ impl HandleRegistry {
         self.is_valid(id)
     }
 
-    /// Get the data associated with a handle, downcasted to the expected type.
-    pub fn get<T: Send + Sync + 'static>(&self, id: Hid) -> Option<Arc<T>> {
+    /// Visit the data associated with a handle, downcasted to the expected type.
+    ///
+    /// This avoids cloning the stored `Arc`. The callback runs while the
+    /// registry read lock is held, so it must not call methods that need to
+    /// mutate the same registry.
+    pub fn with<T, R, F>(&self, id: Hid, callback: F) -> Option<R>
+    where
+        T: Send + Sync + 'static,
+        F: FnOnce(&T) -> R,
+    {
         let entries = self.entries.read();
-        entries
-            .get(&id)
-            .and_then(|e| e.data.clone().downcast::<T>().ok())
+        let data = entries.get(&id)?.data.downcast_ref::<T>()?;
+        Some(callback(data))
     }
 
     /// Remove an id and return whether it existed.
@@ -415,44 +423,24 @@ impl HandleRegistry {
         self.get_type_ref(handle_type)
     }
 
-    /// Iterate over ids of a type.
-    pub fn iterate<F>(&self, handle_type: HandleType, mut callback: F)
+    /// Visit ids of a type while holding the registry read lock.
+    ///
+    /// This avoids allocating a snapshot of ids. The callback must not call
+    /// methods that need to mutate the same registry.
+    pub fn visit_ids_for_type<F>(&self, handle_type: HandleType, mut callback: F)
     where
         F: FnMut(Hid),
     {
-        let ids: Vec<_> = self
-            .entries
-            .read()
+        let entries = self.entries.read();
+        entries
             .iter()
             .filter_map(|(&id, entry)| (entry.handle_type == handle_type).then_some(id))
-            .collect();
-        for id in ids {
-            callback(id);
-        }
+            .for_each(&mut callback);
     }
 
-    /// Internal iterate callback adapter.
-    pub fn iterate_cb<F>(&self, handle_type: HandleType, callback: F)
-    where
-        F: FnMut(Hid),
-    {
-        self.iterate(handle_type, callback);
-    }
-
-    /// Public iterate callback adapter.
-    pub fn iterate_pub_cb<F>(&self, handle_type: HandleType, callback: F)
-    where
-        F: FnMut(Hid),
-    {
-        self.iterate(handle_type, callback);
-    }
-
-    /// Public iterate alias.
-    pub fn iterate_api<F>(&self, handle_type: HandleType, callback: F)
-    where
-        F: FnMut(Hid),
-    {
-        self.iterate(handle_type, callback);
+    /// Append ids of a type into a caller-provided buffer.
+    pub fn ids_for_type_into(&self, handle_type: HandleType, ids: &mut Vec<Hid>) {
+        self.visit_ids_for_type(handle_type, |id| ids.push(id));
     }
 
     /// Find an id of a type matching a predicate.
@@ -486,27 +474,22 @@ impl HandleRegistry {
         self.is_file_object(id).then_some(id)
     }
 
-    /// Return an implementation-defined object name.
-    pub fn get_name(&self, id: Hid) -> Option<String> {
+    /// Visit the parts of an implementation-defined object name.
+    pub fn visit_name_parts<R, F>(&self, id: Hid, callback: F) -> Option<R>
+    where
+        F: FnOnce(HandleType, Hid) -> R,
+    {
         self.handle_type(id)
-            .map(|handle_type| format!("{handle_type:?}:{id}"))
+            .map(|handle_type| callback(handle_type, id))
     }
 
-    /// Internal name-test helper.
-    pub fn get_name_test(&self, id: Hid) -> Option<String> {
-        self.get_name(id)
-    }
-
-    /// Dump ids for a type.
-    pub fn dump_ids_for_type(&self, handle_type: HandleType) -> Vec<Hid> {
-        let mut ids = Vec::new();
-        self.iterate(handle_type, |id| ids.push(id));
-        ids
-    }
-
-    /// Internal dump callback helper.
-    pub fn id_dump_cb(&self, handle_type: HandleType) -> Vec<Hid> {
-        self.dump_ids_for_type(handle_type)
+    /// Write an implementation-defined object name into a caller-provided buffer.
+    pub fn write_name_into(&self, id: Hid, name: &mut String) -> bool {
+        name.clear();
+        self.visit_name_parts(id, |handle_type, id| {
+            let _ = write!(name, "{handle_type:?}:{id}");
+        })
+        .is_some()
     }
 
     /// Number of currently registered handles.
@@ -738,8 +721,21 @@ pub fn H5Iis_valid(registry: &HandleRegistry, id: Hid) -> bool {
 }
 
 #[allow(non_snake_case)]
+pub fn H5I_with_object<T, R, F>(registry: &HandleRegistry, id: Hid, callback: F) -> Option<R>
+where
+    T: Send + Sync + 'static,
+    F: FnOnce(&T) -> R,
+{
+    registry.with(id, callback)
+}
+
+#[allow(non_snake_case)]
+#[deprecated(note = "use H5I_with_object to avoid cloning the stored Arc")]
 pub fn H5I_object<T: Send + Sync + 'static>(registry: &HandleRegistry, id: Hid) -> Option<Arc<T>> {
-    registry.get(id)
+    let entries = registry.entries.read();
+    entries
+        .get(&id)
+        .and_then(|entry| entry.data.clone().downcast::<T>().ok())
 }
 
 #[allow(non_snake_case)]
@@ -833,35 +829,39 @@ pub fn H5Iget_type_ref(registry: &HandleRegistry, handle_type: HandleType) -> i3
 }
 
 #[allow(non_snake_case)]
+#[deprecated(note = "use H5I_visit_ids_for_type or H5I_ids_for_type_into")]
 pub fn H5I__iterate_cb<F>(registry: &HandleRegistry, handle_type: HandleType, callback: F)
 where
     F: FnMut(Hid),
 {
-    registry.iterate_cb(handle_type, callback)
+    registry.visit_ids_for_type(handle_type, callback)
 }
 
 #[allow(non_snake_case)]
+#[deprecated(note = "use H5I_visit_ids_for_type or H5I_ids_for_type_into")]
 pub fn H5I__iterate_pub_cb<F>(registry: &HandleRegistry, handle_type: HandleType, callback: F)
 where
     F: FnMut(Hid),
 {
-    registry.iterate_pub_cb(handle_type, callback)
+    registry.visit_ids_for_type(handle_type, callback)
 }
 
 #[allow(non_snake_case)]
+#[deprecated(note = "use H5I_visit_ids_for_type or H5I_ids_for_type_into")]
 pub fn H5I_iterate<F>(registry: &HandleRegistry, handle_type: HandleType, callback: F)
 where
     F: FnMut(Hid),
 {
-    registry.iterate_api(handle_type, callback)
+    registry.visit_ids_for_type(handle_type, callback)
 }
 
 #[allow(non_snake_case)]
+#[deprecated(note = "use H5I_visit_ids_for_type or H5I_ids_for_type_into")]
 pub fn H5Iiterate<F>(registry: &HandleRegistry, handle_type: HandleType, callback: F)
 where
     F: FnMut(Hid),
 {
-    registry.iterate(handle_type, callback)
+    registry.visit_ids_for_type(handle_type, callback)
 }
 
 #[allow(non_snake_case)]
@@ -902,23 +902,58 @@ pub fn H5Iget_file_id(registry: &HandleRegistry, id: Hid) -> Option<Hid> {
 }
 
 #[allow(non_snake_case)]
+pub fn H5I_write_name_into(registry: &HandleRegistry, id: Hid, name: &mut String) -> bool {
+    registry.write_name_into(id, name)
+}
+
+#[allow(non_snake_case)]
+pub fn H5I_visit_name_parts<R, F>(registry: &HandleRegistry, id: Hid, callback: F) -> Option<R>
+where
+    F: FnOnce(HandleType, Hid) -> R,
+{
+    registry.visit_name_parts(id, callback)
+}
+
+#[allow(non_snake_case)]
+#[deprecated(
+    note = "use H5I_visit_name_parts or H5I_write_name_into to avoid returning an allocated String"
+)]
 pub fn H5Iget_name(registry: &HandleRegistry, id: Hid) -> Option<String> {
-    registry.get_name(id)
+    let mut name = String::new();
+    registry.write_name_into(id, &mut name).then_some(name)
 }
 
 #[allow(non_snake_case)]
-pub fn H5I__get_name_test(registry: &HandleRegistry, id: Hid) -> Option<String> {
-    registry.get_name_test(id)
+pub fn H5I_visit_ids_for_type<F>(registry: &HandleRegistry, handle_type: HandleType, callback: F)
+where
+    F: FnMut(Hid),
+{
+    registry.visit_ids_for_type(handle_type, callback)
 }
 
 #[allow(non_snake_case)]
+pub fn H5I_ids_for_type_into(
+    registry: &HandleRegistry,
+    handle_type: HandleType,
+    ids: &mut Vec<Hid>,
+) {
+    registry.ids_for_type_into(handle_type, ids)
+}
+
+#[allow(non_snake_case)]
+#[deprecated(note = "use H5I_visit_ids_for_type or H5I_ids_for_type_into to avoid allocating")]
 pub fn H5I_dump_ids_for_type(registry: &HandleRegistry, handle_type: HandleType) -> Vec<Hid> {
-    registry.dump_ids_for_type(handle_type)
+    let mut ids = Vec::new();
+    registry.ids_for_type_into(handle_type, &mut ids);
+    ids
 }
 
 #[allow(non_snake_case)]
+#[deprecated(note = "use H5I_visit_ids_for_type or H5I_ids_for_type_into to avoid allocating")]
 pub fn H5I__id_dump_cb(registry: &HandleRegistry, handle_type: HandleType) -> Vec<Hid> {
-    registry.id_dump_cb(handle_type)
+    let mut ids = Vec::new();
+    registry.ids_for_type_into(handle_type, &mut ids);
+    ids
 }
 
 #[cfg(test)]
@@ -934,8 +969,10 @@ mod tests {
         assert_eq!(reg.handle_type(id), Some(HandleType::File));
         assert_eq!(reg.refcount(id), Some(1));
 
-        let data = reg.get::<String>(id).unwrap();
-        assert_eq!(&*data, "test_data");
+        assert_eq!(
+            reg.with::<String, _, _>(id, |data| data == "test_data"),
+            Some(true)
+        );
     }
 
     #[test]
@@ -979,14 +1016,30 @@ mod tests {
         assert_eq!(reg.search(HandleType::Dataset, |id| id == a), Some(a));
 
         let mut seen = Vec::new();
-        reg.iterate_api(HandleType::Dataset, |id| seen.push(id));
+        reg.visit_ids_for_type(HandleType::Dataset, |id| seen.push(id));
         seen.sort_unstable();
         assert_eq!(seen, vec![a, b]);
-        assert_eq!(reg.dump_ids_for_type(HandleType::Dataset).len(), 2);
-        assert_eq!(reg.get_name(a), Some(format!("Dataset:{a}")));
+        let mut buffered = Vec::new();
+        reg.ids_for_type_into(HandleType::Dataset, &mut buffered);
+        buffered.sort_unstable();
+        assert_eq!(buffered, vec![a, b]);
+        let mut visited = Vec::new();
+        reg.visit_ids_for_type(HandleType::Dataset, |id| visited.push(id));
+        visited.sort_unstable();
+        assert_eq!(visited, vec![a, b]);
+        let mut dumped = Vec::new();
+        reg.ids_for_type_into(HandleType::Dataset, &mut dumped);
+        assert_eq!(dumped.len(), 2);
+        let mut name = String::new();
+        assert!(reg.write_name_into(a, &mut name));
+        assert_eq!(name, format!("Dataset:{a}"));
+        assert_eq!(
+            reg.visit_name_parts(a, |handle_type, id| (handle_type, id)),
+            Some((HandleType::Dataset, a))
+        );
 
         assert!(reg.subst(a, "replacement"));
-        assert_eq!(&*reg.get::<&str>(a).unwrap(), &"replacement");
+        assert_eq!(reg.with::<&str, _, _>(a, |data| *data), Some("replacement"));
         assert!(reg.remove_verify(a, HandleType::Dataset));
         assert!(!reg.is_valid(a));
         assert_eq!(reg.clear_type_api(HandleType::Dataset), 1);
@@ -1053,7 +1106,10 @@ mod tests {
             Some(44)
         );
         assert!(H5I_subst(&reg, dset, "replacement"));
-        assert_eq!(&*H5I_object::<&str>(&reg, dset).unwrap(), &"replacement");
+        assert_eq!(
+            H5I_with_object::<&str, _, _>(&reg, dset, |data| *data),
+            Some("replacement")
+        );
 
         assert!(H5I_is_file_object(&reg, file));
         assert_eq!(H5I__unwrap(&reg, file), Some(file));
@@ -1105,17 +1161,23 @@ mod tests {
         );
 
         let mut iterated = Vec::new();
-        H5I__iterate_cb(&reg, HandleType::Group, |id| iterated.push(id));
-        H5I__iterate_pub_cb(&reg, HandleType::Group, |id| iterated.push(id));
-        H5I_iterate(&reg, HandleType::Group, |id| iterated.push(id));
-        H5Iiterate(&reg, HandleType::Group, |id| iterated.push(id));
-        assert_eq!(iterated, vec![group, group, group, group]);
-        assert_eq!(H5I_dump_ids_for_type(&reg, HandleType::Group), vec![group]);
-        assert_eq!(H5I__id_dump_cb(&reg, HandleType::Group), vec![group]);
-        assert_eq!(H5Iget_name(&reg, group), Some(format!("Group:{group}")));
+        H5I_visit_ids_for_type(&reg, HandleType::Group, |id| iterated.push(id));
+        assert_eq!(iterated, vec![group]);
+        let mut ids = Vec::new();
+        H5I_ids_for_type_into(&reg, HandleType::Group, &mut ids);
+        assert_eq!(ids, vec![group]);
+        let mut visited = Vec::new();
+        H5I_visit_ids_for_type(&reg, HandleType::Group, |id| visited.push(id));
+        assert_eq!(visited, vec![group]);
+        let mut dumped = Vec::new();
+        H5I_ids_for_type_into(&reg, HandleType::Group, &mut dumped);
+        assert_eq!(dumped, vec![group]);
+        let mut name = String::new();
+        assert!(H5I_write_name_into(&reg, group, &mut name));
+        assert_eq!(name, format!("Group:{group}"));
         assert_eq!(
-            H5I__get_name_test(&reg, group),
-            Some(format!("Group:{group}"))
+            H5I_visit_name_parts(&reg, group, |handle_type, id| (handle_type, id)),
+            Some((HandleType::Group, group))
         );
 
         assert!(H5I__remove_verify(&reg, attr, HandleType::Attribute));
@@ -1131,5 +1193,42 @@ mod tests {
         assert_eq!(H5Idestroy_type(&reg, HandleType::Dataset), 0);
         H5I_term_package(&reg);
         assert!(reg.is_empty());
+    }
+
+    #[test]
+    fn h5i_allocation_aware_helpers_cover_deprecated_wrapper_behavior() {
+        let reg = HandleRegistry::new();
+        let file = reg.register(HandleType::File, "file".to_string());
+        let group = reg.register(HandleType::Group, "group");
+
+        assert_eq!(
+            reg.with::<String, _, _>(file, |data| data == "file"),
+            Some(true)
+        );
+        assert_eq!(
+            H5I_with_object::<&str, _, _>(&reg, group, |data| *data),
+            Some("group")
+        );
+
+        let mut file_name = String::new();
+        assert!(reg.write_name_into(file, &mut file_name));
+        assert_eq!(file_name, format!("File:{file}"));
+        assert!(H5I_write_name_into(&reg, group, &mut file_name));
+        assert_eq!(file_name, format!("Group:{group}"));
+
+        let mut file_ids = Vec::new();
+        reg.ids_for_type_into(HandleType::File, &mut file_ids);
+        assert_eq!(file_ids, vec![file]);
+        let mut group_ids = Vec::new();
+        reg.ids_for_type_into(HandleType::Group, &mut group_ids);
+        assert_eq!(group_ids, vec![group]);
+
+        let mut method_iterated = Vec::new();
+        reg.visit_ids_for_type(HandleType::File, |id| method_iterated.push(id));
+        assert_eq!(method_iterated, vec![file]);
+
+        let mut function_iterated = Vec::new();
+        H5I_visit_ids_for_type(&reg, HandleType::Group, |id| function_iterated.push(id));
+        assert_eq!(function_iterated, vec![group]);
     }
 }

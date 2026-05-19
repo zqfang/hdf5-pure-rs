@@ -6,9 +6,9 @@ use crate::error::{Error, Result};
 use super::FractalHeapHeader;
 
 impl FractalHeapHeader {
-    pub(super) fn read_tiny(&self, heap_id: &[u8]) -> Result<Vec<u8>> {
+    pub(super) fn read_tiny_payload<'a>(&self, heap_id: &'a [u8]) -> Result<&'a [u8]> {
         let length = usize::from(heap_id[0] & 0x0f) + 1;
-        let data = tiny_heap_payload(heap_id, length)?.to_vec();
+        let data = tiny_heap_payload(heap_id, length)?;
         self.trace_tiny_object(heap_id, u64::try_from(length).unwrap_or(u64::MAX));
         Ok(data)
     }

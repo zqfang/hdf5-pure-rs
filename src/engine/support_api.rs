@@ -1,6 +1,8 @@
 #![allow(dead_code, non_snake_case)]
 
+use std::borrow::Cow;
 use std::cmp::Ordering;
+use std::fmt;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Condvar, Mutex, Once};
@@ -118,12 +120,25 @@ pub fn H5_localtime_r(time: SystemTime) -> u64 {
 }
 
 /// Render a byte slice as a space-separated hex string for debug output.
+pub fn H5_buffer_dump_into<W>(bytes: &[u8], out: &mut W) -> fmt::Result
+where
+    W: fmt::Write + ?Sized,
+{
+    for (idx, byte) in bytes.iter().enumerate() {
+        if idx > 0 {
+            out.write_char(' ')?;
+        }
+        write!(out, "{byte:02x}")?;
+    }
+    Ok(())
+}
+
+/// Render a byte slice as a space-separated hex string for debug output.
+#[deprecated(note = "use H5_buffer_dump_into to reuse formatting storage")]
 pub fn H5_buffer_dump(bytes: &[u8]) -> String {
-    bytes
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<Vec<_>>()
-        .join(" ")
+    let mut out = String::new();
+    H5_buffer_dump_into(bytes, &mut out).expect("writing to String cannot fail");
+    out
 }
 
 /// Acquire the global API lock; no-op in pure-Rust mode.
@@ -194,8 +209,25 @@ pub fn H5_timer_get_total_times(timer: &H5Timer) -> Duration {
 }
 
 /// Format a duration as a human-readable seconds string.
+pub fn H5_timer_get_time_string_fmt<W>(duration: Duration, out: &mut W) -> fmt::Result
+where
+    W: fmt::Write + ?Sized,
+{
+    write!(out, "{:.6}s", duration.as_secs_f64())
+}
+
+/// Format a duration as a human-readable seconds string.
+pub fn H5_timer_get_time_string_into(duration: Duration, out: &mut String) {
+    out.clear();
+    H5_timer_get_time_string_fmt(duration, out).expect("writing to String cannot fail");
+}
+
+/// Format a duration as a human-readable seconds string.
+#[deprecated(note = "use H5_timer_get_time_string_into to reuse String storage")]
 pub fn H5_timer_get_time_string(duration: Duration) -> String {
-    format!("{:.6}s", duration.as_secs_f64())
+    let mut out = String::new();
+    H5_timer_get_time_string_into(duration, &mut out);
+    out
 }
 
 /// Initialize the H5 package: mark the library as open.
@@ -459,28 +491,121 @@ pub fn H5TS_pool_create() -> Result<()> {
 }
 
 /// Format a boolean argument for the API trace log.
+pub fn H5_trace_args_bool_ref(value: bool) -> &'static str {
+    if value {
+        "true"
+    } else {
+        "false"
+    }
+}
+
+/// Format a boolean argument for the API trace log.
+pub fn H5_trace_args_bool_into(value: bool, out: &mut String) {
+    out.clear();
+    out.push_str(H5_trace_args_bool_ref(value));
+}
+
+/// Format a boolean argument for the API trace log.
+#[deprecated(note = "use H5_trace_args_bool_into to reuse String storage")]
 pub fn H5_trace_args_bool(value: bool) -> String {
-    value.to_string()
+    let mut out = String::new();
+    H5_trace_args_bool_into(value, &mut out);
+    out
 }
 
 /// Format a character-set argument for the API trace log.
+pub fn H5_trace_args_cset_fmt<W>(value: u8, out: &mut W) -> fmt::Result
+where
+    W: fmt::Write + ?Sized,
+{
+    write!(out, "{value}")
+}
+
+/// Format a character-set argument for the API trace log.
+pub fn H5_trace_args_cset_into(value: u8, out: &mut String) {
+    out.clear();
+    H5_trace_args_cset_fmt(value, out).expect("writing to String cannot fail");
+}
+
+/// Format a character-set argument for the API trace log.
+#[deprecated(note = "use H5_trace_args_cset_into to reuse String storage")]
 pub fn H5_trace_args_cset(value: u8) -> String {
-    value.to_string()
+    let mut out = String::new();
+    H5_trace_args_cset_into(value, &mut out);
+    out
 }
 
 /// Format a file-close-degree argument for the API trace log.
+pub fn H5_trace_args_close_degree_fmt<W>(value: u8, out: &mut W) -> fmt::Result
+where
+    W: fmt::Write + ?Sized,
+{
+    H5_trace_args_cset_fmt(value, out)
+}
+
+/// Format a file-close-degree argument for the API trace log.
+pub fn H5_trace_args_close_degree_into(value: u8, out: &mut String) {
+    out.clear();
+    H5_trace_args_close_degree_fmt(value, out).expect("writing to String cannot fail");
+}
+
+/// Format a file-close-degree argument for the API trace log.
+#[deprecated(note = "use H5_trace_args_close_degree_into to reuse String storage")]
 pub fn H5_trace_args_close_degree(value: u8) -> String {
-    value.to_string()
+    let mut out = String::new();
+    H5_trace_args_close_degree_into(value, &mut out);
+    out
 }
 
 /// Join a list of pre-formatted argument strings into a single trace argument list.
+pub fn H5_trace_args_fmt<S, W>(args: &[S], out: &mut W) -> fmt::Result
+where
+    S: AsRef<str>,
+    W: fmt::Write + ?Sized,
+{
+    for (idx, arg) in args.iter().enumerate() {
+        if idx > 0 {
+            out.write_str(", ")?;
+        }
+        out.write_str(arg.as_ref())?;
+    }
+    Ok(())
+}
+
+/// Join a list of pre-formatted argument strings into a single trace argument list.
+pub fn H5_trace_args_into<S>(args: &[S], out: &mut String)
+where
+    S: AsRef<str>,
+{
+    out.clear();
+    H5_trace_args_fmt(args, out).expect("writing to String cannot fail");
+}
+
+/// Visit pre-formatted trace arguments in order.
+pub fn H5_trace_args_iter<S>(args: &[S]) -> impl Iterator<Item = &str>
+where
+    S: AsRef<str>,
+{
+    args.iter().map(AsRef::as_ref)
+}
+
+/// Join a list of pre-formatted argument strings into a single trace argument list.
+#[deprecated(note = "use H5_trace_args_iter or H5_trace_args_into")]
 pub fn H5_trace_args(args: &[String]) -> String {
-    args.join(", ")
+    let mut out = String::new();
+    H5_trace_args_into(args, &mut out);
+    out
 }
 
 /// Emit a single trace message line.
+pub fn H5_trace_ref(message: &str) -> &str {
+    message
+}
+
+/// Emit a single trace message line.
+#[deprecated(note = "use H5_trace_ref to borrow the trace message")]
 pub fn H5_trace(message: &str) -> String {
-    message.to_string()
+    H5_trace_ref(message).to_string()
 }
 
 /// Spawn a new OS thread running `f`.
@@ -524,6 +649,21 @@ pub fn H5_make_time(secs: u64) -> SystemTime {
 }
 
 /// Format a `SystemTime` as a local-time string (here, seconds since epoch).
+pub fn H5_get_localtime_str_fmt<W>(time: SystemTime, out: &mut W) -> fmt::Result
+where
+    W: fmt::Write + ?Sized,
+{
+    write!(out, "{}", H5_gmtime_r(time))
+}
+
+/// Format a `SystemTime` as a local-time string (here, seconds since epoch).
+pub fn H5_get_localtime_str_into(time: SystemTime, out: &mut String) {
+    out.clear();
+    H5_get_localtime_str_fmt(time, out).expect("writing to String cannot fail");
+}
+
+/// Format a `SystemTime` as a local-time string (here, seconds since epoch).
+#[deprecated(note = "use H5_get_localtime_str_into to reuse String storage")]
 pub fn H5_get_localtime_str(time: SystemTime) -> String {
     H5_gmtime_r(time).to_string()
 }
@@ -534,17 +674,48 @@ pub fn H5_get_win32_times() -> Result<()> {
 }
 
 /// Decode a UTF-16 buffer into a `String`.
+pub fn H5_get_utf16_str_into(bytes: &[u16], out: &mut String) -> Result<()> {
+    out.clear();
+    for item in std::char::decode_utf16(bytes.iter().copied()) {
+        let ch = item.map_err(|_| Error::InvalidFormat("invalid UTF-16 string".into()))?;
+        out.push(ch);
+    }
+    Ok(())
+}
+
+/// Decode a UTF-16 buffer into a `String`.
+#[deprecated(note = "use H5_get_utf16_str_into to reuse String storage")]
 pub fn H5_get_utf16_str(bytes: &[u16]) -> Result<String> {
-    String::from_utf16(bytes).map_err(|_| Error::InvalidFormat("invalid UTF-16 string".into()))
+    let mut out = String::new();
+    H5_get_utf16_str_into(bytes, &mut out)?;
+    Ok(out)
 }
 
 /// Build a `prefix/name` external-link path.
-pub fn H5_build_extpath(prefix: &str, name: &str) -> String {
+pub fn H5_build_extpath_cow<'a>(prefix: &str, name: &'a str) -> Cow<'a, str> {
     if prefix.is_empty() {
-        name.to_string()
+        Cow::Borrowed(name)
     } else {
-        format!("{prefix}/{name}")
+        Cow::Owned(format!("{prefix}/{name}"))
     }
+}
+
+/// Build a `prefix/name` external-link path into caller-owned storage.
+pub fn H5_build_extpath_into(prefix: &str, name: &str, out: &mut String) {
+    out.clear();
+    if prefix.is_empty() {
+        out.push_str(name);
+    } else {
+        out.push_str(prefix);
+        out.push('/');
+        out.push_str(name);
+    }
+}
+
+/// Build a `prefix/name` external-link path.
+#[deprecated(note = "use H5_build_extpath_cow or H5_build_extpath_into")]
+pub fn H5_build_extpath(prefix: &str, name: &str) -> String {
+    H5_build_extpath_cow(prefix, name).into_owned()
 }
 
 /// Sleep for `nanos` nanoseconds.
@@ -553,29 +724,75 @@ pub fn H5_nanosleep(nanos: u64) {
 }
 
 /// Expand `%ENV%`-style Windows environment variables in a string (no-op here).
+pub fn H5_expand_windows_env_vars_ref(value: &str) -> &str {
+    value
+}
+
+/// Expand `%ENV%`-style Windows environment variables in a string (no-op here).
+#[deprecated(note = "use H5_expand_windows_env_vars_ref to borrow the unchanged string")]
 pub fn H5_expand_windows_env_vars(value: &str) -> String {
-    value.to_string()
+    H5_expand_windows_env_vars_ref(value).to_string()
 }
 
 /// Duplicate the first `len` characters of a string.
+pub fn H5_strndup_cow(value: &str, len: usize) -> Cow<'_, str> {
+    let mut char_indices = value.char_indices();
+    match char_indices.nth(len) {
+        Some((end, _)) => Cow::Borrowed(&value[..end]),
+        None => Cow::Borrowed(value),
+    }
+}
+
+/// Duplicate the first `len` characters of a string into caller-owned storage.
+pub fn H5_strndup_into(value: &str, len: usize, out: &mut String) {
+    out.clear();
+    out.push_str(&H5_strndup_cow(value, len));
+}
+
+/// Duplicate the first `len` characters of a string.
+#[deprecated(note = "use H5_strndup_cow or H5_strndup_into")]
 pub fn H5_strndup(value: &str, len: usize) -> String {
-    value.chars().take(len).collect()
+    H5_strndup_cow(value, len).into_owned()
 }
 
 /// Return the directory portion of a path, or "." if there is none.
-pub fn H5_dirname(value: &str) -> String {
+pub fn H5_dirname_cow(value: &str) -> Cow<'_, str> {
     Path::new(value)
         .parent()
-        .map(|path| path.to_string_lossy().into_owned())
-        .unwrap_or_else(|| ".".to_string())
+        .map(Path::to_string_lossy)
+        .unwrap_or(Cow::Borrowed("."))
+}
+
+/// Return the directory portion of a path into caller-owned storage.
+pub fn H5_dirname_into(value: &str, out: &mut String) {
+    out.clear();
+    out.push_str(&H5_dirname_cow(value));
+}
+
+/// Return the directory portion of a path, or "." if there is none.
+#[deprecated(note = "use H5_dirname_cow or H5_dirname_into")]
+pub fn H5_dirname(value: &str) -> String {
+    H5_dirname_cow(value).into_owned()
 }
 
 /// Return the trailing component (filename) of a path.
-pub fn H5_basename(value: &str) -> String {
+pub fn H5_basename_cow(value: &str) -> Cow<'_, str> {
     Path::new(value)
         .file_name()
-        .map(|path| path.to_string_lossy().into_owned())
-        .unwrap_or_else(|| value.to_string())
+        .map(|path| path.to_string_lossy())
+        .unwrap_or(Cow::Borrowed(value))
+}
+
+/// Return the trailing component (filename) of a path into caller-owned storage.
+pub fn H5_basename_into(value: &str, out: &mut String) {
+    out.clear();
+    out.push_str(&H5_basename_cow(value));
+}
+
+/// Return the trailing component (filename) of a path.
+#[deprecated(note = "use H5_basename_cow or H5_basename_into")]
+pub fn H5_basename(value: &str) -> String {
+    H5_basename_cow(value).into_owned()
 }
 
 /// Return `value` if set, otherwise the provided default.
@@ -585,9 +802,20 @@ pub fn H5_get_option<T: Copy>(value: Option<T>, default: T) -> T {
 
 /// Case-insensitive substring search returning the byte offset of the match.
 pub fn H5_strcasestr(haystack: &str, needle: &str) -> Option<usize> {
+    let needle = needle.as_bytes();
+    if needle.is_empty() {
+        return Some(0);
+    }
+
     haystack
-        .to_ascii_lowercase()
-        .find(&needle.to_ascii_lowercase())
+        .as_bytes()
+        .windows(needle.len())
+        .position(|window| {
+            window
+                .iter()
+                .zip(needle)
+                .all(|(left, right)| left.eq_ignore_ascii_case(right))
+        })
 }
 
 /// Return whether the host CPU is little-endian.
@@ -600,4 +828,35 @@ pub fn H5EA__dblock_create() -> Result<()> {
     Err(Error::Unsupported(
         "extensible-array data block creation is not implemented".into(),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strcasestr_searches_without_changing_offsets() {
+        assert_eq!(H5_strcasestr("prefixDATA", "data"), Some(6));
+        assert_eq!(H5_strcasestr("abcDEFghi", "Def"), Some(3));
+        assert_eq!(H5_strcasestr("abc", ""), Some(0));
+        assert_eq!(H5_strcasestr("abc", "abcd"), None);
+        assert_eq!(H5_strcasestr("abc", "z"), None);
+    }
+
+    #[test]
+    fn support_owned_compat_wrappers_route_through_new_apis() {
+        let mut out = String::new();
+
+        H5_buffer_dump_into(&[0, 10, 255], &mut out).expect("formatting should succeed");
+        assert_eq!(out, "00 0a ff");
+
+        H5_trace_args_into(&["one", "two"], &mut out);
+        assert_eq!(out, "one, two");
+
+        H5_strndup_into("abcdef", 3, &mut out);
+        assert_eq!(out, "abc");
+
+        H5_build_extpath_into("dir", "file.h5", &mut out);
+        assert_eq!(out, "dir/file.h5");
+    }
 }

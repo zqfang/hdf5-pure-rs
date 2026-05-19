@@ -1,34 +1,141 @@
 use std::io::{Read, Seek};
 
 use crate::error::{Error, Result};
-use crate::format::messages::datatype::DatatypeMessage;
+use crate::format::messages::data_layout::LayoutClass;
+use crate::format::messages::datatype::{CompoundFieldView, DatatypeMessage};
 use crate::hl::value::H5Value;
 use crate::io::reader::HdfReader;
 
-use super::{usize_from_u64, Dataset};
+use super::{usize_from_u64, Dataset, DatasetAccess};
 
 impl Dataset {
     /// Read fixed-length strings from the dataset.
     /// Each element is `element_size` bytes, null-padded or space-padded.
     pub fn read_strings(&self) -> Result<Vec<String>> {
+        let mut strings = Vec::new();
+        self.read_strings_into(&mut strings)?;
+        Ok(strings)
+    }
+
+    /// Read strings from the dataset into caller-provided storage.
+    pub fn read_strings_into(&self, out: &mut Vec<String>) -> Result<()> {
+        let mut index = 0usize;
+        self.visit_strings(|value| {
+            if index < out.len() {
+                out[index].clear();
+                out[index].push_str(value);
+            } else {
+                out.push(value.to_string());
+            }
+            index += 1;
+            Ok(())
+        })?;
+        out.truncate(index);
+        Ok(())
+    }
+
+    /// Visit strings from the dataset without collecting them into a `Vec`.
+    pub fn visit_strings<F>(&self, mut f: F) -> Result<()>
+    where
+        F: FnMut(&str) -> Result<()>,
+    {
         let info = self.info()?;
+        if info.datatype.is_variable_length() {
+            return self.visit_vlen_strings_batched(info, f);
+        }
+
         let elem_size = usize_from_u64(u64::from(info.datatype.size), "datatype size")?;
-        let raw = self.read_raw()?;
+        let padding = info.datatype.string_padding().unwrap_or(1);
+        let raw_len = raw_dataset_byte_len(&info)?;
+        if let Some(raw) = compact_dataset_data(&info, raw_len)? {
+            return visit_fixed_string_chunks(raw, elem_size, padding, &mut f);
+        }
+
+        let mut raw = vec![0u8; raw_len];
+        self.read_raw_into_with_info(&info, &DatasetAccess::new(), &mut raw)?;
+
+        visit_fixed_string_chunks(&raw, elem_size, padding, &mut f)
+    }
+
+    fn visit_vlen_strings_batched<F>(
+        &self,
+        info: crate::hl::dataset::DatasetInfo,
+        mut f: F,
+    ) -> Result<()>
+    where
+        F: FnMut(&str) -> Result<()>,
+    {
+        let sizeof_addr = {
+            let guard = self.inner.lock();
+            usize::from(guard.superblock.sizeof_addr)
+        };
+        let ref_size = vlen_descriptor_size(sizeof_addr)?;
+        let mut raw = vec![0u8; raw_dataset_byte_len(&info)?];
+        self.read_raw_into_with_info(&info, &DatasetAccess::new(), &mut raw)?;
+
+        validate_record_aligned(raw.len(), ref_size, "variable-length string descriptors")?;
+
+        let mut guard = self.inner.lock();
+        let mut heap_cache = crate::format::global_heap::GlobalHeapObjectCache::new();
+
+        for chunk in raw.chunks_exact(ref_size) {
+            let (seq_len, addr, index) = decode_vlen_descriptor(chunk, sizeof_addr)?;
+
+            if seq_len == 0 && (addr == 0 || crate::io::reader::is_undef_addr(addr)) {
+                f("")?;
+                continue;
+            }
+
+            let gh_ref = crate::format::global_heap::GlobalHeapRef {
+                collection_addr: addr,
+                object_index: index,
+            };
+            heap_cache.visit_object(&mut guard.reader, &gh_ref, |data| {
+                if data.len() < seq_len {
+                    return Err(Error::InvalidFormat(format!(
+                        "variable-length string payload too short: expected {seq_len} bytes, got {}",
+                        data.len()
+                    )));
+                }
+                let data = &data[..seq_len];
+                trace_vlen_read(seq_len, data);
+                f(decode_utf8_string_slice(
+                    data,
+                    "variable-length string payload",
+                )?)
+            })?;
+        }
+
+        Ok(())
+    }
+
+    fn visit_strings_until<F>(&self, mut f: F) -> Result<()>
+    where
+        F: FnMut(&str) -> Result<bool>,
+    {
+        let info = self.info()?;
 
         if info.datatype.is_variable_length() {
             // Variable-length data: each element is stored as:
             // sequence_length(4) + global_heap_collection_addr(sizeof_addr) + heap_object_index(4)
-            let mut guard = self.inner.lock();
-            let sizeof_addr = usize::from(guard.superblock.sizeof_addr);
+            let sizeof_addr = {
+                let guard = self.inner.lock();
+                usize::from(guard.superblock.sizeof_addr)
+            };
             let ref_size = vlen_descriptor_size(sizeof_addr)?;
+            let mut raw = vec![0u8; raw_dataset_byte_len(&info)?];
+            self.read_raw_into_with_info(&info, &DatasetAccess::new(), &mut raw)?;
             validate_record_aligned(raw.len(), ref_size, "variable-length string descriptors")?;
-            let mut strings = Vec::new();
+            let mut guard = self.inner.lock();
+            let mut heap_cache = crate::format::global_heap::GlobalHeapObjectCache::new();
 
             for chunk in raw.chunks_exact(ref_size) {
                 let (seq_len, addr, index) = decode_vlen_descriptor(chunk, sizeof_addr)?;
 
                 if seq_len == 0 && (addr == 0 || crate::io::reader::is_undef_addr(addr)) {
-                    strings.push(String::new());
+                    if !f("")? {
+                        return Ok(());
+                    }
                 } else {
                     if addr == 0 || crate::io::reader::is_undef_addr(addr) {
                         return Err(Error::InvalidFormat(
@@ -40,100 +147,256 @@ impl Dataset {
                         collection_addr: addr,
                         object_index: index,
                     };
-                    let data = crate::format::global_heap::read_global_heap_object(
-                        &mut guard.reader,
-                        &gh_ref,
-                    )?;
-                    if data.len() < seq_len {
-                        return Err(Error::InvalidFormat(format!(
-                            "variable-length string payload too short: expected {seq_len} bytes, got {}",
-                            data.len()
-                        )));
+                    let keep_going = heap_cache.visit_object(&mut guard.reader, &gh_ref, |data| {
+                        if data.len() < seq_len {
+                            return Err(Error::InvalidFormat(format!(
+                                "variable-length string payload too short: expected {seq_len} bytes, got {}",
+                                data.len()
+                            )));
+                        }
+                        let data = &data[..seq_len];
+                        trace_vlen_read(seq_len, data);
+                        f(decode_utf8_string_slice(
+                            data,
+                            "variable-length string payload",
+                        )?)
+                    })?;
+                    if !keep_going {
+                        return Ok(());
                     }
-                    let data = &data[..seq_len];
-                    trace_vlen_read(seq_len, data);
-                    strings.push(decode_utf8_string(data, "variable-length string payload")?);
                 }
             }
-            return Ok(strings);
+            return Ok(());
         }
 
         // Fixed-length strings
-        validate_record_aligned(raw.len(), elem_size, "fixed-length string data")?;
+        let elem_size = usize_from_u64(u64::from(info.datatype.size), "datatype size")?;
         let padding = info.datatype.string_padding().unwrap_or(1);
-        let mut strings = Vec::new();
-        for chunk in raw.chunks_exact(elem_size) {
-            strings.push(decode_fixed_string_with_padding(chunk, padding)?);
+        let raw_len = raw_dataset_byte_len(&info)?;
+        if let Some(raw) = compact_dataset_data(&info, raw_len)? {
+            return visit_fixed_string_chunks_until(raw, elem_size, padding, &mut f);
         }
-        Ok(strings)
+
+        let mut raw = vec![0u8; raw_len];
+        self.read_raw_into_with_info(&info, &DatasetAccess::new(), &mut raw)?;
+        visit_fixed_string_chunks_until(&raw, elem_size, padding, &mut f)
     }
 
     /// Read a single string (for scalar string datasets/attributes).
     pub fn read_string(&self) -> Result<String> {
-        let strings = self.read_strings()?;
-        strings
-            .into_iter()
-            .next()
-            .ok_or_else(|| Error::InvalidFormat("no string data".into()))
+        let mut value = String::new();
+        self.read_string_into(&mut value)?;
+        Ok(value)
+    }
+
+    /// Read a single string into caller-provided storage.
+    pub fn read_string_into(&self, out: &mut String) -> Result<()> {
+        let mut found = false;
+        self.visit_strings_until(|value| {
+            if !found {
+                out.clear();
+                out.push_str(value);
+                found = true;
+            }
+            Ok(false)
+        })?;
+        if found {
+            Ok(())
+        } else {
+            Err(Error::InvalidFormat("no string data".into()))
+        }
     }
 
     /// Read compound type field info. Returns field names, offsets, and sizes.
     pub fn compound_fields(&self) -> Result<Vec<crate::format::messages::datatype::CompoundField>> {
+        let mut fields = Vec::new();
+        self.compound_fields_into(&mut fields)?;
+        Ok(fields)
+    }
+
+    /// Visit compound type fields without collecting all fields.
+    pub fn visit_compound_fields<F>(&self, mut f: F) -> Result<()>
+    where
+        F: FnMut(crate::format::messages::datatype::CompoundFieldView<'_>) -> Result<()>,
+    {
         let info = self.info()?;
-        info.datatype.compound_fields()
+        for field in info.datatype.compound_fields_iter()? {
+            f(field?)?;
+        }
+        Ok(())
+    }
+
+    /// Store compound type field info in caller-provided storage.
+    pub fn compound_fields_into(
+        &self,
+        out: &mut Vec<crate::format::messages::datatype::CompoundField>,
+    ) -> Result<()> {
+        out.clear();
+        let info = self.info()?;
+        let fields = info.datatype.compound_fields_iter()?;
+        out.reserve(fields.len());
+        for field in fields {
+            let field = field?;
+            out.push(crate::format::messages::datatype::CompoundField {
+                name: field.name.into_owned(),
+                byte_offset: field.byte_offset,
+                size: field.size,
+                class: field.class,
+                byte_order: field.byte_order,
+                datatype: Box::new(field.datatype),
+            });
+        }
+        Ok(())
+    }
+
+    fn with_compound_field<R, F>(&self, field_name: &str, f: F) -> Result<R>
+    where
+        F: FnOnce(&crate::hl::dataset::DatasetInfo, CompoundFieldView<'_>) -> Result<R>,
+    {
+        let info = self.info()?;
+        let mut f = Some(f);
+        let mut result = None;
+        for field in info.datatype.compound_fields_iter()? {
+            let field = field?;
+            if field.name == field_name {
+                let f = f
+                    .take()
+                    .expect("compound field callback should only be consumed once");
+                result = Some(f(&info, field));
+                break;
+            }
+        }
+        result.unwrap_or_else(|| {
+            Err(Error::InvalidFormat(format!(
+                "field '{field_name}' not found"
+            )))
+        })
     }
 
     /// Read a single field from a compound dataset as typed values.
     /// Example: `ds.read_field::<f64>("x")` reads the "x" field from all records.
     pub fn read_field<T: crate::hl::types::H5Type>(&self, field_name: &str) -> Result<Vec<T>> {
-        let fields = self.compound_fields()?;
-        let field = fields
-            .iter()
-            .find(|f| f.name == field_name)
-            .ok_or_else(|| Error::InvalidFormat(format!("field '{field_name}' not found")))?;
+        let mut result = Vec::new();
+        self.visit_field(field_name, |value| {
+            result.push(value);
+            Ok(())
+        })?;
+        Ok(result)
+    }
 
-        if field.size != T::type_size() {
-            return Err(Error::InvalidFormat(format!(
-                "field '{}' has size {} but requested type has size {}",
-                field_name,
-                field.size,
-                T::type_size()
-            )));
-        }
+    /// Visit one typed value for each record of a compound field.
+    pub fn visit_field<T, F>(&self, field_name: &str, mut f: F) -> Result<()>
+    where
+        T: crate::hl::types::H5Type,
+        F: FnMut(T) -> Result<()>,
+    {
+        self.with_compound_field(field_name, |info, field| {
+            if field.size != T::type_size() {
+                return Err(Error::InvalidFormat(format!(
+                    "field '{}' has size {} but requested type has size {}",
+                    field_name,
+                    field.size,
+                    T::type_size()
+                )));
+            }
 
-        let mut raw = self.read_raw()?;
-        self.maybe_byte_swap_field(&mut raw, field)?;
+            let record_size = usize_from_u64(u64::from(info.datatype.size), "datatype size")?;
+            let n_records = Self::value_read_dataset_element_count(info)?;
+            if record_size == 0 {
+                return Err(Error::InvalidFormat("zero-sized compound record".into()));
+            }
 
-        let info = self.info()?;
-        let record_size = usize_from_u64(u64::from(info.datatype.size), "datatype size")?;
-        let offset = field.byte_offset;
-        let elem_size = field.size;
-        let n_records = raw.len() / record_size;
-
-        let mut result = Vec::with_capacity(n_records);
-        for i in 0..n_records {
-            let start = i
-                .checked_mul(record_size)
-                .and_then(|value| value.checked_add(offset))
-                .ok_or_else(|| Error::InvalidFormat("compound field offset overflow".into()))?;
-            let end = start
-                .checked_add(elem_size)
-                .ok_or_else(|| Error::InvalidFormat("compound field offset overflow".into()))?;
-            if end > raw.len() {
+            let field_end = compound_field_end(field.byte_offset, field.size)?;
+            if field_end > record_size {
                 return Err(Error::InvalidFormat(format!(
                     "compound field '{field_name}' exceeds record bounds"
                 )));
             }
-            let bytes = &raw[start..end];
-            // Copy to aligned buffer
-            let val = unsafe {
-                let mut v = std::mem::MaybeUninit::<T>::uninit();
-                std::ptr::copy_nonoverlapping(bytes.as_ptr(), v.as_mut_ptr() as *mut u8, elem_size);
-                v.assume_init()
+
+            let total_bytes = n_records
+                .checked_mul(record_size)
+                .ok_or_else(|| Error::InvalidFormat("compound dataset size overflow".into()))?;
+            let mut raw = vec![0u8; total_bytes];
+            self.read_raw_into_with_info(info, &DatasetAccess::new(), &mut raw)?;
+            maybe_byte_swap_field_view(&mut raw, record_size, &field)?;
+
+            let elem_size = field.size;
+            for record in raw.chunks_exact(record_size) {
+                let bytes = &record[field.byte_offset..field_end];
+                // Copy to aligned buffer
+                let val = unsafe {
+                    let mut v = std::mem::MaybeUninit::<T>::uninit();
+                    std::ptr::copy_nonoverlapping(
+                        bytes.as_ptr(),
+                        v.as_mut_ptr() as *mut u8,
+                        elem_size,
+                    );
+                    v.assume_init()
+                };
+                f(val)?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Read a single field from a compound dataset into caller-provided storage.
+    pub fn read_field_into<T: crate::hl::types::H5Type>(
+        &self,
+        field_name: &str,
+        out: &mut [T],
+    ) -> Result<()> {
+        let mut index = 0usize;
+        let out_len = out.len();
+        self.visit_field(field_name, |value| {
+            let Some(dst) = out.get_mut(index) else {
+                return Err(Error::InvalidFormat(format!(
+                    "field output buffer has too few elements: expected more than {}",
+                    out_len
+                )));
             };
-            result.push(val);
+            *dst = value;
+            index += 1;
+            Ok(())
+        })?;
+        if index != out_len {
+            Err(Error::InvalidFormat(format!(
+                "field output buffer has {out_len} elements, expected {index}"
+            )))
+        } else {
+            Ok(())
         }
-        Ok(result)
+    }
+
+    /// Visit raw bytes for a compound field without collecting per-record buffers.
+    pub fn visit_field_raw<F>(&self, field_name: &str, mut f: F) -> Result<()>
+    where
+        F: FnMut(&[u8]) -> Result<()>,
+    {
+        self.with_compound_field(field_name, |info, field| {
+            let record_size = usize_from_u64(u64::from(info.datatype.size), "datatype size")?;
+            let n_records = Self::value_read_dataset_element_count(info)?;
+            if record_size == 0 {
+                return Err(Error::InvalidFormat("zero-sized compound record".into()));
+            }
+
+            let field_end = compound_field_end(field.byte_offset, field.size)?;
+            if field_end > record_size {
+                return Err(Error::InvalidFormat(format!(
+                    "compound field '{field_name}' exceeds record bounds"
+                )));
+            }
+
+            let total_bytes = n_records
+                .checked_mul(record_size)
+                .ok_or_else(|| Error::InvalidFormat("compound dataset size overflow".into()))?;
+            let mut raw = vec![0u8; total_bytes];
+            self.read_raw_into_with_info(info, &DatasetAccess::new(), &mut raw)?;
+
+            for record in raw.chunks_exact(record_size) {
+                f(&record[field.byte_offset..field_end])?;
+            }
+            Ok(())
+        })
     }
 
     /// Read a single compound field as raw per-record byte slices.
@@ -144,37 +407,42 @@ impl Dataset {
     /// conversion is performed; callers must interpret each returned byte
     /// vector using the field datatype from [`Dataset::compound_fields`].
     pub fn read_field_raw(&self, field_name: &str) -> Result<Vec<Vec<u8>>> {
-        let fields = self.compound_fields()?;
-        let field = fields
-            .iter()
-            .find(|f| f.name == field_name)
-            .ok_or_else(|| Error::InvalidFormat(format!("field '{field_name}' not found")))?;
-
-        let raw = self.read_raw()?;
-        let info = self.info()?;
-        let record_size = usize_from_u64(u64::from(info.datatype.size), "datatype size")?;
-        let offset = field.byte_offset;
-        let elem_size = field.size;
-        let n_records = raw.len() / record_size;
-
-        let mut result = Vec::with_capacity(n_records);
-        for i in 0..n_records {
-            let start = i
-                .checked_mul(record_size)
-                .and_then(|value| value.checked_add(offset))
-                .ok_or_else(|| Error::InvalidFormat("compound field offset overflow".into()))?;
-            let end = start
-                .checked_add(elem_size)
-                .ok_or_else(|| Error::InvalidFormat("compound field offset overflow".into()))?;
-            if end > raw.len() {
-                return Err(Error::InvalidFormat(format!(
-                    "compound field '{field_name}' exceeds record bounds"
-                )));
-            }
-            result.push(raw[start..end].to_vec());
-        }
-
+        let mut result = Vec::new();
+        self.visit_field_raw(field_name, |bytes| {
+            result.push(bytes.to_vec());
+            Ok(())
+        })?;
         Ok(result)
+    }
+
+    /// Read a single compound field into a flat caller-provided byte buffer.
+    ///
+    /// `out` must be exactly `record_count * field_size` bytes. Bytes for each
+    /// selected field are packed contiguously in record order.
+    pub fn read_field_raw_into(&self, field_name: &str, out: &mut [u8]) -> Result<()> {
+        let mut offset = 0usize;
+        let out_len = out.len();
+        self.visit_field_raw(field_name, |bytes| {
+            let end = offset.checked_add(bytes.len()).ok_or_else(|| {
+                Error::InvalidFormat("compound field output size overflow".into())
+            })?;
+            let Some(dst) = out.get_mut(offset..end) else {
+                return Err(Error::InvalidFormat(format!(
+                    "raw field output buffer has too few bytes: expected more than {}",
+                    out_len
+                )));
+            };
+            dst.copy_from_slice(bytes);
+            offset = end;
+            Ok(())
+        })?;
+        if offset != out_len {
+            Err(Error::InvalidFormat(format!(
+                "raw field output buffer has {out_len} bytes, expected {offset}"
+            )))
+        } else {
+            Ok(())
+        }
     }
 
     /// Read a compound field as recursively decoded high-level values.
@@ -184,45 +452,62 @@ impl Dataset {
     /// returned as `H5Value::Raw`. This API is intended for inspection and
     /// simple extraction, not full libhdf5 typed conversion parity.
     pub fn read_field_values(&self, field_name: &str) -> Result<Vec<H5Value>> {
-        let fields = self.compound_fields()?;
-        let field = fields
-            .iter()
-            .find(|f| f.name == field_name)
-            .ok_or_else(|| Error::InvalidFormat(format!("field '{field_name}' not found")))?;
-
-        let raw = self.read_raw()?;
-        let info = self.info()?;
-        let record_size = usize_from_u64(u64::from(info.datatype.size), "datatype size")?;
-        let field_end = compound_field_end(field.byte_offset, field.size)?;
-        if record_size == 0 || field_end > record_size {
-            return Err(Error::InvalidFormat(format!(
-                "compound field '{field_name}' exceeds record bounds"
-            )));
-        }
-
-        let mut guard = self.inner.lock();
-        let sizeof_addr = usize::from(guard.superblock.sizeof_addr);
-        let n_records = raw.len() / record_size;
-        let mut result = Vec::with_capacity(n_records);
-
-        for record in raw.chunks_exact(record_size) {
-            let bytes = &record[field.byte_offset..field_end];
-            result.push(Self::decode_value(
-                &field.datatype,
-                bytes,
-                sizeof_addr,
-                &mut guard.reader,
-            )?);
-        }
-
-        Ok(result)
+        let mut values = Vec::new();
+        self.read_field_values_into(field_name, &mut values)?;
+        Ok(values)
     }
 
-    fn decode_value<R: Read + Seek>(
+    /// Read a compound field as recursively decoded high-level values into caller-provided storage.
+    pub fn read_field_values_into(&self, field_name: &str, out: &mut Vec<H5Value>) -> Result<()> {
+        out.clear();
+        self.visit_field_values(field_name, |value| {
+            out.push(value);
+            Ok(())
+        })
+    }
+
+    /// Visit a compound field as recursively decoded high-level values.
+    pub fn visit_field_values<F>(&self, field_name: &str, mut f: F) -> Result<()>
+    where
+        F: FnMut(H5Value) -> Result<()>,
+    {
+        self.with_compound_field(field_name, |info, field| {
+            let record_size = usize_from_u64(u64::from(info.datatype.size), "datatype size")?;
+            let field_end = compound_field_end(field.byte_offset, field.size)?;
+            if record_size == 0 || field_end > record_size {
+                return Err(Error::InvalidFormat(format!(
+                    "compound field '{field_name}' exceeds record bounds"
+                )));
+            }
+
+            let mut raw = vec![0u8; raw_dataset_byte_len(&info)?];
+            self.read_raw_into_with_info(info, &DatasetAccess::new(), &mut raw)?;
+
+            let mut guard = self.inner.lock();
+            let mut cache = crate::format::global_heap::GlobalHeapObjectCache::new();
+            let sizeof_addr = usize::from(guard.superblock.sizeof_addr);
+
+            for record in raw.chunks_exact(record_size) {
+                let bytes = &record[field.byte_offset..field_end];
+                f(Self::decode_value_with_heap_cache(
+                    &field.datatype,
+                    bytes,
+                    sizeof_addr,
+                    &mut guard.reader,
+                    &mut cache,
+                )?)?;
+            }
+
+            Ok(())
+        })
+    }
+
+    fn decode_value_with_heap_cache<R: Read + Seek>(
         dtype: &DatatypeMessage,
         bytes: &[u8],
         sizeof_addr: usize,
         reader: &mut HdfReader<R>,
+        heap_cache: &mut crate::format::global_heap::GlobalHeapObjectCache,
     ) -> Result<H5Value> {
         use crate::format::messages::datatype::{ByteOrder, DatatypeClass};
 
@@ -248,9 +533,10 @@ impl Dataset {
             },
             DatatypeClass::String => Ok(H5Value::String(decode_fixed_string(bytes)?)),
             DatatypeClass::Compound => {
-                let fields = dtype.compound_fields()?;
+                let fields = dtype.compound_fields_iter()?;
                 let mut values = Vec::with_capacity(fields.len());
                 for field in fields {
+                    let field = field?;
                     let end = field.byte_offset.checked_add(field.size).ok_or_else(|| {
                         Error::InvalidFormat("nested compound field offset overflow".into())
                     })?;
@@ -261,23 +547,25 @@ impl Dataset {
                         )));
                     }
                     values.push((
-                        field.name.clone(),
-                        Self::decode_value(
+                        field.name.into_owned(),
+                        Self::decode_value_with_heap_cache(
                             &field.datatype,
                             &bytes[field.byte_offset..end],
                             sizeof_addr,
                             reader,
+                            heap_cache,
                         )?,
                     ));
                 }
                 Ok(H5Value::Compound(values))
             }
             DatatypeClass::Array => {
-                let (dims, base) = dtype.array_dims_base()?;
-                let count = dims.iter().try_fold(1usize, |acc, &dim| {
+                let count = dtype.array_dims_iter()?.try_fold(1usize, |acc, dim| {
+                    let dim = dim?;
                     acc.checked_mul(usize_from_u64(dim, "array dimension")?)
                         .ok_or_else(|| Error::InvalidFormat("array element count overflow".into()))
                 })?;
+                let base = dtype.array_base()?;
                 let elem_size = usize_from_u64(u64::from(base.size), "array base datatype size")?;
                 let byte_len = count.checked_mul(elem_size).ok_or_else(|| {
                     Error::InvalidFormat("array field payload size overflow".into())
@@ -287,13 +575,25 @@ impl Dataset {
                 }
                 let mut values = Vec::with_capacity(count);
                 for chunk in bytes[..byte_len].chunks_exact(elem_size) {
-                    values.push(Self::decode_value(&base, chunk, sizeof_addr, reader)?);
+                    values.push(Self::decode_value_with_heap_cache(
+                        &base,
+                        chunk,
+                        sizeof_addr,
+                        reader,
+                        heap_cache,
+                    )?);
                 }
                 Ok(H5Value::Array(values))
             }
             DatatypeClass::VarLen => {
                 let base = dtype.vlen_base()?;
-                Self::decode_vlen_value(base.as_ref(), bytes, sizeof_addr, reader)
+                Self::decode_vlen_value_with_heap_cache(
+                    base.as_ref(),
+                    bytes,
+                    sizeof_addr,
+                    reader,
+                    heap_cache,
+                )
             }
             DatatypeClass::Reference => {
                 let n = bytes.len().min(sizeof_addr).min(8);
@@ -309,11 +609,23 @@ impl Dataset {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn decode_vlen_value<R: Read + Seek>(
         base: Option<&DatatypeMessage>,
         bytes: &[u8],
         sizeof_addr: usize,
         reader: &mut HdfReader<R>,
+    ) -> Result<H5Value> {
+        let mut heap_cache = crate::format::global_heap::GlobalHeapObjectCache::new();
+        Self::decode_vlen_value_with_heap_cache(base, bytes, sizeof_addr, reader, &mut heap_cache)
+    }
+
+    fn decode_vlen_value_with_heap_cache<R: Read + Seek>(
+        base: Option<&DatatypeMessage>,
+        bytes: &[u8],
+        sizeof_addr: usize,
+        reader: &mut HdfReader<R>,
+        heap_cache: &mut crate::format::global_heap::GlobalHeapObjectCache,
     ) -> Result<H5Value> {
         let (seq_len, addr, index) = decode_vlen_descriptor(bytes, sizeof_addr)?;
 
@@ -321,7 +633,7 @@ impl Dataset {
             return Ok(H5Value::VarLen(Vec::new()));
         }
 
-        let data = crate::format::global_heap::read_global_heap_object(
+        let data = heap_cache.read_object(
             reader,
             &crate::format::global_heap::GlobalHeapRef {
                 collection_addr: addr,
@@ -368,61 +680,137 @@ impl Dataset {
 
         let mut values = Vec::with_capacity(seq_len);
         for chunk in data.chunks_exact(elem_size) {
-            values.push(Self::decode_value(base, chunk, sizeof_addr, reader)?);
+            values.push(Self::decode_value_with_heap_cache(
+                base,
+                chunk,
+                sizeof_addr,
+                reader,
+                heap_cache,
+            )?);
         }
 
         Ok(H5Value::VarLen(values))
     }
 
-    /// Byte-swap a specific compound field in the raw data buffer.
-    fn maybe_byte_swap_field(
-        &self,
-        data: &mut [u8],
-        field: &crate::format::messages::datatype::CompoundField,
-    ) -> Result<()> {
-        use crate::format::messages::datatype::{ByteOrder, DatatypeClass};
-
-        if field.size <= 1 {
-            return Ok(());
-        }
-
-        match field.class {
-            DatatypeClass::FixedPoint | DatatypeClass::FloatingPoint | DatatypeClass::BitField => {}
-            _ => return Ok(()),
-        }
-
-        let need_swap = match field.byte_order {
-            Some(ByteOrder::BigEndian) => cfg!(target_endian = "little"),
-            Some(ByteOrder::LittleEndian) => cfg!(target_endian = "big"),
-            None => false,
-        };
-
-        if !need_swap {
-            return Ok(());
-        }
-
-        let info = self.info()?;
-        let record_size = usize_from_u64(u64::from(info.datatype.size), "datatype size")?;
-        let field_end = compound_field_end(field.byte_offset, field.size)?;
-        if record_size == 0 || field_end > record_size {
-            return Err(Error::InvalidFormat(format!(
-                "compound field '{}' exceeds record bounds",
-                field.name
-            )));
-        }
-
-        for record in data.chunks_exact_mut(record_size) {
-            record[field.byte_offset..field_end].reverse();
-        }
-
-        Ok(())
+    fn value_read_dataset_element_count(info: &crate::hl::dataset::DatasetInfo) -> Result<usize> {
+        dataset_element_count(info)
     }
+}
+
+/// Byte-swap a specific compound field in the raw data buffer.
+fn maybe_byte_swap_field_view(
+    data: &mut [u8],
+    record_size: usize,
+    field: &CompoundFieldView<'_>,
+) -> Result<()> {
+    use crate::format::messages::datatype::{ByteOrder, DatatypeClass};
+
+    if field.size <= 1 {
+        return Ok(());
+    }
+
+    match field.class {
+        DatatypeClass::FixedPoint | DatatypeClass::FloatingPoint | DatatypeClass::BitField => {}
+        _ => return Ok(()),
+    }
+
+    let need_swap = match field.byte_order {
+        Some(ByteOrder::BigEndian) => cfg!(target_endian = "little"),
+        Some(ByteOrder::LittleEndian) => cfg!(target_endian = "big"),
+        None => false,
+    };
+
+    if !need_swap {
+        return Ok(());
+    }
+
+    let field_end = compound_field_end(field.byte_offset, field.size)?;
+    if record_size == 0 || field_end > record_size {
+        return Err(Error::InvalidFormat(format!(
+            "compound field '{}' exceeds record bounds",
+            field.name
+        )));
+    }
+
+    for record in data.chunks_exact_mut(record_size) {
+        record[field.byte_offset..field_end].reverse();
+    }
+
+    Ok(())
 }
 
 fn compound_field_end(offset: usize, size: usize) -> Result<usize> {
     offset
         .checked_add(size)
         .ok_or_else(|| Error::InvalidFormat("compound field offset overflow".into()))
+}
+
+fn dataset_element_count(info: &crate::hl::dataset::DatasetInfo) -> Result<usize> {
+    usize_from_u64(
+        Dataset::dataspace_element_count(info.dataspace.space_type, &info.dataspace.dims)?,
+        "dimension product",
+    )
+}
+
+fn raw_dataset_byte_len(info: &crate::hl::dataset::DatasetInfo) -> Result<usize> {
+    let element_size = usize_from_u64(u64::from(info.datatype.size), "datatype size")?;
+    if element_size == 0 {
+        return Err(Error::InvalidFormat("zero-sized datatype".into()));
+    }
+    dataset_element_count(info)?
+        .checked_mul(element_size)
+        .ok_or_else(|| Error::InvalidFormat("total data size overflow".into()))
+}
+
+fn compact_dataset_data(
+    info: &crate::hl::dataset::DatasetInfo,
+    total_bytes: usize,
+) -> Result<Option<&[u8]>> {
+    if info.layout.layout_class != LayoutClass::Compact {
+        return Ok(None);
+    }
+    let data = info
+        .layout
+        .compact_data
+        .as_deref()
+        .ok_or_else(|| Error::InvalidFormat("compact dataset missing data".into()))?;
+    if data.len() < total_bytes {
+        return Err(Error::InvalidFormat(format!(
+            "compact dataset data size {} is smaller than expected {total_bytes}",
+            data.len()
+        )));
+    }
+    Ok(Some(&data[..total_bytes]))
+}
+
+fn visit_fixed_string_chunks<F>(raw: &[u8], elem_size: usize, padding: u8, f: &mut F) -> Result<()>
+where
+    F: FnMut(&str) -> Result<()>,
+{
+    validate_record_aligned(raw.len(), elem_size, "fixed-length string data")?;
+    for chunk in raw.chunks_exact(elem_size) {
+        f(decode_fixed_string_slice_with_padding(chunk, padding)?)?;
+    }
+    Ok(())
+}
+
+fn visit_fixed_string_chunks_until<F>(
+    raw: &[u8],
+    elem_size: usize,
+    padding: u8,
+    f: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&str) -> Result<bool>,
+{
+    validate_record_aligned(raw.len(), elem_size, "fixed-length string data")?;
+    for chunk in raw.chunks_exact(elem_size) {
+        let value = decode_fixed_string_slice_with_padding(chunk, padding)?;
+        if !f(value)? {
+            break;
+        }
+    }
+    Ok(())
 }
 
 fn vlen_descriptor_size(sizeof_addr: usize) -> Result<usize> {
@@ -636,20 +1024,23 @@ fn decode_fixed_string(bytes: &[u8]) -> Result<String> {
 }
 
 fn decode_fixed_string_with_padding(bytes: &[u8], padding: u8) -> Result<String> {
+    Ok(decode_fixed_string_slice_with_padding(bytes, padding)?.to_string())
+}
+
+fn decode_fixed_string_slice_with_padding(bytes: &[u8], padding: u8) -> Result<&str> {
     let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
     let bytes = &bytes[..end];
     let s = std::str::from_utf8(bytes)
         .map_err(|_| Error::InvalidFormat("fixed-length string payload is not UTF-8".into()))?;
-    Ok(if padding == 2 {
-        s.trim_end().to_string()
-    } else {
-        s.to_string()
-    })
+    Ok(if padding == 2 { s.trim_end() } else { s })
 }
 
 fn decode_utf8_string(bytes: &[u8], context: &str) -> Result<String> {
+    Ok(decode_utf8_string_slice(bytes, context)?.to_string())
+}
+
+fn decode_utf8_string_slice<'a>(bytes: &'a [u8], context: &str) -> Result<&'a str> {
     Ok(std::str::from_utf8(bytes)
         .map_err(|_| Error::InvalidFormat(format!("{context} is not UTF-8")))?
-        .trim_end_matches('\0')
-        .to_string())
+        .trim_end_matches('\0'))
 }

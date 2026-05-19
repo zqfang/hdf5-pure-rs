@@ -1,7 +1,10 @@
 //! Fractal heap huge-object access — mirrors libhdf5's `H5HFhuge.c` plus
 //! `H5HFbtree2.c` (the v2 B-tree record decode for huge objects).
 
-use std::io::{Read, Seek};
+use std::{
+    cmp::Ordering,
+    io::{Read, Seek},
+};
 
 use crate::error::{Error, Result};
 use crate::io::reader::HdfReader;
@@ -43,6 +46,7 @@ pub(super) struct HugeRecord {
     pub(super) len: u64,
     pub(super) filtered: bool,
     pub(super) obj_size: Option<u64>,
+    pub(super) filter_mask: u32,
     pub(super) id: Option<u64>,
 }
 
@@ -52,6 +56,17 @@ impl FractalHeapHeader {
         reader: &mut HdfReader<R>,
         heap_id: &[u8],
     ) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        self.read_huge_into(reader, heap_id, &mut out)?;
+        Ok(out)
+    }
+
+    pub(super) fn read_huge_into<R: Read + Seek>(
+        &self,
+        reader: &mut HdfReader<R>,
+        heap_id: &[u8],
+        out: &mut Vec<u8>,
+    ) -> Result<()> {
         let addr_size = usize::from(self.sizeof_addr);
         let len_size = usize::from(self.sizeof_size);
 
@@ -76,9 +91,11 @@ impl FractalHeapHeader {
                 ));
             }
             reader.seek(addr)?;
-            let data = reader.read_bytes(heap_object_len(len, "huge heap object length")?)?;
+            out.clear();
+            out.resize(heap_object_len(len, "huge heap object length")?, 0);
+            reader.read_bytes_into(out)?;
             self.trace_huge_object(heap_id, addr, len, len, 0, false);
-            return Ok(data);
+            return Ok(());
         }
 
         let filtered_id_len = checked_huge_len(
@@ -120,12 +137,20 @@ impl FractalHeapHeader {
                 Error::InvalidFormat("filtered huge object missing filter pipeline".into())
             })?;
             reader.seek(addr)?;
-            let filtered =
-                reader.read_bytes(heap_object_len(len, "filtered huge heap object length")?)?;
-            let mut data = crate::filters::apply_pipeline_reverse(&filtered, pipeline, 1)?;
-            data.truncate(heap_object_len(obj_size, "filtered huge heap object size")?);
+            out.clear();
+            out.resize(heap_object_len(len, "filtered huge heap object length")?, 0);
+            reader.read_bytes_into(out)?;
+            let filtered = std::mem::take(out);
+            crate::filters::apply_pipeline_reverse_with_mask_expected_into(
+                &filtered,
+                pipeline,
+                1,
+                filter_mask,
+                heap_object_len(obj_size, "filtered huge heap object size")?,
+                out,
+            )?;
             self.trace_huge_object(heap_id, addr, len, obj_size, filter_mask, true);
-            return Ok(data);
+            return Ok(());
         }
 
         if crate::io::reader::is_undef_addr(self.huge_btree_addr) {
@@ -135,36 +160,51 @@ impl FractalHeapHeader {
         }
 
         let id = read_le_uint(&heap_id[1..]);
-        let records = crate::format::btree_v2::collect_all_records(reader, self.huge_btree_addr)?;
-        for record in records {
-            let huge = self.decode_huge_record(&record)?;
-            if huge.id == Some(id) {
-                reader.seek(huge.addr)?;
-                let mut data =
-                    reader.read_bytes(heap_object_len(huge.len, "huge heap object length")?)?;
-                if huge.filtered {
-                    let pipeline = self.filter_pipeline.as_ref().ok_or_else(|| {
-                        Error::InvalidFormat("filtered huge object missing filter pipeline".into())
-                    })?;
-                    data = crate::filters::apply_pipeline_reverse(&data, pipeline, 1)?;
-                    let decoded_len = u64::try_from(data.len()).map_err(|_| {
-                        Error::InvalidFormat("filtered huge heap object length overflow".into())
-                    })?;
-                    data.truncate(heap_object_len(
-                        huge.obj_size.unwrap_or(decoded_len),
-                        "filtered huge heap object size",
-                    )?);
+        let mut matching_huge = None;
+        crate::format::btree_v2::visit_matching_records(
+            reader,
+            self.huge_btree_addr,
+            |record| compare_huge_indirect_record_id(record, id, addr_size, len_size),
+            |record| {
+                let huge = self.decode_huge_record(record)?;
+                if huge.id == Some(id) {
+                    matching_huge = Some(huge);
                 }
-                self.trace_huge_object(
-                    heap_id,
-                    huge.addr,
-                    huge.len,
-                    huge.obj_size.unwrap_or(huge.len),
-                    0,
-                    huge.filtered,
-                );
-                return Ok(data);
+                Ok(())
+            },
+        )?;
+
+        if let Some(huge) = matching_huge {
+            reader.seek(huge.addr)?;
+            out.clear();
+            out.resize(heap_object_len(huge.len, "huge heap object length")?, 0);
+            reader.read_bytes_into(out)?;
+            if huge.filtered {
+                let pipeline = self.filter_pipeline.as_ref().ok_or_else(|| {
+                    Error::InvalidFormat("filtered huge object missing filter pipeline".into())
+                })?;
+                let expected_len = huge.obj_size.ok_or_else(|| {
+                    Error::InvalidFormat("filtered huge record missing object size".into())
+                })?;
+                let filtered = std::mem::take(out);
+                crate::filters::apply_pipeline_reverse_with_mask_expected_into(
+                    &filtered,
+                    pipeline,
+                    1,
+                    huge.filter_mask,
+                    heap_object_len(expected_len, "filtered huge heap object size")?,
+                    out,
+                )?;
             }
+            self.trace_huge_object(
+                heap_id,
+                huge.addr,
+                huge.len,
+                huge.obj_size.unwrap_or(huge.len),
+                huge.filter_mask,
+                huge.filtered,
+            );
+            return Ok(());
         }
 
         Err(Error::InvalidFormat(format!(
@@ -196,6 +236,7 @@ impl FractalHeapHeader {
                 len,
                 filtered: false,
                 obj_size: None,
+                filter_mask: 0,
                 id: None,
             });
         }
@@ -226,6 +267,7 @@ impl FractalHeapHeader {
                 len,
                 filtered: false,
                 obj_size: None,
+                filter_mask: 0,
                 id: Some(id),
             });
         }
@@ -244,8 +286,12 @@ impl FractalHeapHeader {
                 ss,
                 "filtered direct huge record length",
             )?);
-            let _filter_mask =
-                take_huge_field(record, &mut p, 4, "filtered direct huge record filter mask")?;
+            let filter_mask = read_u32_le(take_huge_field(
+                record,
+                &mut p,
+                4,
+                "filtered direct huge record filter mask",
+            )?)?;
             let obj_size = read_le_uint(take_huge_field(
                 record,
                 &mut p,
@@ -257,6 +303,7 @@ impl FractalHeapHeader {
                 len,
                 filtered: true,
                 obj_size: Some(obj_size),
+                filter_mask,
                 id: None,
             });
         }
@@ -276,12 +323,12 @@ impl FractalHeapHeader {
                 ss,
                 "filtered indirect huge record length",
             )?);
-            let _filter_mask = take_huge_field(
+            let filter_mask = read_u32_le(take_huge_field(
                 record,
                 &mut p,
                 4,
                 "filtered indirect huge record filter mask",
-            )?;
+            )?)?;
             let obj_size = read_le_uint(take_huge_field(
                 record,
                 &mut p,
@@ -299,6 +346,7 @@ impl FractalHeapHeader {
                 len,
                 filtered: true,
                 obj_size: Some(obj_size),
+                filter_mask,
                 id: Some(id),
             });
         }
@@ -320,9 +368,49 @@ fn read_u32_le(bytes: &[u8]) -> Result<u32> {
     Ok(u32::from_le_bytes(bytes))
 }
 
+fn compare_huge_indirect_record_id(
+    record: &[u8],
+    target_id: u64,
+    addr_size: usize,
+    len_size: usize,
+) -> Ordering {
+    let Some(record_id) = huge_indirect_record_id(record, addr_size, len_size) else {
+        return Ordering::Equal;
+    };
+    record_id.cmp(&target_id)
+}
+
+fn huge_indirect_record_id(record: &[u8], addr_size: usize, len_size: usize) -> Option<u64> {
+    let unfiltered_id_start = addr_size.checked_add(len_size)?;
+    let unfiltered_len = unfiltered_id_start.checked_add(len_size)?;
+    if record.len() == unfiltered_len {
+        return record
+            .get(unfiltered_id_start..unfiltered_len)
+            .map(read_le_uint);
+    }
+
+    let filtered_id_start = addr_size
+        .checked_add(len_size)?
+        .checked_add(4)?
+        .checked_add(len_size)?;
+    let filtered_len = filtered_id_start.checked_add(len_size)?;
+    if record.len() == filtered_len {
+        return record
+            .get(filtered_id_start..filtered_len)
+            .map(read_le_uint);
+    }
+
+    None
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{checked_huge_len, read_u32_le, take_huge_field};
+    use std::cmp::Ordering;
+
+    use super::{
+        checked_huge_len, compare_huge_indirect_record_id, huge_indirect_record_id, read_u32_le,
+        take_huge_field,
+    };
 
     #[test]
     fn huge_record_length_rejects_overflow() {
@@ -342,5 +430,19 @@ mod tests {
     fn huge_u32_reader_rejects_truncated_field() {
         let err = read_u32_le(&[0; 3]).unwrap_err();
         assert!(err.to_string().contains("u32 field is truncated"));
+    }
+
+    #[test]
+    fn huge_indirect_record_id_borrows_id_field() {
+        let mut record = Vec::new();
+        record.extend_from_slice(&0x10u64.to_le_bytes());
+        record.extend_from_slice(&5u64.to_le_bytes());
+        record.extend_from_slice(&42u64.to_le_bytes());
+
+        assert_eq!(huge_indirect_record_id(&record, 8, 8), Some(42));
+        assert_eq!(
+            compare_huge_indirect_record_id(&record, 40, 8, 8),
+            Ordering::Greater
+        );
     }
 }

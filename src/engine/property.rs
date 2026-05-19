@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 
 use crate::error::{Error, Result};
@@ -199,6 +200,7 @@ pub fn H5P__register(
 }
 
 /// Register a property on a property class (v1 deprecated API).
+#[deprecated(note = "use H5P__register")]
 #[allow(non_snake_case)]
 pub fn H5Pregister1(
     class: &mut PropertyClass,
@@ -222,6 +224,7 @@ pub fn H5P_insert(
 }
 
 /// Insert a property into a property list (v1 deprecated API).
+#[deprecated(note = "use H5P_insert")]
 #[allow(non_snake_case)]
 pub fn H5Pinsert1(
     list: &mut PropertyList,
@@ -308,8 +311,15 @@ pub fn H5P__do_prop_cb1(prop: &Property) -> (&str, &[u8]) {
 
 /// Read a property value out of a property list as bytes.
 #[allow(non_snake_case)]
+pub fn H5P__do_prop_ref<'a>(list: &'a PropertyList, name: &str) -> Result<&'a [u8]> {
+    Ok(H5P__find_prop_plist(list, name)?.value.as_slice())
+}
+
+/// Read a property value out of a property list as owned bytes.
+#[deprecated(note = "use H5P__do_prop_ref to borrow the property value without cloning")]
+#[allow(non_snake_case)]
 pub fn H5P__do_prop(list: &PropertyList, name: &str) -> Result<Vec<u8>> {
-    Ok(H5P__find_prop_plist(list, name)?.value.clone())
+    Ok(H5P__do_prop_ref(list, name)?.to_vec())
 }
 
 /// Callback that overwrites a property value on a property list.
@@ -321,7 +331,7 @@ pub fn H5P__poke_plist_cb(list: &mut PropertyList, name: &str, value: Vec<u8>) -
 /// Callback that overwrites a property value on a property class.
 #[allow(non_snake_case)]
 pub fn H5P__poke_pclass_cb(class: &mut PropertyClass, name: &str, value: Vec<u8>) -> Result<()> {
-    H5P__register(class, name.to_string(), value)
+    H5P__register(class, name, value)
 }
 
 /// Forcibly write a property value into a property list.
@@ -344,8 +354,15 @@ pub fn H5P_set(list: &mut PropertyList, name: &str, value: Vec<u8>) -> Result<()
 
 /// Read the value of a registered property on a property class.
 #[allow(non_snake_case)]
+pub fn H5P__class_get_ref<'a>(class: &'a PropertyClass, name: &str) -> Result<&'a [u8]> {
+    Ok(H5P__find_prop_pclass(class, name)?.value.as_slice())
+}
+
+/// Read the value of a registered property on a property class.
+#[deprecated(note = "use H5P__class_get_ref to borrow the property value without cloning")]
+#[allow(non_snake_case)]
 pub fn H5P__class_get(class: &PropertyClass, name: &str) -> Result<Vec<u8>> {
-    Ok(H5P__find_prop_pclass(class, name)?.value.clone())
+    Ok(H5P__class_get_ref(class, name)?.to_vec())
 }
 
 /// Set the value of a registered property on a property class.
@@ -429,26 +446,65 @@ pub fn H5P_class_isa(class: &PropertyClass, ancestor_name: &str) -> bool {
 
 /// Iteration callback that returns the names of properties on a class.
 #[allow(non_snake_case)]
+pub fn H5P__iter_pclass_names(class: &PropertyClass) -> impl Iterator<Item = &str> {
+    class.properties.keys().map(String::as_str)
+}
+
+/// Iteration callback that returns the names of properties on a class.
+#[deprecated(note = "use H5P__iter_pclass_names or H5P__visit_pclass_names")]
+#[allow(non_snake_case)]
 pub fn H5P__iterate_pclass_cb(class: &PropertyClass) -> Vec<String> {
-    class.properties.keys().cloned().collect()
+    H5P__iter_pclass_names(class).map(str::to_owned).collect()
+}
+
+/// Visit property names on a class without allocating a name list.
+#[allow(non_snake_case)]
+pub fn H5P__visit_pclass_names<F>(class: &PropertyClass, callback: F)
+where
+    F: FnMut(&str),
+{
+    H5P__iter_pclass_names(class).for_each(callback);
+}
+
+/// Append property names on a class into a caller-provided buffer.
+#[allow(non_snake_case)]
+pub fn H5P__iterate_pclass_into(class: &PropertyClass, names: &mut Vec<String>) {
+    H5P__visit_pclass_names(class, |name| names.push(name.to_owned()));
 }
 
 /// Return the names of properties on a property class.
+#[deprecated(
+    note = "use H5P__iter_pclass_names, H5P__visit_pclass_names, or H5P__iterate_pclass_into"
+)]
 #[allow(non_snake_case)]
 pub fn H5P__iterate_pclass(class: &PropertyClass) -> Vec<String> {
-    H5P__iterate_pclass_cb(class)
+    H5P__iter_pclass_names(class).map(str::to_owned).collect()
 }
 
 /// Callback wrapper around [`H5P_peek`].
 #[allow(non_snake_case)]
+pub fn H5P__peek_cb_ref<'a>(list: &'a PropertyList, name: &str) -> Result<&'a [u8]> {
+    H5P_peek_ref(list, name)
+}
+
+/// Callback wrapper around [`H5P_peek`].
+#[deprecated(note = "use H5P__peek_cb_ref to borrow the property value without cloning")]
+#[allow(non_snake_case)]
 pub fn H5P__peek_cb(list: &PropertyList, name: &str) -> Result<Vec<u8>> {
-    H5P_peek(list, name)
+    Ok(H5P__peek_cb_ref(list, name)?.to_vec())
 }
 
 /// Read a property value from a property list without removing it.
 #[allow(non_snake_case)]
+pub fn H5P_peek_ref<'a>(list: &'a PropertyList, name: &str) -> Result<&'a [u8]> {
+    Ok(H5P__find_prop_plist(list, name)?.value.as_slice())
+}
+
+/// Read a property value from a property list without removing it.
+#[deprecated(note = "use H5P_peek_ref to borrow the property value without cloning")]
+#[allow(non_snake_case)]
 pub fn H5P_peek(list: &PropertyList, name: &str) -> Result<Vec<u8>> {
-    Ok(H5P__find_prop_plist(list, name)?.value.clone())
+    Ok(H5P_peek_ref(list, name)?.to_vec())
 }
 
 /// Remove a property from a property list by name.
@@ -471,23 +527,30 @@ pub fn H5P__unregister(class: &mut PropertyClass, name: &str) -> Result<Property
 
 /// Build the slash-delimited class-path string for a property class.
 #[allow(non_snake_case)]
-pub fn H5P__get_class_path(class: &PropertyClass) -> String {
+pub fn H5P__get_class_path_cow(class: &PropertyClass) -> Cow<'_, str> {
     match &class.parent {
-        Some(parent) => format!("{parent}/{}", class.name),
-        None => class.name.clone(),
+        Some(parent) => Cow::Owned(format!("{parent}/{}", class.name)),
+        None => Cow::Borrowed(class.name.as_str()),
     }
+}
+
+/// Build the slash-delimited class-path string for a property class.
+#[deprecated(note = "use H5P__get_class_path_cow to avoid cloning parentless class names")]
+#[allow(non_snake_case)]
+pub fn H5P__get_class_path(class: &PropertyClass) -> String {
+    H5P__get_class_path_cow(class).into_owned()
 }
 
 /// Return true if the path or name of a class matches the given path string.
 #[allow(non_snake_case)]
 pub fn H5P__open_class_path(class: &PropertyClass, path: &str) -> bool {
-    H5P__get_class_path(class) == path || class.name == path
+    H5P__get_class_path_cow(class) == path || class.name == path
 }
 
-/// Test helper that returns [`H5P__get_class_path`].
+/// Test helper that returns [`H5P__get_class_path_cow`].
 #[allow(non_snake_case)]
-pub fn H5P__get_class_path_test(class: &PropertyClass) -> String {
-    H5P__get_class_path(class)
+pub fn H5P__get_class_path_test(class: &PropertyClass) -> Cow<'_, str> {
+    H5P__get_class_path_cow(class)
 }
 
 /// Test helper that returns [`H5P__open_class_path`].
@@ -510,29 +573,38 @@ pub fn H5P_get_plist_id(list: &PropertyList) -> Result<PropertyList> {
 
 /// Return the class name of a property list.
 #[allow(non_snake_case)]
+pub fn H5P_get_class_ref(list: &PropertyList) -> &str {
+    list.class_name.as_str()
+}
+
+/// Return the class name of a property list.
+#[deprecated(note = "use H5P_get_class_ref to borrow the class name without cloning")]
+#[allow(non_snake_case)]
 pub fn H5P_get_class(list: &PropertyList) -> String {
-    list.class_name.clone()
+    H5P_get_class_ref(list).to_owned()
 }
 
 /// Encode an unsigned integer property value as little-endian bytes.
+#[allow(non_snake_case)]
+pub fn H5P__encode_unsigned_into(value: u64, out: &mut Vec<u8>) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+/// Encode an unsigned integer property value as little-endian bytes.
+#[deprecated(note = "use H5P__encode_unsigned_into to reuse caller allocation")]
 #[allow(non_snake_case)]
 pub fn H5P__encode_unsigned(value: u64) -> Vec<u8> {
     value.to_le_bytes().to_vec()
 }
 
-/// Encode a `uint8_t` property value as a one-byte buffer.
+/// Encode a `uint64_t` property value as little-endian bytes.
 #[allow(non_snake_case)]
-pub fn H5P__encode_uint8_t(value: u8) -> Vec<u8> {
-    vec![value]
-}
-
-/// Encode a boolean property value as a one-byte buffer.
-#[allow(non_snake_case)]
-pub fn H5P__encode_bool(value: bool) -> Vec<u8> {
-    vec![u8::from(value)]
+pub fn H5P__encode_uint64_t_into(value: u64, out: &mut Vec<u8>) {
+    out.extend_from_slice(&value.to_le_bytes());
 }
 
 /// Encode a `uint64_t` property value as little-endian bytes.
+#[deprecated(note = "use H5P__encode_uint64_t_into to reuse caller allocation")]
 #[allow(non_snake_case)]
 pub fn H5P__encode_uint64_t(value: u64) -> Vec<u8> {
     value.to_le_bytes().to_vec()
@@ -540,14 +612,32 @@ pub fn H5P__encode_uint64_t(value: u64) -> Vec<u8> {
 
 /// Encode a `size_t` property value, erroring if it does not fit in `u64`.
 #[allow(non_snake_case)]
+pub fn H5P__encode_size_t_into(value: usize, out: &mut Vec<u8>) -> Result<()> {
+    H5P__encode_uint64_t_into(
+        u64::try_from(value)
+            .map_err(|_| Error::InvalidFormat("size_t property exceeds u64".into()))?,
+        out,
+    );
+    Ok(())
+}
+
+/// Encode a `size_t` property value, erroring if it does not fit in `u64`.
+#[deprecated(note = "use H5P__encode_size_t_into to reuse caller allocation")]
+#[allow(non_snake_case)]
 pub fn H5P__encode_size_t(value: usize) -> Result<Vec<u8>> {
-    Ok(u64::try_from(value)
-        .map_err(|_| Error::InvalidFormat("size_t property exceeds u64".into()))?
-        .to_le_bytes()
-        .to_vec())
+    let mut out = Vec::with_capacity(8);
+    H5P__encode_size_t_into(value, &mut out)?;
+    Ok(out)
 }
 
 /// Encode an `hsize_t` property value as little-endian bytes.
+#[allow(non_snake_case)]
+pub fn H5P__encode_hsize_t_into(value: u64, out: &mut Vec<u8>) {
+    H5P__encode_uint64_t_into(value, out);
+}
+
+/// Encode an `hsize_t` property value as little-endian bytes.
+#[deprecated(note = "use H5P__encode_hsize_t_into to reuse caller allocation")]
 #[allow(non_snake_case)]
 pub fn H5P__encode_hsize_t(value: u64) -> Vec<u8> {
     value.to_le_bytes().to_vec()
@@ -555,51 +645,230 @@ pub fn H5P__encode_hsize_t(value: u64) -> Vec<u8> {
 
 /// Encode a `double` property value as little-endian bytes.
 #[allow(non_snake_case)]
+pub fn H5P__encode_double_into(value: f64, out: &mut Vec<u8>) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+/// Encode a `double` property value as little-endian bytes.
+#[deprecated(note = "use H5P__encode_double_into to reuse caller allocation")]
+#[allow(non_snake_case)]
 pub fn H5P__encode_double(value: f64) -> Vec<u8> {
     value.to_le_bytes().to_vec()
 }
 
+/// Encode a `uint8_t` property value into a caller-provided buffer.
+#[allow(non_snake_case)]
+pub fn H5P__encode_uint8_t_into(value: u8, out: &mut Vec<u8>) {
+    out.push(value);
+}
+
+/// Encode a `uint8_t` property value as a one-byte buffer.
+#[deprecated(note = "use H5P__encode_uint8_t_into or stack array encoders")]
+#[allow(non_snake_case)]
+pub fn H5P__encode_uint8_t(value: u8) -> Vec<u8> {
+    vec![value]
+}
+
+/// Encode a boolean property value into a caller-provided buffer.
+#[allow(non_snake_case)]
+pub fn H5P__encode_bool_into(value: bool, out: &mut Vec<u8>) {
+    H5P__encode_uint8_t_into(u8::from(value), out);
+}
+
+/// Encode a boolean property value as a one-byte buffer.
+#[deprecated(note = "use H5P__encode_bool_into or stack array encoders")]
+#[allow(non_snake_case)]
+pub fn H5P__encode_bool(value: bool) -> Vec<u8> {
+    vec![u8::from(value)]
+}
+
+fn encode_uint8_bytes(value: u8) -> [u8; 1] {
+    [value]
+}
+
+fn encode_bool_bytes(value: bool) -> [u8; 1] {
+    [u8::from(value)]
+}
+
+fn encode_uint64_bytes(value: u64) -> [u8; 8] {
+    value.to_le_bytes()
+}
+
+fn encode_double_bytes(value: f64) -> [u8; 8] {
+    value.to_le_bytes()
+}
+
 /// Serialize a sequence of property chunks with length prefixes.
 #[allow(non_snake_case)]
-pub fn H5P__encode(chunks: &[Vec<u8>]) -> Result<Vec<u8>> {
-    let mut len = 0usize;
+pub fn H5P__encode_slices_into<'a, I>(chunks: I, out: &mut Vec<u8>) -> Result<()>
+where
+    I: IntoIterator<Item = &'a [u8]>,
+{
     for chunk in chunks {
-        len = len
-            .checked_add(8)
-            .and_then(|value| value.checked_add(chunk.len()))
+        let additional = 8usize
+            .checked_add(chunk.len())
             .ok_or_else(|| Error::InvalidFormat("property aggregate length overflow".into()))?;
+        out.try_reserve(additional)
+            .map_err(|_| Error::InvalidFormat("property aggregate length overflow".into()))?;
+        encode_property_chunk(chunk, out)?;
     }
-    let mut out = Vec::with_capacity(len);
+    Ok(())
+}
+
+fn encode_property_chunks_unreserved<'a, I>(chunks: I, out: &mut Vec<u8>) -> Result<()>
+where
+    I: IntoIterator<Item = &'a [u8]>,
+{
     for chunk in chunks {
-        out.extend_from_slice(
-            &u64::try_from(chunk.len())
-                .map_err(|_| Error::InvalidFormat("property chunk length exceeds u64".into()))?
-                .to_le_bytes(),
-        );
-        out.extend_from_slice(chunk);
+        encode_property_chunk(chunk, out)?;
     }
+    Ok(())
+}
+
+fn encode_property_chunk(chunk: &[u8], out: &mut Vec<u8>) -> Result<()> {
+    out.extend_from_slice(
+        &u64::try_from(chunk.len())
+            .map_err(|_| Error::InvalidFormat("property chunk length exceeds u64".into()))?
+            .to_le_bytes(),
+    );
+    out.extend_from_slice(chunk);
+    Ok(())
+}
+
+/// Serialize a sequence of property chunks with length prefixes.
+#[allow(non_snake_case)]
+pub fn H5P__encode_into(chunks: &[Vec<u8>], out: &mut Vec<u8>) -> Result<()> {
+    let additional = encoded_slices_len(chunks.iter().map(Vec::as_slice))?;
+    out.try_reserve(additional)
+        .map_err(|_| Error::InvalidFormat("property aggregate length overflow".into()))?;
+    encode_property_chunks_unreserved(chunks.iter().map(Vec::as_slice), out)
+}
+
+/// Serialize a sequence of property chunks with length prefixes.
+#[deprecated(note = "use H5P__encode_into or H5P__encode_slices_into to reuse caller allocation")]
+#[allow(non_snake_case)]
+pub fn H5P__encode(chunks: &[Vec<u8>]) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(encoded_slices_len(chunks.iter().map(Vec::as_slice))?);
+    encode_property_chunks_unreserved(chunks.iter().map(Vec::as_slice), &mut out)?;
     Ok(out)
 }
 
+fn encoded_slices_len<'a, I>(chunks: I) -> Result<usize>
+where
+    I: IntoIterator<Item = &'a [u8]>,
+{
+    chunks.into_iter().try_fold(0usize, |len, chunk| {
+        let chunk_len = u64::try_from(chunk.len())
+            .map_err(|_| Error::InvalidFormat("property chunk length exceeds u64".into()))?;
+        let chunk_len = usize::try_from(chunk_len).map_err(|_| {
+            Error::InvalidFormat("property chunk length does not fit in usize".into())
+        })?;
+        len.checked_add(8)
+            .and_then(|value| value.checked_add(chunk_len))
+            .ok_or_else(|| Error::InvalidFormat("property aggregate length overflow".into()))
+    })
+}
+
+/// Iterator over length-prefixed property chunks.
+pub struct H5PDecodeChunks<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> Iterator for H5PDecodeChunks<'a> {
+    type Item = Result<&'a [u8]>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.offset >= self.bytes.len() {
+            return None;
+        }
+
+        let len_u64 = match checked_window(self.bytes, self.offset, 8)
+            .ok_or_else(|| Error::InvalidFormat("truncated property chunk length".into()))
+            .and_then(H5P__decode_uint64_t)
+        {
+            Ok(len) => len,
+            Err(err) => {
+                self.offset = self.bytes.len();
+                return Some(Err(err));
+            }
+        };
+        if let Err(err) = advance_offset(&mut self.offset, 8, "property aggregate") {
+            self.offset = self.bytes.len();
+            return Some(Err(err));
+        }
+
+        let len = match usize::try_from(len_u64)
+            .map_err(|_| Error::InvalidFormat("property chunk length does not fit in usize".into()))
+        {
+            Ok(len) => len,
+            Err(err) => {
+                self.offset = self.bytes.len();
+                return Some(Err(err));
+            }
+        };
+
+        let chunk = match checked_window(self.bytes, self.offset, len)
+            .ok_or_else(|| Error::InvalidFormat("truncated property chunk payload".into()))
+        {
+            Ok(chunk) => chunk,
+            Err(err) => {
+                self.offset = self.bytes.len();
+                return Some(Err(err));
+            }
+        };
+        if let Err(err) = advance_offset(&mut self.offset, len, "property aggregate") {
+            self.offset = self.bytes.len();
+            return Some(Err(err));
+        }
+        Some(Ok(chunk))
+    }
+}
+
+/// Borrow decoded length-prefixed property chunks from a serialized buffer.
+#[allow(non_snake_case)]
+pub fn H5P__decode_chunks(bytes: &[u8]) -> H5PDecodeChunks<'_> {
+    H5PDecodeChunks { bytes, offset: 0 }
+}
+
+/// Visit decoded length-prefixed property chunks without allocating a chunk list.
+#[allow(non_snake_case)]
+pub fn H5P__decode_with<F>(bytes: &[u8], mut callback: F) -> Result<()>
+where
+    F: FnMut(&[u8]),
+{
+    for chunk in H5P__decode_chunks(bytes) {
+        callback(chunk?);
+    }
+    Ok(())
+}
+
+/// Append decoded length-prefixed property chunks into a caller-provided buffer.
+#[allow(non_snake_case)]
+pub fn H5P__decode_into(bytes: &[u8], chunks: &mut Vec<Vec<u8>>) -> Result<()> {
+    chunks
+        .try_reserve(decoded_chunk_count(bytes)?)
+        .map_err(|_| Error::InvalidFormat("property chunk count overflow".into()))?;
+    H5P__decode_with(bytes, |chunk| chunks.push(chunk.to_vec()))
+}
+
+fn decoded_chunk_count(bytes: &[u8]) -> Result<usize> {
+    let mut count = 0usize;
+    for chunk in H5P__decode_chunks(bytes) {
+        chunk?;
+        count = count
+            .checked_add(1)
+            .ok_or_else(|| Error::InvalidFormat("property chunk count overflow".into()))?;
+    }
+    Ok(count)
+}
+
 /// Deserialize a sequence of length-prefixed property chunks.
+#[deprecated(note = "use H5P__decode_chunks, H5P__decode_with, or H5P__decode_into")]
 #[allow(non_snake_case)]
 pub fn H5P__decode(bytes: &[u8]) -> Result<Vec<Vec<u8>>> {
     let mut chunks = Vec::new();
-    let mut offset = 0usize;
-    while offset < bytes.len() {
-        let len_u64 = H5P__decode_uint64_t(
-            checked_window(bytes, offset, 8)
-                .ok_or_else(|| Error::InvalidFormat("truncated property chunk length".into()))?,
-        )?;
-        advance_offset(&mut offset, 8, "property aggregate")?;
-        let len = usize::try_from(len_u64).map_err(|_| {
-            Error::InvalidFormat("property chunk length does not fit in usize".into())
-        })?;
-        let chunk = checked_window(bytes, offset, len)
-            .ok_or_else(|| Error::InvalidFormat("truncated property chunk payload".into()))?;
-        chunks.push(chunk.to_vec());
-        advance_offset(&mut offset, len, "property aggregate")?;
-    }
+    H5P__decode_into(bytes, &mut chunks)?;
     Ok(chunks)
 }
 
@@ -667,13 +936,36 @@ fn plist_set(list: &mut PropertyList, name: &str, value: Vec<u8>) -> Result<()> 
 }
 
 /// Internal helper to read a property value from a list.
-fn plist_get(list: &PropertyList, name: &str) -> Result<Vec<u8>> {
+fn plist_get_ref<'a>(list: &'a PropertyList, name: &str) -> Result<&'a [u8]> {
     list.ensure_open()?;
     Ok(list
         .properties
         .get(name)
-        .map(|prop| prop.value.clone())
+        .map(|prop| prop.value.as_slice())
         .unwrap_or_default())
+}
+
+/// Borrow a property value from a list, returning an empty slice if absent.
+#[allow(non_snake_case)]
+pub fn H5P__plist_get_ref<'a>(list: &'a PropertyList, name: &str) -> Result<&'a [u8]> {
+    plist_get_ref(list, name)
+}
+
+/// Append a property value from a list into a caller-provided buffer.
+#[allow(non_snake_case)]
+pub fn H5P__plist_get_into(list: &PropertyList, name: &str, out: &mut Vec<u8>) -> Result<()> {
+    out.extend_from_slice(plist_get_ref(list, name)?);
+    Ok(())
+}
+
+macro_rules! owned_property_get_wrapper {
+    ($owned:ident, $borrowed:ident) => {
+        #[deprecated(note = "use the _ref or _into variant to avoid cloning")]
+        #[allow(non_snake_case)]
+        pub fn $owned(list: &PropertyList) -> Result<Vec<u8>> {
+            Ok($borrowed(list)?.to_vec())
+        }
+    };
 }
 
 /// Internal helper to remove a property from a list.
@@ -683,18 +975,10 @@ fn plist_del(list: &mut PropertyList, name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Internal helper that copies a property value buffer.
-fn prop_copy(value: &[u8]) -> Vec<u8> {
-    value.to_vec()
-}
-
 /// Internal helper that compares two property value buffers.
 fn prop_cmp(left: &[u8], right: &[u8]) -> bool {
     left == right
 }
-
-/// Internal helper that consumes (drops) a property value buffer.
-fn prop_close(_value: Vec<u8>) {}
 
 /// Return an [`Error::Unsupported`] for a driver name not implemented by the pure-Rust backend.
 fn unsupported_driver(name: &str) -> Result<()> {
@@ -722,6 +1006,23 @@ fn encode_optional_string(out: &mut Vec<u8>, value: Option<&str>, context: &str)
     Ok(())
 }
 
+fn encoded_optional_string_len(value: Option<&str>, context: &str) -> Result<usize> {
+    let len = match value {
+        Some(value) => {
+            let len = u32::try_from(value.len()).map_err(|_| {
+                Error::InvalidFormat(format!("{context} string length exceeds u32"))
+            })?;
+            usize::try_from(len).map_err(|_| {
+                Error::InvalidFormat(format!("{context} string length does not fit in usize"))
+            })?
+        }
+        None => 0,
+    };
+    5usize
+        .checked_add(len)
+        .ok_or_else(|| Error::InvalidFormat(format!("{context} encoded string length overflow")))
+}
+
 /// Advance a decode cursor by `delta`, surfacing `context` in overflow errors.
 fn advance_offset(offset: &mut usize, delta: usize, context: &str) -> Result<()> {
     *offset = offset
@@ -730,12 +1031,12 @@ fn advance_offset(offset: &mut usize, delta: usize, context: &str) -> Result<()>
     Ok(())
 }
 
-/// Decode an optional UTF-8 string written by [`encode_optional_string`].
-fn decode_optional_string(
-    bytes: &[u8],
+/// Borrow an optional UTF-8 string written by [`encode_optional_string`].
+fn decode_optional_str<'a>(
+    bytes: &'a [u8],
     offset: &mut usize,
     context: &str,
-) -> Result<Option<String>> {
+) -> Result<Option<&'a str>> {
     let present = *bytes
         .get(*offset)
         .ok_or_else(|| Error::InvalidFormat(format!("truncated {context} string presence flag")))?;
@@ -760,11 +1061,9 @@ fn decode_optional_string(
             )))
         }
     } else if present == 1 {
-        Ok(Some(
-            std::str::from_utf8(value)
-                .map_err(|_| Error::InvalidFormat(format!("{context} string is not UTF-8")))?
-                .to_string(),
-        ))
+        Ok(Some(std::str::from_utf8(value).map_err(|_| {
+            Error::InvalidFormat(format!("{context} string is not UTF-8"))
+        })?))
     } else {
         Err(Error::InvalidFormat(format!(
             "{context} string presence flag is invalid"
@@ -774,26 +1073,47 @@ fn decode_optional_string(
 
 /// Encode an HDFS FAPL configuration into a byte buffer.
 #[allow(non_snake_case)]
-pub fn H5P__encode_hdfs_fapl_config(config: &HdfsFaplConfig) -> Result<Vec<u8>> {
-    let mut out = Vec::new();
-    encode_optional_string(&mut out, Some(&config.namenode_name), "HDFS namenode")?;
+pub fn H5P__encode_hdfs_fapl_config_into(config: &HdfsFaplConfig, out: &mut Vec<u8>) -> Result<()> {
+    out.try_reserve(encoded_hdfs_fapl_config_len(config)?)
+        .map_err(|_| Error::InvalidFormat("HDFS FAPL config length overflow".into()))?;
+    encode_optional_string(out, Some(&config.namenode_name), "HDFS namenode")?;
     out.extend_from_slice(&config.namenode_port.to_le_bytes());
-    encode_optional_string(&mut out, Some(&config.user_name), "HDFS user")?;
+    encode_optional_string(out, Some(&config.user_name), "HDFS user")?;
     out.extend_from_slice(&config.buffer_size.to_le_bytes());
+    Ok(())
+}
+
+/// Encode an HDFS FAPL configuration into a byte buffer.
+#[deprecated(note = "use H5P__encode_hdfs_fapl_config_into to reuse caller allocation")]
+#[allow(non_snake_case)]
+pub fn H5P__encode_hdfs_fapl_config(config: &HdfsFaplConfig) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(encoded_hdfs_fapl_config_len(config)?);
+    H5P__encode_hdfs_fapl_config_into(config, &mut out)?;
     Ok(out)
+}
+
+fn encoded_hdfs_fapl_config_len(config: &HdfsFaplConfig) -> Result<usize> {
+    let user_len = encoded_optional_string_len(Some(&config.user_name), "HDFS user")?;
+    encoded_optional_string_len(Some(&config.namenode_name), "HDFS namenode")?
+        .checked_add(2)
+        .and_then(|len| len.checked_add(user_len))
+        .and_then(|len| len.checked_add(4))
+        .ok_or_else(|| Error::InvalidFormat("HDFS FAPL config length overflow".into()))
 }
 
 /// Decode an HDFS FAPL configuration from a byte buffer.
 #[allow(non_snake_case)]
 pub fn H5P__decode_hdfs_fapl_config(bytes: &[u8]) -> Result<HdfsFaplConfig> {
     let mut offset = 0;
-    let namenode_name = decode_optional_string(bytes, &mut offset, "HDFS namenode")?
-        .ok_or_else(|| Error::InvalidFormat("HDFS namenode string is required".into()))?;
+    let namenode_name = decode_optional_str(bytes, &mut offset, "HDFS namenode")?
+        .ok_or_else(|| Error::InvalidFormat("HDFS namenode string is required".into()))?
+        .to_owned();
     let namenode_port = read_u16_le_at(bytes, offset)
         .ok_or_else(|| Error::InvalidFormat("truncated HDFS namenode port".into()))?;
     advance_offset(&mut offset, 2, "HDFS FAPL config")?;
-    let user_name = decode_optional_string(bytes, &mut offset, "HDFS user")?
-        .ok_or_else(|| Error::InvalidFormat("HDFS user string is required".into()))?;
+    let user_name = decode_optional_str(bytes, &mut offset, "HDFS user")?
+        .ok_or_else(|| Error::InvalidFormat("HDFS user string is required".into()))?
+        .to_owned();
     let buffer_size = read_u32_le_at(bytes, offset)
         .ok_or_else(|| Error::InvalidFormat("truncated HDFS buffer size".into()))?;
     advance_offset(&mut offset, 4, "HDFS FAPL config")?;
@@ -812,21 +1132,40 @@ pub fn H5P__decode_hdfs_fapl_config(bytes: &[u8]) -> Result<HdfsFaplConfig> {
 
 /// Encode a ROS3 FAPL configuration into a byte buffer.
 #[allow(non_snake_case)]
+pub fn H5P__encode_ros3_fapl_config_into(config: &Ros3FaplConfig, out: &mut Vec<u8>) -> Result<()> {
+    out.try_reserve(encoded_ros3_fapl_config_len(config)?)
+        .map_err(|_| Error::InvalidFormat("ROS3 FAPL config length overflow".into()))?;
+    encode_optional_string(out, config.endpoint.as_deref(), "ROS3 endpoint")?;
+    encode_optional_string(out, config.region.as_deref(), "ROS3 region")?;
+    encode_optional_string(out, config.token.as_deref(), "ROS3 token")?;
+    Ok(())
+}
+
+/// Encode a ROS3 FAPL configuration into a byte buffer.
+#[deprecated(note = "use H5P__encode_ros3_fapl_config_into to reuse caller allocation")]
+#[allow(non_snake_case)]
 pub fn H5P__encode_ros3_fapl_config(config: &Ros3FaplConfig) -> Result<Vec<u8>> {
-    let mut out = Vec::new();
-    encode_optional_string(&mut out, config.endpoint.as_deref(), "ROS3 endpoint")?;
-    encode_optional_string(&mut out, config.region.as_deref(), "ROS3 region")?;
-    encode_optional_string(&mut out, config.token.as_deref(), "ROS3 token")?;
+    let mut out = Vec::with_capacity(encoded_ros3_fapl_config_len(config)?);
+    H5P__encode_ros3_fapl_config_into(config, &mut out)?;
     Ok(out)
+}
+
+fn encoded_ros3_fapl_config_len(config: &Ros3FaplConfig) -> Result<usize> {
+    let region_len = encoded_optional_string_len(config.region.as_deref(), "ROS3 region")?;
+    let token_len = encoded_optional_string_len(config.token.as_deref(), "ROS3 token")?;
+    encoded_optional_string_len(config.endpoint.as_deref(), "ROS3 endpoint")?
+        .checked_add(region_len)
+        .and_then(|len| len.checked_add(token_len))
+        .ok_or_else(|| Error::InvalidFormat("ROS3 FAPL config length overflow".into()))
 }
 
 /// Decode a ROS3 FAPL configuration from a byte buffer.
 #[allow(non_snake_case)]
 pub fn H5P__decode_ros3_fapl_config(bytes: &[u8]) -> Result<Ros3FaplConfig> {
     let mut offset = 0;
-    let endpoint = decode_optional_string(bytes, &mut offset, "ROS3 endpoint")?;
-    let region = decode_optional_string(bytes, &mut offset, "ROS3 region")?;
-    let token = decode_optional_string(bytes, &mut offset, "ROS3 token")?;
+    let endpoint = decode_optional_str(bytes, &mut offset, "ROS3 endpoint")?.map(str::to_owned);
+    let region = decode_optional_str(bytes, &mut offset, "ROS3 region")?.map(str::to_owned);
+    let token = decode_optional_str(bytes, &mut offset, "ROS3 token")?.map(str::to_owned);
     if offset != bytes.len() {
         return Err(Error::InvalidFormat(
             "trailing bytes in ROS3 FAPL config".into(),
@@ -861,8 +1200,14 @@ fn read_u32_le_at(data: &[u8], pos: usize) -> Option<u32> {
 
 /// Read the file-space strategy property from a file-creation list.
 #[allow(non_snake_case)]
-pub fn H5P__get_file_space(list: &PropertyList) -> Result<Vec<u8>> {
-    plist_get(list, "file_space_strategy")
+pub fn H5P__get_file_space_ref(list: &PropertyList) -> Result<&[u8]> {
+    H5P__plist_get_ref(list, "file_space_strategy")
+}
+
+/// Read the file-space strategy property into a caller-provided buffer.
+#[allow(non_snake_case)]
+pub fn H5P__get_file_space_into(list: &PropertyList, out: &mut Vec<u8>) -> Result<()> {
+    H5P__plist_get_into(list, "file_space_strategy", out)
 }
 
 /// Set the HDFS file-access driver with default configuration.
@@ -875,21 +1220,19 @@ pub fn H5Pset_fapl_hdfs(list: &mut PropertyList) -> Result<()> {
 #[allow(non_snake_case)]
 pub fn H5Pset_fapl_hdfs_config(list: &mut PropertyList, config: HdfsFaplConfig) -> Result<()> {
     plist_set(list, "driver", b"hdfs".to_vec())?;
-    plist_set(
-        list,
-        "fapl_hdfs_config",
-        H5P__encode_hdfs_fapl_config(&config)?,
-    )
+    let mut encoded = Vec::new();
+    H5P__encode_hdfs_fapl_config_into(&config, &mut encoded)?;
+    plist_set(list, "fapl_hdfs_config", encoded)
 }
 
 /// Get the stored HDFS file-access driver configuration, if any.
 #[allow(non_snake_case)]
 pub fn H5Pget_fapl_hdfs_config(list: &PropertyList) -> Result<Option<HdfsFaplConfig>> {
-    let bytes = plist_get(list, "fapl_hdfs_config")?;
+    let bytes = plist_get_ref(list, "fapl_hdfs_config")?;
     if bytes.is_empty() {
         Ok(None)
     } else {
-        H5P__decode_hdfs_fapl_config(&bytes).map(Some)
+        H5P__decode_hdfs_fapl_config(bytes).map(Some)
     }
 }
 
@@ -973,20 +1316,26 @@ pub fn H5P__dapl_vds_file_pref_set(list: &mut PropertyList, value: Vec<u8>) -> R
 
 /// Get the `dapl_vds_file_pref` property from a property list.
 #[allow(non_snake_case)]
-pub fn H5P__dapl_vds_file_pref_get(list: &PropertyList) -> Result<Vec<u8>> {
-    plist_get(list, "dapl_vds_file_prefix")
+pub fn H5P__dapl_vds_file_pref_get_ref(list: &PropertyList) -> Result<&[u8]> {
+    H5P__plist_get_ref(list, "dapl_vds_file_prefix")
+}
+
+/// Get the `dapl_vds_file_pref` property into a caller-provided buffer.
+#[allow(non_snake_case)]
+pub fn H5P__dapl_vds_file_pref_get_into(list: &PropertyList, out: &mut Vec<u8>) -> Result<()> {
+    H5P__plist_get_into(list, "dapl_vds_file_prefix", out)
 }
 
 /// Encode a `dapl_vds_file_pref` property value into bytes.
 #[allow(non_snake_case)]
-pub fn H5P__dapl_vds_file_pref_enc(value: &[u8]) -> Vec<u8> {
-    prop_copy(value)
+pub fn H5P__dapl_vds_file_pref_enc(value: &[u8]) -> &[u8] {
+    value
 }
 
 /// Decode a `dapl_vds_file_pref` property value from bytes.
 #[allow(non_snake_case)]
-pub fn H5P__dapl_vds_file_pref_dec(value: &[u8]) -> Vec<u8> {
-    prop_copy(value)
+pub fn H5P__dapl_vds_file_pref_dec(value: &[u8]) -> &[u8] {
+    value
 }
 
 /// Delete the `dapl_vds_file_pref` property from a property list.
@@ -997,15 +1346,13 @@ pub fn H5P__dapl_vds_file_pref_del(list: &mut PropertyList) -> Result<()> {
 
 /// Copy a `dapl_vds_file_pref` property value.
 #[allow(non_snake_case)]
-pub fn H5P__dapl_vds_file_pref_copy(value: &[u8]) -> Vec<u8> {
-    prop_copy(value)
+pub fn H5P__dapl_vds_file_pref_copy(value: &[u8]) -> &[u8] {
+    value
 }
 
 /// Close (release storage for) a `dapl_vds_file_pref` property value.
 #[allow(non_snake_case)]
-pub fn H5P__dapl_vds_file_pref_close(value: Vec<u8>) {
-    prop_close(value)
-}
+pub fn H5P__dapl_vds_file_pref_close(_value: &[u8]) {}
 
 /// Set the `dapl_efile_pref` property on a property list.
 #[allow(non_snake_case)]
@@ -1015,20 +1362,26 @@ pub fn H5P__dapl_efile_pref_set(list: &mut PropertyList, value: Vec<u8>) -> Resu
 
 /// Get the `dapl_efile_pref` property from a property list.
 #[allow(non_snake_case)]
-pub fn H5P__dapl_efile_pref_get(list: &PropertyList) -> Result<Vec<u8>> {
-    plist_get(list, "dapl_external_file_prefix")
+pub fn H5P__dapl_efile_pref_get_ref(list: &PropertyList) -> Result<&[u8]> {
+    H5P__plist_get_ref(list, "dapl_external_file_prefix")
+}
+
+/// Get the `dapl_efile_pref` property into a caller-provided buffer.
+#[allow(non_snake_case)]
+pub fn H5P__dapl_efile_pref_get_into(list: &PropertyList, out: &mut Vec<u8>) -> Result<()> {
+    H5P__plist_get_into(list, "dapl_external_file_prefix", out)
 }
 
 /// Encode a `dapl_efile_pref` property value into bytes.
 #[allow(non_snake_case)]
-pub fn H5P__dapl_efile_pref_enc(value: &[u8]) -> Vec<u8> {
-    prop_copy(value)
+pub fn H5P__dapl_efile_pref_enc(value: &[u8]) -> &[u8] {
+    value
 }
 
 /// Decode a `dapl_efile_pref` property value from bytes.
 #[allow(non_snake_case)]
-pub fn H5P__dapl_efile_pref_dec(value: &[u8]) -> Vec<u8> {
-    prop_copy(value)
+pub fn H5P__dapl_efile_pref_dec(value: &[u8]) -> &[u8] {
+    value
 }
 
 /// Delete the `dapl_efile_pref` property from a property list.
@@ -1039,8 +1392,8 @@ pub fn H5P__dapl_efile_pref_del(list: &mut PropertyList) -> Result<()> {
 
 /// Copy a `dapl_efile_pref` property value.
 #[allow(non_snake_case)]
-pub fn H5P__dapl_efile_pref_copy(value: &[u8]) -> Vec<u8> {
-    prop_copy(value)
+pub fn H5P__dapl_efile_pref_copy(value: &[u8]) -> &[u8] {
+    value
 }
 
 /// Compare two `dapl_efile_pref` property values.
@@ -1051,14 +1404,12 @@ pub fn H5P__dapl_efile_pref_cmp(left: &[u8], right: &[u8]) -> bool {
 
 /// Close (release storage for) a `dapl_efile_pref` property value.
 #[allow(non_snake_case)]
-pub fn H5P__dapl_efile_pref_close(value: Vec<u8>) {
-    prop_close(value)
-}
+pub fn H5P__dapl_efile_pref_close(_value: &[u8]) {}
 
 /// Encode a `dacc_vds_view` property value into bytes.
 #[allow(non_snake_case)]
-pub fn H5P__dacc_vds_view_enc(value: u8) -> Vec<u8> {
-    H5P__encode_uint8_t(value)
+pub fn H5P__dacc_vds_view_enc(value: u8) -> [u8; 1] {
+    encode_uint8_bytes(value)
 }
 
 /// Decode a `dacc_vds_view` property value from bytes.
@@ -1069,8 +1420,8 @@ pub fn H5P__dacc_vds_view_dec(value: &[u8]) -> Result<u8> {
 
 /// Duplicate a committed-datatype merge list buffer.
 #[allow(non_snake_case)]
-pub fn H5P__copy_merge_comm_dt_list(value: &[u8]) -> Vec<u8> {
-    prop_copy(value)
+pub fn H5P__copy_merge_comm_dt_list(value: &[u8]) -> &[u8] {
+    value
 }
 
 /// Set the `ocpy_merge_comm_dt_list` property on a property list.
@@ -1081,20 +1432,26 @@ pub fn H5P__ocpy_merge_comm_dt_list_set(list: &mut PropertyList, value: Vec<u8>)
 
 /// Get the `ocpy_merge_comm_dt_list` property from a property list.
 #[allow(non_snake_case)]
-pub fn H5P__ocpy_merge_comm_dt_list_get(list: &PropertyList) -> Result<Vec<u8>> {
-    plist_get(list, "ocpy_merge_committed_datatypes")
+pub fn H5P__ocpy_merge_comm_dt_list_get_ref(list: &PropertyList) -> Result<&[u8]> {
+    H5P__plist_get_ref(list, "ocpy_merge_committed_datatypes")
+}
+
+/// Get the `ocpy_merge_comm_dt_list` property into a caller-provided buffer.
+#[allow(non_snake_case)]
+pub fn H5P__ocpy_merge_comm_dt_list_get_into(list: &PropertyList, out: &mut Vec<u8>) -> Result<()> {
+    H5P__plist_get_into(list, "ocpy_merge_committed_datatypes", out)
 }
 
 /// Encode a `ocpy_merge_comm_dt_list` property value into bytes.
 #[allow(non_snake_case)]
-pub fn H5P__ocpy_merge_comm_dt_list_enc(value: &[u8]) -> Vec<u8> {
-    prop_copy(value)
+pub fn H5P__ocpy_merge_comm_dt_list_enc(value: &[u8]) -> &[u8] {
+    value
 }
 
 /// Decode a `ocpy_merge_comm_dt_list` property value from bytes.
 #[allow(non_snake_case)]
-pub fn H5P__ocpy_merge_comm_dt_list_dec(value: &[u8]) -> Vec<u8> {
-    prop_copy(value)
+pub fn H5P__ocpy_merge_comm_dt_list_dec(value: &[u8]) -> &[u8] {
+    value
 }
 
 /// Delete the `ocpy_merge_comm_dt_list` property from a property list.
@@ -1105,8 +1462,8 @@ pub fn H5P__ocpy_merge_comm_dt_list_del(list: &mut PropertyList) -> Result<()> {
 
 /// Copy a `ocpy_merge_comm_dt_list` property value.
 #[allow(non_snake_case)]
-pub fn H5P__ocpy_merge_comm_dt_list_copy(value: &[u8]) -> Vec<u8> {
-    prop_copy(value)
+pub fn H5P__ocpy_merge_comm_dt_list_copy(value: &[u8]) -> &[u8] {
+    value
 }
 
 /// Compare two `ocpy_merge_comm_dt_list` property values.
@@ -1117,9 +1474,7 @@ pub fn H5P__ocpy_merge_comm_dt_list_cmp(left: &[u8], right: &[u8]) -> bool {
 
 /// Close (release storage for) a `ocpy_merge_comm_dt_list` property value.
 #[allow(non_snake_case)]
-pub fn H5P__ocpy_merge_comm_dt_list_close(value: Vec<u8>) {
-    prop_close(value)
-}
+pub fn H5P__ocpy_merge_comm_dt_list_close(_value: &[u8]) {}
 
 /// Decode the B-tree rank stored on a file-creation property list.
 #[allow(non_snake_case)]
@@ -1129,14 +1484,14 @@ pub fn H5P__fcrt_btree_rank_dec(value: &[u8]) -> Result<u8> {
 
 /// Encode the shared-message index type bitmask.
 #[allow(non_snake_case)]
-pub fn H5P__fcrt_shmsg_index_types_enc(value: u64) -> Vec<u8> {
-    H5P__encode_uint64_t(value)
+pub fn H5P__fcrt_shmsg_index_types_enc(value: u64) -> [u8; 8] {
+    encode_uint64_bytes(value)
 }
 
 /// Encode the shared-message index minimum-size threshold.
 #[allow(non_snake_case)]
-pub fn H5P__fcrt_shmsg_index_minsize_enc(value: u64) -> Vec<u8> {
-    H5P__encode_uint64_t(value)
+pub fn H5P__fcrt_shmsg_index_minsize_enc(value: u64) -> [u8; 8] {
+    encode_uint64_bytes(value)
 }
 
 /// Set the file-space strategy bytes on a file-creation property list.
@@ -1147,14 +1502,14 @@ pub fn H5P__set_file_space_strategy(list: &mut PropertyList, value: Vec<u8>) -> 
 
 /// Decode the file-space strategy property buffer.
 #[allow(non_snake_case)]
-pub fn H5P__fcrt_fspace_strategy_dec(value: &[u8]) -> Vec<u8> {
-    prop_copy(value)
+pub fn H5P__fcrt_fspace_strategy_dec(value: &[u8]) -> &[u8] {
+    value
 }
 
 /// Encode a `dcrt_layout` property value into bytes.
 #[allow(non_snake_case)]
-pub fn H5P__dcrt_layout_enc(value: u8) -> Vec<u8> {
-    H5P__encode_uint8_t(value)
+pub fn H5P__dcrt_layout_enc(value: u8) -> [u8; 1] {
+    encode_uint8_bytes(value)
 }
 
 /// Decode a `dcrt_layout` property value from bytes.
@@ -1165,8 +1520,8 @@ pub fn H5P__dcrt_layout_dec(value: &[u8]) -> Result<u8> {
 
 /// Copy a `dcrt_layout` property value.
 #[allow(non_snake_case)]
-pub fn H5P__dcrt_layout_copy(value: &[u8]) -> Vec<u8> {
-    prop_copy(value)
+pub fn H5P__dcrt_layout_copy(value: &[u8]) -> &[u8] {
+    value
 }
 
 /// Compare two `dcrt_layout` property values.
@@ -1177,9 +1532,7 @@ pub fn H5P__dcrt_layout_cmp(left: &[u8], right: &[u8]) -> bool {
 
 /// Close (release storage for) a `dcrt_layout` property value.
 #[allow(non_snake_case)]
-pub fn H5P__dcrt_layout_close(value: Vec<u8>) {
-    prop_close(value)
-}
+pub fn H5P__dcrt_layout_close(_value: &[u8]) {}
 
 /// Delete the dataset layout property, releasing its storage.
 #[allow(non_snake_case)]
@@ -1195,7 +1548,7 @@ pub fn H5P__dcrt_layout_del(list: &mut PropertyList) -> Result<()> {
 /// Set the dataset layout property on a dataset-creation list.
 #[allow(non_snake_case)]
 pub fn H5P__set_layout(list: &mut PropertyList, layout: u8) -> Result<()> {
-    plist_set(list, "layout", H5P__dcrt_layout_enc(layout))
+    plist_set(list, "layout", H5P__dcrt_layout_enc(layout).to_vec())
 }
 
 /// Set the `dcrt_fill_value` property on a property list.
@@ -1206,20 +1559,26 @@ pub fn H5P__dcrt_fill_value_set(list: &mut PropertyList, value: Vec<u8>) -> Resu
 
 /// Get the `dcrt_fill_value` property from a property list.
 #[allow(non_snake_case)]
-pub fn H5P__dcrt_fill_value_get(list: &PropertyList) -> Result<Vec<u8>> {
-    plist_get(list, "fill_value")
+pub fn H5P__dcrt_fill_value_get_ref(list: &PropertyList) -> Result<&[u8]> {
+    H5P__plist_get_ref(list, "fill_value")
+}
+
+/// Get the `dcrt_fill_value` property into a caller-provided buffer.
+#[allow(non_snake_case)]
+pub fn H5P__dcrt_fill_value_get_into(list: &PropertyList, out: &mut Vec<u8>) -> Result<()> {
+    H5P__plist_get_into(list, "fill_value", out)
 }
 
 /// Encode a `dcrt_fill_value` property value into bytes.
 #[allow(non_snake_case)]
-pub fn H5P__dcrt_fill_value_enc(value: &[u8]) -> Vec<u8> {
-    prop_copy(value)
+pub fn H5P__dcrt_fill_value_enc(value: &[u8]) -> &[u8] {
+    value
 }
 
 /// Decode a `dcrt_fill_value` property value from bytes.
 #[allow(non_snake_case)]
-pub fn H5P__dcrt_fill_value_dec(value: &[u8]) -> Vec<u8> {
-    prop_copy(value)
+pub fn H5P__dcrt_fill_value_dec(value: &[u8]) -> &[u8] {
+    value
 }
 
 /// Delete the `dcrt_fill_value` property from a property list.
@@ -1236,20 +1595,31 @@ pub fn H5P_fill_value_cmp(left: &[u8], right: &[u8]) -> bool {
 
 /// Close (release storage for) a `dcrt_fill_value` property value.
 #[allow(non_snake_case)]
-pub fn H5P__dcrt_fill_value_close(value: Vec<u8>) {
-    prop_close(value)
-}
+pub fn H5P__dcrt_fill_value_close(_value: &[u8]) {}
 
 /// Get the encoded fill value from a property list.
 #[allow(non_snake_case)]
+pub fn H5P_get_fill_value_ref(list: &PropertyList) -> Result<&[u8]> {
+    H5P__dcrt_fill_value_get_ref(list)
+}
+
+/// Get the encoded fill value into a caller-provided buffer.
+#[allow(non_snake_case)]
+pub fn H5P_get_fill_value_into(list: &PropertyList, out: &mut Vec<u8>) -> Result<()> {
+    H5P__dcrt_fill_value_get_into(list, out)
+}
+
+/// Get the encoded fill value from a property list.
+#[deprecated(note = "use H5P_get_fill_value_ref or H5P_get_fill_value_into")]
+#[allow(non_snake_case)]
 pub fn H5P_get_fill_value(list: &PropertyList) -> Result<Vec<u8>> {
-    H5P__dcrt_fill_value_get(list)
+    Ok(H5P_get_fill_value_ref(list)?.to_vec())
 }
 
 /// Return true if a non-empty fill value is set.
 #[allow(non_snake_case)]
 pub fn H5P_is_fill_value_defined(list: &PropertyList) -> Result<bool> {
-    Ok(!H5P__dcrt_fill_value_get(list)?.is_empty())
+    Ok(!H5P__dcrt_fill_value_get_ref(list)?.is_empty())
 }
 
 /// Return true if a non-empty fill value is set.
@@ -1272,20 +1642,26 @@ pub fn H5P__dcrt_ext_file_list_set(list: &mut PropertyList, value: Vec<u8>) -> R
 
 /// Get the `dcrt_ext_file_list` property from a property list.
 #[allow(non_snake_case)]
-pub fn H5P__dcrt_ext_file_list_get(list: &PropertyList) -> Result<Vec<u8>> {
-    plist_get(list, "external_file_list")
+pub fn H5P__dcrt_ext_file_list_get_ref(list: &PropertyList) -> Result<&[u8]> {
+    H5P__plist_get_ref(list, "external_file_list")
+}
+
+/// Get the `dcrt_ext_file_list` property into a caller-provided buffer.
+#[allow(non_snake_case)]
+pub fn H5P__dcrt_ext_file_list_get_into(list: &PropertyList, out: &mut Vec<u8>) -> Result<()> {
+    H5P__plist_get_into(list, "external_file_list", out)
 }
 
 /// Encode a `dcrt_ext_file_list` property value into bytes.
 #[allow(non_snake_case)]
-pub fn H5P__dcrt_ext_file_list_enc(value: &[u8]) -> Vec<u8> {
-    prop_copy(value)
+pub fn H5P__dcrt_ext_file_list_enc(value: &[u8]) -> &[u8] {
+    value
 }
 
 /// Decode a `dcrt_ext_file_list` property value from bytes.
 #[allow(non_snake_case)]
-pub fn H5P__dcrt_ext_file_list_dec(value: &[u8]) -> Vec<u8> {
-    prop_copy(value)
+pub fn H5P__dcrt_ext_file_list_dec(value: &[u8]) -> &[u8] {
+    value
 }
 
 /// Delete the `dcrt_ext_file_list` property from a property list.
@@ -1296,8 +1672,8 @@ pub fn H5P__dcrt_ext_file_list_del(list: &mut PropertyList) -> Result<()> {
 
 /// Copy a `dcrt_ext_file_list` property value.
 #[allow(non_snake_case)]
-pub fn H5P__dcrt_ext_file_list_copy(value: &[u8]) -> Vec<u8> {
-    prop_copy(value)
+pub fn H5P__dcrt_ext_file_list_copy(value: &[u8]) -> &[u8] {
+    value
 }
 
 /// Compare two `dcrt_ext_file_list` property values.
@@ -1308,9 +1684,7 @@ pub fn H5P__dcrt_ext_file_list_cmp(left: &[u8], right: &[u8]) -> bool {
 
 /// Close (release storage for) a `dcrt_ext_file_list` property value.
 #[allow(non_snake_case)]
-pub fn H5P__dcrt_ext_file_list_close(value: Vec<u8>) {
-    prop_close(value)
-}
+pub fn H5P__dcrt_ext_file_list_close(_value: &[u8]) {}
 
 /// Register properties for the `facc` property class.
 #[allow(non_snake_case)]
@@ -1362,14 +1736,20 @@ pub fn H5P_set_driver_by_value(list: &mut PropertyList, value: u8) -> Result<()>
 
 /// Read the driver name from a file-access property list.
 #[allow(non_snake_case)]
-pub fn H5P__facc_file_driver_get(list: &PropertyList) -> Result<Vec<u8>> {
-    plist_get(list, "driver")
+pub fn H5P__facc_file_driver_get_ref(list: &PropertyList) -> Result<&[u8]> {
+    H5P__plist_get_ref(list, "driver")
+}
+
+/// Read the driver name into a caller-provided buffer.
+#[allow(non_snake_case)]
+pub fn H5P__facc_file_driver_get_into(list: &PropertyList, out: &mut Vec<u8>) -> Result<()> {
+    H5P__plist_get_into(list, "driver", out)
 }
 
 /// Set the multi-driver memory type property.
 #[allow(non_snake_case)]
 pub fn H5Pset_multi_type(list: &mut PropertyList, value: u8) -> Result<()> {
-    plist_set(list, "multi_type", H5P__encode_uint8_t(value))
+    plist_set(list, "multi_type", encode_uint8_bytes(value).to_vec())
 }
 
 /// Compare two `facc_cache_image_config` property values.
@@ -1380,14 +1760,14 @@ pub fn H5P__facc_cache_image_config_cmp(left: &[u8], right: &[u8]) -> bool {
 
 /// Encode a `facc_cache_image_config` property value into bytes.
 #[allow(non_snake_case)]
-pub fn H5P__facc_cache_image_config_enc(value: &[u8]) -> Vec<u8> {
-    prop_copy(value)
+pub fn H5P__facc_cache_image_config_enc(value: &[u8]) -> &[u8] {
+    value
 }
 
 /// Decode a `facc_cache_image_config` property value from bytes.
 #[allow(non_snake_case)]
-pub fn H5P__facc_cache_image_config_dec(value: &[u8]) -> Vec<u8> {
-    prop_copy(value)
+pub fn H5P__facc_cache_image_config_dec(value: &[u8]) -> &[u8] {
+    value
 }
 
 /// Set the `facc_file_image_info` property on a property list.
@@ -1398,8 +1778,14 @@ pub fn H5P__facc_file_image_info_set(list: &mut PropertyList, value: Vec<u8>) ->
 
 /// Get the `facc_file_image_info` property from a property list.
 #[allow(non_snake_case)]
-pub fn H5P__facc_file_image_info_get(list: &PropertyList) -> Result<Vec<u8>> {
-    plist_get(list, "file_image_info")
+pub fn H5P__facc_file_image_info_get_ref(list: &PropertyList) -> Result<&[u8]> {
+    H5P__plist_get_ref(list, "file_image_info")
+}
+
+/// Get the `facc_file_image_info` property into a caller-provided buffer.
+#[allow(non_snake_case)]
+pub fn H5P__facc_file_image_info_get_into(list: &PropertyList, out: &mut Vec<u8>) -> Result<()> {
+    H5P__plist_get_into(list, "file_image_info", out)
 }
 
 /// Delete the `facc_file_image_info` property from a property list.
@@ -1416,20 +1802,20 @@ pub fn H5P__facc_file_image_info_cmp(left: &[u8], right: &[u8]) -> bool {
 
 /// Encode a `facc_cache_config` property value into bytes.
 #[allow(non_snake_case)]
-pub fn H5P__facc_cache_config_enc(value: &[u8]) -> Vec<u8> {
-    prop_copy(value)
+pub fn H5P__facc_cache_config_enc(value: &[u8]) -> &[u8] {
+    value
 }
 
 /// Decode a `facc_cache_config` property value from bytes.
 #[allow(non_snake_case)]
-pub fn H5P__facc_cache_config_dec(value: &[u8]) -> Vec<u8> {
-    prop_copy(value)
+pub fn H5P__facc_cache_config_dec(value: &[u8]) -> &[u8] {
+    value
 }
 
 /// Encode a `facc_fclose_degree` property value into bytes.
 #[allow(non_snake_case)]
-pub fn H5P__facc_fclose_degree_enc(value: u8) -> Vec<u8> {
-    H5P__encode_uint8_t(value)
+pub fn H5P__facc_fclose_degree_enc(value: u8) -> [u8; 1] {
+    encode_uint8_bytes(value)
 }
 
 /// Decode a `facc_fclose_degree` property value from bytes.
@@ -1440,8 +1826,8 @@ pub fn H5P__facc_fclose_degree_dec(value: &[u8]) -> Result<u8> {
 
 /// Encode a `facc_multi_type` property value into bytes.
 #[allow(non_snake_case)]
-pub fn H5P__facc_multi_type_enc(value: u8) -> Vec<u8> {
-    H5P__encode_uint8_t(value)
+pub fn H5P__facc_multi_type_enc(value: u8) -> [u8; 1] {
+    encode_uint8_bytes(value)
 }
 
 /// Decode a `facc_multi_type` property value from bytes.
@@ -1452,8 +1838,8 @@ pub fn H5P__facc_multi_type_dec(value: &[u8]) -> Result<u8> {
 
 /// Encode a `facc_libver_type` property value into bytes.
 #[allow(non_snake_case)]
-pub fn H5P__facc_libver_type_enc(value: u8) -> Vec<u8> {
-    H5P__encode_uint8_t(value)
+pub fn H5P__facc_libver_type_enc(value: u8) -> [u8; 1] {
+    encode_uint8_bytes(value)
 }
 
 /// Decode a `facc_libver_type` property value from bytes.
@@ -1464,20 +1850,20 @@ pub fn H5P__facc_libver_type_dec(value: &[u8]) -> Result<u8> {
 
 /// Encode a `facc_mdc_log_location` property value into bytes.
 #[allow(non_snake_case)]
-pub fn H5P__facc_mdc_log_location_enc(value: &[u8]) -> Vec<u8> {
-    prop_copy(value)
+pub fn H5P__facc_mdc_log_location_enc(value: &[u8]) -> &[u8] {
+    value
 }
 
 /// Decode a `facc_mdc_log_location` property value from bytes.
 #[allow(non_snake_case)]
-pub fn H5P__facc_mdc_log_location_dec(value: &[u8]) -> Vec<u8> {
-    prop_copy(value)
+pub fn H5P__facc_mdc_log_location_dec(value: &[u8]) -> &[u8] {
+    value
 }
 
 /// Copy a `facc_mdc_log_location` property value.
 #[allow(non_snake_case)]
-pub fn H5P__facc_mdc_log_location_copy(value: &[u8]) -> Vec<u8> {
-    prop_copy(value)
+pub fn H5P__facc_mdc_log_location_copy(value: &[u8]) -> &[u8] {
+    value
 }
 
 /// Compare two `facc_mdc_log_location` property values.
@@ -1488,9 +1874,7 @@ pub fn H5P__facc_mdc_log_location_cmp(left: &[u8], right: &[u8]) -> bool {
 
 /// Close (release storage for) a `facc_mdc_log_location` property value.
 #[allow(non_snake_case)]
-pub fn H5P__facc_mdc_log_location_close(value: Vec<u8>) {
-    prop_close(value)
-}
+pub fn H5P__facc_mdc_log_location_close(_value: &[u8]) {}
 
 /// The MPI parameters are not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
@@ -1506,7 +1890,7 @@ pub fn H5P__facc_mpi_comm_set(_list: &mut PropertyList, _value: Vec<u8>) -> Resu
 
 /// Get the `facc_mpi_comm` property from a property list.
 #[allow(non_snake_case)]
-pub fn H5P__facc_mpi_comm_get(_list: &PropertyList) -> Result<Vec<u8>> {
+pub fn H5P__facc_mpi_comm_get(_list: &PropertyList) -> Result<&[u8]> {
     Err(Error::Unsupported(
         "mpi communicator driver is not supported by the pure Rust local backend".into(),
     ))
@@ -1520,8 +1904,8 @@ pub fn H5P__facc_mpi_comm_del(_list: &mut PropertyList) -> Result<()> {
 
 /// Copy a `facc_mpi_comm` property value.
 #[allow(non_snake_case)]
-pub fn H5P__facc_mpi_comm_copy(value: &[u8]) -> Vec<u8> {
-    prop_copy(value)
+pub fn H5P__facc_mpi_comm_copy(value: &[u8]) -> &[u8] {
+    value
 }
 
 /// Compare two `facc_mpi_comm` property values.
@@ -1532,9 +1916,7 @@ pub fn H5P__facc_mpi_comm_cmp(left: &[u8], right: &[u8]) -> bool {
 
 /// Close (release storage for) a `facc_mpi_comm` property value.
 #[allow(non_snake_case)]
-pub fn H5P__facc_mpi_comm_close(value: Vec<u8>) {
-    prop_close(value)
-}
+pub fn H5P__facc_mpi_comm_close(_value: &[u8]) {}
 
 /// Set the `facc_mpi_info` property on a property list.
 #[allow(non_snake_case)]
@@ -1544,7 +1926,7 @@ pub fn H5P__facc_mpi_info_set(_list: &mut PropertyList, _value: Vec<u8>) -> Resu
 
 /// Get the `facc_mpi_info` property from a property list.
 #[allow(non_snake_case)]
-pub fn H5P__facc_mpi_info_get(_list: &PropertyList) -> Result<Vec<u8>> {
+pub fn H5P__facc_mpi_info_get(_list: &PropertyList) -> Result<&[u8]> {
     Err(Error::Unsupported(
         "mpi info driver is not supported by the pure Rust local backend".into(),
     ))
@@ -1558,8 +1940,8 @@ pub fn H5P__facc_mpi_info_del(_list: &mut PropertyList) -> Result<()> {
 
 /// Copy a `facc_mpi_info` property value.
 #[allow(non_snake_case)]
-pub fn H5P__facc_mpi_info_copy(value: &[u8]) -> Vec<u8> {
-    prop_copy(value)
+pub fn H5P__facc_mpi_info_copy(value: &[u8]) -> &[u8] {
+    value
 }
 
 /// Compare two `facc_mpi_info` property values.
@@ -1570,14 +1952,12 @@ pub fn H5P__facc_mpi_info_cmp(left: &[u8], right: &[u8]) -> bool {
 
 /// Close (release storage for) a `facc_mpi_info` property value.
 #[allow(non_snake_case)]
-pub fn H5P__facc_mpi_info_close(value: Vec<u8>) {
-    prop_close(value)
-}
+pub fn H5P__facc_mpi_info_close(_value: &[u8]) {}
 
 /// Encode a `facc_page_buffer_size` property value into bytes.
 #[allow(non_snake_case)]
-pub fn H5P__facc_page_buffer_size_enc(value: u64) -> Vec<u8> {
-    H5P__encode_uint64_t(value)
+pub fn H5P__facc_page_buffer_size_enc(value: u64) -> [u8; 8] {
+    encode_uint64_bytes(value)
 }
 
 /// Decode a `facc_page_buffer_size` property value from bytes.
@@ -1608,8 +1988,14 @@ pub fn H5Pset_vol(list: &mut PropertyList, value: Vec<u8>) -> Result<()> {
 
 /// Get the `facc_vol` property from a property list.
 #[allow(non_snake_case)]
-pub fn H5P__facc_vol_get(list: &PropertyList) -> Result<Vec<u8>> {
-    plist_get(list, "vol")
+pub fn H5P__facc_vol_get_ref(list: &PropertyList) -> Result<&[u8]> {
+    H5P__plist_get_ref(list, "vol")
+}
+
+/// Get the `facc_vol` property into a caller-provided buffer.
+#[allow(non_snake_case)]
+pub fn H5P__facc_vol_get_into(list: &PropertyList, out: &mut Vec<u8>) -> Result<()> {
+    H5P__plist_get_into(list, "vol", out)
 }
 
 /// The IOC subfiling driver is not supported.
@@ -1632,8 +2018,8 @@ pub fn H5P__dxfr_reg_prop(class: &mut PropertyClass) -> Result<()> {
 
 /// Encode a `dxfr_bkgr_buf_type` property value into bytes.
 #[allow(non_snake_case)]
-pub fn H5P__dxfr_bkgr_buf_type_enc(value: u8) -> Vec<u8> {
-    H5P__encode_uint8_t(value)
+pub fn H5P__dxfr_bkgr_buf_type_enc(value: u8) -> [u8; 1] {
+    encode_uint8_bytes(value)
 }
 
 /// Decode a `dxfr_bkgr_buf_type` property value from bytes.
@@ -1644,8 +2030,8 @@ pub fn H5P__dxfr_bkgr_buf_type_dec(value: &[u8]) -> Result<u8> {
 
 /// Encode a `dxfr_btree_split_ratio` property value into bytes.
 #[allow(non_snake_case)]
-pub fn H5P__dxfr_btree_split_ratio_enc(value: f64) -> Vec<u8> {
-    H5P__encode_double(value)
+pub fn H5P__dxfr_btree_split_ratio_enc(value: f64) -> [u8; 8] {
+    encode_double_bytes(value)
 }
 
 /// Decode a `dxfr_btree_split_ratio` property value from bytes.
@@ -1662,20 +2048,26 @@ pub fn H5P__dxfr_xform_set(list: &mut PropertyList, value: Vec<u8>) -> Result<()
 
 /// Get the `dxfr_xform` property from a property list.
 #[allow(non_snake_case)]
-pub fn H5P__dxfr_xform_get(list: &PropertyList) -> Result<Vec<u8>> {
-    plist_get(list, "data_transform")
+pub fn H5P__dxfr_xform_get_ref(list: &PropertyList) -> Result<&[u8]> {
+    H5P__plist_get_ref(list, "data_transform")
+}
+
+/// Get the `dxfr_xform` property into a caller-provided buffer.
+#[allow(non_snake_case)]
+pub fn H5P__dxfr_xform_get_into(list: &PropertyList, out: &mut Vec<u8>) -> Result<()> {
+    H5P__plist_get_into(list, "data_transform", out)
 }
 
 /// Encode a `dxfr_xform` property value into bytes.
 #[allow(non_snake_case)]
-pub fn H5P__dxfr_xform_enc(value: &[u8]) -> Vec<u8> {
-    prop_copy(value)
+pub fn H5P__dxfr_xform_enc(value: &[u8]) -> &[u8] {
+    value
 }
 
 /// Decode a `dxfr_xform` property value from bytes.
 #[allow(non_snake_case)]
-pub fn H5P__dxfr_xform_dec(value: &[u8]) -> Vec<u8> {
-    prop_copy(value)
+pub fn H5P__dxfr_xform_dec(value: &[u8]) -> &[u8] {
+    value
 }
 
 /// Delete the `dxfr_xform` property from a property list.
@@ -1686,8 +2078,8 @@ pub fn H5P__dxfr_xform_del(list: &mut PropertyList) -> Result<()> {
 
 /// Copy a `dxfr_xform` property value.
 #[allow(non_snake_case)]
-pub fn H5P__dxfr_xform_copy(value: &[u8]) -> Vec<u8> {
-    prop_copy(value)
+pub fn H5P__dxfr_xform_copy(value: &[u8]) -> &[u8] {
+    value
 }
 
 /// Compare two `dxfr_xform` property values.
@@ -1698,9 +2090,7 @@ pub fn H5P__dxfr_xform_cmp(left: &[u8], right: &[u8]) -> bool {
 
 /// Close (release storage for) a `dxfr_xform` property value.
 #[allow(non_snake_case)]
-pub fn H5P__dxfr_xform_close(value: Vec<u8>) {
-    prop_close(value)
-}
+pub fn H5P__dxfr_xform_close(_value: &[u8]) {}
 
 /// Set the variable-length memory-manager callbacks on a transfer list.
 #[allow(non_snake_case)]
@@ -1710,8 +2100,8 @@ pub fn H5P_set_vlen_mem_manager(list: &mut PropertyList, value: Vec<u8>) -> Resu
 
 /// Encode a `dxfr_io_xfer_mode` property value into bytes.
 #[allow(non_snake_case)]
-pub fn H5P__dxfr_io_xfer_mode_enc(value: u8) -> Vec<u8> {
-    H5P__encode_uint8_t(value)
+pub fn H5P__dxfr_io_xfer_mode_enc(value: u8) -> [u8; 1] {
+    encode_uint8_bytes(value)
 }
 
 /// Decode a `dxfr_io_xfer_mode` property value from bytes.
@@ -1722,8 +2112,8 @@ pub fn H5P__dxfr_io_xfer_mode_dec(value: &[u8]) -> Result<u8> {
 
 /// Encode a `dxfr_mpio_collective_opt` property value into bytes.
 #[allow(non_snake_case)]
-pub fn H5P__dxfr_mpio_collective_opt_enc(value: u8) -> Vec<u8> {
-    H5P__encode_uint8_t(value)
+pub fn H5P__dxfr_mpio_collective_opt_enc(value: u8) -> [u8; 1] {
+    encode_uint8_bytes(value)
 }
 
 /// Decode a `dxfr_mpio_collective_opt` property value from bytes.
@@ -1734,8 +2124,8 @@ pub fn H5P__dxfr_mpio_collective_opt_dec(value: &[u8]) -> Result<u8> {
 
 /// Encode a `dxfr_mpio_chunk_opt_hard` property value into bytes.
 #[allow(non_snake_case)]
-pub fn H5P__dxfr_mpio_chunk_opt_hard_enc(value: u8) -> Vec<u8> {
-    H5P__encode_uint8_t(value)
+pub fn H5P__dxfr_mpio_chunk_opt_hard_enc(value: u8) -> [u8; 1] {
+    encode_uint8_bytes(value)
 }
 
 /// Decode a `dxfr_mpio_chunk_opt_hard` property value from bytes.
@@ -1746,8 +2136,8 @@ pub fn H5P__dxfr_mpio_chunk_opt_hard_dec(value: &[u8]) -> Result<u8> {
 
 /// Encode a `dxfr_edc` property value into bytes.
 #[allow(non_snake_case)]
-pub fn H5P__dxfr_edc_enc(value: u8) -> Vec<u8> {
-    H5P__encode_uint8_t(value)
+pub fn H5P__dxfr_edc_enc(value: u8) -> [u8; 1] {
+    encode_uint8_bytes(value)
 }
 
 /// Decode a `dxfr_edc` property value from bytes.
@@ -1758,8 +2148,8 @@ pub fn H5P__dxfr_edc_dec(value: &[u8]) -> Result<u8> {
 
 /// Copy a `dxfr_dset_io_hyp_sel` property value.
 #[allow(non_snake_case)]
-pub fn H5P__dxfr_dset_io_hyp_sel_copy(value: &[u8]) -> Vec<u8> {
-    prop_copy(value)
+pub fn H5P__dxfr_dset_io_hyp_sel_copy(value: &[u8]) -> &[u8] {
+    value
 }
 
 /// Compare two `dxfr_dset_io_hyp_sel` property values.
@@ -1770,9 +2160,7 @@ pub fn H5P__dxfr_dset_io_hyp_sel_cmp(left: &[u8], right: &[u8]) -> bool {
 
 /// Close (release storage for) a `dxfr_dset_io_hyp_sel` property value.
 #[allow(non_snake_case)]
-pub fn H5P__dxfr_dset_io_hyp_sel_close(value: Vec<u8>) {
-    prop_close(value)
-}
+pub fn H5P__dxfr_dset_io_hyp_sel_close(_value: &[u8]) {}
 
 /// Set a hyperslab selection on a dataset I/O transfer list.
 #[allow(non_snake_case)]
@@ -1865,14 +2253,14 @@ pub fn H5Pset_dataset_io_hyperslab_selection(
 
 /// Encode a `dxfr_selection_io_mode` property value into bytes.
 #[allow(non_snake_case)]
-pub fn H5P__dxfr_selection_io_mode_enc(value: u8) -> Vec<u8> {
-    H5P__encode_uint8_t(value)
+pub fn H5P__dxfr_selection_io_mode_enc(value: u8) -> [u8; 1] {
+    encode_uint8_bytes(value)
 }
 
 /// Encode a `dxfr_modify_write_buf` property value into bytes.
 #[allow(non_snake_case)]
-pub fn H5P__dxfr_modify_write_buf_enc(value: bool) -> Vec<u8> {
-    H5P__encode_bool(value)
+pub fn H5P__dxfr_modify_write_buf_enc(value: bool) -> [u8; 1] {
+    encode_bool_bytes(value)
 }
 
 /// Decode a `dxfr_modify_write_buf` property value from bytes.
@@ -1912,15 +2300,32 @@ pub fn H5P__set_filter(list: &mut PropertyList, filter: Vec<u8>) -> Result<()> {
 }
 
 /// Return the encoded filter pipeline (ignoring filter id lookup).
+#[deprecated(note = "use H5P_get_filter_by_id_ref or H5P_get_filter_by_id_into")]
 #[allow(non_snake_case)]
 pub fn H5P_get_filter_by_id(list: &PropertyList, _filter_id: u32) -> Result<Vec<u8>> {
-    plist_get(list, "filter_pipeline")
+    Ok(H5P_get_filter_by_id_ref(list, _filter_id)?.to_vec())
+}
+
+/// Return the encoded filter pipeline by borrowed reference.
+#[allow(non_snake_case)]
+pub fn H5P_get_filter_by_id_ref(list: &PropertyList, _filter_id: u32) -> Result<&[u8]> {
+    H5P__plist_get_ref(list, "filter_pipeline")
+}
+
+/// Append the encoded filter pipeline into a caller-provided buffer.
+#[allow(non_snake_case)]
+pub fn H5P_get_filter_by_id_into(
+    list: &PropertyList,
+    _filter_id: u32,
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    H5P__plist_get_into(list, "filter_pipeline", out)
 }
 
 /// Return true if any filter pipeline is set on the property list.
 #[allow(non_snake_case)]
 pub fn H5P_filter_in_pline(list: &PropertyList, _filter_id: u32) -> Result<bool> {
-    Ok(!plist_get(list, "filter_pipeline")?.is_empty())
+    Ok(!plist_get_ref(list, "filter_pipeline")?.is_empty())
 }
 
 /// Remove all filters from the filter pipeline on a property list.
@@ -1931,8 +2336,14 @@ pub fn H5Premove_filter(list: &mut PropertyList, _filter_id: u32) -> Result<()> 
 
 /// Read the encoded filter pipeline from a property list.
 #[allow(non_snake_case)]
-pub fn H5P__get_filter(list: &PropertyList) -> Result<Vec<u8>> {
-    plist_get(list, "filter_pipeline")
+pub fn H5P__get_filter_ref(list: &PropertyList) -> Result<&[u8]> {
+    H5P__plist_get_ref(list, "filter_pipeline")
+}
+
+/// Read the encoded filter pipeline into a caller-provided buffer.
+#[allow(non_snake_case)]
+pub fn H5P__get_filter_into(list: &PropertyList, out: &mut Vec<u8>) -> Result<()> {
+    H5P__plist_get_into(list, "filter_pipeline", out)
 }
 
 /// Set the `ocrt_pipeline` property on a property list.
@@ -1943,20 +2354,26 @@ pub fn H5P__ocrt_pipeline_set(list: &mut PropertyList, value: Vec<u8>) -> Result
 
 /// Get the `ocrt_pipeline` property from a property list.
 #[allow(non_snake_case)]
-pub fn H5P__ocrt_pipeline_get(list: &PropertyList) -> Result<Vec<u8>> {
-    plist_get(list, "object_pipeline")
+pub fn H5P__ocrt_pipeline_get_ref(list: &PropertyList) -> Result<&[u8]> {
+    H5P__plist_get_ref(list, "object_pipeline")
+}
+
+/// Get the `ocrt_pipeline` property into a caller-provided buffer.
+#[allow(non_snake_case)]
+pub fn H5P__ocrt_pipeline_get_into(list: &PropertyList, out: &mut Vec<u8>) -> Result<()> {
+    H5P__plist_get_into(list, "object_pipeline", out)
 }
 
 /// Encode a `ocrt_pipeline` property value into bytes.
 #[allow(non_snake_case)]
-pub fn H5P__ocrt_pipeline_enc(value: &[u8]) -> Vec<u8> {
-    prop_copy(value)
+pub fn H5P__ocrt_pipeline_enc(value: &[u8]) -> &[u8] {
+    value
 }
 
 /// Decode a `ocrt_pipeline` property value from bytes.
 #[allow(non_snake_case)]
-pub fn H5P__ocrt_pipeline_dec(value: &[u8]) -> Vec<u8> {
-    prop_copy(value)
+pub fn H5P__ocrt_pipeline_dec(value: &[u8]) -> &[u8] {
+    value
 }
 
 /// Delete the `ocrt_pipeline` property from a property list.
@@ -1967,8 +2384,8 @@ pub fn H5P__ocrt_pipeline_del(list: &mut PropertyList) -> Result<()> {
 
 /// Copy a `ocrt_pipeline` property value.
 #[allow(non_snake_case)]
-pub fn H5P__ocrt_pipeline_copy(value: &[u8]) -> Vec<u8> {
-    prop_copy(value)
+pub fn H5P__ocrt_pipeline_copy(value: &[u8]) -> &[u8] {
+    value
 }
 
 /// Compare two `ocrt_pipeline` property values.
@@ -1979,9 +2396,7 @@ pub fn H5P__ocrt_pipeline_cmp(left: &[u8], right: &[u8]) -> bool {
 
 /// Close (release storage for) a `ocrt_pipeline` property value.
 #[allow(non_snake_case)]
-pub fn H5P__ocrt_pipeline_close(value: Vec<u8>) {
-    prop_close(value)
-}
+pub fn H5P__ocrt_pipeline_close(_value: &[u8]) {}
 
 /// The splitter VFD is not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
@@ -1997,8 +2412,8 @@ pub fn H5P__strcrt_reg_prop(class: &mut PropertyClass) -> Result<()> {
 
 /// Encode a `strcrt_char_encoding` property value into bytes.
 #[allow(non_snake_case)]
-pub fn H5P__strcrt_char_encoding_enc(value: u8) -> Vec<u8> {
-    H5P__encode_uint8_t(value)
+pub fn H5P__strcrt_char_encoding_enc(value: u8) -> [u8; 1] {
+    encode_uint8_bytes(value)
 }
 
 /// Decode a `strcrt_char_encoding` property value from bytes.
@@ -2057,20 +2472,26 @@ pub fn H5P__lacc_elink_fapl_set(list: &mut PropertyList, value: Vec<u8>) -> Resu
 
 /// Get the `lacc_elink_fapl` property from a property list.
 #[allow(non_snake_case)]
-pub fn H5P__lacc_elink_fapl_get(list: &PropertyList) -> Result<Vec<u8>> {
-    plist_get(list, "external_link_fapl")
+pub fn H5P__lacc_elink_fapl_get_ref(list: &PropertyList) -> Result<&[u8]> {
+    H5P__plist_get_ref(list, "external_link_fapl")
+}
+
+/// Get the `lacc_elink_fapl` property into a caller-provided buffer.
+#[allow(non_snake_case)]
+pub fn H5P__lacc_elink_fapl_get_into(list: &PropertyList, out: &mut Vec<u8>) -> Result<()> {
+    H5P__plist_get_into(list, "external_link_fapl", out)
 }
 
 /// Encode a `lacc_elink_fapl` property value into bytes.
 #[allow(non_snake_case)]
-pub fn H5P__lacc_elink_fapl_enc(value: &[u8]) -> Vec<u8> {
-    prop_copy(value)
+pub fn H5P__lacc_elink_fapl_enc(value: &[u8]) -> &[u8] {
+    value
 }
 
 /// Decode a `lacc_elink_fapl` property value from bytes.
 #[allow(non_snake_case)]
-pub fn H5P__lacc_elink_fapl_dec(value: &[u8]) -> Vec<u8> {
-    prop_copy(value)
+pub fn H5P__lacc_elink_fapl_dec(value: &[u8]) -> &[u8] {
+    value
 }
 
 /// Delete the `lacc_elink_fapl` property from a property list.
@@ -2081,8 +2502,8 @@ pub fn H5P__lacc_elink_fapl_del(list: &mut PropertyList) -> Result<()> {
 
 /// Copy a `lacc_elink_fapl` property value.
 #[allow(non_snake_case)]
-pub fn H5P__lacc_elink_fapl_copy(value: &[u8]) -> Vec<u8> {
-    prop_copy(value)
+pub fn H5P__lacc_elink_fapl_copy(value: &[u8]) -> &[u8] {
+    value
 }
 
 /// Compare two `lacc_elink_fapl` property values.
@@ -2093,9 +2514,7 @@ pub fn H5P__lacc_elink_fapl_cmp(left: &[u8], right: &[u8]) -> bool {
 
 /// Close (release storage for) a `lacc_elink_fapl` property value.
 #[allow(non_snake_case)]
-pub fn H5P__lacc_elink_fapl_close(value: Vec<u8>) {
-    prop_close(value)
-}
+pub fn H5P__lacc_elink_fapl_close(_value: &[u8]) {}
 
 /// Set the `lacc_elink_pref` property on a property list.
 #[allow(non_snake_case)]
@@ -2105,20 +2524,26 @@ pub fn H5P__lacc_elink_pref_set(list: &mut PropertyList, value: Vec<u8>) -> Resu
 
 /// Get the `lacc_elink_pref` property from a property list.
 #[allow(non_snake_case)]
-pub fn H5P__lacc_elink_pref_get(list: &PropertyList) -> Result<Vec<u8>> {
-    plist_get(list, "external_link_prefix")
+pub fn H5P__lacc_elink_pref_get_ref(list: &PropertyList) -> Result<&[u8]> {
+    H5P__plist_get_ref(list, "external_link_prefix")
+}
+
+/// Get the `lacc_elink_pref` property into a caller-provided buffer.
+#[allow(non_snake_case)]
+pub fn H5P__lacc_elink_pref_get_into(list: &PropertyList, out: &mut Vec<u8>) -> Result<()> {
+    H5P__plist_get_into(list, "external_link_prefix", out)
 }
 
 /// Encode a `lacc_elink_pref` property value into bytes.
 #[allow(non_snake_case)]
-pub fn H5P__lacc_elink_pref_enc(value: &[u8]) -> Vec<u8> {
-    prop_copy(value)
+pub fn H5P__lacc_elink_pref_enc(value: &[u8]) -> &[u8] {
+    value
 }
 
 /// Decode a `lacc_elink_pref` property value from bytes.
 #[allow(non_snake_case)]
-pub fn H5P__lacc_elink_pref_dec(value: &[u8]) -> Vec<u8> {
-    prop_copy(value)
+pub fn H5P__lacc_elink_pref_dec(value: &[u8]) -> &[u8] {
+    value
 }
 
 /// Delete the `lacc_elink_pref` property from a property list.
@@ -2129,8 +2554,8 @@ pub fn H5P__lacc_elink_pref_del(list: &mut PropertyList) -> Result<()> {
 
 /// Copy a `lacc_elink_pref` property value.
 #[allow(non_snake_case)]
-pub fn H5P__lacc_elink_pref_copy(value: &[u8]) -> Vec<u8> {
-    prop_copy(value)
+pub fn H5P__lacc_elink_pref_copy(value: &[u8]) -> &[u8] {
+    value
 }
 
 /// Compare two `lacc_elink_pref` property values.
@@ -2141,9 +2566,7 @@ pub fn H5P__lacc_elink_pref_cmp(left: &[u8], right: &[u8]) -> bool {
 
 /// Close (release storage for) a `lacc_elink_pref` property value.
 #[allow(non_snake_case)]
-pub fn H5P__lacc_elink_pref_close(value: Vec<u8>) {
-    prop_close(value)
-}
+pub fn H5P__lacc_elink_pref_close(_value: &[u8]) {}
 
 /// Set the ROS3 file-access driver with default configuration.
 #[allow(non_snake_case)]
@@ -2155,21 +2578,19 @@ pub fn H5Pset_fapl_ros3(list: &mut PropertyList) -> Result<()> {
 #[allow(non_snake_case)]
 pub fn H5Pset_fapl_ros3_config(list: &mut PropertyList, config: Ros3FaplConfig) -> Result<()> {
     plist_set(list, "driver", b"ros3".to_vec())?;
-    plist_set(
-        list,
-        "fapl_ros3_config",
-        H5P__encode_ros3_fapl_config(&config)?,
-    )
+    let mut encoded = Vec::new();
+    H5P__encode_ros3_fapl_config_into(&config, &mut encoded)?;
+    plist_set(list, "fapl_ros3_config", encoded)
 }
 
 /// Get the stored ROS3 file-access driver configuration, if any.
 #[allow(non_snake_case)]
 pub fn H5Pget_fapl_ros3_config(list: &PropertyList) -> Result<Option<Ros3FaplConfig>> {
-    let bytes = plist_get(list, "fapl_ros3_config")?;
+    let bytes = plist_get_ref(list, "fapl_ros3_config")?;
     if bytes.is_empty() {
         Ok(None)
     } else {
-        H5P__decode_ros3_fapl_config(&bytes).map(Some)
+        H5P__decode_ros3_fapl_config(bytes).map(Some)
     }
 }
 
@@ -2200,27 +2621,48 @@ pub fn H5P__gcrt_reg_prop(class: &mut PropertyClass) -> Result<()> {
 
 /// Encode a `gcrt_group_info` property value into bytes.
 #[allow(non_snake_case)]
-pub fn H5P__gcrt_group_info_enc(value: &[u8]) -> Vec<u8> {
-    prop_copy(value)
+pub fn H5P__gcrt_group_info_enc(value: &[u8]) -> &[u8] {
+    value
 }
 
 /// Decode a `gcrt_group_info` property value from bytes.
 #[allow(non_snake_case)]
-pub fn H5P__gcrt_group_info_dec(value: &[u8]) -> Vec<u8> {
-    prop_copy(value)
+pub fn H5P__gcrt_group_info_dec(value: &[u8]) -> &[u8] {
+    value
 }
 
 /// Encode a `gcrt_link_info` property value into bytes.
 #[allow(non_snake_case)]
-pub fn H5P__gcrt_link_info_enc(value: &[u8]) -> Vec<u8> {
-    prop_copy(value)
+pub fn H5P__gcrt_link_info_enc(value: &[u8]) -> &[u8] {
+    value
 }
 
 /// Decode a `gcrt_link_info` property value from bytes.
 #[allow(non_snake_case)]
-pub fn H5P__gcrt_link_info_dec(value: &[u8]) -> Vec<u8> {
-    prop_copy(value)
+pub fn H5P__gcrt_link_info_dec(value: &[u8]) -> &[u8] {
+    value
 }
+
+owned_property_get_wrapper!(H5P__get_file_space, H5P__get_file_space_ref);
+owned_property_get_wrapper!(H5P__dapl_vds_file_pref_get, H5P__dapl_vds_file_pref_get_ref);
+owned_property_get_wrapper!(H5P__dapl_efile_pref_get, H5P__dapl_efile_pref_get_ref);
+owned_property_get_wrapper!(
+    H5P__ocpy_merge_comm_dt_list_get,
+    H5P__ocpy_merge_comm_dt_list_get_ref
+);
+owned_property_get_wrapper!(H5P__dcrt_fill_value_get, H5P__dcrt_fill_value_get_ref);
+owned_property_get_wrapper!(H5P__dcrt_ext_file_list_get, H5P__dcrt_ext_file_list_get_ref);
+owned_property_get_wrapper!(H5P__facc_file_driver_get, H5P__facc_file_driver_get_ref);
+owned_property_get_wrapper!(
+    H5P__facc_file_image_info_get,
+    H5P__facc_file_image_info_get_ref
+);
+owned_property_get_wrapper!(H5P__facc_vol_get, H5P__facc_vol_get_ref);
+owned_property_get_wrapper!(H5P__dxfr_xform_get, H5P__dxfr_xform_get_ref);
+owned_property_get_wrapper!(H5P__get_filter, H5P__get_filter_ref);
+owned_property_get_wrapper!(H5P__ocrt_pipeline_get, H5P__ocrt_pipeline_get_ref);
+owned_property_get_wrapper!(H5P__lacc_elink_fapl_get, H5P__lacc_elink_fapl_get_ref);
+owned_property_get_wrapper!(H5P__lacc_elink_pref_get, H5P__lacc_elink_pref_get_ref);
 
 #[cfg(test)]
 mod tests {
@@ -2229,11 +2671,25 @@ mod tests {
     #[test]
     fn property_class_and_list_track_registered_values() {
         let mut class = H5Pcreate_class("dataset_create", Some("root".into()));
-        H5Pregister1(&mut class, "layout", vec![1]).unwrap();
+        H5P__register(&mut class, "layout", vec![1]).unwrap();
+        H5P__register(&mut class, "fill", vec![0]).unwrap();
+        assert_eq!(
+            H5P__iter_pclass_names(&class).collect::<Vec<_>>(),
+            vec!["fill", "layout"]
+        );
+        let mut visited = Vec::new();
+        H5P__visit_pclass_names(&class, |name| visited.push(name.to_owned()));
+        assert_eq!(visited, vec!["fill", "layout"]);
+        let mut buffered = Vec::new();
+        H5P__iterate_pclass_into(&class, &mut buffered);
+        assert_eq!(buffered, vec!["fill".to_string(), "layout".to_string()]);
         let mut list = H5P__create(&class).unwrap();
-        assert_eq!(H5P_peek(&list, "layout").unwrap(), vec![1]);
+        assert_eq!(H5P_peek_ref(&list, "layout").unwrap(), &[1]);
         H5P_set(&mut list, "layout", vec![2]).unwrap();
         assert_eq!(H5P__get_size_plist(&list, "layout").unwrap(), 1);
+        let mut copied_layout = Vec::new();
+        H5P__plist_get_into(&list, "layout", &mut copied_layout).unwrap();
+        assert_eq!(copied_layout, vec![2]);
         assert!(H5P__open_class_path_test(&class, "root/dataset_create"));
         assert!(H5P_remove(&mut list, "layout").is_ok());
     }
@@ -2241,7 +2697,7 @@ mod tests {
     #[test]
     fn property_delete_and_free_callbacks_clear_owned_storage() {
         let mut class = H5Pcreate_class("dataset_create", None);
-        H5Pregister1(&mut class, "layout", vec![2]).unwrap();
+        H5P__register(&mut class, "layout", vec![2]).unwrap();
         let mut list = H5P__create(&class).unwrap();
         H5P__dcrt_layout_del(&mut list).unwrap();
         assert!(!H5P_exist_plist(&list, "layout").unwrap());
@@ -2266,7 +2722,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let encoded = H5P_peek(&list, "dataset_io_hyperslab_selection").unwrap();
+        let encoded = H5P_peek_ref(&list, "dataset_io_hyperslab_selection").unwrap();
         assert_eq!(&encoded[..8], &[2, 0, 0, 0, 0, 0, 0, 0]);
         assert_eq!(u64::from_le_bytes(encoded[8..16].try_into().unwrap()), 3);
         assert_eq!(u64::from_le_bytes(encoded[16..24].try_into().unwrap()), 2);
@@ -2299,27 +2755,41 @@ mod tests {
 
     #[test]
     fn property_encoding_roundtrips_scalars() {
-        assert_eq!(H5P__decode_bool(&H5P__encode_bool(true)).unwrap(), true);
-        assert_eq!(H5P__decode_uint64_t(&H5P__encode_uint64_t(42)).unwrap(), 42);
-        assert_eq!(
-            H5P__decode_size_t(&H5P__encode_size_t(42).unwrap()).unwrap(),
-            42
-        );
-        assert_eq!(H5P__decode_double(&H5P__encode_double(1.5)).unwrap(), 1.5);
+        let mut bool_bytes = Vec::new();
+        H5P__encode_bool_into(true, &mut bool_bytes);
+        assert_eq!(H5P__decode_bool(&bool_bytes).unwrap(), true);
+        let mut uint64_bytes = Vec::new();
+        H5P__encode_uint64_t_into(42, &mut uint64_bytes);
+        assert_eq!(H5P__decode_uint64_t(&uint64_bytes).unwrap(), 42);
+        let mut size_bytes = Vec::new();
+        H5P__encode_size_t_into(42, &mut size_bytes).unwrap();
+        assert_eq!(H5P__decode_size_t(&size_bytes).unwrap(), 42);
+        let mut double_bytes = Vec::new();
+        H5P__encode_double_into(1.5, &mut double_bytes);
+        assert_eq!(H5P__decode_double(&double_bytes).unwrap(), 1.5);
         let mut encoded_chunks = Vec::new();
         encoded_chunks.extend_from_slice(&3u64.to_le_bytes());
         encoded_chunks.extend_from_slice(b"abc");
         encoded_chunks.extend_from_slice(&0u64.to_le_bytes());
+        let chunks = [b"abc".as_slice(), &[]];
+        let mut encoded = Vec::new();
+        H5P__encode_slices_into(chunks, &mut encoded).unwrap();
+        assert_eq!(encoded, encoded_chunks);
         assert_eq!(
-            H5P__encode(&[b"abc".to_vec(), Vec::new()]).unwrap(),
-            encoded_chunks
+            H5P__decode_chunks(&encoded_chunks)
+                .collect::<Result<Vec<_>>>()
+                .unwrap(),
+            vec![b"abc".as_slice(), &[]]
         );
-        assert_eq!(
-            H5P__decode(&encoded_chunks).unwrap(),
-            vec![b"abc".to_vec(), Vec::new()]
-        );
-        assert!(H5P__decode(&encoded_chunks[..10]).is_err());
-        assert!(H5P__decode(&[0; 7]).is_err());
+        let mut decoded = Vec::new();
+        H5P__decode_into(&encoded_chunks, &mut decoded).unwrap();
+        assert_eq!(decoded, vec![b"abc".to_vec(), Vec::new()]);
+        assert!(H5P__decode_chunks(&encoded_chunks[..10])
+            .collect::<Result<Vec<_>>>()
+            .is_err());
+        assert!(H5P__decode_chunks(&[0; 7])
+            .collect::<Result<Vec<_>>>()
+            .is_err());
     }
 
     #[test]
@@ -2334,7 +2804,7 @@ mod tests {
             buffer_size: 65536,
         };
         H5Pset_fapl_hdfs_config(&mut list, hdfs.clone()).unwrap();
-        assert_eq!(H5P_peek(&list, "driver").unwrap(), b"hdfs".to_vec());
+        assert_eq!(H5P_peek_ref(&list, "driver").unwrap(), b"hdfs");
         assert_eq!(H5Pget_fapl_hdfs_config(&list).unwrap(), Some(hdfs));
 
         let ros3 = Ros3FaplConfig {
@@ -2358,17 +2828,22 @@ mod tests {
             user_name: "hdf5".into(),
             buffer_size: 65536,
         };
-        let mut hdfs_bytes = H5P__encode_hdfs_fapl_config(&hdfs).unwrap();
+        let mut hdfs_bytes = Vec::new();
+        H5P__encode_hdfs_fapl_config_into(&hdfs, &mut hdfs_bytes).unwrap();
         assert_eq!(H5P__decode_hdfs_fapl_config(&hdfs_bytes).unwrap(), hdfs);
         hdfs_bytes.pop();
         assert!(H5P__decode_hdfs_fapl_config(&hdfs_bytes).is_err());
 
-        let mut hdfs_absent_name = H5P__encode_hdfs_fapl_config(&HdfsFaplConfig {
-            namenode_name: String::new(),
-            namenode_port: 8020,
-            user_name: "hdf5".into(),
-            buffer_size: 65536,
-        })
+        let mut hdfs_absent_name = Vec::new();
+        H5P__encode_hdfs_fapl_config_into(
+            &HdfsFaplConfig {
+                namenode_name: String::new(),
+                namenode_port: 8020,
+                user_name: "hdf5".into(),
+                buffer_size: 65536,
+            },
+            &mut hdfs_absent_name,
+        )
         .unwrap();
         hdfs_absent_name[0] = 0;
         assert!(H5P__decode_hdfs_fapl_config(&hdfs_absent_name).is_err());
@@ -2378,7 +2853,8 @@ mod tests {
             region: Some("us-east-1".into()),
             token: None,
         };
-        let mut ros3_bytes = H5P__encode_ros3_fapl_config(&ros3).unwrap();
+        let mut ros3_bytes = Vec::new();
+        H5P__encode_ros3_fapl_config_into(&ros3, &mut ros3_bytes).unwrap();
         assert_eq!(H5P__decode_ros3_fapl_config(&ros3_bytes).unwrap(), ros3);
         ros3_bytes.push(0);
         assert!(H5P__decode_ros3_fapl_config(&ros3_bytes).is_err());

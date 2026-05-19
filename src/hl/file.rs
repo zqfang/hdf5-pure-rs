@@ -7,14 +7,11 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 
 use crate::error::{Error, Result};
-use crate::format::btree_v1::BTreeV1Node;
-use crate::format::local_heap::LocalHeap;
-use crate::format::messages::link::{LinkMessage, LinkType};
+use crate::format::messages::link::LinkType;
 use crate::format::object_header::{self, RawMessage};
 use crate::format::superblock::Superblock;
-use crate::format::symbol_table::SymbolTableNode;
 use crate::hl::dataset::Dataset;
-use crate::hl::group::Group;
+use crate::hl::group::{visit_attr_names_at, visit_attrs_at, Group};
 use crate::io::reader::HdfReader;
 
 /// Represents the type of an HDF5 object as determined by its object header messages.
@@ -31,6 +28,25 @@ pub enum ObjectType {
 pub enum FileIntent {
     ReadOnly,
     ReadWrite,
+}
+
+/// File opening mode.
+///
+/// Part of the hdf5-metno compatibility layer and should not be removed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OpenMode {
+    /// Open a file as read-only, file must exist.
+    Read,
+    /// Open a file as read-only in SWMR mode, file must exist.
+    ReadSWMR,
+    /// Open a file as read/write, file must exist.
+    ReadWrite,
+    /// Create a file, truncate if exists.
+    Create,
+    /// Create a file, fail if exists.
+    CreateExcl,
+    /// Open a file as read/write if exists, create otherwise.
+    Append,
 }
 
 /// File-level metadata summary.
@@ -94,6 +110,7 @@ pub(crate) struct FileInner<R: Read + Seek> {
     pub reader: HdfReader<R>,
     pub superblock: Superblock,
     pub path: Option<PathBuf>,
+    pub intent: FileIntent,
     pub access_plist: crate::hl::plist::file_access::FileAccess,
     pub dset_no_attrs_hint: bool,
     pub open_objects: HashMap<u64, OpenObjectKind>,
@@ -104,7 +121,213 @@ pub(crate) struct FileInner<R: Read + Seek> {
 pub struct File {
     inner: Arc<Mutex<FileInner<BufReader<fs::File>>>>,
     superblock: Superblock,
+    path: Option<Arc<PathBuf>>,
     object_id: u64,
+    intent: FileIntent,
+}
+
+/// File-creation builder placeholder.
+///
+/// Part of the hdf5-metno compatibility layer and should not be removed.
+#[derive(Default, Clone, Debug)]
+pub struct FileCreateBuilder;
+
+/// File builder allowing limited compatibility with hdf5-metno open helpers.
+///
+/// Part of the hdf5-metno compatibility layer and should not be removed.
+#[derive(Clone, Debug)]
+pub struct FileBuilder {
+    fapl: crate::hl::plist::file_access::FileAccess,
+    fcpl: FileCreateBuilder,
+}
+
+impl Default for FileBuilder {
+    /// Creates the default file builder placeholder state.
+    ///
+    /// Part of the hdf5-metno compatibility layer and should not be removed.
+    fn default() -> Self {
+        Self {
+            fapl: crate::hl::plist::file_access::FileAccess::default(),
+            fcpl: FileCreateBuilder,
+        }
+    }
+}
+
+impl FileBuilder {
+    /// Creates a new file builder with default property lists.
+    ///
+    /// Part of the hdf5-metno compatibility layer and should not be removed.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Opens a file as read-only, file must exist.
+    ///
+    /// Part of the hdf5-metno compatibility layer and should not be removed.
+    pub fn open<P: AsRef<Path>>(&self, filename: P) -> Result<File> {
+        self.open_as(filename, OpenMode::Read)
+    }
+
+    /// Opens a file as read/write, file must exist.
+    ///
+    /// Part of the hdf5-metno compatibility layer and should not be removed.
+    pub fn open_rw<P: AsRef<Path>>(&self, filename: P) -> Result<File> {
+        self.open_as(filename, OpenMode::ReadWrite)
+    }
+
+    /// Creates a file, truncates if exists.
+    ///
+    /// Part of the hdf5-metno compatibility layer and should not be removed.
+    pub fn create<P: AsRef<Path>>(&self, filename: P) -> Result<File> {
+        self.open_as(filename, OpenMode::Create)
+    }
+
+    /// Creates a file, fails if exists.
+    ///
+    /// Part of the hdf5-metno compatibility layer and should not be removed.
+    pub fn create_excl<P: AsRef<Path>>(&self, filename: P) -> Result<File> {
+        self.open_as(filename, OpenMode::CreateExcl)
+    }
+
+    /// Opens a file as read/write if exists, creates otherwise.
+    ///
+    /// Part of the hdf5-metno compatibility layer and should not be removed.
+    pub fn append<P: AsRef<Path>>(&self, filename: P) -> Result<File> {
+        self.open_as(filename, OpenMode::Append)
+    }
+
+    /// Opens a file in a given mode.
+    ///
+    /// Part of the hdf5-metno compatibility layer and should not be removed.
+    pub fn open_as<P: AsRef<Path>>(&self, filename: P, mode: OpenMode) -> Result<File> {
+        let file = match mode {
+            OpenMode::Read => File::open(filename)?,
+            OpenMode::ReadSWMR => Err(Error::Unsupported(
+                "hdf5-metno compatibility: SWMR File open is not supported".into(),
+            ))?,
+            OpenMode::ReadWrite => File::open_rw(filename)?,
+            OpenMode::Create => File::create(filename)?,
+            OpenMode::CreateExcl => File::create_excl(filename)?,
+            OpenMode::Append => File::append(filename)?,
+        };
+        file.set_access_plist(self.fapl.clone());
+        Ok(file)
+    }
+
+    /// Sets current file access property list to a given one.
+    ///
+    /// Part of the hdf5-metno compatibility layer and should not be removed.
+    pub fn set_access_plist(
+        &mut self,
+        fapl: &crate::hl::plist::file_access::FileAccess,
+    ) -> Result<&mut Self> {
+        self.fapl = fapl.clone();
+        Ok(self)
+    }
+
+    /// A short alias for `set_access_plist()`.
+    ///
+    /// Part of the hdf5-metno compatibility layer and should not be removed.
+    pub fn set_fapl(
+        &mut self,
+        fapl: &crate::hl::plist::file_access::FileAccess,
+    ) -> Result<&mut Self> {
+        self.set_access_plist(fapl)
+    }
+
+    /// Returns the builder object for the file access property list.
+    ///
+    /// Part of the hdf5-metno compatibility layer and should not be removed.
+    pub fn access_plist(&mut self) -> &mut crate::hl::plist::file_access::FileAccess {
+        &mut self.fapl
+    }
+
+    /// A short alias for `access_plist()`.
+    ///
+    /// Part of the hdf5-metno compatibility layer and should not be removed.
+    pub fn fapl(&mut self) -> &mut crate::hl::plist::file_access::FileAccess {
+        self.access_plist()
+    }
+
+    /// Allows accessing the builder object for the file access property list.
+    ///
+    /// Part of the hdf5-metno compatibility layer and should not be removed.
+    pub fn with_access_plist<F>(&mut self, func: F) -> &mut Self
+    where
+        F: Fn(
+            &mut crate::hl::plist::file_access::FileAccess,
+        ) -> &mut crate::hl::plist::file_access::FileAccess,
+    {
+        func(&mut self.fapl);
+        self
+    }
+
+    /// A short alias for `with_access_plist()`.
+    ///
+    /// Part of the hdf5-metno compatibility layer and should not be removed.
+    pub fn with_fapl<F>(&mut self, func: F) -> &mut Self
+    where
+        F: Fn(
+            &mut crate::hl::plist::file_access::FileAccess,
+        ) -> &mut crate::hl::plist::file_access::FileAccess,
+    {
+        self.with_access_plist(func)
+    }
+
+    /// Sets current file creation property list to a given one.
+    ///
+    /// Part of the hdf5-metno compatibility layer and should not be removed.
+    pub fn set_create_plist(
+        &mut self,
+        _fcpl: &crate::hl::plist::file_create::FileCreate,
+    ) -> Result<&mut Self> {
+        Ok(self)
+    }
+
+    /// A short alias for `set_create_plist()`.
+    ///
+    /// Part of the hdf5-metno compatibility layer and should not be removed.
+    pub fn set_fcpl(
+        &mut self,
+        fcpl: &crate::hl::plist::file_create::FileCreate,
+    ) -> Result<&mut Self> {
+        self.set_create_plist(fcpl)
+    }
+
+    /// Returns the placeholder builder object for the file creation property list.
+    ///
+    /// Part of the hdf5-metno compatibility layer and should not be removed.
+    pub fn create_plist(&mut self) -> &mut FileCreateBuilder {
+        &mut self.fcpl
+    }
+
+    /// A short alias for `create_plist()`.
+    ///
+    /// Part of the hdf5-metno compatibility layer and should not be removed.
+    pub fn fcpl(&mut self) -> &mut FileCreateBuilder {
+        self.create_plist()
+    }
+
+    /// Allows accessing the placeholder builder object for the file creation property list.
+    ///
+    /// Part of the hdf5-metno compatibility layer and should not be removed.
+    pub fn with_create_plist<F>(&mut self, func: F) -> &mut Self
+    where
+        F: Fn(&mut FileCreateBuilder) -> &mut FileCreateBuilder,
+    {
+        func(&mut self.fcpl);
+        self
+    }
+
+    /// A short alias for `with_create_plist()`.
+    ///
+    /// Part of the hdf5-metno compatibility layer and should not be removed.
+    pub fn with_fcpl<F>(&mut self, func: F) -> &mut Self
+    where
+        F: Fn(&mut FileCreateBuilder) -> &mut FileCreateBuilder,
+    {
+        self.with_create_plist(func)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -123,10 +346,19 @@ impl File {
 
     /// Open an HDF5 file for reading.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let f = fs::File::open(path.as_ref()).map_err(|e| {
+        Self::open_with_intent(path, FileIntent::ReadOnly)
+    }
+
+    fn open_with_intent<P: AsRef<Path>>(path: P, intent: FileIntent) -> Result<Self> {
+        let path_ref = path.as_ref();
+        let f = match intent {
+            FileIntent::ReadOnly => fs::File::open(path_ref),
+            FileIntent::ReadWrite => fs::OpenOptions::new().read(true).write(true).open(path_ref),
+        }
+        .map_err(|e| {
             Error::Io(std::io::Error::new(
                 e.kind(),
-                format!("failed to open {}: {e}", path.as_ref().display()),
+                format!("failed to open {}: {e}", path_ref.display()),
             ))
         })?;
 
@@ -138,7 +370,8 @@ impl File {
         let inner = Arc::new(Mutex::new(FileInner {
             reader,
             superblock: superblock.clone(),
-            path: Some(path.as_ref().to_path_buf()),
+            path: Some(path_ref.to_path_buf()),
+            intent,
             access_plist: crate::hl::plist::file_access::FileAccess::default(),
             dset_no_attrs_hint: false,
             open_objects: HashMap::new(),
@@ -149,8 +382,63 @@ impl File {
         Ok(File {
             inner,
             superblock,
+            path: Some(Arc::new(path_ref.to_path_buf())),
             object_id,
+            intent,
         })
+    }
+
+    /// Opens a file as read/write, file must exist.
+    ///
+    /// Part of the hdf5-metno compatibility layer and should not be removed.
+    pub fn open_rw<P: AsRef<Path>>(filename: P) -> Result<Self> {
+        Self::open_with_intent(filename, FileIntent::ReadWrite)
+    }
+
+    /// Creates a file, truncates if exists.
+    ///
+    /// Part of the hdf5-metno compatibility layer and should not be removed.
+    pub fn create<P: AsRef<Path>>(filename: P) -> Result<Self> {
+        let path = filename.as_ref().to_path_buf();
+        let writable = crate::hl::writable_file::WritableFile::create(&path)?;
+        let _ = writable.close()?;
+        Self::open_with_intent(&path, FileIntent::ReadWrite)
+    }
+
+    /// Creates a file, fails if exists.
+    ///
+    /// Part of the hdf5-metno compatibility layer and should not be removed.
+    pub fn create_excl<P: AsRef<Path>>(filename: P) -> Result<Self> {
+        let path = filename.as_ref().to_path_buf();
+        let writable = crate::hl::writable_file::WritableFile::create_excl(&path)?;
+        let _ = writable.close()?;
+        Self::open_with_intent(&path, FileIntent::ReadWrite)
+    }
+
+    /// Opens a file as read/write if exists, creates otherwise.
+    ///
+    /// Part of the hdf5-metno compatibility layer and should not be removed.
+    pub fn append<P: AsRef<Path>>(filename: P) -> Result<Self> {
+        let path = filename.as_ref().to_path_buf();
+        if path.exists() {
+            Self::open_rw(&path)
+        } else {
+            Self::create(&path)
+        }
+    }
+
+    /// Opens a file in a given mode.
+    ///
+    /// Part of the hdf5-metno compatibility layer and should not be removed.
+    pub fn open_as<P: AsRef<Path>>(filename: P, mode: OpenMode) -> Result<Self> {
+        FileBuilder::new().open_as(filename, mode)
+    }
+
+    /// Opens a file with custom file-access and file-creation options.
+    ///
+    /// Part of the hdf5-metno compatibility layer and should not be removed.
+    pub fn with_options() -> FileBuilder {
+        FileBuilder::new()
     }
 
     /// Get the superblock.
@@ -166,16 +454,96 @@ impl File {
         self.inner.lock().reader.len()
     }
 
+    /// Returns the file size in bytes, or 0 if it cannot be read.
+    ///
+    /// Part of the hdf5-metno compatibility layer and should not be removed.
+    pub fn size(&self) -> u64 {
+        self.file_size().unwrap_or(0)
+    }
+
+    /// Returns the free space in the file in bytes.
+    ///
+    /// Part of the hdf5-metno compatibility layer and should not be removed.
+    pub fn free_space(&self) -> u64 {
+        self.freespace()
+    }
+
+    /// Returns true if the file was opened in a read-only mode.
+    ///
+    /// Part of the hdf5-metno compatibility layer and should not be removed.
+    pub fn is_read_only(&self) -> bool {
+        self.intent() == FileIntent::ReadOnly
+    }
+
+    /// Returns the userblock size in bytes.
+    ///
+    /// Part of the hdf5-metno compatibility layer and should not be removed.
+    pub fn userblock(&self) -> u64 {
+        0
+    }
+
+    /// Flushes the file to the storage medium.
+    ///
+    /// Part of the hdf5-metno compatibility layer and should not be removed.
+    pub fn flush(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Closes the file handle.
+    ///
+    /// Part of the hdf5-metno compatibility layer and should not be removed.
+    pub fn close(self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Mark this file as ready for opening as SWMR.
+    ///
+    /// Part of the hdf5-metno compatibility layer and should not be removed.
+    pub fn start_swmr(&self) -> Result<()> {
+        Err(Error::Unsupported(
+            "hdf5-metno compatibility: SWMR write mode is not supported".into(),
+        ))
+    }
+
     /// Return the path used to open this file, when the file has an on-disk path.
     ///
     /// This mirrors the useful file-level subset of HDF5's `H5Fget_name`.
     pub fn path(&self) -> Option<PathBuf> {
-        self.inner.lock().path.clone()
+        self.path.as_deref().cloned()
+    }
+
+    /// Borrow the path used to open this file for the duration of `visitor`.
+    pub fn with_path<T, F>(&self, visitor: F) -> T
+    where
+        F: FnOnce(Option<&Path>) -> T,
+    {
+        visitor(self.path.as_deref().map(PathBuf::as_path))
     }
 
     /// Return the access properties for this open file.
     pub fn access_plist(&self) -> crate::hl::plist::file_access::FileAccess {
         crate::hl::plist::file_access::FileAccess::from_file(self)
+    }
+
+    /// A short alias for `access_plist()`.
+    ///
+    /// Part of the hdf5-metno compatibility layer and should not be removed.
+    pub fn fapl(&self) -> crate::hl::plist::file_access::FileAccess {
+        self.access_plist()
+    }
+
+    /// Returns a copy of the file creation property list.
+    ///
+    /// Part of the hdf5-metno compatibility layer and should not be removed.
+    pub fn create_plist(&self) -> crate::hl::plist::file_create::FileCreate {
+        crate::hl::plist::file_create::FileCreate::from_file(self)
+    }
+
+    /// A short alias for `create_plist()`.
+    ///
+    /// Part of the hdf5-metno compatibility layer and should not be removed.
+    pub fn fcpl(&self) -> crate::hl::plist::file_create::FileCreate {
+        self.create_plist()
     }
 
     pub(crate) fn access_plist_snapshot(&self) -> crate::hl::plist::file_access::FileAccess {
@@ -189,7 +557,7 @@ impl File {
 
     /// Return this file's open intent.
     pub fn intent(&self) -> FileIntent {
-        FileIntent::ReadOnly
+        self.intent
     }
 
     /// Return the parsed end-of-address marker from the superblock.
@@ -236,11 +604,37 @@ impl File {
         let len = guard.reader.len()?;
         let len = usize::try_from(len)
             .map_err(|_| Error::InvalidFormat("file image length does not fit usize".into()))?;
-        guard.reader.seek(0)?;
-        let image = guard.reader.read_bytes(len);
-        let restore = guard.reader.seek(pos);
-        match (image, restore) {
-            (Ok(image), Ok(_)) => Ok(image),
+        let mut image = vec![0u8; len];
+        Self::read_file_image_into(&mut guard.reader, pos, &mut image)?;
+        Ok(image)
+    }
+
+    /// Read the current file image into caller-provided storage.
+    pub fn file_image_into(&self, out: &mut [u8]) -> Result<()> {
+        let mut guard = self.inner.lock();
+        let pos = guard.reader.position()?;
+        let len = guard.reader.len()?;
+        let len = usize::try_from(len)
+            .map_err(|_| Error::InvalidFormat("file image length does not fit usize".into()))?;
+        if out.len() != len {
+            return Err(Error::InvalidFormat(format!(
+                "file image output length mismatch: expected {len}, got {}",
+                out.len()
+            )));
+        }
+        Self::read_file_image_into(&mut guard.reader, pos, out)
+    }
+
+    fn read_file_image_into<R: std::io::Read + std::io::Seek>(
+        reader: &mut crate::io::reader::HdfReader<R>,
+        pos: u64,
+        out: &mut [u8],
+    ) -> Result<()> {
+        reader.seek(0)?;
+        let read = reader.read_bytes_into(out);
+        let restore = reader.seek(pos);
+        match (read, restore) {
+            (Ok(_), Ok(_)) => Ok(()),
             (Err(err), _) => Err(err),
             (_, Err(err)) => Err(err),
         }
@@ -248,10 +642,11 @@ impl File {
 
     /// Return a stable file-number surrogate for this open file.
     pub fn fileno(&self) -> Result<u64> {
-        let path = self
-            .path()
-            .ok_or_else(|| Error::Unsupported("open file has no filesystem path".into()))?;
-        file_number_from_path(&path)
+        self.with_path(|path| {
+            let path =
+                path.ok_or_else(|| Error::Unsupported("open file has no filesystem path".into()))?;
+            file_number_from_path(path)
+        })
     }
 
     /// Return this file handle's high-level object id.
@@ -266,9 +661,28 @@ impl File {
 
     /// Return currently live high-level object ids for this file.
     pub fn obj_ids(&self) -> Vec<u64> {
-        let mut ids: Vec<u64> = self.inner.lock().open_objects.keys().copied().collect();
-        ids.sort_unstable();
+        let mut ids = Vec::new();
+        self.obj_ids_into(&mut ids);
         ids
+    }
+
+    /// Visit currently live high-level object ids for this file in sorted order.
+    pub fn visit_obj_ids<F>(&self, mut visitor: F)
+    where
+        F: FnMut(u64),
+    {
+        let mut ids = Vec::new();
+        self.obj_ids_into(&mut ids);
+        for id in ids {
+            visitor(id);
+        }
+    }
+
+    /// Store currently live high-level object ids in caller-provided storage.
+    pub fn obj_ids_into(&self, out: &mut Vec<u64>) {
+        out.clear();
+        out.extend(self.inner.lock().open_objects.keys().copied());
+        out.sort_unstable();
     }
 
     /// Return the native handle for the direct file driver when available.
@@ -375,12 +789,18 @@ impl File {
     }
 
     pub(crate) fn from_inner(inner: Arc<Mutex<FileInner<BufReader<fs::File>>>>) -> Self {
-        let superblock = inner.lock().superblock.clone();
+        let guard = inner.lock();
+        let superblock = guard.superblock.clone();
+        let intent = guard.intent;
+        let path = guard.path.clone().map(Arc::new);
+        drop(guard);
         let object_id = register_open_object(&inner, OpenObjectKind::File);
         Self {
             inner,
             superblock,
+            path,
             object_id,
+            intent,
         }
     }
 
@@ -391,7 +811,34 @@ impl File {
 
     /// List all member names in the root group.
     pub fn member_names(&self) -> Result<Vec<String>> {
-        self.root_group()?.member_names()
+        let mut names = Vec::new();
+        self.member_names_into(&mut names)?;
+        Ok(names)
+    }
+
+    /// Visit all root-group member names without returning an owned list.
+    pub fn visit_member_names<F>(&self, visitor: F) -> Result<()>
+    where
+        F: FnMut(&str) -> Result<()>,
+    {
+        self.root_group()?.visit_member_names(visitor)
+    }
+
+    /// Visit all root-group members as `(name, object_header_addr)` pairs.
+    pub fn visit_members<F>(&self, visitor: F) -> Result<()>
+    where
+        F: FnMut(&str, u64) -> Result<()>,
+    {
+        self.root_group()?.visit_members(visitor)
+    }
+
+    /// Store root-group member names in caller-provided storage.
+    pub fn member_names_into(&self, out: &mut Vec<String>) -> Result<()> {
+        out.clear();
+        self.visit_member_names(|name| {
+            out.push(name.to_string());
+            Ok(())
+        })
     }
 
     /// Open a group by path (starting from root).
@@ -408,20 +855,85 @@ impl File {
 
     /// List attribute names on the root group.
     pub fn attr_names(&self) -> Result<Vec<String>> {
-        crate::hl::attribute::attr_names(&self.inner, self.superblock.root_addr)
+        let mut names = Vec::new();
+        self.attr_names_into(&mut names)?;
+        Ok(names)
+    }
+
+    /// Visit attribute names on the root group in storage order.
+    pub fn visit_attr_names<F>(&self, mut f: F) -> Result<()>
+    where
+        F: FnMut(&str) -> Result<()>,
+    {
+        visit_attr_names_at(&self.inner, self.superblock.root_addr, &mut f)
+    }
+
+    /// Append root-group attribute names into caller-provided storage.
+    pub fn attr_names_into(&self, out: &mut Vec<String>) -> Result<()> {
+        out.clear();
+        self.visit_attr_names(|name| {
+            out.push(name.to_string());
+            Ok(())
+        })
     }
 
     /// List attributes on the root group.
     pub fn attrs(&self) -> Result<Vec<crate::hl::attribute::Attribute>> {
-        crate::hl::attribute::collect_attributes(&self.inner, self.superblock.root_addr)
+        let mut attrs = Vec::new();
+        self.attrs_into(&mut attrs)?;
+        Ok(attrs)
+    }
+
+    /// Visit attributes on the root group in storage order.
+    pub fn visit_attrs<F>(&self, mut f: F) -> Result<()>
+    where
+        F: FnMut(&crate::hl::attribute::Attribute) -> Result<()>,
+    {
+        visit_attrs_at(&self.inner, self.superblock.root_addr, &mut f)
+    }
+
+    /// Store root-group attributes in caller-provided storage.
+    pub fn attrs_into(&self, out: &mut Vec<crate::hl::attribute::Attribute>) -> Result<()> {
+        out.clear();
+        out.extend(crate::hl::attribute::collect_attributes(
+            &self.inner,
+            self.superblock.root_addr,
+        )?);
+        Ok(())
     }
 
     /// List attributes on the root group sorted by tracked creation order.
     pub fn attrs_by_creation_order(&self) -> Result<Vec<crate::hl::attribute::Attribute>> {
-        crate::hl::attribute::collect_attributes_by_creation_order(
+        let mut attrs = Vec::new();
+        self.attrs_by_creation_order_into(&mut attrs)?;
+        Ok(attrs)
+    }
+
+    /// Visit root-group attributes sorted by tracked creation order.
+    pub fn visit_attrs_by_creation_order<F>(&self, mut f: F) -> Result<()>
+    where
+        F: FnMut(&crate::hl::attribute::Attribute) -> Result<()>,
+    {
+        let mut attrs = Vec::new();
+        self.attrs_by_creation_order_into(&mut attrs)?;
+        for attr in attrs.iter() {
+            f(attr)?;
+        }
+        Ok(())
+    }
+
+    /// Store root-group attributes sorted by tracked creation order in caller-provided storage.
+    pub fn attrs_by_creation_order_into(
+        &self,
+        out: &mut Vec<crate::hl::attribute::Attribute>,
+    ) -> Result<()> {
+        out.clear();
+        crate::hl::attribute::collect_attributes_by_creation_order_into(
             &self.inner,
             self.superblock.root_addr,
-        )
+            out,
+        )?;
+        Ok(())
     }
 
     /// Get an attribute by name on the root group.
@@ -472,11 +984,12 @@ impl File {
         let mut seen_paths = HashSet::new();
 
         'resolve: loop {
-            if !seen_paths.insert(path.clone()) {
+            if seen_paths.contains(&path) {
                 return Err(Error::InvalidFormat(format!(
                     "soft link cycle detected while resolving '{path}'"
                 )));
             }
+            seen_paths.insert(path.clone());
             if path == "/" {
                 return Ok(self.root_resolved_object(path));
             }
@@ -520,12 +1033,11 @@ impl File {
         }
     }
 
-    fn path_components(path: &str) -> Result<Vec<String>> {
-        let parts: Vec<String> = path
+    fn path_components(path: &str) -> Result<Vec<&str>> {
+        let parts: Vec<&str> = path
             .trim_start_matches('/')
             .split('/')
             .filter(|part| !part.is_empty())
-            .map(str::to_string)
             .collect();
         for part in &parts {
             if part.len() > Self::MAX_PATH_COMPONENT_LEN {
@@ -539,29 +1051,8 @@ impl File {
         Ok(parts)
     }
 
-    fn lookup_group_link(&self, current: &Group, part: &str) -> Result<LinkMessage> {
-        match current.find_link_by_name(part) {
-            Ok(link) => Ok(link),
-            Err(link_err) => {
-                if let Some((_, addr)) = current
-                    .members()?
-                    .into_iter()
-                    .find(|(member_name, _)| member_name == part)
-                {
-                    Ok(LinkMessage {
-                        name: part.to_string(),
-                        link_type: LinkType::Hard,
-                        creation_order: None,
-                        char_encoding: 0,
-                        hard_link_addr: Some(addr),
-                        soft_link_target: None,
-                        external_link: None,
-                    })
-                } else {
-                    Err(link_err)
-                }
-            }
-        }
+    fn lookup_group_link(&self, current: &Group, part: &str) -> Result<ResolvedLink> {
+        current.with_link_ref_by_name(part, ResolvedLink::from_ref)
     }
 
     fn resolve_path_component(
@@ -570,62 +1061,41 @@ impl File {
         current_path: &str,
         part: &str,
         is_last: bool,
-        remaining_parts: &[String],
-        link: LinkMessage,
+        remaining_parts: &[&str],
+        link: ResolvedLink,
         traversals: &mut usize,
     ) -> Result<PathStep> {
-        match link.link_type {
-            LinkType::Hard => {
-                let addr = link.hard_link_addr.ok_or_else(|| {
-                    Error::InvalidFormat(format!(
-                        "hard link '{}' is missing object address",
-                        link.name
-                    ))
-                })?;
+        match link {
+            ResolvedLink::Hard { addr } => {
                 let next_path = join_absolute_path(current_path, part);
                 let object_type = self.object_type_at(addr)?;
                 self.resolve_hard_path_step(next_path, addr, object_type, is_last)
             }
-            LinkType::Soft => {
+            ResolvedLink::Soft { target } => {
                 *traversals += 1;
                 if *traversals > Self::MAX_SOFT_LINK_TRAVERSALS {
                     return Err(Error::InvalidFormat(
                         "soft link traversal limit exceeded".into(),
                     ));
                 }
-                let target = link.soft_link_target.ok_or_else(|| {
-                    Error::InvalidFormat(format!(
-                        "soft link '{}' is missing target path",
-                        link.name
-                    ))
-                })?;
-                let remaining = remaining_parts.join("/");
                 Ok(PathStep::Restart(resolve_soft_target(
                     current_path,
                     &target,
-                    &remaining,
+                    remaining_parts,
                 )))
             }
-            LinkType::External => {
-                let (filename, object_path) = link.external_link.ok_or_else(|| {
-                    Error::InvalidFormat(format!(
-                        "external link '{}' is missing target path",
-                        link.name
-                    ))
-                })?;
-                let remaining = remaining_parts.join("/");
-                let target_path = if remaining.is_empty() {
-                    canonical_path(&object_path)
-                } else {
-                    canonical_path(&join_absolute_path(&object_path, &remaining))
-                };
+            ResolvedLink::External {
+                filename,
+                object_path,
+            } => {
+                let target_path = append_path_parts(canonical_path(&object_path), remaining_parts);
                 let file_path = self.resolve_external_file_path(&filename)?;
                 let external_file = File::open(file_path)?;
                 Ok(PathStep::Resolved(
                     external_file.resolve_path(&target_path)?,
                 ))
             }
-            LinkType::UserDefined(kind) => Err(Error::Unsupported(format!(
+            ResolvedLink::UserDefined(kind) => Err(Error::Unsupported(format!(
                 "user-defined link traversal is not supported for link type {kind}"
             ))),
         }
@@ -715,6 +1185,60 @@ struct ResolvedObject {
     object_type: ObjectType,
 }
 
+enum ResolvedLink {
+    Hard {
+        addr: u64,
+    },
+    Soft {
+        target: String,
+    },
+    External {
+        filename: String,
+        object_path: String,
+    },
+    UserDefined(u8),
+}
+
+impl ResolvedLink {
+    fn from_ref(link: crate::hl::group::LinkMessageRef<'_>) -> Result<Self> {
+        match link.link_type {
+            LinkType::Hard => {
+                let addr = link.hard_link_addr.ok_or_else(|| {
+                    Error::InvalidFormat(format!(
+                        "hard link '{}' is missing object address",
+                        link.name
+                    ))
+                })?;
+                Ok(Self::Hard { addr })
+            }
+            LinkType::Soft => {
+                let target = link.soft_link_target.ok_or_else(|| {
+                    Error::InvalidFormat(format!(
+                        "soft link '{}' is missing target path",
+                        link.name
+                    ))
+                })?;
+                Ok(Self::Soft {
+                    target: target.to_string(),
+                })
+            }
+            LinkType::External => {
+                let (filename, object_path) = link.external_link.ok_or_else(|| {
+                    Error::InvalidFormat(format!(
+                        "external link '{}' is missing target path",
+                        link.name
+                    ))
+                })?;
+                Ok(Self::External {
+                    filename: filename.to_string(),
+                    object_path: object_path.to_string(),
+                })
+            }
+            LinkType::UserDefined(kind) => Ok(Self::UserDefined(kind)),
+        }
+    }
+}
+
 enum PathStep {
     Resolved(ResolvedObject),
     Descend(Group, String),
@@ -747,17 +1271,27 @@ fn join_absolute_path(parent: &str, child: &str) -> String {
     }
 }
 
-fn resolve_soft_target(parent: &str, target: &str, remaining: &str) -> String {
+fn append_path_parts(mut base: String, parts: &[&str]) -> String {
+    if parts.is_empty() {
+        return base;
+    }
+    base.reserve(parts.iter().map(|part| part.len() + 1).sum());
+    for part in parts {
+        if base != "/" {
+            base.push('/');
+        }
+        base.push_str(part);
+    }
+    base
+}
+
+fn resolve_soft_target(parent: &str, target: &str, remaining: &[&str]) -> String {
     let base = if target.starts_with('/') {
         canonical_path(target)
     } else {
         canonical_path(&join_absolute_path(parent, target))
     };
-    if remaining.is_empty() {
-        base
-    } else {
-        canonical_path(&join_absolute_path(&base, remaining))
-    }
+    append_path_parts(base, remaining)
 }
 
 /// Determine object type from an object header's messages.
@@ -793,53 +1327,6 @@ pub(crate) fn object_type_from_messages(messages: &[RawMessage]) -> ObjectType {
     } else {
         ObjectType::Unknown
     }
-}
-
-/// Collect group member names from a v1 symbol table.
-pub(crate) fn collect_v1_group_members<R: Read + Seek>(
-    reader: &mut HdfReader<R>,
-    btree_addr: u64,
-    heap_addr: u64,
-) -> Result<Vec<(String, u64)>> {
-    let heap = LocalHeap::read_at(reader, heap_addr)?;
-    let snod_addrs = BTreeV1Node::collect_symbol_table_addrs(reader, btree_addr)?;
-
-    let mut members = Vec::new();
-
-    for snod_addr in snod_addrs {
-        let snod = SymbolTableNode::read_at(reader, snod_addr)?;
-        for entry in &snod.entries {
-            let name_offset = usize::try_from(entry.name_offset).map_err(|_| {
-                Error::InvalidFormat("symbol-table name offset does not fit in usize".into())
-            })?;
-            let name = heap.get_string(name_offset)?;
-            if !name.is_empty() {
-                members.push((name, entry.obj_header_addr));
-            }
-        }
-    }
-
-    Ok(members)
-}
-
-/// Collect group member names from v2 link messages in an object header.
-pub(crate) fn collect_v2_link_members(
-    messages: &[RawMessage],
-    sizeof_addr: u8,
-) -> Vec<(String, u64)> {
-    let mut members = Vec::new();
-
-    for msg in messages {
-        if msg.msg_type == object_header::MSG_LINK {
-            if let Ok(link) = LinkMessage::decode(&msg.data, sizeof_addr) {
-                // Include all link types; use hard_link_addr or 0 for soft/external
-                let addr = link.hard_link_addr.unwrap_or(0);
-                members.push((link.name, addr));
-            }
-        }
-    }
-
-    members
 }
 
 #[cfg(unix)]

@@ -1,11 +1,45 @@
 use crate::format::messages::datatype::{
-    ByteOrder, CompoundField, DatatypeClass, DatatypeMessage, FloatFields,
+    ByteOrder, CompoundField, CompoundFields as RawCompoundFields, DatatypeClass, DatatypeMessage,
+    EnumMembers as RawEnumMembers, FloatFields,
 };
+use std::borrow::Cow;
+
+/// hdf5-metno compatibility descriptor alias backed by this crate's parsed datatype message.
+pub type TypeDescriptor = crate::format::messages::datatype::DatatypeMessage;
 
 /// High-level datatype descriptor.
 #[derive(Debug, Clone)]
 pub struct Datatype {
     msg: DatatypeMessage,
+}
+
+/// Borrowed view of a compound member's metadata.
+#[derive(Debug, Clone)]
+pub struct CompoundFieldView<'a> {
+    pub raw_name: &'a [u8],
+    pub name: Cow<'a, str>,
+    pub byte_offset: usize,
+    pub size: usize,
+    pub class: DatatypeClass,
+    pub byte_order: Option<ByteOrder>,
+    pub datatype: Datatype,
+}
+
+/// Borrowed view of an enum member's metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EnumMemberView<'a> {
+    pub name: &'a str,
+    pub value: u64,
+}
+
+/// Iterator over compound datatype fields.
+pub struct CompoundFields<'a> {
+    inner: RawCompoundFields<'a>,
+}
+
+/// Iterator over enum datatype members.
+pub struct EnumMembers<'a> {
+    inner: RawEnumMembers<'a>,
 }
 
 impl Datatype {
@@ -24,8 +58,33 @@ impl Datatype {
     }
 
     /// Return the parsed low-level datatype message.
+    pub fn raw_message_ref(&self) -> &DatatypeMessage {
+        &self.msg
+    }
+
+    /// Return the parsed low-level datatype message.
     pub fn raw_message(&self) -> DatatypeMessage {
         self.msg.clone()
+    }
+
+    /// hdf5-metno compatibility layer: construct from this crate's descriptor alias; do not remove.
+    pub fn from_descriptor(desc: &TypeDescriptor) -> crate::Result<Self> {
+        Ok(Self::from_message(desc.clone()))
+    }
+
+    /// Construct from an owned descriptor without cloning it first.
+    pub fn from_descriptor_owned(desc: TypeDescriptor) -> crate::Result<Self> {
+        Ok(Self::from_message(desc))
+    }
+
+    /// hdf5-metno compatibility layer: return this crate's descriptor alias; do not remove.
+    pub fn to_descriptor(&self) -> crate::Result<TypeDescriptor> {
+        Ok(self.raw_message())
+    }
+
+    /// Borrow this crate's descriptor alias without cloning it.
+    pub fn to_descriptor_ref(&self) -> &TypeDescriptor {
+        self.raw_message_ref()
     }
 
     /// Get datatype creation properties.
@@ -146,9 +205,14 @@ impl Datatype {
         self.msg.class == DatatypeClass::VarLen
     }
 
+    /// Borrow the opaque datatype tag, if this is an opaque datatype.
+    pub fn opaque_tag_str(&self) -> Option<&str> {
+        self.msg.opaque_tag_str()
+    }
+
     /// Opaque datatype tag, if this is an opaque datatype.
     pub fn opaque_tag(&self) -> Option<String> {
-        self.msg.opaque_tag()
+        self.opaque_tag_str().map(str::to_string)
     }
 
     /// Reference datatype kind: 0=object reference, 1=dataset region reference.
@@ -156,9 +220,37 @@ impl Datatype {
         self.msg.reference_type()
     }
 
-    /// Get compound type fields (returns None if not compound).
+    /// Iterate compound type fields (returns an error if not compound).
+    pub fn compound_fields_iter(&self) -> crate::Result<CompoundFields<'_>> {
+        Ok(CompoundFields {
+            inner: self.msg.compound_fields_iter()?,
+        })
+    }
+
+    /// Get compound type fields (returns `None` if not compound).
     pub fn compound_fields(&self) -> Option<Vec<CompoundField>> {
-        self.msg.compound_fields().ok()
+        let mut fields = Vec::new();
+        self.compound_fields_into(&mut fields).ok()?;
+        Some(fields)
+    }
+
+    /// Store compound type fields in caller-provided storage.
+    pub fn compound_fields_into(&self, out: &mut Vec<CompoundField>) -> crate::Result<()> {
+        let fields = self.msg.compound_fields_iter()?;
+        out.clear();
+        out.reserve(fields.len());
+        for field in fields {
+            let field = field?;
+            out.push(CompoundField {
+                name: field.name.into_owned(),
+                byte_offset: field.byte_offset,
+                size: field.size,
+                class: field.class,
+                byte_order: field.byte_order,
+                datatype: Box::new(field.datatype),
+            });
+        }
+        Ok(())
     }
 
     /// Get the number of compound members.
@@ -168,50 +260,116 @@ impl Datatype {
 
     /// Return the zero-based index of a named compound member.
     pub fn member_index(&self, name: &str) -> Option<usize> {
-        self.compound_fields()
-            .and_then(|fields| fields.iter().position(|field| field.name == name))
+        self.compound_fields_iter().ok().and_then(|fields| {
+            fields.enumerate().find_map(|(index, field)| match field {
+                Ok(field) if field.name == name => Some(index),
+                _ => None,
+            })
+        })
     }
 
     /// Return the byte offset of a compound member by index.
     pub fn member_offset(&self, index: usize) -> Option<usize> {
-        self.compound_fields()
-            .and_then(|fields| fields.get(index).map(|field| field.byte_offset))
+        self.compound_fields_iter()
+            .ok()?
+            .nth(index)?
+            .ok()
+            .map(|field| field.byte_offset)
     }
 
     /// Return the datatype class of a compound member by index.
     pub fn member_class(&self, index: usize) -> Option<DatatypeClass> {
-        self.compound_fields()
-            .and_then(|fields| fields.get(index).map(|field| field.class))
+        self.compound_fields_iter()
+            .ok()?
+            .nth(index)?
+            .ok()
+            .map(|field| field.class)
     }
 
     /// Return the datatype of a compound member by index.
     pub fn member_type(&self, index: usize) -> Option<Datatype> {
-        self.compound_fields().and_then(|fields| {
-            fields
-                .get(index)
-                .map(|field| Datatype::from_message((*field.datatype).clone()))
+        self.compound_fields_iter()
+            .ok()?
+            .nth(index)?
+            .ok()
+            .map(|field| field.datatype)
+    }
+
+    /// Iterate enum members as borrowed `(name, value)` views.
+    pub fn enum_members_iter(&self) -> crate::Result<EnumMembers<'_>> {
+        Ok(EnumMembers {
+            inner: self.msg.enum_members_iter()?,
         })
     }
 
-    /// Get enum members as (name, value) pairs.
+    /// Get enum members as owned `(name, value)` pairs.
     pub fn enum_members(&self) -> Option<Vec<(String, u64)>> {
-        self.msg.enum_members().ok()
+        let mut members = Vec::new();
+        self.enum_members_into(&mut members).ok()?;
+        Some(members)
+    }
+
+    /// Store enum members as owned `(name, value)` pairs in caller-provided storage.
+    pub fn enum_members_into(&self, out: &mut Vec<(String, u64)>) -> crate::Result<()> {
+        let members = self.msg.enum_members_iter()?;
+        out.clear();
+        out.reserve(members.len());
+        for member in members {
+            let member = member?;
+            out.push((member.name.to_string(), member.value));
+        }
+        Ok(())
+    }
+
+    /// Find the symbol name corresponding to an enumeration value without allocating.
+    pub fn enum_nameof_ref(&self, value: u64) -> crate::Result<Option<&str>> {
+        for member in self.msg.enum_members_iter()? {
+            let member = member?;
+            if member.value == value {
+                return Ok(Some(member.name));
+            }
+        }
+        Ok(None)
     }
 
     pub fn enum_nameof(&self, value: u64) -> crate::Result<Option<String>> {
-        self.msg.enum_nameof(value)
+        self.enum_nameof_ref(value)
+            .map(|name| name.map(str::to_string))
     }
 
     pub fn enum_valueof(&self, name: &str) -> crate::Result<Option<u64>> {
         self.msg.enum_valueof(name)
     }
 
+    /// Iterate array dimensions without allocating a dimension vector.
+    pub fn array_dims_iter(
+        &self,
+    ) -> crate::Result<impl ExactSizeIterator<Item = crate::Result<u64>> + '_> {
+        self.msg.array_dims_iter()
+    }
+
+    /// Get the base datatype for array types.
+    pub fn array_base(&self) -> Option<Datatype> {
+        self.msg.array_base().ok().map(Datatype::from_message)
+    }
+
     /// Get array dimensions and base datatype for array types.
     pub fn array_dims_base(&self) -> Option<(Vec<u64>, Datatype)> {
-        self.msg
-            .array_dims_base()
-            .ok()
-            .map(|(dims, base)| (dims, Datatype::from_message(base)))
+        let mut dims = Vec::new();
+        self.array_dims_into(&mut dims).ok()?;
+        let base = self.array_base()?;
+        Some((dims, base))
+    }
+
+    /// Store array dimensions in caller-provided storage.
+    pub fn array_dims_into(&self, out: &mut Vec<u64>) -> crate::Result<()> {
+        let dims = self.array_dims_iter()?;
+        out.clear();
+        out.reserve(dims.len());
+        for dim in dims {
+            out.push(dim?);
+        }
+        Ok(())
     }
 
     /// Get the base datatype for variable-length sequence/string types.
@@ -223,3 +381,46 @@ impl Datatype {
             .map(Datatype::from_message)
     }
 }
+
+impl<'a> Iterator for CompoundFields<'a> {
+    type Item = crate::Result<CompoundFieldView<'a>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next().map(|field| {
+            field.map(|field| CompoundFieldView {
+                raw_name: field.raw_name,
+                name: field.name,
+                byte_offset: field.byte_offset,
+                size: field.size,
+                class: field.class,
+                byte_order: field.byte_order,
+                datatype: Datatype::from_message(field.datatype),
+            })
+        })
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
+}
+
+impl ExactSizeIterator for CompoundFields<'_> {}
+
+impl<'a> Iterator for EnumMembers<'a> {
+    type Item = crate::Result<EnumMemberView<'a>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next().map(|member| {
+            member.map(|member| EnumMemberView {
+                name: member.name,
+                value: member.value,
+            })
+        })
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
+}
+
+impl ExactSizeIterator for EnumMembers<'_> {}

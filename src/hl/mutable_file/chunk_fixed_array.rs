@@ -47,7 +47,13 @@ impl MutableFile {
         let sa = usize::from(self.superblock.sizeof_addr);
         self.write_handle
             .seek(SeekFrom::Start(element_location.element_addr))?;
-        let chunk_addr = Self::encode_uint_le(chunk_addr, sa, "fixed array chunk address")?;
+        let mut encoded_addr = [0u8; 8];
+        let chunk_addr = Self::encode_uint_le_into(
+            chunk_addr,
+            &mut encoded_addr,
+            sa,
+            "fixed array chunk address",
+        )?;
         self.write_handle.write_all(&chunk_addr)?;
         if filtered {
             self.write_uint_le(chunk_size, chunk_size_len)?;

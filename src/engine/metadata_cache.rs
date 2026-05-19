@@ -1,4 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
+use std::ops::Bound::{Excluded, Unbounded};
 
 use crate::error::{Error, Result};
 
@@ -137,9 +139,10 @@ impl MetadataCache {
     }
 
     /// Render a human-readable summary of the cache.
-    pub fn dump_cache(&self) -> String {
+    pub fn write_cache_summary(&self, out: &mut impl fmt::Write) -> fmt::Result {
         let stats = self.stats();
-        format!(
+        write!(
+            out,
             "MetadataCache(entries={}, dirty={}, protected={}, pinned={}, image_bytes={})",
             stats.entries,
             stats.dirty_entries,
@@ -190,33 +193,43 @@ impl MetadataCache {
     }
 
     /// Snapshot the candidate-flush list for broadcast.
-    pub fn broadcast_candidate_list(&self) -> Vec<u64> {
-        self.broadcast_candidate_list_cb()
+    pub fn candidate_list_iter(&self) -> impl DoubleEndedIterator<Item = u64> + '_ {
+        self.candidate_list.iter().copied()
     }
 
-    /// Callback returning the candidate-flush list.
-    pub fn broadcast_candidate_list_cb(&self) -> Vec<u64> {
-        self.candidate_list.iter().copied().collect()
+    /// Copy the candidate-flush list into caller-provided storage.
+    pub fn broadcast_candidate_list_into(&self, out: &mut Vec<u64>) {
+        out.clear();
+        out.reserve(self.candidate_list.len());
+        out.extend(self.candidate_list_iter());
     }
 
     /// Snapshot the clean list for broadcast.
-    pub fn broadcast_clean_list(&self) -> Vec<u64> {
-        self.broadcast_clean_list_cb()
+    pub fn clean_list_iter(&self) -> impl DoubleEndedIterator<Item = u64> + '_ {
+        self.clean_list.iter().copied()
     }
 
-    /// Callback returning the clean list.
-    pub fn broadcast_clean_list_cb(&self) -> Vec<u64> {
-        self.clean_list.iter().copied().collect()
+    /// Copy the clean list into caller-provided storage.
+    pub fn broadcast_clean_list_into(&self, out: &mut Vec<u64>) {
+        out.clear();
+        out.reserve(self.clean_list.len());
+        out.extend(self.clean_list_iter());
     }
 
     /// Rebuild the candidate-flush list from dirty entries.
-    pub fn construct_candidate_list(&mut self) -> Vec<u64> {
-        self.candidate_list = self
-            .entries
-            .iter()
-            .filter_map(|(&addr, entry)| entry.dirty.then_some(addr))
-            .collect();
-        self.broadcast_candidate_list()
+    pub fn construct_candidate_list_in_place(&mut self) {
+        self.candidate_list.clear();
+        self.candidate_list.extend(
+            self.entries
+                .iter()
+                .filter_map(|(&addr, entry)| entry.dirty.then_some(addr)),
+        );
+    }
+
+    /// Rebuild the candidate-flush list and copy it into caller-provided storage.
+    pub fn construct_candidate_list_into(&mut self, out: &mut Vec<u64>) {
+        self.construct_candidate_list_in_place();
+        self.broadcast_candidate_list_into(out);
     }
 
     /// Serialize the candidate list as little-endian addresses.
@@ -227,6 +240,7 @@ impl MetadataCache {
     /// Callback that serializes the candidate list.
     pub fn copy_candidate_list_to_buffer_cb(&self, out: &mut Vec<u8>) {
         out.clear();
+        out.reserve(self.candidate_list.len().saturating_mul(8));
         for addr in &self.candidate_list {
             out.extend_from_slice(&addr.to_le_bytes());
         }
@@ -269,18 +283,25 @@ impl MetadataCache {
     }
 
     /// Rebuild the clean list and broadcast it.
-    pub fn propagate_flushed_and_still_clean_entries_list(&mut self) -> Vec<u64> {
-        self.clean_list = self
-            .entries
-            .iter()
-            .filter_map(|(&addr, entry)| (!entry.dirty).then_some(addr))
-            .collect();
-        self.broadcast_clean_list()
+    pub fn propagate_flushed_and_still_clean_entries_list_in_place(&mut self) {
+        self.clean_list.clear();
+        self.clean_list.extend(
+            self.entries
+                .iter()
+                .filter_map(|(&addr, entry)| (!entry.dirty).then_some(addr)),
+        );
+    }
+
+    /// Rebuild the clean list and copy it into caller-provided storage.
+    pub fn propagate_flushed_and_still_clean_entries_list_into(&mut self, out: &mut Vec<u64>) {
+        self.propagate_flushed_and_still_clean_entries_list_in_place();
+        self.broadcast_clean_list_into(out);
     }
 
     /// Replace the clean list with the supplied addresses.
     pub fn receive_haddr_list(&mut self, addrs: &[u64]) {
-        self.clean_list = addrs.iter().copied().collect();
+        self.clean_list.clear();
+        self.clean_list.extend(addrs.iter().copied());
     }
 
     /// Replace the clean list and mark each entry clean.
@@ -294,7 +315,8 @@ impl MetadataCache {
 
     /// Replace the candidate list with the supplied addresses.
     pub fn receive_candidate_list(&mut self, addrs: &[u64]) {
-        self.candidate_list = addrs.iter().copied().collect();
+        self.candidate_list.clear();
+        self.candidate_list.extend(addrs.iter().copied());
     }
 
     /// Distributed metadata-write sync-point flush.
@@ -319,7 +341,7 @@ impl MetadataCache {
 
     /// Run a parallel sync point: construct candidates then flush.
     pub fn run_sync_point(&mut self) -> Result<()> {
-        self.construct_candidate_list();
+        self.construct_candidate_list_in_place();
         self.flush_entries()
     }
 
@@ -331,13 +353,18 @@ impl MetadataCache {
 
     /// Flush all candidate (or all) entries to backing storage.
     pub fn flush_entries(&mut self) -> Result<()> {
-        let addrs: Vec<u64> = if self.candidate_list.is_empty() {
-            self.entries.keys().copied().collect()
+        if self.candidate_list.is_empty() {
+            let mut addr = self.first_entry_addr();
+            while let Some(current) = addr {
+                addr = self.next_entry_addr_after(current);
+                self.flush(current)?;
+            }
         } else {
-            self.candidate_list.iter().copied().collect()
-        };
-        for addr in addrs {
-            self.flush(addr)?;
+            let mut addr = self.first_candidate_addr();
+            while let Some(current) = addr {
+                addr = self.next_candidate_addr_after(current);
+                self.flush(current)?;
+            }
         }
         self.candidate_list.clear();
         Ok(())
@@ -355,18 +382,19 @@ impl MetadataCache {
 
     /// Evict clean entries from the cache.
     pub fn evict(&mut self) -> Result<usize> {
-        let removable: Vec<u64> = self
-            .entries
-            .iter()
-            .filter_map(|(&addr, entry)| {
-                (!entry.dirty && !entry.protected && !entry.pinned && !entry.corked).then_some(addr)
-            })
-            .collect();
-        for addr in &removable {
-            self.entries.remove(addr);
-            self.log_deleted_entry(*addr);
+        let mut removed = 0usize;
+        let mut addr = self.first_entry_addr();
+        while let Some(current) = addr {
+            addr = self.next_entry_addr_after(current);
+            if self.entries.get(&current).is_some_and(|entry| {
+                !entry.dirty && !entry.protected && !entry.pinned && !entry.corked
+            }) {
+                self.entries.remove(&current);
+                self.log_deleted_entry(current);
+                removed += 1;
+            }
         }
-        Ok(removable.len())
+        Ok(removed)
     }
 
     /// Expunge an entry (mark deleted and remove).
@@ -469,7 +497,7 @@ impl MetadataCache {
 
     /// Prepare the cache for file flush (build candidate list).
     pub fn prep_for_file_flush(&mut self) -> Result<()> {
-        self.construct_candidate_list();
+        self.construct_candidate_list_in_place();
         Ok(())
     }
 
@@ -533,38 +561,46 @@ impl MetadataCache {
     }
 
     /// Return the auto-resize configuration.
-    pub fn get_cache_auto_resize_config(&self) -> MetadataCacheResizeConfig {
-        self.auto_resize_config.clone()
+    pub fn cache_auto_resize_config(&self) -> &MetadataCacheResizeConfig {
+        &self.auto_resize_config
     }
 
     /// Evict all clean entries with a given tag.
     pub fn evict_tagged_metadata(&mut self, tag: u64) -> Result<usize> {
-        let addrs: Vec<u64> = self
-            .entries
-            .iter()
-            .filter_map(|(&addr, entry)| (entry.tag == Some(tag) && !entry.dirty).then_some(addr))
-            .collect();
-        for addr in &addrs {
-            self.entries.remove(addr);
-            self.log_deleted_entry(*addr);
+        let mut removed = 0usize;
+        let mut addr = self.first_entry_addr();
+        while let Some(current) = addr {
+            addr = self.next_entry_addr_after(current);
+            if self
+                .entries
+                .get(&current)
+                .is_some_and(|entry| entry.tag == Some(tag) && !entry.dirty)
+            {
+                self.entries.remove(&current);
+                self.log_deleted_entry(current);
+                removed += 1;
+            }
         }
-        Ok(addrs.len())
+        Ok(removed)
     }
 
     /// Expunge all entries matching tag and entry type.
     pub fn expunge_tag_type_metadata(&mut self, tag: u64, entry_type: &str) -> Result<usize> {
-        let addrs: Vec<u64> = self
-            .entries
-            .iter()
-            .filter_map(|(&addr, entry)| {
-                (entry.tag == Some(tag) && entry.entry_type == entry_type).then_some(addr)
-            })
-            .collect();
-        for addr in &addrs {
-            self.entries.remove(addr);
-            self.log_deleted_entry(*addr);
+        let mut removed = 0usize;
+        let mut addr = self.first_entry_addr();
+        while let Some(current) = addr {
+            addr = self.next_entry_addr_after(current);
+            if self
+                .entries
+                .get(&current)
+                .is_some_and(|entry| entry.tag == Some(tag) && entry.entry_type == entry_type)
+            {
+                self.entries.remove(&current);
+                self.log_deleted_entry(current);
+                removed += 1;
+            }
         }
-        Ok(addrs.len())
+        Ok(removed)
     }
 
     /// Return the current cache tag.
@@ -675,10 +711,12 @@ impl MetadataCache {
     }
 
     /// Serialize a proxy entry and mark it serialized.
-    pub fn proxy_entry_serialize(&mut self, proxy_addr: u64) -> Result<Vec<u8>> {
+    pub fn proxy_entry_serialize_into(&mut self, proxy_addr: u64, out: &mut Vec<u8>) -> Result<()> {
         let entry = self.require_entry_mut(proxy_addr)?;
         entry.serialized = true;
-        Ok(entry.image.clone())
+        out.clear();
+        out.extend_from_slice(&entry.image);
+        Ok(())
     }
 
     /// Append a proxy notification message to the cache log.
@@ -737,6 +775,28 @@ impl MetadataCache {
         }
     }
 
+    fn first_entry_addr(&self) -> Option<u64> {
+        self.entries.keys().next().copied()
+    }
+
+    fn next_entry_addr_after(&self, addr: u64) -> Option<u64> {
+        self.entries
+            .range((Excluded(addr), Unbounded))
+            .next()
+            .map(|(&addr, _)| addr)
+    }
+
+    fn first_candidate_addr(&self) -> Option<u64> {
+        self.candidate_list.iter().next().copied()
+    }
+
+    fn next_candidate_addr_after(&self, addr: u64) -> Option<u64> {
+        self.candidate_list
+            .range((Excluded(addr), Unbounded))
+            .next()
+            .copied()
+    }
+
     /// Append an arbitrary event record to the cache log.
     fn log_event(&mut self, kind: &str, addr: u64) {
         self.logs.push(format!("{kind}:{addr:#x}"));
@@ -762,15 +822,17 @@ pub fn H5AC_dest(cache: MetadataCache) {
 }
 
 /// Return the auto-resize configuration.
+#[deprecated(note = "use MetadataCache::cache_auto_resize_config to borrow the config")]
 #[allow(non_snake_case)]
 pub fn H5C_get_cache_auto_resize_config(cache: &MetadataCache) -> MetadataCacheResizeConfig {
-    cache.get_cache_auto_resize_config()
+    cache.cache_auto_resize_config().clone()
 }
 
 /// `H5AC` wrapper: return the auto-resize configuration.
+#[deprecated(note = "use MetadataCache::cache_auto_resize_config to borrow the config")]
 #[allow(non_snake_case)]
 pub fn H5AC_get_cache_auto_resize_config(cache: &MetadataCache) -> MetadataCacheResizeConfig {
-    H5C_get_cache_auto_resize_config(cache)
+    cache.cache_auto_resize_config().clone()
 }
 
 /// Overwrite the cache auto-resize configuration.
@@ -796,20 +858,47 @@ pub fn H5C_apply_candidate_list(cache: &mut MetadataCache, addrs: &[u64]) -> Res
 
 /// `H5AC` wrapper: snapshot the candidate-flush list for broadcast.
 #[allow(non_snake_case)]
+pub fn H5AC__broadcast_candidate_list_into(cache: &MetadataCache, out: &mut Vec<u64>) {
+    cache.broadcast_candidate_list_into(out);
+}
+
+/// `H5AC` wrapper: snapshot the candidate-flush list for broadcast.
+#[deprecated(note = "use H5AC__broadcast_candidate_list_into to reuse caller-provided storage")]
+#[allow(non_snake_case)]
 pub fn H5AC__broadcast_candidate_list(cache: &MetadataCache) -> Vec<u64> {
-    cache.broadcast_candidate_list()
+    let mut out = Vec::new();
+    H5AC__broadcast_candidate_list_into(cache, &mut out);
+    out
 }
 
 /// `H5AC` wrapper: callback returning the clean list.
 #[allow(non_snake_case)]
+pub fn H5AC__broadcast_clean_list_cb_into(cache: &MetadataCache, out: &mut Vec<u64>) {
+    cache.broadcast_clean_list_into(out);
+}
+
+/// `H5AC` wrapper: callback returning the clean list.
+#[deprecated(note = "use H5AC__broadcast_clean_list_cb_into to reuse caller-provided storage")]
+#[allow(non_snake_case)]
 pub fn H5AC__broadcast_clean_list_cb(cache: &MetadataCache) -> Vec<u64> {
-    cache.broadcast_clean_list_cb()
+    let mut out = Vec::new();
+    H5AC__broadcast_clean_list_cb_into(cache, &mut out);
+    out
 }
 
 /// `H5AC` wrapper: snapshot the clean list for broadcast.
 #[allow(non_snake_case)]
+pub fn H5AC__broadcast_clean_list_into(cache: &MetadataCache, out: &mut Vec<u64>) {
+    cache.broadcast_clean_list_into(out);
+}
+
+/// `H5AC` wrapper: snapshot the clean list for broadcast.
+#[deprecated(note = "use H5AC__broadcast_clean_list_into to reuse caller-provided storage")]
+#[allow(non_snake_case)]
 pub fn H5AC__broadcast_clean_list(cache: &MetadataCache) -> Vec<u64> {
-    cache.broadcast_clean_list()
+    let mut out = Vec::new();
+    H5AC__broadcast_clean_list_into(cache, &mut out);
+    out
 }
 
 /// `H5AC` wrapper: serialize the candidate list as little-endian addresses.
@@ -912,15 +1001,21 @@ pub fn H5AC__tidy_cache_0_lists(cache: &mut MetadataCache) {
 }
 
 /// Build the clean list by gathering all non-dirty entries.
+#[deprecated(note = "use MetadataCache::propagate_flushed_and_still_clean_entries_list_into")]
 #[allow(non_snake_case)]
 pub fn H5C_construct_candidate_list__clean_cache(cache: &mut MetadataCache) -> Vec<u64> {
-    cache.propagate_flushed_and_still_clean_entries_list()
+    let mut out = Vec::new();
+    cache.propagate_flushed_and_still_clean_entries_list_into(&mut out);
+    out
 }
 
 /// Build the candidate list of all dirty entries.
+#[deprecated(note = "use MetadataCache::construct_candidate_list_in_place or *_into")]
 #[allow(non_snake_case)]
 pub fn H5C_construct_candidate_list__min_clean(cache: &mut MetadataCache) -> Vec<u64> {
-    cache.construct_candidate_list()
+    let mut out = Vec::new();
+    cache.construct_candidate_list_into(&mut out);
+    out
 }
 
 /// Clear collective-entry tracking lists.
@@ -944,19 +1039,16 @@ pub fn H5C__flush_candidate_entries(cache: &mut MetadataCache) -> Result<()> {
 /// Flush candidate entries that belong to the given ring.
 #[allow(non_snake_case)]
 pub fn H5C__flush_candidates_in_ring(cache: &mut MetadataCache, ring: u8) -> Result<()> {
-    let addrs: Vec<u64> = cache
-        .candidate_list
-        .iter()
-        .copied()
-        .filter(|addr| {
-            cache
-                .entries
-                .get(addr)
-                .is_some_and(|entry| entry.ring == ring)
-        })
-        .collect();
-    for addr in addrs {
-        cache.flush(addr)?;
+    let mut addr = cache.first_candidate_addr();
+    while let Some(current) = addr {
+        addr = cache.next_candidate_addr_after(current);
+        if cache
+            .entries
+            .get(&current)
+            .is_some_and(|entry| entry.ring == ring)
+        {
+            cache.flush(current)?;
+        }
     }
     Ok(())
 }
@@ -1025,28 +1117,36 @@ pub fn H5C__flush_invalidate_cache(cache: &mut MetadataCache) -> Result<()> {
 /// Flush then remove all entries in a given ring.
 #[allow(non_snake_case)]
 pub fn H5C__flush_invalidate_ring(cache: &mut MetadataCache, ring: u8) -> Result<usize> {
-    let addrs: Vec<u64> = cache
-        .entries
-        .iter()
-        .filter_map(|(&addr, entry)| (entry.ring == ring).then_some(addr))
-        .collect();
-    for addr in &addrs {
-        cache.flush(*addr)?;
-        cache.remove_entry(*addr)?;
+    let mut removed = 0usize;
+    let mut addr = cache.first_entry_addr();
+    while let Some(current) = addr {
+        addr = cache.next_entry_addr_after(current);
+        if cache
+            .entries
+            .get(&current)
+            .is_some_and(|entry| entry.ring == ring)
+        {
+            cache.flush(current)?;
+            cache.remove_entry(current)?;
+            removed += 1;
+        }
     }
-    Ok(addrs.len())
+    Ok(removed)
 }
 
 /// Flush all entries in a given ring.
 #[allow(non_snake_case)]
 pub fn H5C__flush_ring(cache: &mut MetadataCache, ring: u8) -> Result<()> {
-    let addrs: Vec<u64> = cache
-        .entries
-        .iter()
-        .filter_map(|(&addr, entry)| (entry.ring == ring).then_some(addr))
-        .collect();
-    for addr in addrs {
-        cache.flush(addr)?;
+    let mut addr = cache.first_entry_addr();
+    while let Some(current) = addr {
+        addr = cache.next_entry_addr_after(current);
+        if cache
+            .entries
+            .get(&current)
+            .is_some_and(|entry| entry.ring == ring)
+        {
+            cache.flush(current)?;
+        }
     }
     Ok(())
 }
@@ -1063,23 +1163,41 @@ pub fn H5C__make_space_in_cache(cache: &mut MetadataCache, needed: usize) -> Res
 
 /// Flush and serialize the entire cache to a buffer.
 #[allow(non_snake_case)]
-pub fn H5C__serialize_cache(cache: &mut MetadataCache) -> Result<Vec<u8>> {
+pub fn H5C__serialize_cache_into(cache: &mut MetadataCache, out: &mut Vec<u8>) -> Result<()> {
     cache.flush_entries()?;
-    H5C__construct_cache_image_buffer(cache)
+    H5C__construct_cache_image_buffer_into(cache, out)
+}
+
+/// Flush and serialize the entire cache to a buffer.
+#[deprecated(note = "use H5C__serialize_cache_into to reuse caller-provided storage")]
+#[allow(non_snake_case)]
+pub fn H5C__serialize_cache(cache: &mut MetadataCache) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    H5C__serialize_cache_into(cache, &mut out)?;
+    Ok(out)
 }
 
 /// Flush and serialize only the entries in a given ring.
 #[allow(non_snake_case)]
-pub fn H5C__serialize_ring(cache: &mut MetadataCache, ring: u8) -> Result<Vec<u8>> {
+pub fn H5C__serialize_ring_into(
+    cache: &mut MetadataCache,
+    ring: u8,
+    out: &mut Vec<u8>,
+) -> Result<()> {
     H5C__flush_ring(cache, ring)?;
-    let mut out = Vec::new();
+    out.clear();
     for entry in cache.entries.values().filter(|entry| entry.ring == ring) {
-        out.extend_from_slice(&entry.addr.to_le_bytes());
-        out.extend_from_slice(
-            &usize_to_u64(entry.image.len(), "metadata cache entry image length")?.to_le_bytes(),
-        );
-        out.extend_from_slice(&entry.image);
+        write_cache_image_entry(entry, out)?;
     }
+    Ok(())
+}
+
+/// Flush and serialize only the entries in a given ring.
+#[deprecated(note = "use H5C__serialize_ring_into to reuse caller-provided storage")]
+#[allow(non_snake_case)]
+pub fn H5C__serialize_ring(cache: &mut MetadataCache, ring: u8) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    H5C__serialize_ring_into(cache, ring, &mut out)?;
     Ok(out)
 }
 
@@ -1103,23 +1221,42 @@ pub fn H5C_cache_image_status(cache: &MetadataCache) -> (bool, usize) {
 
 /// Serialize all cache entries into a single image buffer.
 #[allow(non_snake_case)]
+pub fn H5C__construct_cache_image_buffer_into(
+    cache: &MetadataCache,
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    out.clear();
+    let stats = cache.stats();
+    out.reserve(
+        stats
+            .entries
+            .saturating_mul(16)
+            .saturating_add(stats.total_image_bytes),
+    );
+    for entry in cache.entries.values() {
+        write_cache_image_entry(entry, out)?;
+    }
+    Ok(())
+}
+
+/// Serialize all cache entries into a single image buffer.
+#[deprecated(note = "use H5C__construct_cache_image_buffer_into to reuse caller-provided storage")]
+#[allow(non_snake_case)]
 pub fn H5C__construct_cache_image_buffer(cache: &MetadataCache) -> Result<Vec<u8>> {
     let mut out = Vec::new();
-    for entry in cache.entries.values() {
-        out.extend_from_slice(&entry.addr.to_le_bytes());
-        out.extend_from_slice(
-            &usize_to_u64(entry.image.len(), "metadata cache entry image length")?.to_le_bytes(),
-        );
-        out.extend_from_slice(&entry.image);
-    }
+    H5C__construct_cache_image_buffer_into(cache, &mut out)?;
     Ok(out)
 }
 
 /// Deserialize a cache image buffer into individual entries.
 #[allow(non_snake_case)]
-pub fn H5C__deserialize_cache_image_buffer(bytes: &[u8]) -> Result<Vec<MetadataCacheEntry>> {
+pub fn H5C__deserialize_cache_image_buffer_into(
+    bytes: &[u8],
+    entries: &mut Vec<MetadataCacheEntry>,
+) -> Result<()> {
+    entries.clear();
+    entries.reserve(cache_image_entry_count_hint(bytes));
     let mut pos = 0usize;
-    let mut entries = Vec::new();
     while pos < bytes.len() {
         let addr = read_u64_at(bytes, pos, "metadata cache image entry address")?;
         pos = checked_add(pos, 8, "metadata cache image entry address")?;
@@ -1138,19 +1275,57 @@ pub fn H5C__deserialize_cache_image_buffer(bytes: &[u8]) -> Result<Vec<MetadataC
         entries.push(MetadataCacheEntry::new(addr, "prefetched", image));
         pos = end;
     }
+    Ok(())
+}
+
+/// Deserialize a cache image buffer into individual entries.
+#[deprecated(note = "use H5C__deserialize_cache_image_buffer_into to reuse entry storage")]
+#[allow(non_snake_case)]
+pub fn H5C__deserialize_cache_image_buffer(bytes: &[u8]) -> Result<Vec<MetadataCacheEntry>> {
+    let mut entries = Vec::new();
+    H5C__deserialize_cache_image_buffer_into(bytes, &mut entries)?;
     Ok(entries)
 }
 
 /// Reconstruct a cache from its serialized image buffer.
 #[allow(non_snake_case)]
 pub fn H5C__reconstruct_cache_contents_from_image(bytes: &[u8]) -> Result<MetadataCache> {
-    H5C__reconstruct_cache_contents(H5C__deserialize_cache_image_buffer(bytes)?)
+    let mut cache = MetadataCache::init();
+    let mut pos = 0usize;
+    while pos < bytes.len() {
+        let addr = read_u64_at(bytes, pos, "metadata cache image entry address")?;
+        pos = checked_add(pos, 8, "metadata cache image entry address")?;
+        let len = read_u64_at(bytes, pos, "metadata cache image entry length")?;
+        pos = checked_add(pos, 8, "metadata cache image entry length")?;
+        let len = usize::try_from(len).map_err(|_| {
+            Error::InvalidFormat("metadata cache image entry length exceeds usize".into())
+        })?;
+        let end = checked_add(pos, len, "metadata cache image entry payload")?;
+        let image = bytes
+            .get(pos..end)
+            .ok_or_else(|| {
+                Error::InvalidFormat("metadata cache image entry payload is truncated".into())
+            })?
+            .to_vec();
+        cache.insert_entry(MetadataCacheEntry::new(addr, "prefetched", image))?;
+        pos = end;
+    }
+    Ok(cache)
 }
 
 /// Generate a cache image buffer for the whole cache.
 #[allow(non_snake_case)]
+pub fn H5C__generate_cache_image_into(cache: &mut MetadataCache, out: &mut Vec<u8>) -> Result<()> {
+    H5C__serialize_cache_into(cache, out)
+}
+
+/// Generate a cache image buffer for the whole cache.
+#[deprecated(note = "use H5C__generate_cache_image_into to reuse caller-provided storage")]
+#[allow(non_snake_case)]
 pub fn H5C__generate_cache_image(cache: &mut MetadataCache) -> Result<Vec<u8>> {
-    H5C__serialize_cache(cache)
+    let mut out = Vec::new();
+    H5C__generate_cache_image_into(cache, &mut out)?;
+    Ok(out)
 }
 
 /// Drop a list of cache-image entries.
@@ -1176,8 +1351,20 @@ pub fn H5C__image_entry_cmp(
 
 /// Prepare a cache image buffer prior to file close.
 #[allow(non_snake_case)]
+pub fn H5C__prep_image_for_file_close_into(
+    cache: &mut MetadataCache,
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    H5C__serialize_cache_into(cache, out)
+}
+
+/// Prepare a cache image buffer prior to file close.
+#[deprecated(note = "use H5C__prep_image_for_file_close_into to reuse caller-provided storage")]
+#[allow(non_snake_case)]
 pub fn H5C__prep_image_for_file_close(cache: &mut MetadataCache) -> Result<Vec<u8>> {
-    H5C__serialize_cache(cache)
+    let mut out = Vec::new();
+    H5C__prep_image_for_file_close_into(cache, &mut out)?;
+    Ok(out)
 }
 
 /// Validate an auto-resize config (min<=max and fraction<=100).
@@ -1188,9 +1375,10 @@ pub fn H5C_validate_cache_image_config(config: &MetadataCacheResizeConfig) -> bo
 
 /// Encode the eight-byte magic + counts header for a cache image.
 #[allow(non_snake_case)]
-pub fn H5C__encode_cache_image_header(cache: &MetadataCache) -> Result<Vec<u8>> {
+pub fn H5C__encode_cache_image_header_into(cache: &MetadataCache, out: &mut Vec<u8>) -> Result<()> {
     let stats = cache.stats();
-    let mut out = b"H5CIMG\0\0".to_vec();
+    out.clear();
+    out.extend_from_slice(b"H5CIMG\0\0");
     out.extend_from_slice(
         &usize_to_u64(stats.entries, "metadata cache image entry count")?.to_le_bytes(),
     );
@@ -1201,6 +1389,15 @@ pub fn H5C__encode_cache_image_header(cache: &MetadataCache) -> Result<Vec<u8>> 
         )?
         .to_le_bytes(),
     );
+    Ok(())
+}
+
+/// Encode the eight-byte magic + counts header for a cache image.
+#[deprecated(note = "use H5C__encode_cache_image_header_into to reuse caller-provided storage")]
+#[allow(non_snake_case)]
+pub fn H5C__encode_cache_image_header(cache: &MetadataCache) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    H5C__encode_cache_image_header_into(cache, &mut out)?;
     Ok(out)
 }
 
@@ -1231,32 +1428,75 @@ pub fn H5C__decode_cache_image_header(bytes: &[u8]) -> Result<MetadataCacheImage
 
 /// Compute flush-dependency height for each entry at close.
 #[allow(non_snake_case)]
-pub fn H5C__prep_for_file_close__compute_fd_heights(cache: &MetadataCache) -> BTreeMap<u64, usize> {
+pub fn H5C__prep_for_file_close__fd_heights_iter(
+    cache: &MetadataCache,
+) -> impl Iterator<Item = (u64, usize)> + '_ {
     cache
         .entries
         .iter()
         .map(|(&addr, entry)| (addr, entry.parents.len()))
-        .collect()
+}
+
+/// Compute flush-dependency height for each entry at close.
+#[allow(non_snake_case)]
+pub fn H5C__prep_for_file_close__compute_fd_heights_into(
+    cache: &MetadataCache,
+    out: &mut BTreeMap<u64, usize>,
+) {
+    out.clear();
+    out.extend(H5C__prep_for_file_close__fd_heights_iter(cache));
+}
+
+/// Compute flush-dependency height for each entry at close.
+#[deprecated(note = "use H5C__prep_for_file_close__fd_heights_iter or *_into")]
+#[allow(non_snake_case)]
+pub fn H5C__prep_for_file_close__compute_fd_heights(cache: &MetadataCache) -> BTreeMap<u64, usize> {
+    let mut out = BTreeMap::new();
+    H5C__prep_for_file_close__compute_fd_heights_into(cache, &mut out);
+    out
 }
 
 /// Internal variant of compute_fd_heights.
+#[deprecated(note = "use H5C__prep_for_file_close__fd_heights_iter or *_into")]
 #[allow(non_snake_case)]
 pub fn H5C__prep_for_file_close__compute_fd_heights_real(
     cache: &MetadataCache,
 ) -> BTreeMap<u64, usize> {
-    H5C__prep_for_file_close__compute_fd_heights(cache)
+    let mut out = BTreeMap::new();
+    H5C__prep_for_file_close__compute_fd_heights_into(cache, &mut out);
+    out
 }
 
 /// Return all entry addresses for close-time scanning.
 #[allow(non_snake_case)]
+pub fn H5C__prep_for_file_close__scan_entries_iter(
+    cache: &MetadataCache,
+) -> impl DoubleEndedIterator<Item = u64> + '_ {
+    cache.entries.keys().copied()
+}
+
+/// Return all entry addresses for close-time scanning.
+#[allow(non_snake_case)]
+pub fn H5C__prep_for_file_close__scan_entries_into(cache: &MetadataCache, out: &mut Vec<u64>) {
+    out.clear();
+    out.reserve(cache.entries.len());
+    out.extend(H5C__prep_for_file_close__scan_entries_iter(cache));
+}
+
+/// Return all entry addresses for close-time scanning.
+#[deprecated(note = "use H5C__prep_for_file_close__scan_entries_iter or *_into")]
+#[allow(non_snake_case)]
 pub fn H5C__prep_for_file_close__scan_entries(cache: &MetadataCache) -> Vec<u64> {
-    cache.entries.keys().copied().collect()
+    let mut out = Vec::new();
+    H5C__prep_for_file_close__scan_entries_into(cache, &mut out);
+    out
 }
 
 /// Detect duplicate addresses in the entry index.
 #[allow(non_snake_case)]
 pub fn H5C__check_for_duplicates(cache: &MetadataCache) -> bool {
-    cache.entries.len() == cache.entries.keys().collect::<BTreeSet<_>>().len()
+    let _ = cache;
+    true
 }
 
 /// Reconstruct a metadata cache from a list of entries.
@@ -1281,14 +1521,35 @@ pub fn H5C__reconstruct_cache_entry(
 
 /// Encode the cache-image superblock message payload.
 #[allow(non_snake_case)]
+pub fn H5C__write_cache_image_superblock_msg_into(
+    cache: &MetadataCache,
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    H5C__encode_cache_image_header_into(cache, out)
+}
+
+/// Encode the cache-image superblock message payload.
+#[deprecated(note = "use H5C__write_cache_image_superblock_msg_into to reuse caller storage")]
+#[allow(non_snake_case)]
 pub fn H5C__write_cache_image_superblock_msg(cache: &MetadataCache) -> Result<Vec<u8>> {
-    H5C__encode_cache_image_header(cache)
+    let mut out = Vec::new();
+    H5C__write_cache_image_superblock_msg_into(cache, &mut out)?;
+    Ok(out)
 }
 
 /// Flush the cache and serialize it into an image buffer.
 #[allow(non_snake_case)]
+pub fn H5C__write_cache_image_into(cache: &mut MetadataCache, out: &mut Vec<u8>) -> Result<()> {
+    H5C__serialize_cache_into(cache, out)
+}
+
+/// Flush the cache and serialize it into an image buffer.
+#[deprecated(note = "use H5C__write_cache_image_into to reuse caller-provided storage")]
+#[allow(non_snake_case)]
 pub fn H5C__write_cache_image(cache: &mut MetadataCache) -> Result<Vec<u8>> {
-    H5C__serialize_cache(cache)
+    let mut out = Vec::new();
+    H5C__write_cache_image_into(cache, &mut out)?;
+    Ok(out)
 }
 
 /// Prepare the cache for file close (flush then evict).
@@ -1345,10 +1606,29 @@ pub fn H5C__unpin_entry_from_client(cache: &mut MetadataCache, addr: u64) -> Res
     cache.unpin_entry(addr)
 }
 
+/// Borrow an entry's in-core image.
+#[allow(non_snake_case)]
+pub fn H5C__generate_image_view(cache: &MetadataCache, addr: u64) -> Result<&[u8]> {
+    Ok(&cache.require_entry(addr)?.image)
+}
+
+/// Copy an entry's in-core image into caller-provided storage.
+#[allow(non_snake_case)]
+pub fn H5C__generate_image_into(cache: &MetadataCache, addr: u64, out: &mut Vec<u8>) -> Result<()> {
+    out.clear();
+    out.extend_from_slice(H5C__generate_image_view(cache, addr)?);
+    Ok(())
+}
+
 /// Return a clone of an entry's in-core image.
+#[deprecated(
+    note = "use H5C__generate_image_view to borrow the image or H5C__generate_image_into to reuse caller-provided storage"
+)]
 #[allow(non_snake_case)]
 pub fn H5C__generate_image(cache: &mut MetadataCache, addr: u64) -> Result<Vec<u8>> {
-    Ok(cache.require_entry(addr)?.image.clone())
+    let mut out = Vec::new();
+    H5C__generate_image_into(cache, addr, &mut out)?;
+    Ok(out)
 }
 
 /// Flush one specific entry by address.
@@ -1382,6 +1662,16 @@ fn usize_to_u64(value: usize, context: &str) -> Result<u64> {
     u64::try_from(value).map_err(|_| Error::InvalidFormat(format!("{context} exceeds u64")))
 }
 
+/// Append one cache-image entry record to `out`.
+fn write_cache_image_entry(entry: &MetadataCacheEntry, out: &mut Vec<u8>) -> Result<()> {
+    out.extend_from_slice(&entry.addr.to_le_bytes());
+    out.extend_from_slice(
+        &usize_to_u64(entry.image.len(), "metadata cache entry image length")?.to_le_bytes(),
+    );
+    out.extend_from_slice(&entry.image);
+    Ok(())
+}
+
 /// Add two `usize` values, surfacing `context` on overflow.
 fn checked_add(left: usize, right: usize, context: &str) -> Result<usize> {
     left.checked_add(right)
@@ -1399,10 +1689,57 @@ fn read_u64_at(bytes: &[u8], pos: usize, context: &str) -> Result<u64> {
     Ok(u64::from_le_bytes(raw))
 }
 
+fn cache_image_entry_count_hint(bytes: &[u8]) -> usize {
+    let mut pos = 0usize;
+    let mut count = 0usize;
+    while pos < bytes.len() {
+        let Some(header_end) = pos.checked_add(16) else {
+            break;
+        };
+        if header_end > bytes.len() {
+            break;
+        }
+        let raw_len: [u8; 8] = bytes[pos + 8..header_end]
+            .try_into()
+            .expect("slice length checked above");
+        let Ok(len) = usize::try_from(u64::from_le_bytes(raw_len)) else {
+            break;
+        };
+        let Some(end) = header_end.checked_add(len) else {
+            break;
+        };
+        if end > bytes.len() {
+            break;
+        }
+        count += 1;
+        pos = end;
+    }
+    count
+}
+
+/// Load an entry image by address as a borrowed view.
+#[allow(non_snake_case)]
+pub fn H5C__load_entry_view(cache: &MetadataCache, addr: u64) -> Result<&[u8]> {
+    Ok(&cache.require_entry(addr)?.image)
+}
+
+/// Load an entry image by address into caller-provided storage.
+#[allow(non_snake_case)]
+pub fn H5C__load_entry_into(cache: &MetadataCache, addr: u64, out: &mut Vec<u8>) -> Result<()> {
+    out.clear();
+    out.extend_from_slice(H5C__load_entry_view(cache, addr)?);
+    Ok(())
+}
+
 /// Load (clone) an entry image by address.
+#[deprecated(
+    note = "use H5C__load_entry_view to borrow the image or H5C__load_entry_into to reuse caller-provided storage"
+)]
 #[allow(non_snake_case)]
 pub fn H5C__load_entry(cache: &MetadataCache, addr: u64) -> Result<Vec<u8>> {
-    Ok(cache.require_entry(addr)?.image.clone())
+    let mut out = Vec::new();
+    H5C__load_entry_into(cache, addr, &mut out)?;
+    Ok(out)
 }
 
 /// Mark a flush-dependency entry as dirty.
@@ -1435,24 +1772,41 @@ pub fn H5C__assert_flush_dep_nocycle(cache: &MetadataCache, parent: u64, child: 
     parent != child && !cache.flush_dependency_exists(child, parent)
 }
 
-/// Mark an entry serialized and return a clone of its image.
+/// Mark an entry serialized and borrow its image.
 #[allow(non_snake_case)]
-pub fn H5C__serialize_single_entry(cache: &mut MetadataCache, addr: u64) -> Result<Vec<u8>> {
+pub fn H5C__serialize_single_entry_view(cache: &mut MetadataCache, addr: u64) -> Result<&[u8]> {
     let entry = cache.require_entry_mut(addr)?;
     entry.serialized = true;
-    Ok(entry.image.clone())
+    Ok(&entry.image)
+}
+
+/// Mark an entry serialized and copy its image into caller-provided storage.
+#[allow(non_snake_case)]
+pub fn H5C__serialize_single_entry_into(
+    cache: &mut MetadataCache,
+    addr: u64,
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    out.clear();
+    out.extend_from_slice(H5C__serialize_single_entry_view(cache, addr)?);
+    Ok(())
+}
+
+/// Mark an entry serialized and return a clone of its image.
+#[deprecated(
+    note = "use H5C__serialize_single_entry_view to borrow the image or H5C__serialize_single_entry_into to reuse caller-provided storage"
+)]
+#[allow(non_snake_case)]
+pub fn H5C__serialize_single_entry(cache: &mut MetadataCache, addr: u64) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    H5C__serialize_single_entry_into(cache, addr, &mut out)?;
+    Ok(out)
 }
 
 /// Destroy all child flush dependencies of a prefetched entry.
 #[allow(non_snake_case)]
 pub fn H5C__destroy_pf_entry_child_flush_deps(cache: &mut MetadataCache, addr: u64) -> Result<()> {
-    let children: Vec<u64> = cache
-        .require_entry(addr)?
-        .children
-        .iter()
-        .copied()
-        .collect();
-    for child in children {
+    while let Some(child) = cache.require_entry(addr)?.children.iter().next().copied() {
         cache.destroy_flush_dependency(addr, child)?;
     }
     Ok(())
@@ -1731,18 +2085,37 @@ pub fn H5C__untag_entry(cache: &mut MetadataCache, addr: u64) -> Result<()> {
 
 /// Internal variant of [`H5C__iter_tagged_entries`].
 #[allow(non_snake_case)]
-pub fn H5C__iter_tagged_entries_real(cache: &MetadataCache, tag: u64) -> Vec<u64> {
+pub fn H5C__tagged_entries_iter(cache: &MetadataCache, tag: u64) -> impl Iterator<Item = u64> + '_ {
     cache
         .entries
         .iter()
-        .filter_map(|(&addr, entry)| (entry.tag == Some(tag)).then_some(addr))
-        .collect()
+        .filter_map(move |(&addr, entry)| (entry.tag == Some(tag)).then_some(addr))
+}
+
+/// Internal variant of [`H5C__iter_tagged_entries`].
+#[allow(non_snake_case)]
+pub fn H5C__iter_tagged_entries_into(cache: &MetadataCache, tag: u64, out: &mut Vec<u64>) {
+    out.clear();
+    out.reserve(cache.entries.len());
+    out.extend(H5C__tagged_entries_iter(cache, tag));
+}
+
+/// Internal variant of [`H5C__iter_tagged_entries`].
+#[deprecated(note = "use H5C__tagged_entries_iter or H5C__iter_tagged_entries_into")]
+#[allow(non_snake_case)]
+pub fn H5C__iter_tagged_entries_real(cache: &MetadataCache, tag: u64) -> Vec<u64> {
+    let mut out = Vec::new();
+    H5C__iter_tagged_entries_into(cache, tag, &mut out);
+    out
 }
 
 /// List entries with a given tag.
+#[deprecated(note = "use H5C__tagged_entries_iter or H5C__iter_tagged_entries_into")]
 #[allow(non_snake_case)]
 pub fn H5C__iter_tagged_entries(cache: &MetadataCache, tag: u64) -> Vec<u64> {
-    H5C__iter_tagged_entries_real(cache, tag)
+    let mut out = Vec::new();
+    H5C__iter_tagged_entries_into(cache, tag, &mut out);
+    out
 }
 
 /// Callback that evicts entries with a given tag.
@@ -1766,9 +2139,16 @@ pub fn H5C_verify_tag(cache: &MetadataCache, addr: u64, tag: u64) -> bool {
 /// Callback that flushes all entries with a given tag.
 #[allow(non_snake_case)]
 pub fn H5C__flush_tagged_entries_cb(cache: &mut MetadataCache, tag: u64) -> Result<()> {
-    let addrs = H5C__iter_tagged_entries(cache, tag);
-    for addr in addrs {
-        cache.flush(addr)?;
+    let mut addr = cache.first_entry_addr();
+    while let Some(current) = addr {
+        addr = cache.next_entry_addr_after(current);
+        if cache
+            .entries
+            .get(&current)
+            .is_some_and(|entry| entry.tag == Some(tag))
+        {
+            cache.flush(current)?;
+        }
     }
     Ok(())
 }
@@ -1782,11 +2162,20 @@ pub fn H5C_flush_tagged_entries(cache: &mut MetadataCache, tag: u64) -> Result<(
 /// Move entries from one tag value to another.
 #[allow(non_snake_case)]
 pub fn H5C_retag_entries(cache: &mut MetadataCache, old_tag: u64, new_tag: u64) -> Result<usize> {
-    let addrs = H5C__iter_tagged_entries(cache, old_tag);
-    for addr in &addrs {
-        cache.set_tag_for_entry(*addr, new_tag)?;
+    let mut changed = 0usize;
+    let mut addr = cache.first_entry_addr();
+    while let Some(current) = addr {
+        addr = cache.next_entry_addr_after(current);
+        if cache
+            .entries
+            .get(&current)
+            .is_some_and(|entry| entry.tag == Some(old_tag))
+        {
+            cache.set_tag_for_entry(current, new_tag)?;
+            changed += 1;
+        }
     }
-    Ok(addrs.len())
+    Ok(changed)
 }
 
 /// Callback that expunges entries with a given tag and entry type.
@@ -1817,20 +2206,66 @@ pub fn H5C_get_tag(cache: &MetadataCache) -> Option<u64> {
 
 /// Render a human-readable summary of the cache.
 #[allow(non_snake_case)]
+pub fn H5C_dump_cache_fmt(cache: &MetadataCache, out: &mut impl fmt::Write) -> fmt::Result {
+    cache.write_cache_summary(out)
+}
+
+/// Render a human-readable summary of the cache.
+#[deprecated(note = "use H5C_dump_cache_fmt to reuse caller-provided storage")]
+#[allow(non_snake_case)]
 pub fn H5C_dump_cache(cache: &MetadataCache) -> String {
-    cache.dump_cache()
+    let mut out = String::new();
+    H5C_dump_cache_fmt(cache, &mut out)
+        .expect("writing metadata cache summary to String cannot fail");
+    out
 }
 
 /// Return the cache addresses in insertion order.
 #[allow(non_snake_case)]
+pub fn H5C_dump_cache_LRU_iter(cache: &MetadataCache) -> impl DoubleEndedIterator<Item = u64> + '_ {
+    cache.entries.keys().copied()
+}
+
+/// Return the cache addresses in insertion order.
+#[allow(non_snake_case)]
+pub fn H5C_dump_cache_LRU_into(cache: &MetadataCache, out: &mut Vec<u64>) {
+    out.clear();
+    out.reserve(cache.entries.len());
+    out.extend(H5C_dump_cache_LRU_iter(cache));
+}
+
+/// Return the cache addresses in insertion order.
+#[deprecated(note = "use H5C_dump_cache_LRU_iter or H5C_dump_cache_LRU_into")]
+#[allow(non_snake_case)]
 pub fn H5C_dump_cache_LRU(cache: &MetadataCache) -> Vec<u64> {
-    cache.entries.keys().copied().collect()
+    let mut out = Vec::new();
+    H5C_dump_cache_LRU_into(cache, &mut out);
+    out
 }
 
 /// Return the cache addresses in reverse insertion order.
 #[allow(non_snake_case)]
+pub fn H5C_dump_cache_skip_list_iter(
+    cache: &MetadataCache,
+) -> impl DoubleEndedIterator<Item = u64> + '_ {
+    cache.entries.keys().rev().copied()
+}
+
+/// Return the cache addresses in reverse insertion order.
+#[allow(non_snake_case)]
+pub fn H5C_dump_cache_skip_list_into(cache: &MetadataCache, out: &mut Vec<u64>) {
+    out.clear();
+    out.reserve(cache.entries.len());
+    out.extend(H5C_dump_cache_skip_list_iter(cache));
+}
+
+/// Return the cache addresses in reverse insertion order.
+#[deprecated(note = "use H5C_dump_cache_skip_list_iter or H5C_dump_cache_skip_list_into")]
+#[allow(non_snake_case)]
 pub fn H5C_dump_cache_skip_list(cache: &MetadataCache) -> Vec<u64> {
-    cache.entries.keys().rev().copied().collect()
+    let mut out = Vec::new();
+    H5C_dump_cache_skip_list_into(cache, &mut out);
+    out
 }
 
 /// Set a prefix string for log records.
@@ -1880,8 +2315,21 @@ pub fn H5C_verify_entry_type(cache: &MetadataCache, addr: u64, entry_type: &str)
 
 /// Render the auto-resize configuration as a string.
 #[allow(non_snake_case)]
+pub fn H5C_def_auto_resize_rpt_fcn_fmt(
+    cache: &MetadataCache,
+    out: &mut impl fmt::Write,
+) -> fmt::Result {
+    write!(out, "{:?}", cache.cache_auto_resize_config())
+}
+
+/// Render the auto-resize configuration as a string.
+#[deprecated(note = "use H5C_def_auto_resize_rpt_fcn_fmt to reuse caller-provided storage")]
+#[allow(non_snake_case)]
 pub fn H5C_def_auto_resize_rpt_fcn(cache: &MetadataCache) -> String {
-    format!("{:?}", cache.get_cache_auto_resize_config())
+    let mut out = String::new();
+    H5C_def_auto_resize_rpt_fcn_fmt(cache, &mut out)
+        .expect("writing metadata cache config to String cannot fail");
+    out
 }
 
 /// Validate the LRU list invariants (test helper).
@@ -2355,10 +2803,13 @@ mod tests {
             .unwrap();
         cache.mark_entry_dirty(0x100).unwrap();
         assert!(!cache.cache_is_clean());
-        assert_eq!(cache.construct_candidate_list(), vec![0x100]);
+        let mut addrs = Vec::new();
+        cache.construct_candidate_list_into(&mut addrs);
+        assert_eq!(addrs, vec![0x100]);
         cache.flush_entries().unwrap();
         assert!(cache.cache_is_clean());
-        assert_eq!(cache.broadcast_clean_list(), vec![0x100]);
+        cache.broadcast_clean_list_into(&mut addrs);
+        assert_eq!(addrs, vec![0x100]);
     }
 
     #[test]
@@ -2375,7 +2826,9 @@ mod tests {
 
         H5C_mark_entries_as_clean(&mut cache, &[0x100, 0x200]).unwrap();
         assert!(cache.cache_is_clean());
-        assert_eq!(cache.broadcast_clean_list(), vec![0x100, 0x200]);
+        let mut clean = Vec::new();
+        cache.broadcast_clean_list_into(&mut clean);
+        assert_eq!(clean, vec![0x100, 0x200]);
 
         assert!(H5C_mark_entries_as_clean(&mut cache, &[0x100]).is_err());
         assert!(H5C_mark_entries_as_clean(&mut cache, &[0x300]).is_err());
@@ -2411,15 +2864,17 @@ mod tests {
             .insert_entry(MetadataCacheEntry::new(0x200, "heap", vec![4, 5]))
             .unwrap();
 
-        let header =
-            H5C__decode_cache_image_header(&H5C__encode_cache_image_header(&cache).unwrap())
-                .unwrap();
+        let mut header_buf = Vec::new();
+        H5C__encode_cache_image_header_into(&cache, &mut header_buf).unwrap();
+        let header = H5C__decode_cache_image_header(&header_buf).unwrap();
         assert_eq!(header.entries, 2);
         assert_eq!(header.total_image_bytes, 5);
         assert!(H5C__decode_cache_image_header(b"bad").is_err());
 
-        let image = H5C__construct_cache_image_buffer(&cache).unwrap();
-        let entries = H5C__deserialize_cache_image_buffer(&image).unwrap();
+        let mut image = Vec::new();
+        H5C__construct_cache_image_buffer_into(&cache, &mut image).unwrap();
+        let mut entries = Vec::new();
+        H5C__deserialize_cache_image_buffer_into(&image, &mut entries).unwrap();
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].addr, 0x100);
         assert_eq!(entries[0].image, vec![1, 2, 3]);
@@ -2433,11 +2888,13 @@ mod tests {
             vec![1, 2, 3]
         );
 
-        assert!(H5C__deserialize_cache_image_buffer(&image[..15]).is_err());
+        assert!(H5C__deserialize_cache_image_buffer_into(&image[..15], &mut entries).is_err());
         let mut truncated_payload = Vec::new();
         truncated_payload.extend_from_slice(&0x300u64.to_le_bytes());
         truncated_payload.extend_from_slice(&3u64.to_le_bytes());
         truncated_payload.extend_from_slice(&[1, 2]);
-        assert!(H5C__deserialize_cache_image_buffer(&truncated_payload).is_err());
+        assert!(
+            H5C__deserialize_cache_image_buffer_into(&truncated_payload, &mut entries).is_err()
+        );
     }
 }

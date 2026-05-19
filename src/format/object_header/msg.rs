@@ -56,8 +56,7 @@ pub(super) fn read_v1_messages<R: Read + Seek>(
         let header_end = checked_u64_add(pos, 8, "object header v1 message header")?;
         if header_end > chunk_end {
             let remaining = usize_from_u64(chunk_end - pos, "object header v1 message padding")?;
-            let padding = reader.read_bytes(remaining)?;
-            if padding.iter().all(|&b| b == 0) {
+            if read_zero_padding(reader, remaining)? {
                 break;
             }
             return Err(Error::InvalidFormat(
@@ -114,7 +113,14 @@ pub(super) fn read_v1_messages<R: Read + Seek>(
             continue;
         }
 
-        let data = reader.read_bytes(usize_from_u64(msg_size, "object header message size")?)?;
+        let data = read_message_data(
+            reader,
+            msg_type,
+            msg_flags,
+            msg_size,
+            reader.sizeof_addr(),
+            reader.sizeof_size(),
+        )?;
         // Skip padding to alignment
         let padding = aligned_size - msg_size;
         if padding > 0 {
@@ -161,8 +167,7 @@ pub(super) fn read_v2_messages<R: Read + Seek>(
         if header_end > chunk_data_end {
             let remaining =
                 usize_from_u64(chunk_data_end - pos, "object header v2 message padding")?;
-            let padding = reader.read_bytes(remaining)?;
-            if padding.iter().all(|&b| b == 0) {
+            if read_zero_padding(reader, remaining)? {
                 break;
             }
             return Err(Error::InvalidFormat(
@@ -226,7 +231,14 @@ pub(super) fn read_v2_messages<R: Read + Seek>(
             continue;
         }
 
-        let data = reader.read_bytes(usize_from_u64(msg_size, "object header message size")?)?;
+        let data = read_message_data(
+            reader,
+            msg_type,
+            msg_flags,
+            msg_size,
+            reader.sizeof_addr(),
+            reader.sizeof_size(),
+        )?;
         validate_message_payload(
             msg_type,
             msg_flags,
@@ -245,6 +257,110 @@ pub(super) fn read_v2_messages<R: Read + Seek>(
     }
 
     Ok(())
+}
+
+fn read_zero_padding<R: Read + Seek>(
+    reader: &mut HdfReader<R>,
+    mut remaining: usize,
+) -> Result<bool> {
+    let mut scratch = [0u8; 256];
+    while remaining > 0 {
+        let take = remaining.min(scratch.len());
+        reader.read_bytes_into(&mut scratch[..take])?;
+        if scratch[..take].iter().any(|&byte| byte != 0) {
+            return Ok(false);
+        }
+        remaining -= take;
+    }
+    Ok(true)
+}
+
+fn read_message_data<R: Read + Seek>(
+    reader: &mut HdfReader<R>,
+    msg_type: u16,
+    msg_flags: u8,
+    msg_size: u64,
+    sizeof_addr: u8,
+    sizeof_size: u8,
+) -> Result<Vec<u8>> {
+    if msg_flags & MSG_FLAG_SHARED == 0 {
+        let mut data = vec![0u8; usize_from_u64(msg_size, "object header message size")?];
+        reader.read_bytes_into(&mut data)?;
+        return Ok(data);
+    }
+
+    read_shared_message_data_after_reference_check(
+        reader,
+        msg_type,
+        msg_size,
+        sizeof_addr,
+        sizeof_size,
+    )
+}
+
+fn read_shared_message_data_after_reference_check<R: Read + Seek>(
+    reader: &mut HdfReader<R>,
+    msg_type: u16,
+    msg_size: u64,
+    sizeof_addr: u8,
+    sizeof_size: u8,
+) -> Result<Vec<u8>> {
+    if msg_type == MSG_SHARED_MSG_TABLE
+        || msg_type == MSG_GROUP_INFO
+        || msg_type == MSG_BTREE_K
+        || msg_type == MSG_OBJ_REF_COUNT
+    {
+        let mut data = vec![0u8; usize_from_u64(msg_size, "object header message size")?];
+        reader.read_bytes_into(&mut data)?;
+        return Ok(data);
+    }
+
+    let msg_size_usize = usize_from_u64(msg_size, "object header message size")?;
+    let prefix_len = shared_message_reference_validation_len(msg_size_usize, reader)?;
+    let mut data = vec![0u8; msg_size_usize];
+    reader.read_bytes_into(&mut data[..prefix_len])?;
+    validate_shared_message_reference(&data[..prefix_len], sizeof_addr, sizeof_size)?;
+
+    reader.read_bytes_into(&mut data[prefix_len..])?;
+    Ok(data)
+}
+
+fn shared_message_reference_validation_len<R: Read + Seek>(
+    msg_size: usize,
+    reader: &mut HdfReader<R>,
+) -> Result<usize> {
+    let start = reader.position()?;
+    let mut version_and_type = [0u8; 2];
+    let header_len = msg_size.min(version_and_type.len());
+    reader.read_bytes_into(&mut version_and_type[..header_len])?;
+    reader.seek(start)?;
+    if header_len < version_and_type.len() {
+        return Ok(header_len);
+    }
+
+    let len = match version_and_type[0] {
+        SHARED_REFERENCE_VERSION_1 => 2usize
+            .checked_add(6)
+            .and_then(|len| len.checked_add(usize::from(reader.sizeof_size())))
+            .and_then(|len| len.checked_add(usize::from(reader.sizeof_addr())))
+            .ok_or_else(|| Error::InvalidFormat("shared message reference size overflow".into()))?,
+        SHARED_REFERENCE_VERSION_2 => checked_usize_add(
+            2,
+            usize::from(reader.sizeof_addr()),
+            "shared message v2 address",
+        )?,
+        SHARED_REFERENCE_VERSION_3 => match version_and_type[1] {
+            SHARED_TYPE_SOHM => checked_usize_add(2, SHARED_HEAP_ID_LEN, "shared SOHM reference")?,
+            SHARED_TYPE_COMMITTED => checked_usize_add(
+                2,
+                usize::from(reader.sizeof_addr()),
+                "shared message v3 address",
+            )?,
+            _ => version_and_type.len(),
+        },
+        _ => version_and_type.len(),
+    };
+    Ok(len.min(msg_size))
 }
 
 /// Sanity-check a decoded message payload. For shared messages we only verify

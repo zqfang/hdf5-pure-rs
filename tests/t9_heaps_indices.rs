@@ -5,10 +5,84 @@ use std::io::Cursor;
 use hdf5_pure_rust::format::checksum::checksum_metadata;
 use hdf5_pure_rust::format::fractal_heap::FractalHeapHeader;
 use hdf5_pure_rust::format::global_heap::{
-    read_global_heap_object, GlobalHeapCollection, GlobalHeapRef,
+    read_global_heap_object_into, read_global_heap_objects_batched, GlobalHeapCollection,
+    GlobalHeapRef,
 };
 use hdf5_pure_rust::io::reader::HdfReader;
-use hdf5_pure_rust::File;
+use hdf5_pure_rust::{Dataset, File, H5Type, Result};
+
+fn file_member_summary<const N: usize>(
+    file: &File,
+    expected: [&str; N],
+) -> hdf5_pure_rust::Result<(usize, [bool; N])> {
+    let mut count = 0;
+    let mut found = [false; N];
+    file.visit_member_names(|name| {
+        count += 1;
+        for (idx, expected_name) in expected.iter().enumerate() {
+            if name == *expected_name {
+                found[idx] = true;
+            }
+        }
+        Ok(())
+    })?;
+    Ok((count, found))
+}
+
+fn group_member_summary<const N: usize>(
+    group: &hdf5_pure_rust::Group,
+    expected: [&str; N],
+) -> hdf5_pure_rust::Result<(usize, [bool; N])> {
+    let mut count = 0;
+    let mut found = [false; N];
+    group.visit_member_names(|name| {
+        count += 1;
+        for (idx, expected_name) in expected.iter().enumerate() {
+            if name == *expected_name {
+                found[idx] = true;
+            }
+        }
+        Ok(())
+    })?;
+    Ok((count, found))
+}
+
+fn assert_dataset_shape(ds: &Dataset, expected: &[u64]) {
+    let space = ds.space().unwrap();
+    assert_eq!(space.shape(), expected);
+}
+
+fn dataset_values<T>(ds: &Dataset) -> Result<Vec<T>>
+where
+    T: H5Type + Default + Clone,
+{
+    let mut values = vec![T::default(); ds.size()? as usize];
+    ds.read_into(&mut values)?;
+    Ok(values)
+}
+
+fn dataset_strings(ds: &Dataset) -> Result<Vec<String>> {
+    let mut strings = Vec::new();
+    ds.read_strings_into(&mut strings)?;
+    Ok(strings)
+}
+
+fn append_serialized_global_heap(
+    file: &mut Vec<u8>,
+    addr: usize,
+    objects: &[(u32, &[u8])],
+) -> Result<()> {
+    let mut collection = GlobalHeapCollection::create();
+    for (index, data) in objects {
+        collection.insert(*index, data.to_vec())?;
+    }
+
+    let mut image = Vec::new();
+    collection.cache_heap_serialize_into(8, &mut image)?;
+    file.resize(addr, 0);
+    file.extend_from_slice(&image);
+    Ok(())
+}
 
 // T9a: Global heap (variable-length data)
 
@@ -16,16 +90,97 @@ use hdf5_pure_rust::File;
 fn t9a_global_heap_vlen_strings() {
     let f = File::open("tests/data/strings.h5").unwrap();
     let ds = f.dataset("vlen_ds").unwrap();
-    let strings = ds.read_strings().unwrap();
+    let strings = dataset_strings(&ds).unwrap();
     assert_eq!(strings, vec!["alpha", "beta", "gamma"]);
+}
+
+#[test]
+fn t9a_global_heap_batched_reads_preserve_order_across_collections() {
+    let first_addr = 32usize;
+    let second_addr = 160usize;
+    let mut file = Vec::new();
+    append_serialized_global_heap(&mut file, first_addr, &[(1, b"one-a"), (3, b"one-c")]).unwrap();
+    append_serialized_global_heap(&mut file, second_addr, &[(1, b"two-a"), (2, b"two-b")]).unwrap();
+
+    let refs = [
+        GlobalHeapRef {
+            collection_addr: second_addr as u64,
+            object_index: 2,
+        },
+        GlobalHeapRef {
+            collection_addr: first_addr as u64,
+            object_index: 3,
+        },
+        GlobalHeapRef {
+            collection_addr: first_addr as u64,
+            object_index: 1,
+        },
+        GlobalHeapRef {
+            collection_addr: second_addr as u64,
+            object_index: 1,
+        },
+        GlobalHeapRef {
+            collection_addr: first_addr as u64,
+            object_index: 3,
+        },
+    ];
+
+    let mut reader = HdfReader::new(Cursor::new(file));
+    let data = read_global_heap_objects_batched(&mut reader, &refs).unwrap();
+    assert_eq!(
+        data,
+        vec![
+            b"two-b".to_vec(),
+            b"one-c".to_vec(),
+            b"one-a".to_vec(),
+            b"two-a".to_vec(),
+            b"one-c".to_vec(),
+        ]
+    );
+}
+
+#[test]
+fn t9a_global_heap_batched_missing_object_reports_reference() {
+    let heap_addr = 32usize;
+    let mut file = Vec::new();
+    append_serialized_global_heap(&mut file, heap_addr, &[(1, b"present")]).unwrap();
+
+    let refs = [GlobalHeapRef {
+        collection_addr: heap_addr as u64,
+        object_index: 9,
+    }];
+
+    let mut reader = HdfReader::new(Cursor::new(file));
+    let err = read_global_heap_objects_batched(&mut reader, &refs).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("global heap object 9 not found in collection at 0x20"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn t9a_global_heap_vlen_strings_reuse_and_truncate_output_buffer() {
+    let f = File::open("tests/data/hdf5_ref/vlen_string_cases.h5").unwrap();
+    let ds = f.dataset("vlen_global_heap_edges").unwrap();
+
+    let mut strings = vec![
+        String::from("stale-first"),
+        String::from("stale-second"),
+        String::from("stale-third"),
+        String::from("stale-extra"),
+    ];
+    ds.read_strings_into(&mut strings).unwrap();
+
+    let long = format!("long-{}", "x".repeat(96));
+    assert_eq!(strings, vec!["dup", "dup", long.as_str()]);
 }
 
 #[test]
 fn t9a_global_heap_vlen_attr() {
     // The simple_v2.h5 has a vlen string attribute "test_attr"
     let f = File::open("tests/data/simple_v2.h5").unwrap();
-    let names = f.attr_names().unwrap();
-    assert!(names.contains(&"test_attr".to_string()));
+    assert!(f.attr_exists("test_attr").unwrap());
 }
 
 #[test]
@@ -124,12 +279,14 @@ fn t9a_global_heap_read_object_skips_deleted_and_padding() {
     heap[8..16].copy_from_slice(&collection_size.to_le_bytes());
 
     let mut reader = HdfReader::new(Cursor::new(heap));
-    let data = read_global_heap_object(
+    let mut data = Vec::new();
+    read_global_heap_object_into(
         &mut reader,
         &GlobalHeapRef {
             collection_addr: 0,
             object_index: 7,
         },
+        &mut data,
     )
     .unwrap();
     assert_eq!(data, b"target");
@@ -140,18 +297,18 @@ fn t9a_global_heap_read_object_skips_deleted_and_padding() {
 #[test]
 fn t9b_local_heap_names() {
     let f = File::open("tests/data/simple_v0.h5").unwrap();
-    let names = f.member_names().unwrap();
+    let (_count, [has_data, has_group1]) = file_member_summary(&f, ["data", "group1"]).unwrap();
     // Names come from the local heap
-    assert!(names.contains(&"data".to_string()));
-    assert!(names.contains(&"group1".to_string()));
+    assert!(has_data);
+    assert!(has_group1);
 }
 
 #[test]
 fn t9b_local_heap_large_group() {
     // datasets_v0.h5 has more members
     let f = File::open("tests/data/datasets_v0.h5").unwrap();
-    let names = f.member_names().unwrap();
-    assert!(names.len() >= 4); // float64_1d, int32_1d, scalar, int8_2d, chunked
+    let (count, []) = file_member_summary(&f, []).unwrap();
+    assert!(count >= 4); // float64_1d, int32_1d, scalar, int8_2d, chunked
 }
 
 // T9c: Fractal heap (dense link/attr storage)
@@ -159,30 +316,32 @@ fn t9b_local_heap_large_group() {
 #[test]
 fn t9c_fractal_heap_dense_links() {
     let f = File::open("tests/data/dense_links.h5").unwrap();
-    let names = f.member_names().unwrap();
-    assert_eq!(names.len(), 20);
+    let (count, []) = file_member_summary(&f, []).unwrap();
+    assert_eq!(count, 20);
 }
 
 #[test]
 fn t9c_fractal_heap_modern_dense_links() {
     let f = File::open("tests/data/hdf5_ref/fractal_heap_modern.h5").unwrap();
     let group = f.group("many_links").unwrap();
-    let names = group.member_names().unwrap();
-    assert_eq!(names.len(), 80);
-    assert!(names.contains(&"link_000".to_string()));
-    assert!(names.contains(&"link_079".to_string()));
+    let (count, [has_first, has_last]) =
+        group_member_summary(&group, ["link_000", "link_079"]).unwrap();
+    assert_eq!(count, 80);
+    assert!(has_first);
+    assert!(has_last);
 }
 
 #[test]
 fn t9c_fractal_heap_indirect_growth_beyond_one_level() {
     let f = File::open("tests/data/hdf5_ref/dense_group_cases.h5").unwrap();
     let group = f.group("name_index_deep").unwrap();
-    let names = group.member_names().unwrap();
+    let (count, [has_first, has_middle, has_last]) =
+        group_member_summary(&group, ["link_0000", "link_2048", "link_4095"]).unwrap();
 
-    assert_eq!(names.len(), 4096);
-    assert!(names.contains(&"link_0000".to_string()));
-    assert!(names.contains(&"link_2048".to_string()));
-    assert!(names.contains(&"link_4095".to_string()));
+    assert_eq!(count, 4096);
+    assert!(has_first);
+    assert!(has_middle);
+    assert!(has_last);
     assert_eq!(
         group.member_type("link_4095").unwrap(),
         hdf5_pure_rust::hl::file::ObjectType::Dataset
@@ -268,8 +427,8 @@ fn t9c_fractal_heap_direct_and_indirect_checksum_corruption_fails() {
 fn t9c_fractal_heap_dense_attrs() {
     // dense_attrs.h5 has the "data" dataset via inline link
     let f = File::open("tests/data/dense_attrs.h5").unwrap();
-    let names = f.member_names().unwrap();
-    assert!(names.contains(&"data".to_string()));
+    let (_count, [has_data]) = file_member_summary(&f, ["data"]).unwrap();
+    assert!(has_data);
 }
 
 // T9d: V2 B-tree (used for dense link name index)
@@ -290,27 +449,27 @@ fn t9d_v2_btree_link_lookup() {
 fn t9ef_btree_v1_chunk_index() {
     // btree_idx_1_6 and btree_idx_1_8 from C test suite
     let f = File::open("tests/data/hdf5_ref/btree_idx_1_6.h5").unwrap();
-    let names = f.member_names().unwrap();
-    println!("btree_idx_1_6 members: {names:?}");
+    let (count, []) = file_member_summary(&f, []).unwrap();
+    println!("btree_idx_1_6 member count: {count}");
     // Just verify it opens and lists without error
-    assert!(!names.is_empty());
+    assert!(count > 0);
 }
 
 #[test]
 fn t9ef_btree_v1_chunk_index_18() {
     let f = File::open("tests/data/hdf5_ref/btree_idx_1_8.h5").unwrap();
-    let names = f.member_names().unwrap();
-    println!("btree_idx_1_8 members: {names:?}");
-    assert!(!names.is_empty());
+    let (count, []) = file_member_summary(&f, []).unwrap();
+    println!("btree_idx_1_8 member count: {count}");
+    assert!(count > 0);
 }
 
 #[test]
 fn t9ef_btree_v1_chunk_index_3d_coordinates() {
     let f = File::open("tests/data/hdf5_ref/v1_btree_3d_chunks.h5").unwrap();
     let ds = f.dataset("btree_v1_3d").unwrap();
-    assert_eq!(ds.shape().unwrap(), vec![4, 5, 6]);
+    assert_dataset_shape(&ds, &[4, 5, 6]);
 
-    let vals: Vec<i32> = ds.read::<i32>().unwrap();
+    let vals: Vec<i32> = dataset_values(&ds).unwrap();
     assert_eq!(vals.len(), 4 * 5 * 6);
     assert_eq!(vals[0], 0);
     assert_eq!(vals[5], 5);
@@ -323,9 +482,9 @@ fn t9ef_btree_v1_chunk_index_3d_coordinates() {
 fn t9ef_btree_v1_sparse_nonmonotonic_chunks() {
     let f = File::open("tests/data/hdf5_ref/v1_btree_sparse_nonmonotonic.h5").unwrap();
     let ds = f.dataset("btree_v1_sparse_nonmonotonic").unwrap();
-    assert_eq!(ds.shape().unwrap(), vec![6, 6]);
+    assert_dataset_shape(&ds, &[6, 6]);
 
-    let vals: Vec<i32> = ds.read::<i32>().unwrap();
+    let vals: Vec<i32> = dataset_values(&ds).unwrap();
     let mut expected = vec![-9; 6 * 6];
     expected[0] = 0;
     expected[1] = 1;
@@ -345,6 +504,6 @@ fn t9ef_btree_v1_sparse_nonmonotonic_chunks() {
 #[test]
 fn t9ef_non_default_heap_sizes() {
     let f = File::open("tests/data/hdf5_ref/tsizeslheap.h5").unwrap();
-    let names = f.member_names().unwrap();
-    println!("tsizeslheap members: {names:?}");
+    let (count, []) = file_member_summary(&f, []).unwrap();
+    println!("tsizeslheap member count: {count}");
 }

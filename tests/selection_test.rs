@@ -3,44 +3,119 @@ use hdf5_pure_rust::{
     File, HyperslabDim, SelectionType,
 };
 
+fn assert_hyperslab_blocks_eq_into(
+    selection: &Selection,
+    shape: &[u64],
+    starts: &mut Vec<u64>,
+    ends: &mut Vec<u64>,
+    expected: Option<(&[u64], &[u64])>,
+) -> hdf5_pure_rust::Result<()> {
+    let Some(block_count) = selection.hyperslab_block_count(shape) else {
+        assert!(expected.is_none());
+        return Ok(());
+    };
+    let rank = match selection {
+        Selection::None => 0,
+        Selection::All => shape.len(),
+        Selection::Hyperslab(dims) => dims.len(),
+        Selection::Slice(slices) => slices.len(),
+        Selection::Points(_) => unreachable!("point selection block count is None"),
+    };
+    starts.resize(block_count as usize * rank, 0);
+    ends.resize(block_count as usize * rank, 0);
+    assert_eq!(
+        selection.hyperslab_blocklist_into(shape, starts, ends)?,
+        Some(block_count as usize)
+    );
+    let Some((expected_starts, expected_ends)) = expected else {
+        panic!("expected hyperslab blocklist for non-point selection");
+    };
+    assert_eq!(starts, expected_starts);
+    assert_eq!(ends, expected_ends);
+    Ok(())
+}
+
+fn assert_bounds_eq(
+    selection: &Selection,
+    shape: &[u64],
+    start: &mut Vec<u64>,
+    end: &mut Vec<u64>,
+    expected: Option<(&[u64], &[u64])>,
+) {
+    assert_eq!(selection.bounds_into(shape, start, end), expected.is_some());
+    if let Some((expected_start, expected_end)) = expected {
+        assert_eq!(start, expected_start);
+        assert_eq!(end, expected_end);
+    } else {
+        assert!(start.is_empty());
+        assert!(end.is_empty());
+    }
+}
+
 #[test]
 fn test_read_slice_1d_range() {
     let f = File::open("tests/data/datasets_v0.h5").unwrap();
     let ds = f.dataset("float64_1d").unwrap();
     // Read elements 1..4 (indices 1, 2, 3)
-    let vals: Vec<f64> = ds.read_slice::<f64, _>(1..4).unwrap();
-    assert_eq!(vals, vec![2.0, 3.0, 4.0]);
+    let mut vals = [0.0; 3];
+    ds.read_slice_into::<f64, _>(1..4, &mut vals).unwrap();
+    assert_eq!(vals, [2.0, 3.0, 4.0]);
+}
+
+#[test]
+fn test_read_slice_into_1d_range() {
+    let f = File::open("tests/data/datasets_v0.h5").unwrap();
+    let ds = f.dataset("float64_1d").unwrap();
+    let mut vals = [0.0; 3];
+    ds.read_slice_into::<f64, _>(1..4, &mut vals).unwrap();
+    assert_eq!(vals, [2.0, 3.0, 4.0]);
+}
+
+#[test]
+fn test_read_slice_into_rejects_wrong_output_length() {
+    let f = File::open("tests/data/datasets_v0.h5").unwrap();
+    let ds = f.dataset("float64_1d").unwrap();
+    let mut vals = [0.0; 2];
+    let err = ds
+        .read_slice_into::<f64, _>(1..4, &mut vals)
+        .expect_err("output length should be validated");
+    assert!(err.to_string().contains("expected 3"));
 }
 
 #[test]
 fn test_read_slice_1d_from_start() {
     let f = File::open("tests/data/datasets_v0.h5").unwrap();
     let ds = f.dataset("float64_1d").unwrap();
-    let vals: Vec<f64> = ds.read_slice::<f64, _>(..3).unwrap();
-    assert_eq!(vals, vec![1.0, 2.0, 3.0]);
+    let mut vals = [0.0; 3];
+    ds.read_slice_into::<f64, _>(..3, &mut vals).unwrap();
+    assert_eq!(vals, [1.0, 2.0, 3.0]);
 }
 
 #[test]
 fn test_read_slice_1d_to_end() {
     let f = File::open("tests/data/datasets_v0.h5").unwrap();
     let ds = f.dataset("float64_1d").unwrap();
-    let vals: Vec<f64> = ds.read_slice::<f64, _>(3..).unwrap();
-    assert_eq!(vals, vec![4.0, 5.0]);
+    let mut vals = [0.0; 2];
+    ds.read_slice_into::<f64, _>(3.., &mut vals).unwrap();
+    assert_eq!(vals, [4.0, 5.0]);
 }
 
 #[test]
 fn test_read_slice_all() {
     let f = File::open("tests/data/datasets_v0.h5").unwrap();
     let ds = f.dataset("float64_1d").unwrap();
-    let vals: Vec<f64> = ds.read_slice::<f64, _>(..).unwrap();
-    assert_eq!(vals, vec![1.0, 2.0, 3.0, 4.0, 5.0]);
+    let mut vals = [0.0; 5];
+    ds.read_slice_into::<f64, _>(.., &mut vals).unwrap();
+    assert_eq!(vals, [1.0, 2.0, 3.0, 4.0, 5.0]);
 }
 
 #[test]
 fn test_read_slice_none() {
     let f = File::open("tests/data/datasets_v0.h5").unwrap();
     let ds = f.dataset("float64_1d").unwrap();
-    let vals: Vec<f64> = ds.read_slice::<f64, _>(Selection::None).unwrap();
+    let mut vals: Vec<f64> = Vec::new();
+    ds.read_slice_into::<f64, _>(Selection::None, &mut vals)
+        .unwrap();
     assert!(vals.is_empty());
 }
 
@@ -48,7 +123,8 @@ fn test_read_slice_none() {
 fn test_read_slice_zero_length_range() {
     let f = File::open("tests/data/datasets_v0.h5").unwrap();
     let ds = f.dataset("float64_1d").unwrap();
-    let vals: Vec<f64> = ds.read_slice::<f64, _>(2..2).unwrap();
+    let mut vals: Vec<f64> = Vec::new();
+    ds.read_slice_into::<f64, _>(2..2, &mut vals).unwrap();
     assert!(vals.is_empty());
 }
 
@@ -57,8 +133,9 @@ fn test_read_slice_1d_stepped_selection() {
     let f = File::open("tests/data/datasets_v0.h5").unwrap();
     let ds = f.dataset("float64_1d").unwrap();
     let selection = Selection::Slice(vec![SliceInfo::with_step(0, 5, 2)]);
-    let vals: Vec<f64> = ds.read_slice::<f64, _>(selection).unwrap();
-    assert_eq!(vals, vec![1.0, 3.0, 5.0]);
+    let mut vals = [0.0; 3];
+    ds.read_slice_into::<f64, _>(selection, &mut vals).unwrap();
+    assert_eq!(vals, [1.0, 3.0, 5.0]);
 }
 
 #[test]
@@ -66,8 +143,9 @@ fn test_read_slice_1d_point_selection() {
     let f = File::open("tests/data/datasets_v0.h5").unwrap();
     let ds = f.dataset("float64_1d").unwrap();
     let selection = Selection::Points(vec![vec![4], vec![0], vec![2]]);
-    let vals: Vec<f64> = ds.read_slice::<f64, _>(selection).unwrap();
-    assert_eq!(vals, vec![5.0, 1.0, 3.0]);
+    let mut vals = [0.0; 3];
+    ds.read_slice_into::<f64, _>(selection, &mut vals).unwrap();
+    assert_eq!(vals, [5.0, 1.0, 3.0]);
 }
 
 #[test]
@@ -75,8 +153,9 @@ fn test_read_slice_1d_block_hyperslab_selection() {
     let f = File::open("tests/data/datasets_v0.h5").unwrap();
     let ds = f.dataset("float64_1d").unwrap();
     let selection = Selection::Hyperslab(vec![HyperslabDim::new(0, 3, 2, 2)]);
-    let vals: Vec<f64> = ds.read_slice::<f64, _>(selection).unwrap();
-    assert_eq!(vals, vec![1.0, 2.0, 4.0, 5.0]);
+    let mut vals = [0.0; 4];
+    ds.read_slice_into::<f64, _>(selection, &mut vals).unwrap();
+    assert_eq!(vals, [1.0, 2.0, 4.0, 5.0]);
 }
 
 #[test]
@@ -84,40 +163,46 @@ fn test_read_slice_2d() {
     let f = File::open("tests/data/datasets_v0.h5").unwrap();
     let ds = f.dataset("int8_2d").unwrap();
     // Read row 1 only (row 1, all columns)
-    let vals: Vec<i8> = ds.read_slice::<i8, _>((1..2, 0..3)).unwrap();
-    assert_eq!(vals, vec![4, 5, 6]);
+    let mut vals = [0; 3];
+    ds.read_slice_into::<i8, _>((1..2, 0..3), &mut vals)
+        .unwrap();
+    assert_eq!(vals, [4, 5, 6]);
 }
 
 #[test]
 fn test_read_slice_2d_range_full_column() {
     let f = File::open("tests/data/datasets_v0.h5").unwrap();
     let ds = f.dataset("int8_2d").unwrap();
-    let vals: Vec<i8> = ds.read_slice::<i8, _>((.., 1..3)).unwrap();
-    assert_eq!(vals, vec![2, 3, 5, 6]);
+    let mut vals = [0; 4];
+    ds.read_slice_into::<i8, _>((.., 1..3), &mut vals).unwrap();
+    assert_eq!(vals, [2, 3, 5, 6]);
 }
 
 #[test]
 fn test_read_slice_2d_range_full_row() {
     let f = File::open("tests/data/datasets_v0.h5").unwrap();
     let ds = f.dataset("int8_2d").unwrap();
-    let vals: Vec<i8> = ds.read_slice::<i8, _>((1..2, ..)).unwrap();
-    assert_eq!(vals, vec![4, 5, 6]);
+    let mut vals = [0; 3];
+    ds.read_slice_into::<i8, _>((1..2, ..), &mut vals).unwrap();
+    assert_eq!(vals, [4, 5, 6]);
 }
 
 #[test]
 fn test_read_slice_2d_full_tuple() {
     let f = File::open("tests/data/datasets_v0.h5").unwrap();
     let ds = f.dataset("int8_2d").unwrap();
-    let vals: Vec<i8> = ds.read_slice::<i8, _>((.., ..)).unwrap();
-    assert_eq!(vals, vec![1, 2, 3, 4, 5, 6]);
+    let mut vals = [0; 6];
+    ds.read_slice_into::<i8, _>((.., ..), &mut vals).unwrap();
+    assert_eq!(vals, [1, 2, 3, 4, 5, 6]);
 }
 
 #[test]
 fn test_read_slice_2d_open_ended_tuple_ranges() {
     let f = File::open("tests/data/datasets_v0.h5").unwrap();
     let ds = f.dataset("int8_2d").unwrap();
-    let vals: Vec<i8> = ds.read_slice::<i8, _>((1.., ..2)).unwrap();
-    assert_eq!(vals, vec![4, 5]);
+    let mut vals = [0; 2];
+    ds.read_slice_into::<i8, _>((1.., ..2), &mut vals).unwrap();
+    assert_eq!(vals, [4, 5]);
 }
 
 #[test]
@@ -125,8 +210,10 @@ fn test_read_slice_2d_subregion() {
     let f = File::open("tests/data/datasets_v0.h5").unwrap();
     let ds = f.dataset("int8_2d").unwrap();
     // Read rows 0-1, cols 1-2
-    let vals: Vec<i8> = ds.read_slice::<i8, _>((0..2, 1..3)).unwrap();
-    assert_eq!(vals, vec![2, 3, 5, 6]);
+    let mut vals = [0; 4];
+    ds.read_slice_into::<i8, _>((0..2, 1..3), &mut vals)
+        .unwrap();
+    assert_eq!(vals, [2, 3, 5, 6]);
 }
 
 #[test]
@@ -137,8 +224,9 @@ fn test_read_slice_2d_stepped_selection() {
         SliceInfo::with_step(0, 2, 1),
         SliceInfo::with_step(0, 3, 2),
     ]);
-    let vals: Vec<i8> = ds.read_slice::<i8, _>(selection).unwrap();
-    assert_eq!(vals, vec![1, 3, 4, 6]);
+    let mut vals = [0; 4];
+    ds.read_slice_into::<i8, _>(selection, &mut vals).unwrap();
+    assert_eq!(vals, [1, 3, 4, 6]);
 }
 
 #[test]
@@ -146,8 +234,9 @@ fn test_read_slice_2d_point_selection() {
     let f = File::open("tests/data/datasets_v0.h5").unwrap();
     let ds = f.dataset("int8_2d").unwrap();
     let selection = Selection::Points(vec![vec![1, 2], vec![0, 0], vec![1, 1]]);
-    let vals: Vec<i8> = ds.read_slice::<i8, _>(selection).unwrap();
-    assert_eq!(vals, vec![6, 1, 5]);
+    let mut vals = [0; 3];
+    ds.read_slice_into::<i8, _>(selection, &mut vals).unwrap();
+    assert_eq!(vals, [6, 1, 5]);
 }
 
 #[test]
@@ -158,46 +247,79 @@ fn test_read_slice_2d_block_hyperslab_selection() {
         HyperslabDim::new(0, 1, 2, 1),
         HyperslabDim::new(0, 2, 2, 1),
     ]);
-    let vals: Vec<i8> = ds.read_slice::<i8, _>(selection).unwrap();
-    assert_eq!(vals, vec![1, 3, 4, 6]);
+    let mut vals = [0; 4];
+    ds.read_slice_into::<i8, _>(selection, &mut vals).unwrap();
+    assert_eq!(vals, [1, 3, 4, 6]);
 }
 
 #[test]
 fn test_selection_bounds_count_and_regularity_helpers() {
     let shape = [2, 3];
+    let mut start = Vec::new();
+    let mut end = Vec::new();
+    let mut block_starts = Vec::new();
+    let mut block_ends = Vec::new();
 
     let all = Selection::All;
     assert!(all.is_all());
     assert_eq!(all.selection_type(), SelectionType::All);
     assert_eq!(all.selected_count(&shape), Some(6));
-    assert_eq!(all.bounds(&shape), Some((vec![0, 0], vec![1, 2])));
+    assert_bounds_eq(&all, &shape, &mut start, &mut end, Some((&[0, 0], &[1, 2])));
     assert_eq!(all.hyperslab_block_count(&shape), Some(1));
-    assert_eq!(
-        all.hyperslab_blocklist(&shape).unwrap(),
-        Some(vec![(vec![0, 0], vec![1, 2])])
-    );
+    assert_hyperslab_blocks_eq_into(
+        &all,
+        &shape,
+        &mut block_starts,
+        &mut block_ends,
+        Some((&[0, 0], &[1, 2])),
+    )
+    .unwrap();
     assert!(all.is_regular());
 
     let none = Selection::None;
     assert!(none.is_none());
     assert_eq!(none.selection_type(), SelectionType::None);
     assert_eq!(none.selected_count(&shape), Some(0));
-    assert_eq!(none.bounds(&shape), None);
+    assert_bounds_eq(&none, &shape, &mut start, &mut end, None);
     assert_eq!(none.hyperslab_block_count(&shape), Some(0));
-    assert_eq!(none.hyperslab_blocklist(&shape).unwrap(), Some(Vec::new()));
+    assert_hyperslab_blocks_eq_into(
+        &none,
+        &shape,
+        &mut block_starts,
+        &mut block_ends,
+        Some((&[], &[])),
+    )
+    .unwrap();
     assert!(none.is_regular());
 
     let points = Selection::Points(vec![vec![1, 2], vec![0, 1], vec![1, 0]]);
     assert_eq!(points.selection_type(), SelectionType::Points);
     assert_eq!(points.selected_count(&shape), Some(3));
-    assert_eq!(points.bounds(&shape), Some((vec![0, 0], vec![1, 2])));
+    assert_bounds_eq(
+        &points,
+        &shape,
+        &mut start,
+        &mut end,
+        Some((&[0, 0], &[1, 2])),
+    );
     assert_eq!(points.hyperslab_block_count(&shape), None);
-    assert_eq!(points.hyperslab_blocklist(&shape).unwrap(), None);
+    assert_eq!(
+        points
+            .hyperslab_blocklist_into(&shape, &mut block_starts, &mut block_ends)
+            .unwrap(),
+        None
+    );
     assert_eq!(points.element_point_count(), Some(3));
     assert_eq!(
-        points.element_pointlist(),
-        Some(vec![vec![1, 2], vec![0, 1], vec![1, 0]].as_slice())
+        points.element_points().unwrap().collect::<Vec<_>>(),
+        vec![&[1, 2][..], &[0, 1][..], &[1, 0][..]]
     );
+    let mut pointlist = [0; 6];
+    assert_eq!(
+        points.element_pointlist_into(&mut pointlist).unwrap(),
+        Some(3)
+    );
+    assert_eq!(pointlist, [1, 2, 0, 1, 1, 0]);
     assert!(!points.is_regular());
 
     let slices = Selection::Slice(vec![
@@ -206,12 +328,22 @@ fn test_selection_bounds_count_and_regularity_helpers() {
     ]);
     assert_eq!(slices.selection_type(), SelectionType::Hyperslab);
     assert_eq!(slices.selected_count(&shape), Some(4));
-    assert_eq!(slices.bounds(&shape), Some((vec![0, 0], vec![1, 2])));
-    assert_eq!(slices.hyperslab_block_count(&shape), Some(2));
-    assert_eq!(
-        slices.hyperslab_blocklist(&shape).unwrap(),
-        Some(vec![(vec![0, 0], vec![1, 0]), (vec![0, 2], vec![1, 2])])
+    assert_bounds_eq(
+        &slices,
+        &shape,
+        &mut start,
+        &mut end,
+        Some((&[0, 0], &[1, 2])),
     );
+    assert_eq!(slices.hyperslab_block_count(&shape), Some(2));
+    assert_hyperslab_blocks_eq_into(
+        &slices,
+        &shape,
+        &mut block_starts,
+        &mut block_ends,
+        Some((&[0, 0, 0, 2], &[1, 0, 1, 2])),
+    )
+    .unwrap();
     assert_eq!(slices.element_point_count(), None);
     assert!(slices.is_regular());
 
@@ -221,17 +353,22 @@ fn test_selection_bounds_count_and_regularity_helpers() {
     ]);
     assert_eq!(hyperslab.selection_type(), SelectionType::Hyperslab);
     assert_eq!(hyperslab.selected_count(&shape), Some(4));
-    assert_eq!(hyperslab.bounds(&shape), Some((vec![0, 0], vec![1, 2])));
-    assert_eq!(hyperslab.hyperslab_block_count(&shape), Some(4));
-    assert_eq!(
-        hyperslab.hyperslab_blocklist(&shape).unwrap(),
-        Some(vec![
-            (vec![0, 0], vec![0, 0]),
-            (vec![0, 2], vec![0, 2]),
-            (vec![1, 0], vec![1, 0]),
-            (vec![1, 2], vec![1, 2])
-        ])
+    assert_bounds_eq(
+        &hyperslab,
+        &shape,
+        &mut start,
+        &mut end,
+        Some((&[0, 0], &[1, 2])),
     );
+    assert_eq!(hyperslab.hyperslab_block_count(&shape), Some(4));
+    assert_hyperslab_blocks_eq_into(
+        &hyperslab,
+        &shape,
+        &mut block_starts,
+        &mut block_ends,
+        Some((&[0, 0, 0, 2, 1, 0, 1, 2], &[0, 0, 0, 2, 1, 0, 1, 2])),
+    )
+    .unwrap();
     assert!(hyperslab.is_regular());
 }
 
@@ -241,8 +378,14 @@ fn test_selection_materialize_and_combine_helpers() {
     let left = Selection::Slice(vec![SliceInfo::new(0, 2), SliceInfo::with_step(0, 3, 2)]);
     let right = Selection::Points(vec![vec![0, 1], vec![1, 2]]);
 
+    let mut visited = Vec::new();
+    left.visit_points(&shape, |point| {
+        visited.push(point.to_vec());
+        Ok(())
+    })
+    .unwrap();
     assert_eq!(
-        left.materialize_points(&shape).unwrap(),
+        visited,
         vec![vec![0, 0], vec![0, 2], vec![1, 0], vec![1, 2]]
     );
 
@@ -303,10 +446,12 @@ fn test_selection_point_iterator_and_projection_helpers() {
     let shape = [2, 3];
     let selection = Selection::Slice(vec![SliceInfo::new(0, 2), SliceInfo::with_step(0, 3, 2)]);
 
-    let mut iter = selection.iter_points(&shape).unwrap();
+    let mut iter = selection.select_iter_init(&shape).unwrap();
     assert_eq!(iter.len(), 4);
-    assert_eq!(iter.next(), Some(vec![0, 0]));
-    assert_eq!(iter.next(), Some(vec![0, 2]));
+    assert_eq!(iter.select_iter_next_ref(), Some(&[0, 0][..]));
+    let mut coord = [0, 0];
+    assert!(iter.select_iter_next_into(&mut coord).unwrap());
+    assert_eq!(coord, [0, 2]);
     assert_eq!(iter.len(), 2);
     assert_eq!(iter.collect::<Vec<_>>(), vec![vec![1, 0], vec![1, 2]]);
 
@@ -331,18 +476,30 @@ fn test_selection_point_iterator_and_projection_helpers() {
 
 #[test]
 fn test_selection_bounds_reject_coordinate_overflow() {
+    let mut start = Vec::new();
+    let mut end = Vec::new();
+
     let slice = Selection::Slice(vec![SliceInfo::with_step(u64::MAX - 1, u64::MAX, 2)]);
-    assert_eq!(
-        slice.bounds(&[u64::MAX]),
-        Some((vec![u64::MAX - 1], vec![u64::MAX - 1]))
+    assert_bounds_eq(
+        &slice,
+        &[u64::MAX],
+        &mut start,
+        &mut end,
+        Some((&[u64::MAX - 1], &[u64::MAX - 1])),
     );
 
     let zero_step_slice = Selection::Slice(vec![SliceInfo::with_step(1, u64::MAX, 0)]);
-    assert_eq!(zero_step_slice.bounds(&[u64::MAX]), None);
+    assert_bounds_eq(&zero_step_slice, &[u64::MAX], &mut start, &mut end, None);
 
     let overflowing_hyperslab =
         Selection::Hyperslab(vec![HyperslabDim::new(u64::MAX - 1, 2, 2, 1)]);
-    assert_eq!(overflowing_hyperslab.bounds(&[u64::MAX]), None);
+    assert_bounds_eq(
+        &overflowing_hyperslab,
+        &[u64::MAX],
+        &mut start,
+        &mut end,
+        None,
+    );
 }
 
 #[test]
@@ -350,6 +507,7 @@ fn test_read_slice_chunked() {
     let f = File::open("tests/data/datasets_v0.h5").unwrap();
     let ds = f.dataset("chunked").unwrap();
     // Read elements 50..55 from a chunked dataset
-    let vals: Vec<f32> = ds.read_slice::<f32, _>(50..55).unwrap();
-    assert_eq!(vals, vec![50.0, 51.0, 52.0, 53.0, 54.0]);
+    let mut vals = [0.0; 5];
+    ds.read_slice_into::<f32, _>(50..55, &mut vals).unwrap();
+    assert_eq!(vals, [50.0, 51.0, 52.0, 53.0, 54.0]);
 }

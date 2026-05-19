@@ -1,6 +1,8 @@
 #![allow(dead_code, non_snake_case)]
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::io::Cursor;
 
 use crate::error::{Error, Result};
@@ -125,16 +127,16 @@ pub struct FileLoggingFlags {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DriverInfoBlock {
+pub struct DriverInfoBlock<'a> {
     pub version: u8,
     pub name: [u8; 8],
-    pub data: Vec<u8>,
+    pub data: Cow<'a, [u8]>,
 }
 
 #[derive(Debug, Clone)]
-pub struct SuperblockCacheImage {
+pub struct SuperblockCacheImage<'a> {
     pub superblock: Superblock,
-    pub raw: Vec<u8>,
+    pub raw: Cow<'a, [u8]>,
 }
 
 /// Returns an `Unsupported` error stub for file-driver behavior not implemented in pure-Rust mode.
@@ -198,9 +200,17 @@ pub fn H5F__get_all_count_cb(file: &FileApiState) -> usize {
     file.object_ids.len()
 }
 
-/// Callback returning the full list of open object IDs in a file.
-pub fn H5F__get_all_ids_cb(file: &FileApiState) -> Vec<u64> {
-    file.object_ids.iter().copied().collect()
+/// Copy all open object IDs into caller-provided storage.
+pub fn H5F__get_all_ids_cb_into(file: &FileApiState, out: &mut Vec<u64>) -> usize {
+    H5F_get_obj_ids_into(file, out)
+}
+
+/// Visit each open object ID without allocating an intermediate list.
+pub fn H5F__visit_all_ids_cb<F>(file: &FileApiState, visitor: F)
+where
+    F: FnMut(u64),
+{
+    H5F_visit_obj_ids(file, visitor);
 }
 
 /// Check if a given image is an accessible HDF5 file (signature check).
@@ -360,7 +370,7 @@ pub fn H5F__cache_superblock_verify_chksum(_image: &[u8]) -> bool {
 }
 
 /// Metadata-cache hook: deserialize a superblock image into a cache entry.
-pub fn H5F__cache_superblock_deserialize(image: &[u8]) -> Result<SuperblockCacheImage> {
+pub fn H5F__cache_superblock_deserialize(image: &[u8]) -> Result<SuperblockCacheImage<'_>> {
     let mut reader = HdfReader::new(Cursor::new(image));
     let superblock = Superblock::read(&mut reader)?;
     let size = superblock.checked_size()?;
@@ -371,17 +381,17 @@ pub fn H5F__cache_superblock_deserialize(image: &[u8]) -> Result<SuperblockCache
     }
     Ok(SuperblockCacheImage {
         superblock,
-        raw: image[..size].to_vec(),
+        raw: Cow::Borrowed(&image[..size]),
     })
 }
 
 /// Metadata-cache hook: return the serialized image length for a cached superblock.
-pub fn H5F__cache_superblock_image_len(image: &SuperblockCacheImage) -> usize {
+pub fn H5F__cache_superblock_image_len(image: &SuperblockCacheImage<'_>) -> usize {
     image.raw.len()
 }
 
 /// Metadata-cache hook: free the in-core representation of a cached superblock.
-pub fn H5F__cache_superblock_free_icr(_image: SuperblockCacheImage) {}
+pub fn H5F__cache_superblock_free_icr(_image: SuperblockCacheImage<'_>) {}
 
 /// Metadata-cache hook: initial bytes needed to start loading the driver-info block.
 pub fn H5F__cache_drvrinfo_get_initial_load_size() -> usize {
@@ -397,7 +407,7 @@ pub fn H5F__cache_drvrinfo_get_final_load_size(image: &[u8]) -> Result<usize> {
 }
 
 /// Metadata-cache hook: decode a driver-info cache block image.
-pub fn H5F__cache_drvrinfo_deserialize(image: &[u8]) -> Result<DriverInfoBlock> {
+pub fn H5F__cache_drvrinfo_deserialize(image: &[u8]) -> Result<DriverInfoBlock<'_>> {
     let len = decode_driver_info_block_payload_len(image)?;
     let total = 16usize
         .checked_add(len)
@@ -413,20 +423,23 @@ pub fn H5F__cache_drvrinfo_deserialize(image: &[u8]) -> Result<DriverInfoBlock> 
     Ok(DriverInfoBlock {
         version: image[0],
         name,
-        data: image[16..total].to_vec(),
+        data: Cow::Borrowed(&image[16..total]),
     })
 }
 
 /// Metadata-cache hook: serialized image length of a driver-info block.
-pub fn H5F__cache_drvrinfo_image_len(block: &DriverInfoBlock) -> Result<usize> {
+pub fn H5F__cache_drvrinfo_image_len(block: &DriverInfoBlock<'_>) -> Result<usize> {
     let len = driver_info_block_payload_len_u32(block)?;
     16usize
         .checked_add(len as usize)
         .ok_or_else(|| Error::InvalidFormat("driver info cache block size overflow".into()))
 }
 
-/// Metadata-cache hook: encode a driver-info block into its on-disk image.
-pub fn H5F__cache_drvrinfo_serialize(block: &DriverInfoBlock) -> Result<Vec<u8>> {
+/// Metadata-cache hook: encode a driver-info block into caller-provided storage.
+pub fn H5F__cache_drvrinfo_serialize_into(
+    block: &DriverInfoBlock<'_>,
+    out: &mut Vec<u8>,
+) -> Result<usize> {
     if block.version != 0 {
         return Err(Error::InvalidFormat(format!(
             "unsupported driver info cache block version {}",
@@ -434,17 +447,19 @@ pub fn H5F__cache_drvrinfo_serialize(block: &DriverInfoBlock) -> Result<Vec<u8>>
         )));
     }
     let len = driver_info_block_payload_len_u32(block)?;
-    let mut image = Vec::with_capacity(H5F__cache_drvrinfo_image_len(block)?);
-    image.push(block.version);
-    image.extend_from_slice(&[0, 0, 0]);
-    image.extend_from_slice(&len.to_le_bytes());
-    image.extend_from_slice(&block.name);
-    image.extend_from_slice(&block.data);
-    Ok(image)
+    let total = H5F__cache_drvrinfo_image_len(block)?;
+    out.clear();
+    out.reserve(total);
+    out.push(block.version);
+    out.extend_from_slice(&[0, 0, 0]);
+    out.extend_from_slice(&len.to_le_bytes());
+    out.extend_from_slice(&block.name);
+    out.extend_from_slice(&block.data);
+    Ok(out.len())
 }
 
 /// Metadata-cache hook: free the in-core representation of a driver-info block.
-pub fn H5F__cache_drvrinfo_free_icr(_block: DriverInfoBlock) {}
+pub fn H5F__cache_drvrinfo_free_icr(_block: DriverInfoBlock<'_>) {}
 
 /// Read the 32-bit little-endian payload length from a driver-info block prefix.
 fn decode_driver_info_block_payload_len(image: &[u8]) -> Result<usize> {
@@ -463,7 +478,7 @@ fn decode_driver_info_block_payload_len(image: &[u8]) -> Result<usize> {
 }
 
 /// Convert a driver-info block payload length to a `u32`, erroring on overflow.
-fn driver_info_block_payload_len_u32(block: &DriverInfoBlock) -> Result<u32> {
+fn driver_info_block_payload_len_u32(block: &DriverInfoBlock<'_>) -> Result<u32> {
     u32::try_from(block.data.len())
         .map_err(|_| Error::InvalidFormat("driver info cache block payload too large".into()))
 }
@@ -473,10 +488,13 @@ pub fn H5F__close_cb(_file: FileApiState) {}
 
 /// Parse the `HDF5_USE_FILE_LOCKING` environment variable into a tri-state setting.
 pub fn H5F__parse_file_lock_env_var(value: Option<&str>) -> Result<Option<bool>> {
-    match value.map(str::to_ascii_uppercase).as_deref() {
+    match value {
         None => Ok(None),
-        Some("FALSE") | Some("0") => Ok(Some(false)),
-        Some("TRUE") | Some("1") | Some("BEST_EFFORT") => Ok(Some(true)),
+        Some("0") => Ok(Some(false)),
+        Some("1") => Ok(Some(true)),
+        Some(value) if value.eq_ignore_ascii_case("FALSE") => Ok(Some(false)),
+        Some(value) if value.eq_ignore_ascii_case("TRUE") => Ok(Some(true)),
+        Some(value) if value.eq_ignore_ascii_case("BEST_EFFORT") => Ok(Some(true)),
         Some(other) => Err(Error::InvalidFormat(format!(
             "invalid HDF5 file locking environment value '{other}'"
         ))),
@@ -498,14 +516,34 @@ pub fn H5F_get_obj_count(file: &FileApiState) -> usize {
     file.object_ids.len()
 }
 
-/// Return the list of object IDs currently open in the file.
-pub fn H5F_get_obj_ids(file: &FileApiState) -> Vec<u64> {
-    file.object_ids.iter().copied().collect()
+/// Copy object IDs currently open in the file into caller-provided storage.
+pub fn H5F_get_obj_ids_into(file: &FileApiState, out: &mut Vec<u64>) -> usize {
+    out.clear();
+    out.extend(file.object_ids.iter().copied());
+    out.len()
 }
 
-/// Return the list of objects open in the file (internal package helper).
-pub fn H5F__get_objects(file: &FileApiState) -> Vec<u64> {
-    H5F_get_obj_ids(file)
+/// Visit object IDs currently open in the file without allocating a list.
+pub fn H5F_visit_obj_ids<F>(file: &FileApiState, mut visitor: F)
+where
+    F: FnMut(u64),
+{
+    for id in &file.object_ids {
+        visitor(*id);
+    }
+}
+
+/// Copy open object IDs into caller-provided storage (internal package helper).
+pub fn H5F__get_objects_into(file: &FileApiState, out: &mut Vec<u64>) -> usize {
+    H5F_get_obj_ids_into(file, out)
+}
+
+/// Visit open object IDs without allocating (internal package helper).
+pub fn H5F__visit_objects<F>(file: &FileApiState, visitor: F)
+where
+    F: FnMut(u64),
+{
+    H5F_visit_obj_ids(file, visitor);
 }
 
 /// Callback returning the count of objects open in the file.
@@ -513,23 +551,40 @@ pub fn H5F__get_objects_cb(file: &FileApiState) -> usize {
     H5F_get_obj_count(file)
 }
 
-/// Build a full path by joining a prefix and a name with `/`.
-pub fn H5F__build_name(prefix: &str, name: &str) -> String {
+/// Build a full path, borrowing `name` when no prefix is needed.
+pub fn H5F__build_name_cow<'a>(prefix: &str, name: &'a str) -> Cow<'a, str> {
     if prefix.is_empty() {
-        name.to_string()
+        Cow::Borrowed(name)
     } else {
-        format!("{prefix}/{name}")
+        Cow::Owned(format!("{prefix}/{name}"))
     }
 }
 
-/// Decode an `HDF5_PREFIX`-style environment string into a path prefix.
-pub fn H5F__getenv_prefix_name(value: Option<&str>) -> Option<String> {
-    value.map(str::to_string)
+/// Build a full path into caller-provided string storage.
+pub fn H5F__build_name_into(prefix: &str, name: &str, out: &mut String) {
+    out.clear();
+    if prefix.is_empty() {
+        out.push_str(name);
+    } else {
+        out.push_str(prefix);
+        out.push('/');
+        out.push_str(name);
+    }
 }
 
-/// Resolve a file path against a search prefix when opening an external file.
-pub fn H5F_prefix_open_file(prefix: &str, name: &str) -> String {
-    H5F__build_name(prefix, name)
+/// Decode an `HDF5_PREFIX`-style environment string without allocating.
+pub fn H5F__getenv_prefix_name_cow(value: Option<&str>) -> Option<Cow<'_, str>> {
+    value.map(Cow::Borrowed)
+}
+
+/// Resolve a file path against a search prefix, borrowing `name` when possible.
+pub fn H5F_prefix_open_file_cow<'a>(prefix: &str, name: &'a str) -> Cow<'a, str> {
+    H5F__build_name_cow(prefix, name)
+}
+
+/// Resolve a file path against a search prefix into caller-provided storage.
+pub fn H5F_prefix_open_file_into(prefix: &str, name: &str, out: &mut String) {
+    H5F__build_name_into(prefix, name, out);
 }
 
 /// Check whether the buffer begins with the HDF5 file signature.
@@ -547,9 +602,15 @@ pub fn H5F__check_if_using_file_locks(file: &FileApiState) -> bool {
 
 /// Open a file (or share an already-open one), returning a refcounted handle.
 pub fn H5F_open(file: &FileApiState) -> FileApiState {
-    let mut reopened = file.clone();
-    reopened.nrefs = reopened.nrefs.saturating_add(1);
+    let mut reopened = FileApiState::default();
+    H5F_open_into(file, &mut reopened);
     reopened
+}
+
+/// Open a file into caller-provided storage, reusing owned buffers where possible.
+pub fn H5F_open_into(file: &FileApiState, out: &mut FileApiState) {
+    out.clone_from(file);
+    out.nrefs = out.nrefs.saturating_add(1);
 }
 
 /// Post-open hook called after the file is fully constructed.
@@ -600,7 +661,8 @@ pub fn H5F_decr_nopen_objs(file: &mut FileApiState) -> usize {
 
 /// Record the actual on-disk name for the file (post symlink/external resolution).
 pub fn H5F__build_actual_name(file: &mut FileApiState, name: &str) {
-    file.actual_name = name.to_string();
+    file.actual_name.clear();
+    file.actual_name.push_str(name);
 }
 
 /// Mark whether the file uses shared B-tree storage for groups.
@@ -638,11 +700,6 @@ pub fn H5F__set_libver_bounds(file: &mut FileApiState, low: u8, high: u8) {
     file.high_bound = high;
 }
 
-/// Return a copy of the in-memory file image.
-pub fn H5F__get_file_image(file: &FileApiState) -> Vec<u8> {
-    file.image.clone()
-}
-
 /// Copy the in-memory file image into a caller-provided buffer.
 ///
 /// Mirrors the caller-buffer form of `H5Fget_file_image`: callers can query
@@ -655,6 +712,18 @@ pub fn H5F__get_file_image_into(file: &FileApiState, out: &mut [u8]) -> Result<u
     }
     out[..file.image.len()].copy_from_slice(&file.image);
     Ok(file.image.len())
+}
+
+/// Return the current in-memory file image size.
+pub fn H5F__get_file_image_size(file: &FileApiState) -> usize {
+    file.image.len()
+}
+
+/// Copy the in-memory file image into caller-owned `Vec` storage.
+pub fn H5F__get_file_image_vec_into(file: &FileApiState, out: &mut Vec<u8>) -> usize {
+    out.clear();
+    out.extend_from_slice(&file.image);
+    out.len()
 }
 
 /// Return a `(eof, eoa)` tuple summarizing the file's allocation state.
@@ -714,7 +783,8 @@ pub fn H5F__update_super_ext_driver_msg(_file: &mut FileApiState) {}
 
 /// Initialize the file's superblock by writing the HDF5 signature.
 pub fn H5F__super_init(file: &mut FileApiState) {
-    file.image = b"\x89HDF\r\n\x1a\n".to_vec();
+    file.image.clear();
+    file.image.extend_from_slice(b"\x89HDF\r\n\x1a\n");
 }
 
 /// Mark the EOA value as dirty so it will be written on the next flush.
@@ -733,11 +803,6 @@ pub fn H5F__super_ext_remove_msg(file: &mut FileApiState) {
     file.super_ext_addr = None;
 }
 
-/// Read `len` bytes from the file's shared image at `offset`.
-pub fn H5F_shared_block_read(file: &FileApiState, offset: usize, len: usize) -> Result<Vec<u8>> {
-    H5F_block_read(file, offset, len)
-}
-
 /// Read bytes from the file's shared image into caller-provided storage.
 pub fn H5F_shared_block_read_into(
     file: &FileApiState,
@@ -745,13 +810,6 @@ pub fn H5F_shared_block_read_into(
     out: &mut [u8],
 ) -> Result<()> {
     H5F_block_read_into(file, offset, out)
-}
-
-/// Read `len` bytes from the file's image at `offset`, erroring if out of bounds.
-pub fn H5F_block_read(file: &FileApiState, offset: usize, len: usize) -> Result<Vec<u8>> {
-    let mut out = vec![0u8; len];
-    H5F_block_read_into(file, offset, &mut out)?;
-    Ok(out)
 }
 
 /// Read bytes from the file image into caller-provided storage.
@@ -784,17 +842,6 @@ pub fn H5F_block_write(file: &mut FileApiState, offset: usize, data: &[u8]) -> R
     let end_u64 = usize_to_u64(end, "H5F EOF")?;
     file.eof = file.eof.max(end_u64);
     Ok(())
-}
-
-/// Read multiple ranges from the file image and concatenate the results.
-pub fn H5F_shared_select_read(file: &FileApiState, spans: &[(usize, usize)]) -> Result<Vec<u8>> {
-    let total = spans.iter().try_fold(0usize, |acc, &(_, len)| {
-        acc.checked_add(len)
-            .ok_or_else(|| Error::InvalidFormat("H5F select read size overflow".into()))
-    })?;
-    let mut out = vec![0u8; total];
-    H5F_shared_select_read_into(file, spans, &mut out)?;
-    Ok(out)
 }
 
 /// Read multiple ranges from the file image into a caller-provided contiguous buffer.
@@ -830,11 +877,6 @@ pub fn H5F_shared_select_write(file: &mut FileApiState, spans: &[(usize, &[u8])]
     Ok(())
 }
 
-/// Vectored read of multiple `(offset, len)` ranges, returning concatenated bytes.
-pub fn H5F_shared_vector_read(file: &FileApiState, spans: &[(usize, usize)]) -> Result<Vec<u8>> {
-    H5F_shared_select_read(file, spans)
-}
-
 /// Vectored read into a caller-provided contiguous buffer.
 pub fn H5F_shared_vector_read_into(
     file: &FileApiState,
@@ -862,8 +904,15 @@ pub fn H5F_get_checksums(file: &FileApiState) -> u32 {
 }
 
 /// Return a short debug string describing the file.
-pub fn H5F_debug(file: &FileApiState) -> String {
-    format!("H5F(id={}, name={}, eof={})", file.id, file.name, file.eof)
+pub fn H5F_debug_into<W>(file: &FileApiState, out: &mut W) -> fmt::Result
+where
+    W: fmt::Write + ?Sized,
+{
+    write!(
+        out,
+        "H5F(id={}, name={}, eof={})",
+        file.id, file.name, file.eof
+    )
 }
 
 /// Assert that the number of shared open files equals `expected`.
@@ -1101,11 +1150,15 @@ pub fn H5F__accum_free(file: &mut FileApiState) {
 
 /// Flush any pending data in the metadata accumulator out to the file image.
 pub fn H5F__accum_flush(file: &mut FileApiState) -> Result<()> {
-    let data = file.accum.clone();
+    let data = std::mem::take(&mut file.accum);
     let eof = u64_to_usize(file.eof, "H5F accumulator EOF")?;
-    H5F_block_write(file, eof, &data)?;
-    file.accum.clear();
-    Ok(())
+    match H5F_block_write(file, eof, &data) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            file.accum = data;
+            Err(err)
+        }
+    }
 }
 
 /// Convert a `usize` to `u64`, erroring with a descriptive context on overflow.
@@ -1143,9 +1196,21 @@ pub fn H5F_get_actual_name(file: &FileApiState) -> &str {
     &file.actual_name
 }
 
+/// Copy the file's resolved on-disk name into caller-provided storage.
+pub fn H5F_get_actual_name_into(file: &FileApiState, out: &mut String) {
+    out.clear();
+    out.push_str(&file.actual_name);
+}
+
 /// Return the external-link search path stored on the file.
 pub fn H5F_get_extpath(file: &FileApiState) -> &str {
     &file.name
+}
+
+/// Copy the external-link search path into caller-provided storage.
+pub fn H5F_get_extpath_into(file: &FileApiState, out: &mut String) {
+    out.clear();
+    out.push_str(&file.name);
 }
 
 /// Return a reference to the shared file state.
@@ -1411,9 +1476,21 @@ pub fn H5F_flush_mounts(file: &mut FileApiState) {
     H5F__flush(file);
 }
 
-/// Traverse the mount tree, returning a list of mount-point names.
-pub fn H5F_traverse_mount(file: &FileApiState) -> Vec<String> {
-    file.mounts.iter().cloned().collect()
+/// Copy mount-point names into caller-provided storage.
+pub fn H5F_traverse_mount_into(file: &FileApiState, out: &mut Vec<String>) -> usize {
+    out.clear();
+    out.extend(file.mounts.iter().cloned());
+    out.len()
+}
+
+/// Visit mount-point names without allocating an intermediate list.
+pub fn H5F_visit_mounts<'a, F>(file: &'a FileApiState, mut visitor: F)
+where
+    F: FnMut(&'a str),
+{
+    for mount in &file.mounts {
+        visitor(mount);
+    }
 }
 
 /// Check whether a buffer is a recognizable HDF5 file image.
@@ -1475,6 +1552,66 @@ mod tests {
     }
 
     #[test]
+    fn object_id_helpers_support_reused_storage_and_visitors() {
+        let mut file = FileApiState::default();
+        file.object_ids.insert(7);
+        file.object_ids.insert(3);
+
+        let mut ids = vec![99];
+        assert_eq!(H5F_get_obj_ids_into(&file, &mut ids), 2);
+        assert_eq!(ids, vec![3, 7]);
+
+        ids.push(99);
+        assert_eq!(H5F__get_all_ids_cb_into(&file, &mut ids), 2);
+        assert_eq!(ids, vec![3, 7]);
+
+        let mut visited = Vec::new();
+        H5F_visit_obj_ids(&file, |id| visited.push(id));
+        assert_eq!(visited, vec![3, 7]);
+
+        visited.clear();
+        H5F__visit_objects(&file, |id| visited.push(id));
+        assert_eq!(visited, vec![3, 7]);
+    }
+
+    #[test]
+    fn path_prefix_helpers_borrow_or_reuse_storage() {
+        assert!(matches!(
+            H5F__build_name_cow("", "data.h5"),
+            Cow::Borrowed("data.h5")
+        ));
+        assert_eq!(H5F__build_name_cow("/tmp", "data.h5"), "/tmp/data.h5");
+
+        let mut path = String::from("old-value");
+        H5F__build_name_into("/prefix", "child.h5", &mut path);
+        assert_eq!(path, "/prefix/child.h5");
+
+        H5F_prefix_open_file_into("", "child.h5", &mut path);
+        assert_eq!(path, "child.h5");
+
+        assert!(matches!(
+            H5F__getenv_prefix_name_cow(Some("/env")),
+            Some(Cow::Borrowed("/env"))
+        ));
+        assert_eq!(H5F__getenv_prefix_name_cow(None), None);
+    }
+
+    #[test]
+    fn mount_traversal_helpers_support_reused_storage_and_visitors() {
+        let mut file = FileApiState::default();
+        H5F_mount(&mut file, "/z");
+        H5F_mount(&mut file, "/a");
+
+        let mut mounts = vec![String::from("stale")];
+        assert_eq!(H5F_traverse_mount_into(&file, &mut mounts), 2);
+        assert_eq!(mounts, vec![String::from("/a"), String::from("/z")]);
+
+        let mut visited = Vec::new();
+        H5F_visit_mounts(&file, |name| visited.push(name));
+        assert_eq!(visited, mounts);
+    }
+
+    #[test]
     fn external_file_cache_tracks_open_release_and_limits() {
         let mut cache = H5F__efc_create(1);
         assert_eq!(H5F__efc_max_nfiles(&cache), 1);
@@ -1516,7 +1653,8 @@ mod tests {
         assert_eq!(cached.superblock.root_addr, 48);
         assert_eq!(cached.superblock.eof_addr, 64);
         assert_eq!(H5F__cache_superblock_image_len(&cached), sb.size());
-        assert_eq!(cached.raw, image[..sb.size()]);
+        assert!(matches!(cached.raw, Cow::Borrowed(_)));
+        assert_eq!(&*cached.raw, &image[..sb.size()]);
         H5F__cache_superblock_free_icr(cached);
 
         let bad = b"not-hdf5";
@@ -1542,10 +1680,15 @@ mod tests {
         let block = H5F__cache_drvrinfo_deserialize(&image).unwrap();
         assert_eq!(block.version, 0);
         assert_eq!(&block.name, b"sec2\0\0\0\0");
-        assert_eq!(block.data, b"abc");
+        assert!(matches!(block.data, Cow::Borrowed(_)));
+        assert_eq!(&*block.data, b"abc");
         assert_eq!(H5F__cache_drvrinfo_image_len(&block).unwrap(), image.len());
 
-        let serialized = H5F__cache_drvrinfo_serialize(&block).unwrap();
+        let mut serialized = Vec::new();
+        assert_eq!(
+            H5F__cache_drvrinfo_serialize_into(&block, &mut serialized).unwrap(),
+            image.len()
+        );
         assert_eq!(
             serialized,
             vec![0, 0, 0, 0, 3, 0, 0, 0, b's', b'e', b'c', b'2', 0, 0, 0, 0, b'a', b'b', b'c',]

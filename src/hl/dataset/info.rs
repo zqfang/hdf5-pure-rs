@@ -6,6 +6,7 @@ use crate::format::messages::datatype::DatatypeMessage;
 use crate::format::messages::fill_value::FillValueMessage;
 use crate::format::messages::filter_pipeline::FilterPipelineMessage;
 use crate::format::object_header::{self, ObjectHeader, RawMessage};
+use crate::hl::group::{visit_attr_names_at, visit_attrs_at};
 
 use super::{
     read_le_uint_at, read_u8_at, u64_from_usize, usize_from_u64, Dataset, DatasetAccess, VdsView,
@@ -28,7 +29,7 @@ fn is_undefined_external_addr(addr: u64, sizeof_addr: usize) -> Result<bool> {
 }
 
 /// Metadata about a dataset parsed from its object header.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DatasetInfo {
     pub dataspace: DataspaceMessage,
     pub datatype: DatatypeMessage,
@@ -72,14 +73,75 @@ impl Dataset {
         crate::hl::attribute::attr_names(&self.inner, self.addr)
     }
 
+    /// Visit attribute names in storage order.
+    pub fn visit_attr_names<F>(&self, mut f: F) -> Result<()>
+    where
+        F: FnMut(&str) -> Result<()>,
+    {
+        visit_attr_names_at(&self.inner, self.addr, &mut f)
+    }
+
+    /// Append attribute names in storage order into caller-provided storage.
+    pub fn attr_names_into(&self, out: &mut Vec<String>) -> Result<()> {
+        out.clear();
+        self.visit_attr_names(|name| {
+            out.push(name.to_string());
+            Ok(())
+        })
+    }
+
     /// List attributes.
     pub fn attrs(&self) -> Result<Vec<crate::hl::attribute::Attribute>> {
         crate::hl::attribute::collect_attributes(&self.inner, self.addr)
     }
 
+    /// Visit attributes in storage order.
+    pub fn visit_attrs<F>(&self, mut f: F) -> Result<()>
+    where
+        F: FnMut(&crate::hl::attribute::Attribute) -> Result<()>,
+    {
+        visit_attrs_at(&self.inner, self.addr, &mut f)
+    }
+
+    /// Store attributes in caller-provided storage.
+    pub fn attrs_into(&self, out: &mut Vec<crate::hl::attribute::Attribute>) -> Result<()> {
+        out.clear();
+        out.extend(crate::hl::attribute::collect_attributes(
+            &self.inner,
+            self.addr,
+        )?);
+        Ok(())
+    }
+
     /// List attributes sorted by tracked creation order.
     pub fn attrs_by_creation_order(&self) -> Result<Vec<crate::hl::attribute::Attribute>> {
         crate::hl::attribute::collect_attributes_by_creation_order(&self.inner, self.addr)
+    }
+
+    /// Visit attributes sorted by tracked creation order.
+    pub fn visit_attrs_by_creation_order<F>(&self, mut f: F) -> Result<()>
+    where
+        F: FnMut(&crate::hl::attribute::Attribute) -> Result<()>,
+    {
+        let attrs =
+            crate::hl::attribute::collect_attributes_by_creation_order(&self.inner, self.addr)?;
+        for attr in &attrs {
+            f(attr)?;
+        }
+        Ok(())
+    }
+
+    /// Store attributes sorted by tracked creation order in caller-provided storage.
+    pub fn attrs_by_creation_order_into(
+        &self,
+        out: &mut Vec<crate::hl::attribute::Attribute>,
+    ) -> Result<()> {
+        out.clear();
+        out.extend(crate::hl::attribute::collect_attributes_by_creation_order(
+            &self.inner,
+            self.addr,
+        )?);
+        Ok(())
     }
 
     /// Get an attribute by name.
@@ -222,12 +284,26 @@ impl Dataset {
 
     /// Get the shape of the dataset.
     pub fn shape(&self) -> Result<Vec<u64>> {
-        self.shape_with_vds_view(VdsView::LastAvailable)
+        let mut shape = Vec::new();
+        self.shape_into(&mut shape)?;
+        Ok(shape)
+    }
+
+    /// Get the shape of the dataset into caller-provided storage.
+    pub fn shape_into(&self, out: &mut Vec<u64>) -> Result<()> {
+        self.shape_with_access_into(&DatasetAccess::new(), out)
     }
 
     /// Get the shape of the dataset, overriding the VDS view policy.
     pub fn shape_with_vds_view(&self, view: VdsView) -> Result<Vec<u64>> {
-        self.shape_with_access(&DatasetAccess::new().with_virtual_view(view))
+        let mut shape = Vec::new();
+        self.shape_with_vds_view_into(view, &mut shape)?;
+        Ok(shape)
+    }
+
+    /// Get the shape of the dataset into caller-provided storage, overriding the VDS view policy.
+    pub fn shape_with_vds_view_into(&self, view: VdsView, out: &mut Vec<u64>) -> Result<()> {
+        self.shape_with_access_into(&DatasetAccess::new().with_virtual_view(view), out)
     }
 
     /// Get the shape of the dataset, overriding dataset access properties.
@@ -237,6 +313,18 @@ impl Dataset {
             return self.virtual_shape_with_info(&info, access);
         }
         Ok(info.dataspace.dims)
+    }
+
+    /// Get the shape of the dataset into caller-provided storage, overriding dataset access properties.
+    pub fn shape_with_access_into(&self, access: &DatasetAccess, out: &mut Vec<u64>) -> Result<()> {
+        let info = self.info()?;
+        out.clear();
+        if info.layout.layout_class == LayoutClass::Virtual {
+            out.extend(self.virtual_shape_with_info(&info, access)?);
+        } else {
+            out.extend_from_slice(&info.dataspace.dims);
+        }
+        Ok(())
     }
 
     /// Get the total number of elements.
@@ -331,7 +419,21 @@ impl Dataset {
     /// Get the chunk dimensions (None if not chunked).
     pub fn chunk(&self) -> Result<Option<Vec<u64>>> {
         let info = self.info()?;
-        Ok(info.layout.chunk_dims.clone())
+        Ok(info.layout.chunk_dims)
+    }
+
+    /// Get the chunk dimensions into caller-provided storage.
+    ///
+    /// Returns `true` if the dataset is chunked and `out` was filled.
+    pub fn chunk_into(&self, out: &mut Vec<u64>) -> Result<bool> {
+        let info = self.info()?;
+        out.clear();
+        if let Some(chunk_dims) = info.layout.chunk_dims.as_ref() {
+            out.extend_from_slice(chunk_dims);
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 
     /// Get the filter pipeline (empty if no filters).
@@ -340,14 +442,65 @@ impl Dataset {
         Ok(info.filter_pipeline.map(|p| p.filters).unwrap_or_default())
     }
 
+    /// Visit filters in the dataset creation pipeline.
+    pub fn visit_filters<F>(&self, mut f: F) -> Result<()>
+    where
+        F: FnMut(&crate::format::messages::filter_pipeline::FilterDesc) -> Result<()>,
+    {
+        let info = self.info()?;
+        if let Some(pipeline) = info.filter_pipeline.as_ref() {
+            for filter in &pipeline.filters {
+                f(filter)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Store filters in caller-provided storage.
+    pub fn filters_into(
+        &self,
+        out: &mut Vec<crate::format::messages::filter_pipeline::FilterDesc>,
+    ) -> Result<()> {
+        out.clear();
+        self.visit_filters(|filter| {
+            out.push(filter.clone());
+            Ok(())
+        })
+    }
+
     /// Get the dataset creation properties.
     pub fn create_plist(&self) -> Result<crate::hl::plist::dataset_create::DatasetCreate> {
         crate::hl::plist::dataset_create::DatasetCreate::from_dataset(self)
     }
 
+    /// hdf5-metno compatibility layer: alias for `create_plist`; do not remove.
+    pub fn dcpl(&self) -> Result<crate::hl::plist::dataset_create::DatasetCreate> {
+        self.create_plist()
+    }
+
     /// Get dataset access properties for default high-level reads.
     pub fn access_plist(&self) -> DatasetAccess {
         DatasetAccess::new()
+    }
+
+    /// hdf5-metno compatibility layer: alias for `access_plist`; do not remove.
+    pub fn dapl(&self) -> Result<DatasetAccess> {
+        Ok(self.access_plist())
+    }
+
+    /// hdf5-metno compatibility layer: returns raw fill-value bytes; do not remove.
+    pub fn fill_value(&self) -> Result<Option<Vec<u8>>> {
+        Ok(self.info()?.fill_value.and_then(|fill| fill.value))
+    }
+
+    /// hdf5-metno compatibility layer: no-op for the pure-Rust read handle; do not remove.
+    pub fn flush(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// hdf5-metno compatibility layer: no-op for the pure-Rust read handle; do not remove.
+    pub fn refresh(&self) -> Result<()> {
+        Ok(())
     }
 
     /// Return the allocation status of dataset raw storage.
@@ -386,28 +539,72 @@ impl Dataset {
 
     /// Return the number of allocated chunks.
     pub fn num_chunks(&self) -> Result<usize> {
-        Ok(self.chunk_infos()?.len())
+        let mut count = 0usize;
+        self.visit_chunk_infos(|_, _, _, _| {
+            count += 1;
+            Ok(())
+        })?;
+        Ok(count)
     }
 
     /// Return allocated chunk metadata by storage-order index.
     pub fn chunk_info(&self, index: usize) -> Result<ChunkInfo> {
-        self.chunk_infos()?
-            .get(index)
-            .cloned()
-            .ok_or_else(|| Error::InvalidFormat(format!("chunk index {index} is out of bounds")))
+        let mut current = 0usize;
+        let mut found = None;
+        self.visit_chunk_infos(|offset, filter_mask, addr, size| {
+            if current == index {
+                found = Some(ChunkInfo {
+                    offset: offset.to_vec(),
+                    filter_mask,
+                    addr,
+                    size,
+                });
+            }
+            current += 1;
+            Ok(())
+        })?;
+        found.ok_or_else(|| Error::InvalidFormat(format!("chunk index {index} is out of bounds")))
     }
 
-    fn chunk_infos(&self) -> Result<Vec<ChunkInfo>> {
+    /// Visit allocated chunk metadata in storage-order index.
+    pub fn visit_chunk_infos<F>(&self, mut f: F) -> Result<()>
+    where
+        F: FnMut(&[u64], u32, u64, u64) -> Result<()>,
+    {
+        self.visit_chunk_infos_impl(|offset, filter_mask, addr, size| {
+            f(offset, filter_mask, addr, size)
+        })
+    }
+
+    /// Store allocated chunk metadata in caller-provided storage.
+    pub fn chunk_infos_into(&self, out: &mut Vec<ChunkInfo>) -> Result<()> {
+        out.clear();
+        self.visit_chunk_infos_impl(|offset, filter_mask, addr, size| {
+            out.push(ChunkInfo {
+                offset: offset.to_vec(),
+                filter_mask,
+                addr,
+                size,
+            });
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    fn visit_chunk_infos_impl<F>(&self, mut f: F) -> Result<()>
+    where
+        F: FnMut(&[u64], u32, u64, u64) -> Result<()>,
+    {
         let info = self.info()?;
         if info.layout.layout_class != LayoutClass::Chunked {
-            return Ok(Vec::new());
+            return Ok(());
         }
         let idx_addr = info
             .layout
             .chunk_index_addr
             .ok_or_else(|| Error::InvalidFormat("chunked dataset missing index address".into()))?;
         if crate::io::reader::is_undef_addr(idx_addr) {
-            return Ok(Vec::new());
+            return Ok(());
         }
 
         let data_dims = &info.dataspace.dims;
@@ -430,7 +627,7 @@ impl Dataset {
         let mut guard = self.inner.lock();
         let sizeof_addr = usize::from(guard.reader.sizeof_addr());
         let sizeof_size = usize::from(guard.reader.sizeof_size());
-        let infos = match info
+        match info
             .layout
             .chunk_index_type
             .or_else(|| (info.layout.version <= 3).then_some(ChunkIndexType::BTreeV1))
@@ -440,29 +637,31 @@ impl Dataset {
                     .layout
                     .single_chunk_filtered_size
                     .unwrap_or(u64_from_usize(chunk_bytes, "single-chunk size")?);
-                vec![ChunkInfo {
-                    offset: vec![0; data_dims.len()],
-                    filter_mask: info.layout.single_chunk_filter_mask.unwrap_or(0),
-                    addr: idx_addr,
+                let offset = vec![0; data_dims.len()];
+                f(
+                    &offset,
+                    info.layout.single_chunk_filter_mask.unwrap_or(0),
+                    idx_addr,
                     size,
-                }]
+                )?;
             }
             Some(ChunkIndexType::BTreeV1) => {
                 let records =
                     Self::collect_btree_v1_chunks(&mut guard.reader, idx_addr, data_dims.len())?;
-                records
-                    .into_iter()
-                    .filter(|record| !crate::io::reader::is_undef_addr(record.chunk_addr))
-                    .map(|record| ChunkInfo {
-                        offset: record.coords,
-                        filter_mask: record.filter_mask,
-                        addr: record.chunk_addr,
-                        size: record.chunk_size,
-                    })
-                    .collect()
+                for record in records {
+                    if crate::io::reader::is_undef_addr(record.chunk_addr) {
+                        continue;
+                    }
+                    f(
+                        &record.coords,
+                        record.filter_mask,
+                        record.chunk_addr,
+                        record.chunk_size,
+                    )?;
+                }
             }
             Some(ChunkIndexType::Implicit) => {
-                self.implicit_chunk_infos(&info, idx_addr, chunk_dims, chunk_bytes)?
+                self.visit_implicit_chunk_infos(&info, idx_addr, chunk_dims, chunk_bytes, &mut f)?;
             }
             Some(ChunkIndexType::FixedArray) => {
                 let chunk_size_len = if filtered {
@@ -470,13 +669,21 @@ impl Dataset {
                 } else {
                     0
                 };
-                let elements = crate::format::fixed_array::read_fixed_array_chunks(
+                let mut elements = Vec::new();
+                crate::format::fixed_array::read_fixed_array_chunks_into(
                     &mut guard.reader,
                     idx_addr,
                     filtered,
                     chunk_size_len,
+                    &mut elements,
                 )?;
-                self.linear_index_chunk_infos(elements, &info, chunk_dims, chunk_bytes)?
+                self.visit_linear_index_chunk_infos(
+                    elements,
+                    &info,
+                    chunk_dims,
+                    chunk_bytes,
+                    &mut f,
+                )?;
             }
             Some(ChunkIndexType::ExtensibleArray) => {
                 let chunk_size_len = if filtered {
@@ -484,13 +691,21 @@ impl Dataset {
                 } else {
                     0
                 };
-                let elements = crate::format::extensible_array::read_extensible_array_chunks(
+                let mut elements = Vec::new();
+                crate::format::extensible_array::read_extensible_array_chunks_into(
                     &mut guard.reader,
                     idx_addr,
                     filtered,
                     chunk_size_len,
+                    &mut elements,
                 )?;
-                self.linear_index_chunk_infos(elements, &info, chunk_dims, chunk_bytes)?
+                self.visit_linear_index_chunk_infos(
+                    elements,
+                    &info,
+                    chunk_dims,
+                    chunk_bytes,
+                    &mut f,
+                )?;
             }
             Some(ChunkIndexType::BTreeV2) => {
                 let chunk_size_len = if filtered {
@@ -498,43 +713,34 @@ impl Dataset {
                 } else {
                     0
                 };
-                let records =
-                    crate::format::btree_v2::collect_all_records(&mut guard.reader, idx_addr)?;
-                records
-                    .into_iter()
-                    .map(|record| {
-                        let (addr, size, filter_mask, scaled) = Self::decode_btree_v2_chunk_record(
-                            &record,
-                            filtered,
-                            chunk_size_len,
-                            sizeof_addr,
-                            data_dims.len(),
-                            chunk_bytes,
-                        )?;
-                        let offset = scaled
-                            .iter()
-                            .zip(chunk_dims)
-                            .map(|(&coord, &chunk)| {
-                                coord.checked_mul(chunk).ok_or_else(|| {
-                                    Error::InvalidFormat("chunk coordinate overflow".into())
-                                })
-                            })
-                            .collect::<Result<Vec<_>>>()?;
-                        Ok(ChunkInfo {
-                            offset,
-                            filter_mask,
-                            addr,
-                            size,
-                        })
-                    })
-                    .collect::<Result<Vec<_>>>()?
-                    .into_iter()
-                    .filter(|chunk| !crate::io::reader::is_undef_addr(chunk.addr))
-                    .collect()
+                let mut records = Vec::new();
+                crate::format::btree_v2::collect_all_records_into(
+                    &mut guard.reader,
+                    idx_addr,
+                    &mut records,
+                )?;
+                let mut offset = Vec::new();
+                let mut scaled = Vec::new();
+                for record in records {
+                    let (addr, size, filter_mask) = Self::decode_btree_v2_chunk_record_into(
+                        &record,
+                        filtered,
+                        chunk_size_len,
+                        sizeof_addr,
+                        data_dims.len(),
+                        chunk_bytes,
+                        &mut scaled,
+                    )?;
+                    if crate::io::reader::is_undef_addr(addr) {
+                        continue;
+                    }
+                    Self::scaled_chunk_offset_into(&scaled, chunk_dims, &mut offset)?;
+                    f(&offset, filter_mask, addr, size)?;
+                }
             }
-            None => Vec::new(),
-        };
-        Ok(infos)
+            None => {}
+        }
+        Ok(())
     }
 
     fn logical_chunk_count(&self, info: &DatasetInfo) -> Result<usize> {
@@ -548,30 +754,32 @@ impl Dataset {
             .ok_or_else(|| Error::InvalidFormat("chunk count overflow".into()))
     }
 
-    fn implicit_chunk_infos(
+    fn visit_implicit_chunk_infos<F>(
         &self,
         info: &DatasetInfo,
         idx_addr: u64,
         chunk_dims: &[u64],
         chunk_bytes: usize,
-    ) -> Result<Vec<ChunkInfo>> {
+        mut f: F,
+    ) -> Result<()>
+    where
+        F: FnMut(&[u64], u32, u64, u64) -> Result<()>,
+    {
         let chunks_per_dim = Self::chunks_per_dim(&info.dataspace.dims, chunk_dims)?;
         let total_chunks = chunks_per_dim
             .iter()
             .try_fold(1usize, |acc, &value| acc.checked_mul(value))
             .ok_or_else(|| Error::InvalidFormat("chunk count overflow".into()))?;
-        let mut infos = Vec::with_capacity(total_chunks);
+        let mut offset = Vec::new();
+        let mut scaled = Vec::new();
         for chunk_index in 0..total_chunks {
-            let scaled = Self::implicit_chunk_coords(chunk_index, chunk_dims, &chunks_per_dim)?;
-            let offset = scaled
-                .iter()
-                .zip(chunk_dims)
-                .map(|(&coord, &chunk)| {
-                    coord
-                        .checked_mul(chunk)
-                        .ok_or_else(|| Error::InvalidFormat("chunk coordinate overflow".into()))
-                })
-                .collect::<Result<Vec<_>>>()?;
+            Self::implicit_chunk_coords_into(
+                chunk_index,
+                chunk_dims,
+                &chunks_per_dim,
+                &mut scaled,
+            )?;
+            Self::scaled_chunk_offset_into(&scaled, chunk_dims, &mut offset)?;
             let addr = idx_addr
                 .checked_add(
                     u64_from_usize(chunk_index, "implicit chunk index")?
@@ -579,71 +787,94 @@ impl Dataset {
                         .ok_or_else(|| Error::InvalidFormat("chunk address overflow".into()))?,
                 )
                 .ok_or_else(|| Error::InvalidFormat("chunk address overflow".into()))?;
-            infos.push(ChunkInfo {
-                offset,
-                filter_mask: 0,
+            f(
+                &offset,
+                0,
                 addr,
-                size: u64_from_usize(chunk_bytes, "implicit chunk size")?,
-            });
+                u64_from_usize(chunk_bytes, "implicit chunk size")?,
+            )?;
         }
-        Ok(infos)
+        Ok(())
     }
 
-    fn linear_index_chunk_infos(
+    fn visit_linear_index_chunk_infos<F>(
         &self,
         elements: Vec<crate::format::fixed_array::FixedArrayElement>,
         info: &DatasetInfo,
         chunk_dims: &[u64],
         chunk_bytes: usize,
-    ) -> Result<Vec<ChunkInfo>> {
+        mut f: F,
+    ) -> Result<()>
+    where
+        F: FnMut(&[u64], u32, u64, u64) -> Result<()>,
+    {
         let chunks_per_dim = Self::chunks_per_dim(&info.dataspace.dims, chunk_dims)?;
-        let mut chunks = Vec::new();
+        let mut offset = Vec::new();
+        let mut scaled = Vec::new();
         for (chunk_index, element) in elements.into_iter().enumerate() {
             if crate::io::reader::is_undef_addr(element.addr) {
                 continue;
             }
-            let scaled = Self::implicit_chunk_coords(chunk_index, chunk_dims, &chunks_per_dim)?;
-            let offset = scaled
-                .iter()
-                .zip(chunk_dims)
-                .map(|(&coord, &chunk)| {
-                    coord
-                        .checked_mul(chunk)
-                        .ok_or_else(|| Error::InvalidFormat("chunk coordinate overflow".into()))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            chunks.push(ChunkInfo {
-                offset,
-                filter_mask: element.filter_mask,
-                addr: element.addr,
-                size: element
+            Self::implicit_chunk_coords_into(
+                chunk_index,
+                chunk_dims,
+                &chunks_per_dim,
+                &mut scaled,
+            )?;
+            Self::scaled_chunk_offset_into(&scaled, chunk_dims, &mut offset)?;
+            f(
+                &offset,
+                element.filter_mask,
+                element.addr,
+                element
                     .nbytes
                     .unwrap_or(u64_from_usize(chunk_bytes, "linear chunk size")?),
-            });
+            )?;
         }
-        Ok(chunks)
+        Ok(())
     }
 
-    pub(crate) fn external_storage_entries_with_info(
+    fn scaled_chunk_offset_into(
+        scaled: &[u64],
+        chunk_dims: &[u64],
+        out: &mut Vec<u64>,
+    ) -> Result<()> {
+        if scaled.len() != chunk_dims.len() {
+            return Err(Error::InvalidFormat(
+                "scaled chunk coordinate rank does not match chunk rank".into(),
+            ));
+        }
+        out.clear();
+        for (&coord, &chunk) in scaled.iter().zip(chunk_dims) {
+            out.push(
+                coord
+                    .checked_mul(chunk)
+                    .ok_or_else(|| Error::InvalidFormat("chunk coordinate overflow".into()))?,
+            );
+        }
+        Ok(())
+    }
+
+    pub(crate) fn external_storage_entries_with_info_into(
         &self,
         info: &DatasetInfo,
-    ) -> Result<Vec<crate::hl::plist::dataset_create::ExternalStorageInfo>> {
+        out: &mut Vec<crate::hl::plist::dataset_create::ExternalStorageInfo>,
+    ) -> Result<()> {
+        out.clear();
         let Some(external) = info.external_file_list.as_ref() else {
-            return Ok(Vec::new());
+            return Ok(());
         };
         let mut guard = self.inner.lock();
         let heap = LocalHeap::read_at(&mut guard.reader, external.heap_addr)?;
-        external
-            .entries
-            .iter()
-            .map(|entry| {
-                let name_offset = usize_from_u64(entry.name_offset, "external file name offset")?;
-                Ok(crate::hl::plist::dataset_create::ExternalStorageInfo {
-                    name: heap.get_string(name_offset)?,
-                    file_offset: entry.file_offset,
-                    size: entry.size,
-                })
-            })
-            .collect()
+        out.reserve(external.entries.len());
+        for entry in &external.entries {
+            let name_offset = usize_from_u64(entry.name_offset, "external file name offset")?;
+            out.push(crate::hl::plist::dataset_create::ExternalStorageInfo {
+                name: heap.get_str(name_offset)?.to_string(),
+                file_offset: entry.file_offset,
+                size: entry.size,
+            });
+        }
+        Ok(())
     }
 }

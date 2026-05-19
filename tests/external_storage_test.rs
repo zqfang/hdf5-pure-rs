@@ -13,8 +13,9 @@ fn test_external_raw_data_storage_reads_relative_file() {
     assert_eq!(external.size, u64::MAX);
     assert!(plist.external(1).is_none());
 
-    let vals: Vec<i32> = ds.read::<i32>().unwrap();
-    assert_eq!(vals, vec![1, 2, 3, 4]);
+    let mut vals = [0; 4];
+    ds.read_into(&mut vals).unwrap();
+    assert_eq!(vals, [1, 2, 3, 4]);
 }
 
 #[test]
@@ -27,6 +28,7 @@ fn test_external_raw_data_storage_reads_multiple_files() {
     assert_eq!(plist.external(0).unwrap().name, "external_raw_multi_a.bin");
     assert_eq!(plist.external(1).unwrap().name, "external_raw_multi_b.bin");
 
-    let vals: Vec<i32> = ds.read::<i32>().unwrap();
-    assert_eq!(vals, (10..18).collect::<Vec<_>>());
+    let mut vals = [0; 8];
+    ds.read_into(&mut vals).unwrap();
+    assert_eq!(vals, [10, 11, 12, 13, 14, 15, 16, 17]);
 }

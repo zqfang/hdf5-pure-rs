@@ -35,17 +35,30 @@ fn test_derive_struct_size() {
 
 #[test]
 fn test_derive_struct_fields() {
-    let fields = Point::compound_fields().unwrap();
-    assert_eq!(fields.len(), 3);
-    assert_eq!(fields[0].name, "x");
-    assert_eq!(fields[0].offset, 0);
-    assert_eq!(fields[0].size, 8);
-    assert_eq!(fields[1].name, "y");
-    assert_eq!(fields[1].offset, 8);
-    assert_eq!(fields[1].size, 8);
-    assert_eq!(fields[2].name, "label");
-    assert_eq!(fields[2].offset, 16);
-    assert_eq!(fields[2].size, 4);
+    let mut index = 0;
+    Point::visit_compound_fields(|field| {
+        match index {
+            0 => {
+                assert_eq!(field.name, "x");
+                assert_eq!(field.offset, 0);
+                assert_eq!(field.size, 8);
+            }
+            1 => {
+                assert_eq!(field.name, "y");
+                assert_eq!(field.offset, 8);
+                assert_eq!(field.size, 8);
+            }
+            2 => {
+                assert_eq!(field.name, "label");
+                assert_eq!(field.offset, 16);
+                assert_eq!(field.size, 4);
+            }
+            _ => panic!("unexpected extra field: {field:?}"),
+        }
+        index += 1;
+    })
+    .unwrap();
+    assert_eq!(index, 3);
 }
 
 #[test]
@@ -55,40 +68,39 @@ fn test_derive_enum_size() {
 
 #[test]
 fn test_derive_enum_members() {
-    let members = Color::enum_members().unwrap();
-    assert_eq!(members.len(), 3);
-    assert_eq!(members[0], ("Red".to_string(), 0));
-    assert_eq!(members[1], ("Green".to_string(), 1));
-    assert_eq!(members[2], ("Blue".to_string(), 2));
+    let expected = [("Red", 0), ("Green", 1), ("Blue", 2)];
+    let mut index = 0;
+    Color::visit_enum_members(|name, value| {
+        assert_eq!((name, value), expected[index]);
+        index += 1;
+    })
+    .unwrap();
+    assert_eq!(index, expected.len());
 }
 
 #[test]
 fn test_derive_with_rename() {
-    let fields = Measurement::compound_fields().unwrap();
-    assert_eq!(fields.len(), 2);
-    assert_eq!(fields[0].name, "value");
-    assert_eq!(fields[1].name, "error_margin");
+    let expected = ["value", "error_margin"];
+    let mut index = 0;
+    Measurement::visit_compound_fields(|field| {
+        assert_eq!(field.name, expected[index]);
+        index += 1;
+    })
+    .unwrap();
+    assert_eq!(index, expected.len());
 }
 
 #[test]
 fn test_derive_struct_can_read() {
     // Verify the derived type works with read operations
     // (uses type_size for byte reinterpretation)
-    let data = vec![
-        1.0f64.to_le_bytes(),
-        2.0f64.to_le_bytes(),
-        42i32
-            .to_le_bytes()
-            .to_vec()
-            .into_iter()
-            .chain(std::iter::repeat(0).take(4)) // padding
-            .collect::<Vec<u8>>()
-            .try_into()
-            .unwrap(),
-    ];
-    let bytes: Vec<u8> = data.into_iter().flat_map(|b: [u8; 8]| b).collect();
+    let mut bytes = [0u8; 24];
+    bytes[0..8].copy_from_slice(&1.0f64.to_le_bytes());
+    bytes[8..16].copy_from_slice(&2.0f64.to_le_bytes());
+    bytes[16..20].copy_from_slice(&42i32.to_le_bytes());
 
-    let points: Vec<Point> = hdf5_pure_rust::hl::types::bytes_to_vec::<Point>(bytes).unwrap();
+    let points: Vec<Point> =
+        hdf5_pure_rust::hl::types::bytes_to_vec::<Point>(bytes.to_vec()).unwrap();
     assert_eq!(points.len(), 1);
     assert_eq!(points[0].x, 1.0);
     assert_eq!(points[0].y, 2.0);

@@ -20,6 +20,8 @@ mod iblock;
 mod man;
 mod tiny;
 
+use std::collections::{BTreeMap, HashMap};
+use std::fmt;
 use std::io::{Read, Seek};
 
 use crate::error::{Error, Result};
@@ -70,6 +72,48 @@ pub struct FractalHeap {
     pub header: FractalHeapHeader,
     objects: Vec<Vec<u8>>,
     closed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct DirectBlockCacheKey {
+    block_addr: u64,
+    block_size: u64,
+    filtered_size: Option<u64>,
+    filter_mask: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct IndirectBlockCacheKey {
+    block_addr: u64,
+    nrows: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct FilteredIndirectBlockCacheKey {
+    block_addr: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DirectBlockSpan {
+    start: u64,
+    end: u64,
+    block_addr: u64,
+    block_size: u64,
+    filtered_size: Option<u64>,
+    filter_mask: u32,
+}
+
+/// Per-traversal cache for reading several managed objects from the same
+/// fractal heap. Dense link and attribute indexes often point many records at
+/// a small number of direct blocks, so keeping decoded block images and heap
+/// offset spans here avoids repeated indirect-table decodes, scans, seeks,
+/// reads, and filter application.
+#[derive(Debug, Default)]
+pub struct FractalHeapManagedObjectCache {
+    direct_blocks: HashMap<DirectBlockCacheKey, Vec<u8>>,
+    indirect_blocks: HashMap<IndirectBlockCacheKey, iblock::IndirectBlock>,
+    filtered_indirect_blocks: HashMap<FilteredIndirectBlockCacheKey, iblock::FilteredIndirectBlock>,
+    direct_spans: BTreeMap<u64, DirectBlockSpan>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -351,99 +395,74 @@ impl FractalHeapHeader {
         base + (12 * size_width) + (3 * addr_width) + filter_len
     }
 
-    /// Pre-serialize hook: in libhdf5 this is where address fix-ups would
-    /// happen; here we just serialize. Mirrors `H5HF__cache_hdr_pre_serialize`.
-    pub fn cache_hdr_pre_serialize(&self) -> Result<Vec<u8>> {
-        self.cache_hdr_serialize()
+    /// Pre-serialize the header into an existing output buffer.
+    pub fn cache_hdr_pre_serialize_into(&self, out: &mut Vec<u8>) -> Result<()> {
+        self.cache_hdr_serialize_into(out)
     }
 
-    /// Construct the on-disk image of the fractal heap header. Mirrors
+    /// Append the on-disk image of the fractal heap header to `out`. Mirrors
     /// `H5HF__cache_hdr_serialize`.
-    pub fn cache_hdr_serialize(&self) -> Result<Vec<u8>> {
+    pub fn cache_hdr_serialize_into(&self, out: &mut Vec<u8>) -> Result<()> {
         self.validate_header()?;
-        let mut out = Vec::with_capacity(self.cache_hdr_image_len());
+        let start = out.len();
+        out.reserve(self.cache_hdr_image_len());
         out.extend_from_slice(&FRHP_MAGIC);
         out.push(0);
         out.extend_from_slice(&self.heap_id_len.to_le_bytes());
         out.extend_from_slice(&self.io_filter_len.to_le_bytes());
         out.push(self.flags);
         out.extend_from_slice(&self.max_managed_obj_size.to_le_bytes());
-        encode_size_field(&mut out, 0, self.sizeof_size, "fractal heap next huge id")?;
+        encode_size_field(out, 0, self.sizeof_size, "fractal heap next huge id")?;
         encode_addr_field(
-            &mut out,
+            out,
             self.huge_btree_addr,
             self.sizeof_addr,
             "fractal heap huge B-tree address",
         )?;
-        encode_size_field(
-            &mut out,
-            0,
-            self.sizeof_size,
-            "fractal heap managed free space",
-        )?;
+        encode_size_field(out, 0, self.sizeof_size, "fractal heap managed free space")?;
         encode_addr_field(
-            &mut out,
+            out,
             UNDEF_ADDR,
             self.sizeof_addr,
             "fractal heap free-space-manager address",
         )?;
         encode_size_field(
-            &mut out,
+            out,
             self.num_managed_objects,
             self.sizeof_size,
             "fractal heap managed object storage size",
         )?;
         encode_size_field(
-            &mut out,
+            out,
             self.num_managed_objects,
             self.sizeof_size,
             "fractal heap managed allocated size",
         )?;
         encode_size_field(
-            &mut out,
+            out,
             0,
             self.sizeof_size,
             "fractal heap managed iterator offset",
         )?;
         encode_size_field(
-            &mut out,
+            out,
             self.num_managed_objects,
             self.sizeof_size,
             "fractal heap managed object count",
         )?;
-        encode_size_field(
-            &mut out,
-            0,
-            self.sizeof_size,
-            "fractal heap huge object size",
-        )?;
-        encode_size_field(
-            &mut out,
-            0,
-            self.sizeof_size,
-            "fractal heap huge object count",
-        )?;
-        encode_size_field(
-            &mut out,
-            0,
-            self.sizeof_size,
-            "fractal heap tiny object size",
-        )?;
-        encode_size_field(
-            &mut out,
-            0,
-            self.sizeof_size,
-            "fractal heap tiny object count",
-        )?;
+        encode_size_field(out, 0, self.sizeof_size, "fractal heap huge object size")?;
+        encode_size_field(out, 0, self.sizeof_size, "fractal heap huge object count")?;
+        encode_size_field(out, 0, self.sizeof_size, "fractal heap tiny object size")?;
+        encode_size_field(out, 0, self.sizeof_size, "fractal heap tiny object count")?;
         out.extend_from_slice(&self.table_width.to_le_bytes());
         encode_size_field(
-            &mut out,
+            out,
             self.start_block_size,
             self.sizeof_size,
             "fractal heap start block size",
         )?;
         encode_size_field(
-            &mut out,
+            out,
             self.max_direct_block_size,
             self.sizeof_size,
             "fractal heap max direct block size",
@@ -451,7 +470,7 @@ impl FractalHeapHeader {
         out.extend_from_slice(&self.max_heap_size.to_le_bytes());
         out.extend_from_slice(&self.start_root_rows.to_le_bytes());
         encode_addr_field(
-            &mut out,
+            out,
             self.root_block_addr,
             self.sizeof_addr,
             "fractal heap root block address",
@@ -459,7 +478,7 @@ impl FractalHeapHeader {
         out.extend_from_slice(&self.current_root_rows.to_le_bytes());
         if self.io_filter_len > 0 {
             encode_size_field(
-                &mut out,
+                out,
                 self.root_direct_filtered_size.unwrap_or(0),
                 self.sizeof_size,
                 "fractal heap root direct filtered size",
@@ -476,9 +495,9 @@ impl FractalHeapHeader {
             }
             out.extend_from_slice(&pipeline_bytes);
         }
-        let checksum = checksum_metadata(&out);
+        let checksum = checksum_metadata(&out[start..]);
         out.extend_from_slice(&checksum.to_le_bytes());
-        Ok(out)
+        Ok(())
     }
 
     /// Free the in-core image. Mirrors `H5HF__cache_hdr_free_icr` (no-op
@@ -496,15 +515,17 @@ impl FractalHeapHeader {
         self.cache_hdr_image_len()
     }
 
-    /// Print info about a fractal heap header. Mirrors `H5HF_hdr_print`.
-    pub fn hdr_print(&self) -> String {
-        self.hdr_debug()
+    /// Write info about a fractal heap header into `out`. Mirrors
+    /// `H5HF_hdr_print`.
+    pub fn hdr_print_fmt(&self, out: &mut impl fmt::Write) -> fmt::Result {
+        self.hdr_debug_fmt(out)
     }
 
-    /// Render debugging info about a fractal heap header. Mirrors
+    /// Write debugging info about a fractal heap header into `out`. Mirrors
     /// `H5HF_hdr_debug`.
-    pub fn hdr_debug(&self) -> String {
-        format!(
+    pub fn hdr_debug_fmt(&self, out: &mut impl fmt::Write) -> fmt::Result {
+        write!(
+            out,
             "FractalHeapHeader(addr={:#x}, id_len={}, width={}, root={:#x}, nmanaged={})",
             self.heap_addr,
             self.heap_id_len,
@@ -578,10 +599,9 @@ impl FractalHeapHeader {
             .ok_or_else(|| Error::InvalidFormat("fractal heap ID too short for offset".into()))
     }
 
-    /// Retrieve a tiny object's ID length and bytes. Mirrors
-    /// `H5HF_get_tiny_info_test`.
-    pub fn get_tiny_info_test(&self, heap_id: &[u8]) -> Result<(usize, Vec<u8>)> {
-        let data = self.read_tiny(heap_id)?;
+    /// Retrieve a tiny object's ID length and borrowed bytes.
+    pub fn get_tiny_info_slice_test<'a>(&self, heap_id: &'a [u8]) -> Result<(usize, &'a [u8])> {
+        let data = self.read_tiny_payload(heap_id)?;
         Ok((data.len(), data))
     }
 
@@ -591,9 +611,9 @@ impl FractalHeapHeader {
         (self.huge_btree_addr, u64::from(self.max_managed_obj_size))
     }
 
-    /// Encode the doubling-table metadata as bytes. Mirrors
+    /// Append the doubling-table metadata image to `out`. Mirrors
     /// `H5HF__dtable_encode`.
-    pub fn dtable_encode(&self) -> Result<Vec<u8>> {
+    pub fn dtable_encode_into(&self, out: &mut Vec<u8>) -> Result<()> {
         validate_heap_create_params(&FractalHeapCreateParams {
             heap_id_len: self.heap_id_len,
             table_width: self.table_width,
@@ -607,18 +627,18 @@ impl FractalHeapHeader {
             ));
         }
 
-        let mut out = Vec::with_capacity(FRACTAL_HEAP_DTABLE_IMAGE_LEN);
+        out.reserve(FRACTAL_HEAP_DTABLE_IMAGE_LEN);
         out.extend_from_slice(&self.table_width.to_le_bytes());
         out.extend_from_slice(&self.start_block_size.to_le_bytes());
         out.extend_from_slice(&self.max_direct_block_size.to_le_bytes());
         out.extend_from_slice(&self.max_heap_size.to_le_bytes());
         out.extend_from_slice(&self.start_root_rows.to_le_bytes());
         out.extend_from_slice(&self.current_root_rows.to_le_bytes());
-        Ok(out)
+        Ok(())
     }
 
     /// Decode the on-disk doubling-table image into its parsed fields.
-    /// Counterpart of `dtable_encode`.
+    /// Counterpart of `dtable_encode_into`.
     pub fn dtable_decode(bytes: &[u8]) -> Result<FractalHeapDTableImage> {
         if bytes.len() != FRACTAL_HEAP_DTABLE_IMAGE_LEN {
             return Err(Error::InvalidFormat(format!(
@@ -654,10 +674,11 @@ impl FractalHeapHeader {
         })
     }
 
-    /// Render debugging info about the doubling table. Mirrors
+    /// Write debugging info about the doubling table into `out`. Mirrors
     /// `H5HF__dtable_debug`.
-    pub fn dtable_debug(&self) -> String {
-        format!(
+    pub fn dtable_debug_fmt(&self, out: &mut impl fmt::Write) -> fmt::Result {
+        write!(
+            out,
             "FractalHeapDTable(width={}, start={}, max_direct={}, max_heap_bits={})",
             self.table_width, self.start_block_size, self.max_direct_block_size, self.max_heap_size
         )
@@ -756,17 +777,17 @@ impl FractalHeapHeader {
     /// `H5HF__tiny_init` (no-op).
     pub fn tiny_init(&self) {}
 
-    /// Pack a tiny object into a heap ID. Mirrors `H5HF__tiny_insert`.
-    pub fn tiny_insert(&self, data: &[u8]) -> Result<Vec<u8>> {
+    /// Append a tiny-object heap ID to `out`. Mirrors `H5HF__tiny_insert`.
+    pub fn tiny_insert_into(&self, data: &[u8], out: &mut Vec<u8>) -> Result<()> {
         if data.is_empty() || data.len() > 16 {
             return Err(Error::InvalidFormat(
                 "tiny fractal heap object size must be 1..=16".into(),
             ));
         }
-        let mut id = Vec::with_capacity(data.len() + 1);
-        id.push(0x20 | ((data.len() as u8) - 1));
-        id.extend_from_slice(data);
-        Ok(id)
+        out.reserve(data.len() + 1);
+        out.push(0x20 | ((data.len() as u8) - 1));
+        out.extend_from_slice(data);
+        Ok(())
     }
 
     /// Get the size of a tiny object encoded in `heap_id`. Mirrors
@@ -778,10 +799,9 @@ impl FractalHeapHeader {
         Ok(usize::from(heap_id[0] & 0x0f) + 1)
     }
 
-    /// Operate directly on a tiny heap object (return its bytes).
-    /// Mirrors `H5HF__tiny_op`.
-    pub fn tiny_op(&self, heap_id: &[u8]) -> Result<Vec<u8>> {
-        self.read_tiny(heap_id)
+    /// Operate directly on a tiny heap object without allocating.
+    pub fn tiny_op_slice<'a>(&self, heap_id: &'a [u8]) -> Result<&'a [u8]> {
+        self.read_tiny_payload(heap_id)
     }
 
     /// Remove a tiny object from the heap statistics. Mirrors
@@ -800,12 +820,11 @@ impl FractalHeapHeader {
     /// `H5HF__huge_init` (no-op).
     pub fn huge_init(&self) {}
 
-    /// Encode a new heap ID for an indirectly accessed huge object.
-    /// Mirrors `H5HF__huge_new_id`.
-    pub fn huge_new_id(&self, id: u64) -> Vec<u8> {
-        let mut out = vec![0x10];
+    /// Append a new huge-object heap ID to `out`. Mirrors `H5HF__huge_new_id`.
+    pub fn huge_new_id_into(&self, id: u64, out: &mut Vec<u8>) {
+        out.reserve(9);
+        out.push(0x10);
         out.extend_from_slice(&id.to_le_bytes());
-        out
     }
 
     /// Insert a huge object record into the heap's tracking list,
@@ -818,16 +837,22 @@ impl FractalHeapHeader {
     /// Get the size of a huge object by ID. Mirrors
     /// `H5HF__huge_get_obj_len`.
     pub fn huge_get_obj_len(records: &[FractalHeapHugeRecord], id: u64) -> Option<u64> {
-        records
-            .iter()
-            .find(|record| record.id == id)
-            .map(|record| record.obj_size)
+        Self::huge_op_ref(records, id).map(|record| record.obj_size)
     }
 
-    /// Operate directly on a huge object record (returns a clone).
-    /// Mirrors `H5HF__huge_op`.
-    pub fn huge_op(records: &[FractalHeapHugeRecord], id: u64) -> Option<FractalHeapHugeRecord> {
-        records.iter().find(|record| record.id == id).cloned()
+    /// Borrow a huge object record by ID. Mirrors `H5HF__huge_op`.
+    pub fn huge_op_ref(
+        records: &[FractalHeapHugeRecord],
+        id: u64,
+    ) -> Option<&FractalHeapHugeRecord> {
+        if let Some(record) = records
+            .binary_search_by_key(&id, |record| record.id)
+            .ok()
+            .and_then(|idx| records.get(idx))
+        {
+            return Some(record);
+        }
+        records.iter().find(|record| record.id == id)
     }
 
     /// Remove a huge object from the v2 B-tree tracker. Mirrors
@@ -889,33 +914,41 @@ impl FractalHeapHeader {
         reader: &mut HdfReader<R>,
         heap_id: &[u8],
     ) -> Result<Vec<u8>> {
-        if heap_id.is_empty() {
-            return Err(Error::InvalidFormat("empty heap ID".into()));
-        }
-
-        // Heap ID byte 0 layout (per H5HFpkg.h): bits 6-7 = version,
-        // bits 4-5 = type, bits 0-3 = reserved (or tiny-length). Only
-        // version 0 is currently defined; reject anything else, matching
-        // libhdf5's `H5HF_get_obj_len` "incorrect heap ID version" check.
-        let version = (heap_id[0] >> 6) & 0x03;
-        if version != 0 {
-            return Err(Error::InvalidFormat(format!(
-                "unsupported fractal heap ID version {version}"
-            )));
-        }
-        let id_type = (heap_id[0] >> 4) & 0x03;
-        if id_type != 2 && heap_id[0] & 0x0f != 0 {
-            return Err(Error::InvalidFormat(format!(
-                "fractal heap ID reserved bits are nonzero: {:#04x}",
-                heap_id[0] & 0x0f
-            )));
-        }
-
-        match id_type {
+        match decode_heap_id_type(heap_id)? {
             0 => self.read_managed(reader, heap_id),
             1 => self.read_huge(reader, heap_id),
-            2 => self.read_tiny(heap_id),
-            _ => Err(Error::InvalidFormat(format!(
+            2 => Ok(self.read_tiny_payload(heap_id)?.to_vec()),
+            id_type => Err(Error::InvalidFormat(format!(
+                "unknown heap ID type {id_type}"
+            ))),
+        }
+    }
+
+    /// Read a batch of managed heap objects while reusing decoded direct
+    /// blocks across records.
+    pub fn read_managed_objects_batched<R: Read + Seek>(
+        &self,
+        reader: &mut HdfReader<R>,
+        heap_ids: &[&[u8]],
+    ) -> Vec<Result<Vec<u8>>> {
+        let mut cache = FractalHeapManagedObjectCache::new();
+        heap_ids
+            .iter()
+            .map(|heap_id| self.read_managed_object_cached(reader, heap_id, &mut cache))
+            .collect()
+    }
+
+    pub(crate) fn read_managed_object_cached<R: Read + Seek>(
+        &self,
+        reader: &mut HdfReader<R>,
+        heap_id: &[u8],
+        cache: &mut FractalHeapManagedObjectCache,
+    ) -> Result<Vec<u8>> {
+        match decode_heap_id_type(heap_id)? {
+            0 => self.read_managed_with_cache(reader, heap_id, cache),
+            1 => self.read_huge(reader, heap_id),
+            2 => Ok(self.read_tiny_payload(heap_id)?.to_vec()),
+            id_type => Err(Error::InvalidFormat(format!(
                 "unknown heap ID type {id_type}"
             ))),
         }
@@ -941,6 +974,59 @@ impl FractalHeapHeader {
         }
         validate_heap_create_params(&self.get_cparam_test())
     }
+}
+
+impl FractalHeapManagedObjectCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn lookup_direct_span(&self, offset: u64) -> Option<&DirectBlockSpan> {
+        let (_, span) = self.direct_spans.range(..=offset).next_back()?;
+        (offset < span.end).then_some(span)
+    }
+
+    fn insert_direct_span(&mut self, span: DirectBlockSpan) {
+        self.direct_spans.entry(span.start).or_insert(span);
+    }
+
+    fn insert_indirect_block(&mut self, key: IndirectBlockCacheKey, block: iblock::IndirectBlock) {
+        self.indirect_blocks.entry(key).or_insert(block);
+    }
+
+    fn insert_filtered_indirect_block(
+        &mut self,
+        key: FilteredIndirectBlockCacheKey,
+        block: iblock::FilteredIndirectBlock,
+    ) {
+        self.filtered_indirect_blocks.entry(key).or_insert(block);
+    }
+}
+
+fn decode_heap_id_type(heap_id: &[u8]) -> Result<u8> {
+    if heap_id.is_empty() {
+        return Err(Error::InvalidFormat("empty heap ID".into()));
+    }
+
+    // Heap ID byte 0 layout (per H5HFpkg.h): bits 6-7 = version,
+    // bits 4-5 = type, bits 0-3 = reserved (or tiny-length). Only
+    // version 0 is currently defined; reject anything else, matching
+    // libhdf5's `H5HF_get_obj_len` "incorrect heap ID version" check.
+    let version = (heap_id[0] >> 6) & 0x03;
+    if version != 0 {
+        return Err(Error::InvalidFormat(format!(
+            "unsupported fractal heap ID version {version}"
+        )));
+    }
+    let id_type = (heap_id[0] >> 4) & 0x03;
+    if id_type != 2 && heap_id[0] & 0x0f != 0 {
+        return Err(Error::InvalidFormat(format!(
+            "fractal heap ID reserved bits are nonzero: {:#04x}",
+            heap_id[0] & 0x0f
+        )));
+    }
+
+    Ok(id_type)
 }
 
 impl FractalHeap {
@@ -1063,14 +1149,13 @@ impl FractalHeap {
             .unwrap_or(u64::MAX)
     }
 
-    /// Render a fractal heap ID as a hex string. Mirrors libhdf5's
+    /// Write a fractal heap ID as hex into `out`. Mirrors libhdf5's
     /// `H5HF_id_print`.
-    pub fn id_print(heap_id: &[u8]) -> String {
-        heap_id
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect::<Vec<_>>()
-            .join("")
+    pub fn id_print_fmt(heap_id: &[u8], out: &mut impl fmt::Write) -> fmt::Result {
+        for byte in heap_id {
+            write!(out, "{byte:02x}")?;
+        }
+        Ok(())
     }
 
     /// Build the heap-ID bytes for a managed object at `offset`.
@@ -1237,28 +1322,28 @@ impl FractalHeapIndirectBlock {
             })
     }
 
-    /// Pre-serialize hook for the indirect block. Mirrors
-    /// `H5HF__cache_iblock_pre_serialize`.
-    pub fn cache_iblock_pre_serialize(&self) -> Result<Vec<u8>> {
-        self.cache_iblock_serialize()
+    /// Pre-serialize the indirect block into an existing output buffer.
+    pub fn cache_iblock_pre_serialize_into(&self, out: &mut Vec<u8>) -> Result<()> {
+        self.cache_iblock_serialize_into(out)
     }
 
-    /// Serialize the indirect block to its on-disk image. Mirrors
+    /// Append the indirect block's on-disk image to `out`. Mirrors
     /// `H5HF__cache_iblock_serialize`.
-    pub fn cache_iblock_serialize(&self) -> Result<Vec<u8>> {
+    pub fn cache_iblock_serialize_into(&self, out: &mut Vec<u8>) -> Result<()> {
         let nrows = u64::try_from(self.nrows).map_err(|_| {
             Error::InvalidFormat("fractal heap indirect block row count is too large".into())
         })?;
-        let mut out = Vec::with_capacity(self.cache_iblock_image_len()?);
+        let start = out.len();
+        out.reserve(self.cache_iblock_image_len()?);
         out.extend_from_slice(&FHIB_MAGIC);
         out.push(0);
         out.extend_from_slice(&nrows.to_le_bytes());
         for addr in &self.child_addrs {
             out.extend_from_slice(&addr.to_le_bytes());
         }
-        let checksum = checksum_metadata(&out);
+        let checksum = checksum_metadata(&out[start..]);
         out.extend_from_slice(&checksum.to_le_bytes());
-        Ok(out)
+        Ok(())
     }
 
     /// Flush-dependency lifecycle hook. Mirrors
@@ -1288,16 +1373,17 @@ impl FractalHeapIndirectBlock {
         blocks.iter().all(|block| !block.dirty)
     }
 
-    /// Print debugging info about a fractal heap indirect block.
+    /// Write debugging info about a fractal heap indirect block into `out`.
     /// Mirrors `H5HF_iblock_print`.
-    pub fn iblock_print(&self) -> String {
-        self.iblock_debug()
+    pub fn iblock_print_fmt(&self, out: &mut impl fmt::Write) -> fmt::Result {
+        self.iblock_debug_fmt(out)
     }
 
-    /// Render debugging info about a fractal heap indirect block.
+    /// Write debugging info about a fractal heap indirect block into `out`.
     /// Mirrors `H5HF_iblock_debug`.
-    pub fn iblock_debug(&self) -> String {
-        format!(
+    pub fn iblock_debug_fmt(&self, out: &mut impl fmt::Write) -> fmt::Result {
+        write!(
+            out,
             "FractalHeapIndirectBlock(nrows={}, children={}, dirty={})",
             self.nrows,
             self.child_addrs.len(),
@@ -1321,6 +1407,17 @@ impl FractalHeapDirectBlock {
     /// (`H5AC_protect` wrapper).
     pub fn man_dblock_protect(&self) -> Self {
         self.clone()
+    }
+
+    /// Borrow a pinned direct block when the caller does not need ownership.
+    pub fn man_dblock_protect_ref(&self) -> &Self {
+        self
+    }
+
+    /// Consume a direct block as its pinned value, avoiding a clone when
+    /// ownership is already available.
+    pub fn man_dblock_protect_into(self) -> Self {
+        self
     }
 
     /// Delete a managed direct block. Mirrors `H5HF__man_dblock_delete`.
@@ -1350,23 +1447,23 @@ impl FractalHeapDirectBlock {
             })
     }
 
-    /// Pre-serialize hook for the direct block. Mirrors
-    /// `H5HF__cache_dblock_pre_serialize`.
-    pub fn cache_dblock_pre_serialize(&self) -> Result<Vec<u8>> {
-        self.cache_dblock_serialize()
+    /// Pre-serialize the direct block into an existing output buffer.
+    pub fn cache_dblock_pre_serialize_into(&self, out: &mut Vec<u8>) -> Result<()> {
+        self.cache_dblock_serialize_into(out)
     }
 
-    /// Serialize the direct block to its on-disk image. Mirrors
+    /// Append the direct block's on-disk image to `out`. Mirrors
     /// `H5HF__cache_dblock_serialize`.
-    pub fn cache_dblock_serialize(&self) -> Result<Vec<u8>> {
-        let mut out = Vec::with_capacity(self.cache_dblock_image_len()?);
+    pub fn cache_dblock_serialize_into(&self, out: &mut Vec<u8>) -> Result<()> {
+        let start = out.len();
+        out.reserve(self.cache_dblock_image_len()?);
         out.extend_from_slice(&FHDB_MAGIC);
         out.push(0);
         out.extend_from_slice(&self.addr.to_le_bytes());
         out.extend_from_slice(&self.data);
-        let checksum = checksum_metadata(&out);
+        let checksum = checksum_metadata(&out[start..]);
         out.extend_from_slice(&checksum.to_le_bytes());
-        Ok(out)
+        Ok(())
     }
 
     /// Flush-dependency lifecycle hook. Mirrors
@@ -1384,15 +1481,16 @@ impl FractalHeapDirectBlock {
         self.data.len()
     }
 
-    /// Per-block debug callback. Mirrors `H5HF_dblock_debug_cb`.
-    pub fn dblock_debug_cb(&self) -> String {
-        self.dblock_debug()
+    /// Write per-block debug info into `out`. Mirrors `H5HF_dblock_debug_cb`.
+    pub fn dblock_debug_cb_fmt(&self, out: &mut impl fmt::Write) -> fmt::Result {
+        self.dblock_debug_fmt(out)
     }
 
-    /// Render debugging info about a fractal heap direct block.
+    /// Write debugging info about a fractal heap direct block into `out`.
     /// Mirrors `H5HF_dblock_debug`.
-    pub fn dblock_debug(&self) -> String {
-        format!(
+    pub fn dblock_debug_fmt(&self, out: &mut impl fmt::Write) -> fmt::Result {
+        write!(
+            out,
             "FractalHeapDirectBlock(addr={:#x}, size={})",
             self.addr,
             self.data.len()
@@ -1428,7 +1526,10 @@ impl FractalHeapHugeRecord {
     /// Free space for an indirectly accessed huge object by removing its
     /// v2 B-tree record. Mirrors `H5HF__huge_bt2_indir_remove`.
     pub fn huge_bt2_indir_remove(records: &mut Vec<Self>, id: u64) -> Option<Self> {
-        let idx = records.iter().position(|record| record.id == id)?;
+        let idx = records
+            .binary_search_by_key(&id, |record| record.id)
+            .ok()
+            .or_else(|| records.iter().position(|record| record.id == id))?;
         Some(records.remove(idx))
     }
 
@@ -1438,10 +1539,11 @@ impl FractalHeapHugeRecord {
         left.id.cmp(&right.id)
     }
 
-    /// Render debug info for an indirect-huge record. Mirrors
+    /// Write debug info for an indirect-huge record into `out`. Mirrors
     /// `H5HF__huge_bt2_indir_debug`.
-    pub fn huge_bt2_indir_debug(&self) -> String {
-        format!(
+    pub fn huge_bt2_indir_debug_fmt(&self, out: &mut impl fmt::Write) -> fmt::Result {
+        write!(
+            out,
             "HugeIndirect(id={}, addr={:#x}, len={})",
             self.id, self.addr, self.len
         )
@@ -1484,10 +1586,11 @@ impl FractalHeapHugeRecord {
         Self::huge_bt2_indir_compare(left, right)
     }
 
-    /// Render debug info for a filtered-indirect record. Mirrors
+    /// Write debug info for a filtered-indirect record into `out`. Mirrors
     /// `H5HF__huge_bt2_filt_indir_debug`.
-    pub fn huge_bt2_filt_indir_debug(&self) -> String {
-        format!(
+    pub fn huge_bt2_filt_indir_debug_fmt(&self, out: &mut impl fmt::Write) -> fmt::Result {
+        write!(
+            out,
             "HugeFilteredIndirect(id={}, addr={:#x}, len={}, obj_size={}, mask={:#x})",
             self.id, self.addr, self.len, self.obj_size, self.filter_mask
         )
@@ -1512,10 +1615,10 @@ impl FractalHeapHugeRecord {
         left.addr.cmp(&right.addr)
     }
 
-    /// Render debug info for a direct-huge record. Mirrors
+    /// Write debug info for a direct-huge record into `out`. Mirrors
     /// `H5HF__huge_bt2_dir_debug`.
-    pub fn huge_bt2_dir_debug(&self) -> String {
-        format!("HugeDirect(addr={:#x}, len={})", self.addr, self.len)
+    pub fn huge_bt2_dir_debug_fmt(&self, out: &mut impl fmt::Write) -> fmt::Result {
+        write!(out, "HugeDirect(addr={:#x}, len={})", self.addr, self.len)
     }
 
     /// Whether this filtered-direct record matches the given address and
@@ -1548,20 +1651,20 @@ impl FractalHeapHugeRecord {
         Self::huge_bt2_dir_compare(left, right)
     }
 
-    /// Encode a filtered-direct record into its on-disk raw form.
+    /// Append a filtered-direct record's raw on-disk form to `out`.
     /// Mirrors `H5HF__huge_bt2_filt_dir_encode`.
-    pub fn huge_bt2_filt_dir_encode(&self) -> Result<Vec<u8>> {
+    pub fn huge_bt2_filt_dir_encode_into(&self, out: &mut Vec<u8>) -> Result<()> {
         if self.filter_mask == 0 {
             return Err(Error::InvalidFormat(
                 "filtered huge direct record has no filter mask".into(),
             ));
         }
-        let mut out = Vec::with_capacity(HUGE_FILTERED_DIRECT_RECORD_LEN);
+        out.reserve(HUGE_FILTERED_DIRECT_RECORD_LEN);
         out.extend_from_slice(&self.addr.to_le_bytes());
         out.extend_from_slice(&self.len.to_le_bytes());
         out.extend_from_slice(&self.filter_mask.to_le_bytes());
         out.extend_from_slice(&self.obj_size.to_le_bytes());
-        Ok(out)
+        Ok(())
     }
 
     /// Decode the on-disk raw form of a filtered-direct record into a
@@ -1590,10 +1693,11 @@ impl FractalHeapHugeRecord {
         })
     }
 
-    /// Render debug info for a filtered-direct record. Mirrors
+    /// Write debug info for a filtered-direct record into `out`. Mirrors
     /// `H5HF__huge_bt2_filt_dir_debug`.
-    pub fn huge_bt2_filt_dir_debug(&self) -> String {
-        format!(
+    pub fn huge_bt2_filt_dir_debug_fmt(&self, out: &mut impl fmt::Write) -> fmt::Result {
+        write!(
+            out,
             "HugeFilteredDirect(addr={:#x}, len={}, obj_size={}, mask={:#x})",
             self.addr, self.len, self.obj_size, self.filter_mask
         )
@@ -1813,18 +1917,18 @@ impl FractalHeapSection {
     /// `H5HF__sect_row_term_cls` (no-op).
     pub fn sect_row_term_cls() {}
 
-    /// Serialize a live row section into a byte buffer. Mirrors
+    /// Append a row section's serialized form to `out`. Mirrors
     /// `H5HF__sect_row_serialize`.
-    pub fn sect_row_serialize(&self) -> Result<Vec<u8>> {
+    pub fn sect_row_serialize_into(&self, out: &mut Vec<u8>) -> Result<()> {
         let Self::Row { offset, size, .. } = self else {
             return Err(Error::InvalidFormat(
                 "fractal heap row section serializer received non-row section".into(),
             ));
         };
-        let mut out = Vec::with_capacity(16);
+        out.reserve(16);
         out.extend_from_slice(&offset.to_le_bytes());
         out.extend_from_slice(&size.to_le_bytes());
-        Ok(out)
+        Ok(())
     }
 
     /// Deserialize a row section. Mirrors `H5HF__sect_row_deserialize`.
@@ -1870,10 +1974,10 @@ impl FractalHeapSection {
         self.sect_single_valid()
     }
 
-    /// Dump debugging information about a row section. Mirrors
+    /// Write debugging information about a row section into `out`. Mirrors
     /// `H5HF__sect_row_debug`.
-    pub fn sect_row_debug(&self) -> String {
-        format!("{self:?}")
+    pub fn sect_row_debug_fmt(&self, out: &mut impl fmt::Write) -> fmt::Result {
+        write!(out, "{self:?}")
     }
 
     /// Indirect-block offset for this section. Mirrors
@@ -2005,10 +2109,10 @@ impl FractalHeapSection {
         self.sect_single_merge_checked(other)
     }
 
-    /// Build a parent Indirect section for this section. Mirrors
+    /// Borrow the parent Indirect section for this section. Mirrors
     /// `H5HF__sect_indirect_build_parent`.
-    pub fn sect_indirect_build_parent(&self) -> Option<Self> {
-        Some(self.clone())
+    pub fn sect_indirect_build_parent_ref(&self) -> Option<&Self> {
+        Some(self)
     }
 
     /// Shrink the container with this indirect section. Mirrors
@@ -2017,18 +2121,18 @@ impl FractalHeapSection {
         self.sect_indirect_reduce(amount);
     }
 
-    /// Serialize a live Indirect section into a byte buffer. Mirrors
+    /// Append an indirect section's serialized form to `out`. Mirrors
     /// `H5HF__sect_indirect_serialize`.
-    pub fn sect_indirect_serialize(&self) -> Result<Vec<u8>> {
+    pub fn sect_indirect_serialize_into(&self, out: &mut Vec<u8>) -> Result<()> {
         let Self::Indirect { offset, size, .. } = self else {
             return Err(Error::InvalidFormat(
                 "fractal heap indirect section serializer received non-indirect section".into(),
             ));
         };
-        let mut out = Vec::with_capacity(16);
+        out.reserve(16);
         out.extend_from_slice(&offset.to_le_bytes());
         out.extend_from_slice(&size.to_le_bytes());
-        Ok(out)
+        Ok(())
     }
 
     /// Free an Indirect section node. Mirrors `H5HF__sect_indirect_free`.
@@ -2040,10 +2144,10 @@ impl FractalHeapSection {
         self.sect_single_valid()
     }
 
-    /// Dump debugging information about an Indirect section. Mirrors
+    /// Write debugging information about an Indirect section into `out`. Mirrors
     /// `H5HF__sect_indirect_debug`.
-    pub fn sect_indirect_debug(&self) -> String {
-        format!("{self:?}")
+    pub fn sect_indirect_debug_fmt(&self, out: &mut impl fmt::Write) -> fmt::Result {
+        write!(out, "{self:?}")
     }
 }
 
@@ -2128,19 +2232,31 @@ impl FractalHeapSpace {
         }
     }
 
-    /// Per-section debug callback. Mirrors `H5HF__sects_debug_cb`.
-    pub fn sects_debug_cb(section: &FractalHeapSection) -> String {
-        format!("{section:?}")
+    /// Write per-section debug info into `out`. Mirrors `H5HF__sects_debug_cb`.
+    pub fn sects_debug_cb_fmt(
+        section: &FractalHeapSection,
+        out: &mut impl fmt::Write,
+    ) -> fmt::Result {
+        write!(out, "{section:?}")
     }
 
-    /// Render debug info for all sections in the free space. Mirrors
+    /// Write debug info for all sections in the free space into `out`. Mirrors
     /// `H5HF__sects_debug`.
-    pub fn sects_debug(&self) -> String {
-        self.sections
-            .iter()
-            .map(Self::sects_debug_cb)
-            .collect::<Vec<_>>()
-            .join(", ")
+    pub fn sects_debug_fmt(&self, out: &mut impl fmt::Write) -> fmt::Result {
+        let mut sections = self.sections.iter();
+        if let Some(section) = sections.next() {
+            Self::sects_debug_cb_fmt(section, out)?;
+            for section in sections {
+                out.write_str(", ")?;
+                Self::sects_debug_cb_fmt(section, out)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Iterate over free-space sections without cloning the section list.
+    pub fn sections(&self) -> impl ExactSizeIterator<Item = &FractalHeapSection> {
+        self.sections.iter()
     }
 }
 
@@ -2310,7 +2426,8 @@ pub(super) fn verify_metadata_checksum<R: Read + Seek>(
     let restore = reader.position()?;
     let check_len_usize = heap_object_len(check_len, context)?;
     reader.seek(start)?;
-    let bytes = reader.read_bytes(check_len_usize)?;
+    let mut bytes = vec![0; check_len_usize];
+    reader.read_bytes_into(&mut bytes)?;
     let stored = reader.read_u32()?;
     let computed = checksum_metadata(&bytes);
     reader.seek(restore)?;
@@ -2342,10 +2459,12 @@ pub(super) fn verify_direct_block_checksum<R: Read + Seek>(
             Error::InvalidFormat("fractal heap direct block checksum span overflow".into())
         })?;
     reader.seek(start)?;
-    let bytes = reader.read_bytes(check_len)?;
+    let mut bytes = vec![0; check_len];
+    reader.read_bytes_into(&mut bytes)?;
     let stored = reader.read_u32()?;
     let payload_len = heap_object_len(block_size, "fractal heap direct block size")?;
-    let payload = reader.read_bytes(payload_len)?;
+    let mut payload = vec![0; payload_len];
+    reader.read_bytes_into(&mut payload)?;
     reader.seek(restore)?;
 
     let computed = checksum_metadata(&bytes);
@@ -2562,20 +2681,30 @@ mod tests {
             ref_count: 1,
             dirty: true,
         };
-        let image = iblock.cache_iblock_serialize().unwrap();
+        let mut image = Vec::new();
+        iblock.cache_iblock_serialize_into(&mut image).unwrap();
         assert_eq!(image.len(), iblock.cache_iblock_image_len().unwrap());
         assert_eq!(&image[..4], &FHIB_MAGIC);
         assert_eq!(u64::from_le_bytes(image[5..13].try_into().unwrap()), 2);
         FractalHeapIndirectBlock::cache_iblock_verify_chksum(&image).unwrap();
-        assert_eq!(iblock.cache_iblock_pre_serialize().unwrap(), image);
+        let mut pre_image = Vec::new();
+        iblock
+            .cache_iblock_pre_serialize_into(&mut pre_image)
+            .unwrap();
+        assert_eq!(pre_image, image);
 
         let dblock = FractalHeapDirectBlock::man_dblock_new(64, vec![1, 2, 3, 4]);
-        let image = dblock.cache_dblock_serialize().unwrap();
+        let mut image = Vec::new();
+        dblock.cache_dblock_serialize_into(&mut image).unwrap();
         assert_eq!(image.len(), dblock.cache_dblock_image_len().unwrap());
         assert_eq!(&image[..4], &FHDB_MAGIC);
         assert_eq!(u64::from_le_bytes(image[5..13].try_into().unwrap()), 64);
         verify_image_checksum(&image, "fractal heap direct block").unwrap();
-        assert_eq!(dblock.cache_dblock_pre_serialize().unwrap(), image);
+        let mut pre_image = Vec::new();
+        dblock
+            .cache_dblock_pre_serialize_into(&mut pre_image)
+            .unwrap();
+        assert_eq!(pre_image, image);
     }
 
     #[test]
@@ -2593,7 +2722,8 @@ mod tests {
         header.huge_btree_addr = UNDEF_ADDR;
         header.root_block_addr = UNDEF_ADDR;
 
-        let image = header.cache_hdr_serialize().unwrap();
+        let mut image = Vec::new();
+        header.cache_hdr_serialize_into(&mut image).unwrap();
         assert_eq!(image.len(), header.cache_hdr_image_len());
         FractalHeapHeader::cache_hdr_verify_chksum(&image).unwrap();
 
@@ -2610,7 +2740,8 @@ mod tests {
             root_block_addr: u64::from(u32::MAX) + 1,
             ..header
         };
-        assert!(too_large.cache_hdr_serialize().is_err());
+        let mut image = Vec::new();
+        assert!(too_large.cache_hdr_serialize_into(&mut image).is_err());
     }
 
     #[test]
@@ -2671,18 +2802,21 @@ mod tests {
     #[test]
     fn section_class_serializers_reject_wrong_section_variants() {
         let row = FractalHeapSection::sect_row_deserialize(3, 10, 20);
-        let image = row.sect_row_serialize().unwrap();
+        let mut image = Vec::new();
+        row.sect_row_serialize_into(&mut image).unwrap();
         assert_eq!(u64::from_le_bytes(image[..8].try_into().unwrap()), 10);
         assert_eq!(u64::from_le_bytes(image[8..16].try_into().unwrap()), 20);
 
         let indirect = FractalHeapSection::sect_indirect_new(30, 2, 40);
-        let image = indirect.sect_indirect_serialize().unwrap();
+        let mut image = Vec::new();
+        indirect.sect_indirect_serialize_into(&mut image).unwrap();
         assert_eq!(u64::from_le_bytes(image[..8].try_into().unwrap()), 30);
         assert_eq!(u64::from_le_bytes(image[8..16].try_into().unwrap()), 40);
 
         let single = FractalHeapSection::sect_single_new(1, 2);
-        assert!(single.sect_row_serialize().is_err());
-        assert!(single.sect_indirect_serialize().is_err());
+        let mut image = Vec::new();
+        assert!(single.sect_row_serialize_into(&mut image).is_err());
+        assert!(single.sect_indirect_serialize_into(&mut image).is_err());
     }
 
     #[test]
@@ -2698,7 +2832,8 @@ mod tests {
         header.start_root_rows = 2;
         header.current_root_rows = 3;
 
-        let image = header.dtable_encode().unwrap();
+        let mut image = Vec::new();
+        header.dtable_encode_into(&mut image).unwrap();
         assert_eq!(image.len(), FRACTAL_HEAP_DTABLE_IMAGE_LEN);
         let decoded = FractalHeapHeader::dtable_decode(&image).unwrap();
         assert_eq!(decoded.table_width, 4);
@@ -2707,13 +2842,15 @@ mod tests {
 
         assert!(FractalHeapHeader::dtable_decode(&image[..23]).is_err());
         header.current_root_rows = 1;
-        assert!(header.dtable_encode().is_err());
+        let mut image = Vec::new();
+        assert!(header.dtable_encode_into(&mut image).is_err());
     }
 
     #[test]
     fn filtered_huge_direct_record_image_roundtrips() {
         let record = FractalHeapHugeRecord::huge_bt2_filt_dir_store(0x10, 20, 100, 0x04);
-        let image = record.huge_bt2_filt_dir_encode().unwrap();
+        let mut image = Vec::new();
+        record.huge_bt2_filt_dir_encode_into(&mut image).unwrap();
         assert_eq!(image.len(), HUGE_FILTERED_DIRECT_RECORD_LEN);
 
         let decoded = FractalHeapHugeRecord::huge_bt2_filt_dir_decode(&image).unwrap();
@@ -2724,6 +2861,9 @@ mod tests {
 
         assert!(FractalHeapHugeRecord::huge_bt2_filt_dir_decode(&image[..27]).is_err());
         let unfiltered = FractalHeapHugeRecord::huge_bt2_filt_dir_store(0x10, 20, 100, 0);
-        assert!(unfiltered.huge_bt2_filt_dir_encode().is_err());
+        let mut image = Vec::new();
+        assert!(unfiltered
+            .huge_bt2_filt_dir_encode_into(&mut image)
+            .is_err());
     }
 }

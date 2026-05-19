@@ -5,16 +5,19 @@
 
 #![allow(dead_code)]
 
-use std::io::{Read, Seek};
+use std::{
+    fmt,
+    io::{Read, Seek},
+};
 
 use crate::error::{Error, Result};
 use crate::format::checksum::checksum_metadata;
 use crate::io::reader::HdfReader;
 
-use super::dblock::{append_data_block_elements, read_element};
+use super::dblock::{append_data_block_elements_with_scratch, read_element};
 use super::fixed_array::FixedArrayElement;
 use super::hdr::ExtensibleArrayHeader;
-use super::sblock::read_super_block;
+use super::sblock::read_super_block_with_scratch;
 
 /// Decoded extensible-array index block: the inline elements plus the
 /// data-block and super-block address tables. Mirrors
@@ -29,8 +32,12 @@ pub(super) struct ExtArrayIndexBlock {
     pub(super) super_block_addrs: Vec<u64>,
 }
 
-pub(super) fn iblock_debug(block: &ExtArrayIndexBlock) -> String {
-    format!(
+pub(super) fn write_iblock_debug(
+    block: &ExtArrayIndexBlock,
+    out: &mut impl fmt::Write,
+) -> fmt::Result {
+    write!(
+        out,
         "ExtArrayIndexBlock(elements={}, data_block_addrs={}, super_block_addrs={})",
         block.elements.len(),
         block.data_block_addrs.len(),
@@ -78,15 +85,19 @@ pub(super) fn cache_iblock_image_len(
         })
 }
 
-pub(super) fn cache_iblock_serialize(prefix_and_payload: &[u8]) -> Result<Vec<u8>> {
+pub(super) fn cache_iblock_serialize_into(
+    prefix_and_payload: &[u8],
+    out: &mut Vec<u8>,
+) -> Result<()> {
     let image_len = prefix_and_payload.len().checked_add(4).ok_or_else(|| {
         Error::InvalidFormat("extensible array index block image length overflow".into())
     })?;
-    let mut out = Vec::with_capacity(image_len);
+    out.clear();
+    out.reserve(image_len);
     out.extend_from_slice(prefix_and_payload);
     let checksum = crate::format::checksum::checksum_metadata(&out);
     out.extend_from_slice(&checksum.to_le_bytes());
-    Ok(out)
+    Ok(())
 }
 
 pub(super) fn cache_iblock_notify(_block: &ExtArrayIndexBlock) {}
@@ -128,8 +139,9 @@ pub(super) fn decode_index_block<R: Read + Seek>(
     chunk_size_len: usize,
 ) -> Result<ExtArrayIndexBlock> {
     reader.seek(header.index_block_addr)?;
-    let magic = reader.read_bytes(4)?;
-    if magic != b"EAIB" {
+    let mut magic = [0u8; 4];
+    reader.read_bytes_into(&mut magic)?;
+    if magic != *b"EAIB" {
         return Err(Error::InvalidFormat(
             "invalid extensible array index block magic".into(),
         ));
@@ -176,9 +188,11 @@ pub(super) fn decode_index_block<R: Read + Seek>(
         )));
     }
 
-    let max_index_count =
-        super::usize_from_u64(header.max_index_set, "extensible array max index")?;
-    let mut elements = Vec::with_capacity(max_index_count);
+    let inline_element_count = usize::from(header.index_block_elements).min(super::usize_from_u64(
+        header.max_index_set,
+        "extensible array max index",
+    )?);
+    let mut elements = Vec::with_capacity(inline_element_count);
     for idx in 0..header.index_block_elements {
         let element = read_element(reader, filtered, chunk_size_len)?;
         if u64::from(idx) < header.max_index_set {
@@ -241,7 +255,8 @@ fn verify_reader_checksum<R: Read + Seek>(
     )
     .map_err(|_| Error::InvalidFormat(format!("{context} checksum span is too large")))?;
     reader.seek(start)?;
-    let bytes = reader.read_bytes(check_len)?;
+    let mut bytes = vec![0; check_len];
+    reader.read_bytes_into(&mut bytes)?;
     let computed = checksum_metadata(&bytes);
     if stored != computed {
         return Err(Error::InvalidFormat(format!(
@@ -257,19 +272,23 @@ fn verify_reader_checksum<R: Read + Seek>(
 /// Drive the decoded index block to materialize the full element vector
 /// — descends into spillover data/super blocks. Composition mirrors
 /// the C-side `H5EA_iterate` after `H5EA__iblock_protect` returns.
-pub(super) fn read_index_block<R: Read + Seek>(
+pub(super) fn read_index_block_into<R: Read + Seek>(
     reader: &mut HdfReader<R>,
     header_addr: u64,
     header: &ExtensibleArrayHeader,
     filtered: bool,
     chunk_size_len: usize,
-) -> Result<Vec<FixedArrayElement>> {
+    elements: &mut Vec<FixedArrayElement>,
+) -> Result<()> {
     let iblock = decode_index_block(reader, header_addr, header, filtered, chunk_size_len)?;
     let ExtArrayIndexBlock {
-        mut elements,
+        elements: mut decoded,
         data_block_addrs,
         super_block_addrs,
     } = iblock;
+    elements.clear();
+    elements.append(&mut decoded);
+    let mut checksum_scratch = Vec::new();
     read_spillover_blocks(
         reader,
         header_addr,
@@ -278,9 +297,9 @@ pub(super) fn read_index_block<R: Read + Seek>(
         chunk_size_len,
         &data_block_addrs,
         &super_block_addrs,
-        &mut elements,
-    )?;
-    Ok(elements)
+        elements,
+        &mut checksum_scratch,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -293,6 +312,7 @@ fn read_spillover_blocks<R: Read + Seek>(
     data_block_addrs: &[u64],
     super_block_addrs: &[u64],
     elements: &mut Vec<FixedArrayElement>,
+    checksum_scratch: &mut Vec<u8>,
 ) -> Result<()> {
     for (super_block_index, info) in header.super_block_info.iter().enumerate() {
         let elements_len =
@@ -332,7 +352,7 @@ fn read_spillover_blocks<R: Read + Seek>(
                     "extensible array remaining element count",
                 )?;
                 let count = info.data_block_elements.min(remaining);
-                append_data_block_elements(
+                append_data_block_elements_with_scratch(
                     reader,
                     header_addr,
                     header,
@@ -343,6 +363,7 @@ fn read_spillover_blocks<R: Read + Seek>(
                     None,
                     count,
                     elements,
+                    checksum_scratch,
                 )?;
             }
         } else {
@@ -352,7 +373,7 @@ fn read_spillover_blocks<R: Read + Seek>(
                     "extensible array super block address index out of bounds".into(),
                 ));
             };
-            read_super_block(
+            read_super_block_with_scratch(
                 reader,
                 header_addr,
                 header,
@@ -361,6 +382,7 @@ fn read_spillover_blocks<R: Read + Seek>(
                 super_block_addr,
                 info,
                 elements,
+                checksum_scratch,
             )?;
         }
     }

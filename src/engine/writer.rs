@@ -49,6 +49,12 @@ struct OwnedAttrSpec {
     data: Vec<u8>,
 }
 
+struct EncodedLinkRecord {
+    name: String,
+    compact_message: Vec<u8>,
+    dense_message: Vec<u8>,
+}
+
 impl OwnedAttrSpec {
     /// Borrow this owned attribute spec as a non-owning [`AttrSpec`].
     fn as_attr_spec(&self) -> AttrSpec<'_> {
@@ -178,52 +184,68 @@ impl DtypeSpec {
 
     /// Encode as HDF5 datatype message bytes.
     pub fn encode(&self) -> Result<Vec<u8>> {
-        self.encode_with_padding(true)
-    }
-
-    /// Encode without top-level alignment padding for use inside other messages.
-    fn encode_embedded(&self) -> Result<Vec<u8>> {
-        self.encode_with_padding(false)
-    }
-
-    /// Encode optionally adding top-level 8-byte alignment padding.
-    fn encode_with_padding(&self, pad_top_level: bool) -> Result<Vec<u8>> {
-        let mut buf = match self {
-            DtypeSpec::F32 | DtypeSpec::F64 => self.encode_floating_point(),
-            DtypeSpec::FixedAsciiString { len, padding } => {
-                Self::encode_fixed_string(*len, *padding, false)?
-            }
-            DtypeSpec::FixedUtf8String { len, padding } => {
-                Self::encode_fixed_string(*len, *padding, true)?
-            }
-            DtypeSpec::VarLenUtf8String => Self::encode_vlen_utf8_string(),
-            DtypeSpec::Compound { size, fields } => Self::encode_compound(*size, fields)?,
-            DtypeSpec::Enum { base, members } => Self::encode_enum(base, members)?,
-            DtypeSpec::Opaque { size, tag } => Self::encode_opaque(*size, tag)?,
-            DtypeSpec::Array { dims, base } => {
-                Self::encode_array(self.checked_size()?, dims, base)?
-            }
-            _ => self.encode_fixed_point(),
-        };
-
-        DatatypeMessage::decode(&buf)?;
-
-        if pad_top_level
-            && matches!(
-                self,
-                DtypeSpec::Compound { .. }
-                    | DtypeSpec::Enum { .. }
-                    | DtypeSpec::Opaque { .. }
-                    | DtypeSpec::Array { .. }
-                    | DtypeSpec::VarLenUtf8String
-            )
-        {
-            while buf.len() % 8 != 0 {
-                buf.push(0);
-            }
-        }
-
+        let mut buf = Vec::new();
+        self.encode_into(&mut buf)?;
         Ok(buf)
+    }
+
+    /// Append this datatype as HDF5 datatype message bytes.
+    pub fn encode_into(&self, out: &mut Vec<u8>) -> Result<()> {
+        self.encode_with_padding_into(out, true)
+    }
+
+    /// Append without top-level alignment padding for use inside other messages.
+    fn encode_embedded_into(&self, out: &mut Vec<u8>) -> Result<()> {
+        self.encode_with_padding_into(out, false)
+    }
+
+    /// Append optionally adding top-level 8-byte alignment padding.
+    fn encode_with_padding_into(&self, out: &mut Vec<u8>, pad_top_level: bool) -> Result<()> {
+        let start = out.len();
+        let result = (|| {
+            match self {
+                DtypeSpec::F32 | DtypeSpec::F64 => self.encode_floating_point_into(out),
+                DtypeSpec::FixedAsciiString { len, padding } => {
+                    Self::encode_fixed_string_into(out, *len, *padding, false)?
+                }
+                DtypeSpec::FixedUtf8String { len, padding } => {
+                    Self::encode_fixed_string_into(out, *len, *padding, true)?
+                }
+                DtypeSpec::VarLenUtf8String => Self::encode_vlen_utf8_string_into(out),
+                DtypeSpec::Compound { size, fields } => {
+                    Self::encode_compound_into(out, *size, fields)?
+                }
+                DtypeSpec::Enum { base, members } => Self::encode_enum_into(out, base, members)?,
+                DtypeSpec::Opaque { size, tag } => Self::encode_opaque_into(out, *size, tag)?,
+                DtypeSpec::Array { dims, base } => {
+                    Self::encode_array_into(out, self.checked_size()?, dims, base)?
+                }
+                _ => self.encode_fixed_point_into(out),
+            }
+
+            DatatypeMessage::decode(&out[start..])?;
+
+            if pad_top_level
+                && matches!(
+                    self,
+                    DtypeSpec::Compound { .. }
+                        | DtypeSpec::Enum { .. }
+                        | DtypeSpec::Opaque { .. }
+                        | DtypeSpec::Array { .. }
+                        | DtypeSpec::VarLenUtf8String
+                )
+            {
+                while out.len() % 8 != 0 {
+                    out.push(0);
+                }
+            }
+
+            Ok(())
+        })();
+        if result.is_err() {
+            out.truncate(start);
+        }
+        result
     }
 
     /// Compute the byte size with overflow checking.
@@ -255,10 +277,9 @@ impl DtypeSpec {
         }
     }
 
-    /// Encode an IEEE float datatype message.
-    fn encode_floating_point(&self) -> Vec<u8> {
+    /// Append an IEEE float datatype message.
+    fn encode_floating_point_into(&self, buf: &mut Vec<u8>) {
         let size = self.size();
-        let mut buf = Vec::new();
         let class_and_version = 0x11u8;
         buf.push(class_and_version);
         if size == 4 {
@@ -282,27 +303,29 @@ impl DtypeSpec {
             buf.push(52);
             buf.extend_from_slice(&1023u32.to_le_bytes());
         }
-        buf
     }
 
-    /// Encode a fixed-length string datatype message.
-    fn encode_fixed_string(len: u32, padding: u8, utf8: bool) -> Result<Vec<u8>> {
+    /// Append a fixed-length string datatype message.
+    fn encode_fixed_string_into(
+        buf: &mut Vec<u8>,
+        len: u32,
+        padding: u8,
+        utf8: bool,
+    ) -> Result<()> {
         if padding > 2 {
             return Err(Error::InvalidFormat(format!(
                 "fixed-length string padding {padding} is invalid"
             )));
         }
-        let mut buf = Vec::new();
         buf.push(0x13);
         buf.push(padding | if utf8 { 0x10 } else { 0x00 });
         buf.extend_from_slice(&[0x00, 0x00]);
         buf.extend_from_slice(&len.to_le_bytes());
-        Ok(buf)
+        Ok(())
     }
 
-    /// Encode a variable-length UTF-8 string datatype message.
-    fn encode_vlen_utf8_string() -> Vec<u8> {
-        let mut buf = Vec::new();
+    /// Append a variable-length UTF-8 string datatype message.
+    fn encode_vlen_utf8_string_into(buf: &mut Vec<u8>) {
         buf.push(0x19);
         buf.extend_from_slice(&[0x01, 0x01, 0x00]);
         buf.extend_from_slice(&16u32.to_le_bytes());
@@ -310,29 +333,31 @@ impl DtypeSpec {
             0x10, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00,
             0x00, 0x00,
         ]);
-        buf
     }
 
-    /// Encode a compound datatype message.
-    fn encode_compound(size: u32, fields: &[CompoundFieldSpec]) -> Result<Vec<u8>> {
-        let mut buf = Self::encode_compound_header(size, fields.len())?;
+    /// Append a compound datatype message.
+    fn encode_compound_into(
+        buf: &mut Vec<u8>,
+        size: u32,
+        fields: &[CompoundFieldSpec],
+    ) -> Result<()> {
+        Self::encode_compound_header_into(buf, size, fields.len())?;
         for field in fields {
-            Self::encode_compound_field(&mut buf, field)?;
+            Self::encode_compound_field(buf, field)?;
         }
-        Ok(buf)
+        Ok(())
     }
 
-    /// Encode the leading bytes of a compound datatype message.
-    fn encode_compound_header(size: u32, field_count: usize) -> Result<Vec<u8>> {
+    /// Append the leading bytes of a compound datatype message.
+    fn encode_compound_header_into(buf: &mut Vec<u8>, size: u32, field_count: usize) -> Result<()> {
         let field_count = u16::try_from(field_count).map_err(|_| {
             Error::InvalidFormat("compound datatype member count exceeds u16".into())
         })?;
-        let mut buf = Vec::new();
         buf.push(0x16);
         buf.extend_from_slice(&field_count.to_le_bytes());
         buf.push(0);
         buf.extend_from_slice(&size.to_le_bytes());
-        Ok(buf)
+        Ok(())
     }
 
     /// Append one compound field record to `buf`.
@@ -347,37 +372,42 @@ impl DtypeSpec {
         }
         buf.extend_from_slice(&field.offset.to_le_bytes());
         buf.extend_from_slice(&[0; 28]);
-        buf.extend_from_slice(&field.dtype.encode_embedded()?);
+        field.dtype.encode_embedded_into(buf)?;
         Ok(())
     }
 
-    /// Encode an enumeration datatype message.
-    fn encode_enum(base: &DtypeSpec, members: &[(String, u64)]) -> Result<Vec<u8>> {
-        let base_bytes = base.encode_embedded()?;
+    /// Append an enumeration datatype message.
+    fn encode_enum_into(
+        buf: &mut Vec<u8>,
+        base: &DtypeSpec,
+        members: &[(String, u64)],
+    ) -> Result<()> {
+        let mut base_bytes = Vec::new();
+        base.encode_embedded_into(&mut base_bytes)?;
         let base_size = base.checked_size()?;
-        let mut buf = Self::encode_enum_header(base_size, members.len(), &base_bytes)?;
-        Self::encode_enum_names(&mut buf, members)?;
+        Self::encode_enum_header_into(buf, base_size, members.len(), &base_bytes)?;
+        Self::encode_enum_names(buf, members)?;
         let base_size = usize::try_from(base_size)
             .map_err(|_| Error::InvalidFormat("enum datatype base size exceeds usize".into()))?;
-        Self::encode_enum_values(&mut buf, base_size, members)?;
-        Ok(buf)
+        Self::encode_enum_values(buf, base_size, members)?;
+        Ok(())
     }
 
-    /// Encode the leading bytes of an enum datatype message.
-    fn encode_enum_header(
+    /// Append the leading bytes of an enum datatype message.
+    fn encode_enum_header_into(
+        buf: &mut Vec<u8>,
         base_size: u32,
         member_count: usize,
         base_bytes: &[u8],
-    ) -> Result<Vec<u8>> {
+    ) -> Result<()> {
         let member_count = u16::try_from(member_count)
             .map_err(|_| Error::InvalidFormat("enum datatype member count exceeds u16".into()))?;
-        let mut buf = Vec::new();
         buf.push(0x18);
         buf.extend_from_slice(&member_count.to_le_bytes());
         buf.push(0);
         buf.extend_from_slice(&base_size.to_le_bytes());
         buf.extend_from_slice(base_bytes);
-        Ok(buf)
+        Ok(())
     }
 
     /// Append the padded member names of an enum datatype.
@@ -411,21 +441,20 @@ impl DtypeSpec {
         Ok(())
     }
 
-    /// Encode an opaque datatype message.
-    fn encode_opaque(size: u32, tag: &str) -> Result<Vec<u8>> {
+    /// Append an opaque datatype message.
+    fn encode_opaque_into(buf: &mut Vec<u8>, size: u32, tag: &str) -> Result<()> {
         validate_dtype_name(tag, "opaque datatype tag")?;
-        let mut buf = Self::encode_opaque_header(size, tag)?;
+        Self::encode_opaque_header_into(buf, size, tag)?;
         buf.extend_from_slice(tag.as_bytes());
         buf.push(0);
         while buf.len() % 8 != 0 {
             buf.push(0);
         }
-        Ok(buf)
+        Ok(())
     }
 
-    /// Encode the leading bytes of an opaque datatype message.
-    fn encode_opaque_header(size: u32, tag: &str) -> Result<Vec<u8>> {
-        let mut buf = Vec::new();
+    /// Append the leading bytes of an opaque datatype message.
+    fn encode_opaque_header_into(buf: &mut Vec<u8>, size: u32, tag: &str) -> Result<()> {
         buf.push(0x15);
         let tag_with_null = tag
             .len()
@@ -440,18 +469,23 @@ impl DtypeSpec {
         })?;
         buf.extend_from_slice(&[padded_tag_len, 0x00, 0x00]);
         buf.extend_from_slice(&size.to_le_bytes());
-        Ok(buf)
+        Ok(())
     }
 
-    /// Encode an array datatype message.
-    fn encode_array(size: u32, dims: &[u32], base: &DtypeSpec) -> Result<Vec<u8>> {
-        let mut buf = Self::encode_array_header(size, dims)?;
-        buf.extend_from_slice(&base.encode_embedded()?);
-        Ok(buf)
+    /// Append an array datatype message.
+    fn encode_array_into(
+        buf: &mut Vec<u8>,
+        size: u32,
+        dims: &[u32],
+        base: &DtypeSpec,
+    ) -> Result<()> {
+        Self::encode_array_header_into(buf, size, dims)?;
+        base.encode_embedded_into(buf)?;
+        Ok(())
     }
 
-    /// Encode the leading bytes of an array datatype message.
-    fn encode_array_header(size: u32, dims: &[u32]) -> Result<Vec<u8>> {
+    /// Append the leading bytes of an array datatype message.
+    fn encode_array_header_into(buf: &mut Vec<u8>, size: u32, dims: &[u32]) -> Result<()> {
         if dims.is_empty() {
             return Err(Error::InvalidFormat(
                 "array datatype rank must be positive".into(),
@@ -464,7 +498,6 @@ impl DtypeSpec {
                 "array datatype dimension must be positive".into(),
             ));
         }
-        let mut buf = Vec::new();
         buf.push(0x4a);
         buf.extend_from_slice(&[0x00, 0x00, 0x00]);
         buf.extend_from_slice(&size.to_le_bytes());
@@ -472,12 +505,11 @@ impl DtypeSpec {
         for dim in dims {
             buf.extend_from_slice(&dim.to_le_bytes());
         }
-        Ok(buf)
+        Ok(())
     }
 
-    /// Encode a fixed-point (integer) datatype message.
-    fn encode_fixed_point(&self) -> Vec<u8> {
-        let mut buf = Vec::new();
+    /// Append a fixed-point (integer) datatype message.
+    fn encode_fixed_point_into(&self, buf: &mut Vec<u8>) {
         let size = self.size();
         let is_signed = matches!(
             self,
@@ -490,7 +522,6 @@ impl DtypeSpec {
         buf.extend_from_slice(&0u16.to_le_bytes());
         let bit_precision = u16::try_from(size).unwrap_or(u16::MAX).saturating_mul(8);
         buf.extend_from_slice(&bit_precision.to_le_bytes());
-        buf
     }
 
     /// Append a null-terminated name padded to 8-byte alignment.
@@ -521,10 +552,12 @@ fn link_name_size_flag(name_len: usize) -> Result<u8> {
         Ok(1)
     } else if u32::try_from(name_len).is_ok() {
         Ok(2)
+    } else if u64::try_from(name_len).is_ok() {
+        Ok(3)
     } else {
         Err(Error::InvalidFormat(format!(
             "link name is {name_len} bytes, maximum is {}",
-            u32::MAX
+            u64::MAX
         )))
     }
 }
@@ -544,6 +577,11 @@ fn encode_link_name_len(out: &mut Vec<u8>, name_len: usize, size_flag: u8) -> Re
         2 => out.extend_from_slice(
             &u32::try_from(name_len)
                 .map_err(|_| Error::InvalidFormat("link name length exceeds u32 encoding".into()))?
+                .to_le_bytes(),
+        ),
+        3 => out.extend_from_slice(
+            &u64::try_from(name_len)
+                .map_err(|_| Error::InvalidFormat("link name length exceeds u64 encoding".into()))?
                 .to_le_bytes(),
         ),
         _ => {
@@ -603,19 +641,19 @@ fn encoded_width_max(width: u8) -> u64 {
     }
 }
 
-/// Encode a dataspace message.
-fn encode_dataspace(shape: &[u64]) -> Result<Vec<u8>> {
+/// Append a dataspace message.
+fn encode_dataspace_into(out: &mut Vec<u8>, shape: &[u64]) -> Result<()> {
     if shape.len() > MAX_DATASPACE_RANK {
         return Err(Error::InvalidFormat(format!(
             "dataspace rank {} exceeds supported maximum {MAX_DATASPACE_RANK}",
             shape.len()
         )));
     }
-    encode_dataspace_impl(shape, None)
+    encode_dataspace_impl_into(out, shape, None)
 }
 
-/// Encode the dataspace for a dataset spec, including max-shape.
-fn encode_dataspace_for_spec(spec: &DatasetSpec<'_>) -> Result<Vec<u8>> {
+/// Append the dataspace for a dataset spec, including max-shape.
+fn encode_dataspace_for_spec_into(out: &mut Vec<u8>, spec: &DatasetSpec<'_>) -> Result<()> {
     if spec.shape.len() > MAX_DATASPACE_RANK {
         return Err(Error::InvalidFormat(format!(
             "dataspace rank {} exceeds supported maximum {MAX_DATASPACE_RANK}",
@@ -638,13 +676,15 @@ fn encode_dataspace_for_spec(spec: &DatasetSpec<'_>) -> Result<Vec<u8>> {
             }
         }
     }
-    encode_dataspace_impl(spec.shape, spec.max_shape)
+    encode_dataspace_impl_into(out, spec.shape, spec.max_shape)
 }
 
-/// Encode a dataspace from a shape and optional max-shape.
-fn encode_dataspace_impl(shape: &[u64], max_shape: Option<&[u64]>) -> Result<Vec<u8>> {
-    let mut buf = Vec::new();
-
+/// Append a dataspace from a shape and optional max-shape.
+fn encode_dataspace_impl_into(
+    buf: &mut Vec<u8>,
+    shape: &[u64],
+    max_shape: Option<&[u64]>,
+) -> Result<()> {
     if shape.is_empty() {
         // Scalar
         buf.push(2); // version 2
@@ -668,7 +708,7 @@ fn encode_dataspace_impl(shape: &[u64], max_shape: Option<&[u64]>) -> Result<Vec
         }
     }
 
-    Ok(buf)
+    Ok(())
 }
 
 /// Encode a dense hard link message. Libhdf5 stores ASCII dense-link
@@ -784,32 +824,32 @@ fn encode_external_link_message(name: &str, filename: &str, obj_path: &str) -> R
     Ok(buf)
 }
 
-/// Encode a data layout message (v3, contiguous).
-fn encode_contiguous_layout(
+/// Append a data layout message (v3, contiguous).
+fn encode_contiguous_layout_into(
+    buf: &mut Vec<u8>,
     data_addr: u64,
     data_size: u64,
     sizeof_addr: u8,
     sizeof_size: u8,
-) -> Result<Vec<u8>> {
-    let mut buf = Vec::new();
+) -> Result<()> {
     buf.push(3); // version 3
     buf.push(1); // layout class = contiguous
 
-    append_encoded_addr(&mut buf, data_addr, sizeof_addr)?;
+    append_encoded_addr(buf, data_addr, sizeof_addr)?;
 
-    append_encoded_size(&mut buf, data_size, sizeof_size)?;
+    append_encoded_size(buf, data_size, sizeof_size)?;
 
-    Ok(buf)
+    Ok(())
 }
 
-/// Encode a data layout message (v3, chunked).
-fn encode_chunked_layout_v3(
+/// Append a data layout message (v3, chunked).
+fn encode_chunked_layout_v3_into(
+    buf: &mut Vec<u8>,
     btree_addr: u64,
     chunk_dims: &[u64],
     element_size: u32,
     sizeof_addr: u8,
-) -> Result<Vec<u8>> {
-    let mut buf = Vec::new();
+) -> Result<()> {
     buf.push(3); // version 3
     buf.push(2); // layout class = chunked
 
@@ -823,7 +863,7 @@ fn encode_chunked_layout_v3(
     buf.push(ndims);
 
     // B-tree address
-    append_encoded_addr(&mut buf, btree_addr, sizeof_addr)?;
+    append_encoded_addr(buf, btree_addr, sizeof_addr)?;
 
     // Chunk dimensions (each 4 bytes) + element size as last dim
     for &d in chunk_dims {
@@ -838,69 +878,67 @@ fn encode_chunked_layout_v3(
     }
     buf.extend_from_slice(&element_size.to_le_bytes());
 
-    Ok(buf)
+    Ok(())
 }
 
-/// Encode a filter pipeline message.
-fn encode_filter_pipeline(
+/// Append a filter pipeline message.
+fn encode_filter_pipeline_into(
+    buf: &mut Vec<u8>,
     compression_level: Option<u32>,
     shuffle: bool,
     fletcher32: bool,
-) -> Result<Vec<u8>> {
-    let mut filters = Vec::new();
+) -> Result<()> {
+    let filter_count =
+        u8::from(shuffle) + u8::from(compression_level.is_some()) + u8::from(fletcher32);
+    if filter_count == 0 {
+        return Ok(());
+    }
+
+    buf.push(2); // version 2
+    buf.push(filter_count); // number of filters
 
     if shuffle {
-        filters.push((2u16, Vec::<u32>::new())); // SHUFFLE, no params
+        encode_filter_pipeline_entry_into(buf, 2, &[])?;
     }
     if let Some(level) = compression_level {
-        filters.push((1u16, vec![level])); // DEFLATE, 1 param = level
+        encode_filter_pipeline_entry_into(buf, 1, &[level])?;
     }
     if fletcher32 {
-        filters.push((3u16, Vec::<u32>::new())); // FLETCHER32, no params
+        encode_filter_pipeline_entry_into(buf, 3, &[])?;
     }
 
-    if filters.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let mut buf = Vec::new();
-    buf.push(2); // version 2
-    buf.push(
-        u8::try_from(filters.len())
-            .map_err(|_| Error::InvalidFormat("filter count exceeds u8".into()))?,
-    ); // number of filters
-
-    for (id, params) in &filters {
-        buf.extend_from_slice(&id.to_le_bytes()); // filter ID
-                                                  // v2: skip name_length for known filter IDs (< 256)
-        buf.extend_from_slice(&0u16.to_le_bytes()); // flags
-        buf.extend_from_slice(
-            &u16::try_from(params.len())
-                .map_err(|_| {
-                    Error::InvalidFormat("filter client-data value count exceeds u16".into())
-                })?
-                .to_le_bytes(),
-        ); // number of client data values
-        for &p in params {
-            buf.extend_from_slice(&p.to_le_bytes());
-        }
-    }
-
-    Ok(buf)
+    Ok(())
 }
 
-/// Encode an attribute message (v3).
-fn encode_attribute_message(
+/// Append one known-filter pipeline entry.
+fn encode_filter_pipeline_entry_into(buf: &mut Vec<u8>, id: u16, params: &[u32]) -> Result<()> {
+    buf.extend_from_slice(&id.to_le_bytes()); // filter ID
+                                              // v2: skip name_length for known filter IDs (< 256)
+    buf.extend_from_slice(&0u16.to_le_bytes()); // flags
+    buf.extend_from_slice(
+        &u16::try_from(params.len())
+            .map_err(|_| Error::InvalidFormat("filter client-data value count exceeds u16".into()))?
+            .to_le_bytes(),
+    ); // number of client data values
+    for &p in params {
+        buf.extend_from_slice(&p.to_le_bytes());
+    }
+    Ok(())
+}
+
+/// Append an attribute message (v3).
+fn encode_attribute_message_into(
+    buf: &mut Vec<u8>,
     name: &str,
     dtype: &DtypeSpec,
     shape: &[u64],
     data: &[u8],
-) -> Result<Vec<u8>> {
-    let mut buf = Vec::new();
-
+) -> Result<()> {
     validate_attr_payload(name, dtype, shape, data)?;
-    let dtype_bytes = dtype.encode()?;
-    let ds_bytes = encode_dataspace(shape)?;
+    let mut dtype_bytes = Vec::new();
+    dtype.encode_into(&mut dtype_bytes)?;
+    let mut ds_bytes = Vec::new();
+    encode_dataspace_into(&mut ds_bytes, shape)?;
     let name_bytes = name.as_bytes();
     let name_with_null = name_bytes.len() + 1; // include null terminator
     let name_with_null = u16::try_from(name_with_null).map_err(|_| {
@@ -939,35 +977,57 @@ fn encode_attribute_message(
     buf.extend_from_slice(&ds_bytes);
     buf.extend_from_slice(data);
 
-    Ok(buf)
+    Ok(())
 }
 
-/// Encode a link-info message (mirrors `H5O__linfo_encode`).
-fn encode_link_info_message(
+/// Append a link-info message (mirrors `H5O__linfo_encode`).
+fn encode_link_info_message_into(
+    buf: &mut Vec<u8>,
     heap_addr: u64,
     name_btree_addr: u64,
     sizeof_addr: u8,
-) -> Result<Vec<u8>> {
-    let mut buf = Vec::new();
+) -> Result<()> {
     buf.push(0);
     buf.push(0);
-    append_encoded_addr(&mut buf, heap_addr, sizeof_addr)?;
-    append_encoded_addr(&mut buf, name_btree_addr, sizeof_addr)?;
-    Ok(buf)
+    append_encoded_addr(buf, heap_addr, sizeof_addr)?;
+    append_encoded_addr(buf, name_btree_addr, sizeof_addr)?;
+    Ok(())
 }
 
-/// Encode an attribute-info message (mirrors `H5O__ainfo_encode`).
-fn encode_attr_info_message(
+/// Append an attribute-info message (mirrors `H5O__ainfo_encode`).
+fn encode_attr_info_message_into(
+    buf: &mut Vec<u8>,
     heap_addr: u64,
     name_btree_addr: u64,
     sizeof_addr: u8,
-) -> Result<Vec<u8>> {
-    let mut buf = Vec::new();
+) -> Result<()> {
     buf.push(0);
     buf.push(0);
-    append_encoded_addr(&mut buf, heap_addr, sizeof_addr)?;
-    append_encoded_addr(&mut buf, name_btree_addr, sizeof_addr)?;
-    Ok(buf)
+    append_encoded_addr(buf, heap_addr, sizeof_addr)?;
+    append_encoded_addr(buf, name_btree_addr, sizeof_addr)?;
+    Ok(())
+}
+
+fn attrs_need_dense_storage(attrs: &[AttrSpec<'_>]) -> Result<bool> {
+    if attrs.len() > 8 {
+        return Ok(true);
+    }
+
+    for attr in attrs {
+        let mut attr_bytes = Vec::new();
+        encode_attribute_message_into(
+            &mut attr_bytes,
+            attr.name,
+            &attr.dtype,
+            attr.shape,
+            attr.data,
+        )?;
+        if u16::try_from(attr_bytes.len()).is_err() {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
 }
 
 /// Compute the Jenkins lookup3 hash of a link name (mirrors `H5_checksum_lookup3`).
@@ -1077,10 +1137,14 @@ fn build_v2_object_header(messages: &[(u16, &[u8])], flags: u8) -> Result<Vec<u8
     Ok(buf)
 }
 
-/// Encode a new-style fill-value message (mirrors `H5O__fill_new_encode`).
-fn encode_fill_value_message(fill: Option<FillValueSpec<'_>>) -> Result<Vec<u8>> {
+/// Append a new-style fill-value message (mirrors `H5O__fill_new_encode`).
+fn encode_fill_value_message_into(
+    buf: &mut Vec<u8>,
+    fill: Option<FillValueSpec<'_>>,
+) -> Result<()> {
     let Some(fill) = fill else {
-        return Ok(vec![3u8, 0x09]);
+        buf.extend_from_slice(&[3u8, 0x09]);
+        return Ok(());
     };
     if fill.alloc_time > 3 {
         return Err(Error::InvalidFormat(format!(
@@ -1096,7 +1160,7 @@ fn encode_fill_value_message(fill: Option<FillValueSpec<'_>>) -> Result<Vec<u8>>
     }
 
     let mut flags = fill.alloc_time | (fill.fill_time << 2);
-    let mut buf = vec![3u8];
+    buf.push(3u8);
     if let Some(value) = fill.value {
         flags |= 0x20;
         buf.push(flags);
@@ -1110,29 +1174,41 @@ fn encode_fill_value_message(fill: Option<FillValueSpec<'_>>) -> Result<Vec<u8>>
         flags |= 0x10;
         buf.push(flags);
     }
-    Ok(buf)
+    Ok(())
 }
 
 /// Encode a global heap collection (mirrors `H5HG__cache_heap_serialize`).
-fn encode_global_heap_collection(objects: &[Vec<u8>], sizeof_size: u8) -> Result<Vec<u8>> {
-    if sizeof_size != 8 {
-        return Err(Error::Unsupported(
-            "global heap writer currently requires 8-byte size fields".into(),
-        ));
+const MAX_GLOBAL_HEAP_OBJECTS_PER_COLLECTION: usize = u16::MAX as usize;
+
+fn encode_global_heap_collection<T: AsRef<[u8]>>(
+    objects: &[T],
+    sizeof_size: u8,
+) -> Result<Vec<u8>> {
+    if sizeof_size == 0 || sizeof_size > 8 {
+        return Err(Error::InvalidFormat(format!(
+            "global heap size field width {sizeof_size} is invalid"
+        )));
     }
-    if u16::try_from(objects.len()).is_err() {
+    if objects.len() > MAX_GLOBAL_HEAP_OBJECTS_PER_COLLECTION {
         return Err(Error::InvalidFormat(
             "too many global heap objects for vlen string dataset".into(),
         ));
     }
 
+    let size_len = usize::from(sizeof_size);
+    let heap_header_len = 8usize
+        .checked_add(size_len)
+        .ok_or_else(|| Error::InvalidFormat("global heap header size overflow".into()))?;
+    let object_header_len = heap_header_len;
+
     let mut buf = Vec::new();
     buf.extend_from_slice(b"GCOL");
     buf.push(1);
     buf.extend_from_slice(&[0; 3]);
-    buf.extend_from_slice(&0u64.to_le_bytes());
+    append_encoded_size(&mut buf, 0, sizeof_size)?;
 
     for (idx, object) in objects.iter().enumerate() {
+        let object = object.as_ref();
         let object_size = u64::try_from(object.len()).map_err(|_| {
             Error::InvalidFormat("global heap object length does not fit in u64".into())
         })?;
@@ -1149,7 +1225,7 @@ fn encode_global_heap_collection(objects: &[Vec<u8>], sizeof_size: u8) -> Result
         buf.extend_from_slice(&object_index.to_le_bytes());
         buf.extend_from_slice(&0u16.to_le_bytes());
         buf.extend_from_slice(&[0; 4]);
-        buf.extend_from_slice(&object_size.to_le_bytes());
+        append_encoded_size(&mut buf, object_size, sizeof_size)?;
         buf.extend_from_slice(object);
         let padded_end = buf
             .len()
@@ -1173,14 +1249,25 @@ fn encode_global_heap_collection(objects: &[Vec<u8>], sizeof_size: u8) -> Result
     buf.extend_from_slice(&[0; 4]);
     let free_size = u64::try_from(free_size)
         .map_err(|_| Error::InvalidFormat("global heap free object size exceeds u64".into()))?;
-    buf.extend_from_slice(&free_size.to_le_bytes());
+    append_encoded_size(&mut buf, free_size, sizeof_size)?;
+    debug_assert_eq!(
+        buf.len(),
+        object_header_len + (target_size - free_size as usize)
+    );
     buf.resize(target_size, 0);
 
     let collection_size = u64::try_from(buf.len()).map_err(|_| {
         Error::InvalidFormat("global heap collection length does not fit in u64".into())
     })?;
-    checked_window_mut(&mut buf, 8, 8, "global heap collection size")?
-        .copy_from_slice(&collection_size.to_le_bytes());
+    if collection_size > encoded_width_max(sizeof_size) {
+        return Err(Error::InvalidFormat(format!(
+            "global heap collection size {collection_size:#x} does not fit in {sizeof_size} bytes"
+        )));
+    }
+    let encoded_collection_size = collection_size.to_le_bytes();
+    checked_window_mut(&mut buf, 8, size_len, "global heap collection size")?
+        .copy_from_slice(&encoded_collection_size[..size_len]);
+    debug_assert!(buf.len() >= heap_header_len);
     Ok(buf)
 }
 
@@ -1267,6 +1354,20 @@ fn read_u64_le_at(data: &[u8], pos: usize, context: &str) -> Result<u64> {
     Ok(u64::from_le_bytes(bytes.try_into().map_err(|_| {
         Error::InvalidFormat(format!("{context} is truncated"))
     })?))
+}
+
+/// Read a little-endian encoded size field from `data` at `pos`.
+#[cfg(test)]
+fn read_encoded_size_le_at(data: &[u8], pos: usize, sizeof_size: u8, context: &str) -> Result<u64> {
+    if sizeof_size == 0 || sizeof_size > 8 {
+        return Err(Error::InvalidFormat(format!(
+            "{context} width {sizeof_size} is invalid"
+        )));
+    }
+    let bytes = checked_window(data, pos, usize::from(sizeof_size), context)?;
+    let mut encoded = [0; 8];
+    encoded[..bytes.len()].copy_from_slice(bytes);
+    Ok(u64::from_le_bytes(encoded))
 }
 
 /// Hash a dense-link record using its name field.
@@ -1694,8 +1795,10 @@ impl<W: Write + Seek> HdfFileWriter<W> {
         self.ensure_child_name_available(parent, spec.name)?;
         validate_unique_attr_names(attrs)?;
         validate_dataset_data_len(spec)?;
-        let dtype_bytes = spec.dtype.encode()?;
-        let ds_bytes = encode_dataspace_for_spec(spec)?;
+        let mut dtype_bytes = Vec::new();
+        spec.dtype.encode_into(&mut dtype_bytes)?;
+        let mut ds_bytes = Vec::new();
+        encode_dataspace_for_spec_into(&mut ds_bytes, spec)?;
         let compact_data_len = u16::try_from(spec.data.len()).map_err(|_| {
             Error::InvalidFormat(format!(
                 "compact dataset payload is {} bytes, maximum is {}",
@@ -1710,7 +1813,8 @@ impl<W: Write + Seek> HdfFileWriter<W> {
         layout_bytes.extend_from_slice(&compact_data_len.to_le_bytes());
         layout_bytes.extend_from_slice(spec.data);
 
-        let fill_value_bytes = encode_fill_value_message(fill)?;
+        let mut fill_value_bytes = Vec::new();
+        encode_fill_value_message_into(&mut fill_value_bytes, fill)?;
         let mut messages: Vec<(u16, Vec<u8>)> = vec![
             (MSG_DATASPACE, ds_bytes),
             (MSG_DATATYPE, dtype_bytes),
@@ -1718,18 +1822,31 @@ impl<W: Write + Seek> HdfFileWriter<W> {
             (MSG_LAYOUT, layout_bytes),
         ];
 
-        if attrs.len() > 8 {
+        if attrs_need_dense_storage(attrs)? {
             let (heap_addr, btree_addr) = self.write_dense_attribute_storage(attrs)?;
-            messages.push((
-                MSG_ATTR_INFO,
-                encode_attr_info_message(heap_addr, btree_addr, self.sizeof_addr)?,
-            ));
+            messages.push((MSG_ATTR_INFO, {
+                let mut attr_info = Vec::new();
+                encode_attr_info_message_into(
+                    &mut attr_info,
+                    heap_addr,
+                    btree_addr,
+                    self.sizeof_addr,
+                )?;
+                attr_info
+            }));
         } else {
             for attr in attrs {
-                messages.push((
-                    MSG_ATTRIBUTE,
-                    encode_attribute_message(attr.name, &attr.dtype, attr.shape, attr.data)?,
-                ));
+                messages.push((MSG_ATTRIBUTE, {
+                    let mut attr_msg = Vec::new();
+                    encode_attribute_message_into(
+                        &mut attr_msg,
+                        attr.name,
+                        &attr.dtype,
+                        attr.shape,
+                        attr.data,
+                    )?;
+                    attr_msg
+                }));
             }
         }
 
@@ -1757,8 +1874,10 @@ impl<W: Write + Seek> HdfFileWriter<W> {
     ) -> Result<u64> {
         self.ensure_child_name_available(parent, spec.name)?;
         validate_dataset_data_len(spec)?;
-        let dtype_bytes = spec.dtype.encode()?;
-        let ds_bytes = encode_dataspace_for_spec(spec)?;
+        let mut dtype_bytes = Vec::new();
+        spec.dtype.encode_into(&mut dtype_bytes)?;
+        let mut ds_bytes = Vec::new();
+        encode_dataspace_for_spec_into(&mut ds_bytes, spec)?;
         let compact_data_len = u16::try_from(spec.data.len()).map_err(|_| {
             Error::InvalidFormat(format!(
                 "compact dataset payload is {} bytes, maximum is {}",
@@ -1774,7 +1893,8 @@ impl<W: Write + Seek> HdfFileWriter<W> {
         layout_bytes.extend_from_slice(&compact_data_len.to_le_bytes());
         layout_bytes.extend_from_slice(spec.data);
 
-        let fill_value_bytes = encode_fill_value_message(fill)?;
+        let mut fill_value_bytes = Vec::new();
+        encode_fill_value_message_into(&mut fill_value_bytes, fill)?;
 
         let messages: Vec<(u16, &[u8])> = vec![
             (MSG_DATASPACE, &ds_bytes),
@@ -1810,8 +1930,10 @@ impl<W: Write + Seek> HdfFileWriter<W> {
     ) -> Result<u64> {
         self.ensure_child_name_available(parent, spec.name)?;
         validate_dataset_data_len(spec)?;
-        let dtype_bytes = spec.dtype.encode()?;
-        let ds_bytes = encode_dataspace_for_spec(spec)?;
+        let mut dtype_bytes = Vec::new();
+        spec.dtype.encode_into(&mut dtype_bytes)?;
+        let mut ds_bytes = Vec::new();
+        encode_dataspace_for_spec_into(&mut ds_bytes, spec)?;
 
         // Allocate space for the data
         let data_size = u64_from_usize_writer(spec.data.len(), "dataset data size")?;
@@ -1823,10 +1945,17 @@ impl<W: Write + Seek> HdfFileWriter<W> {
             UNDEF_ADDR
         };
 
-        let layout_bytes =
-            encode_contiguous_layout(data_addr, data_size, self.sizeof_addr, self.sizeof_size)?;
+        let mut layout_bytes = Vec::new();
+        encode_contiguous_layout_into(
+            &mut layout_bytes,
+            data_addr,
+            data_size,
+            self.sizeof_addr,
+            self.sizeof_size,
+        )?;
 
-        let fill_value_bytes = encode_fill_value_message(fill)?;
+        let mut fill_value_bytes = Vec::new();
+        encode_fill_value_message_into(&mut fill_value_bytes, fill)?;
 
         let messages: Vec<(u16, &[u8])> = vec![
             (MSG_DATASPACE, &ds_bytes),
@@ -1881,72 +2010,23 @@ impl<W: Write + Seek> HdfFileWriter<W> {
             )));
         }
 
-        let mut heap_objects = Vec::new();
-        let mut heap_indices = vec![0u32; strings.len()];
-        for (pos, value) in strings.iter().enumerate().rev() {
-            heap_objects.push(value.as_bytes().to_vec());
-            heap_indices[pos] = u32::try_from(heap_objects.len())
-                .map_err(|_| Error::InvalidFormat("global heap object index exceeds u32".into()))?;
-        }
-
-        let heap_bytes = if strings.is_empty() {
-            None
-        } else {
-            Some(encode_global_heap_collection(
-                &heap_objects,
-                self.sizeof_size,
-            )?)
-        };
-
-        let vlen_descriptor_size =
-            usize::try_from(DtypeSpec::VarLenUtf8String.size()).map_err(|_| {
-                Error::InvalidFormat("vlen string descriptor size exceeds usize".into())
-            })?;
-        let vlen_payload_size =
-            strings
-                .len()
-                .checked_mul(vlen_descriptor_size)
-                .ok_or_else(|| {
-                    Error::InvalidFormat("vlen string descriptor payload size overflow".into())
-                })?;
-
+        let data = self.prepare_vlen_utf8_string_data(strings)?;
+        let vlen_payload_size = data.len();
         let data_addr = if vlen_payload_size == 0 {
             UNDEF_ADDR
         } else {
-            self.allocator.allocate(
+            let addr = self.allocator.allocate(
                 u64::try_from(vlen_payload_size).map_err(|_| {
                     Error::InvalidFormat("vlen string descriptor payload too large".into())
                 })?,
                 8,
-            )
-        };
-        let heap_addr = if let Some(heap_bytes) = &heap_bytes {
-            self.allocator.allocate(
-                u64::try_from(heap_bytes.len())
-                    .map_err(|_| Error::InvalidFormat("global heap collection too large".into()))?,
-                8,
-            )
-        } else {
-            UNDEF_ADDR
+            );
+            self.write_at(addr, &data)?;
+            addr
         };
 
-        let mut data = Vec::with_capacity(vlen_payload_size);
-        for (value, index) in strings.iter().zip(heap_indices) {
-            let len = u32::try_from(value.len())
-                .map_err(|_| Error::InvalidFormat("vlen string length exceeds u32".into()))?;
-            data.extend_from_slice(&len.to_le_bytes());
-            data.extend_from_slice(&heap_addr.to_le_bytes());
-            data.extend_from_slice(&index.to_le_bytes());
-        }
-
-        if data_addr != UNDEF_ADDR {
-            self.write_at(data_addr, &data)?;
-        }
-        if let Some(heap_bytes) = &heap_bytes {
-            self.write_at(heap_addr, heap_bytes)?;
-        }
-
-        let dtype_bytes = DtypeSpec::VarLenUtf8String.encode()?;
+        let mut dtype_bytes = Vec::new();
+        DtypeSpec::VarLenUtf8String.encode_into(&mut dtype_bytes)?;
         let spec = DatasetSpec {
             name,
             shape,
@@ -1954,8 +2034,11 @@ impl<W: Write + Seek> HdfFileWriter<W> {
             dtype: DtypeSpec::VarLenUtf8String,
             data: &data,
         };
-        let ds_bytes = encode_dataspace_for_spec(&spec)?;
-        let layout_bytes = encode_contiguous_layout(
+        let mut ds_bytes = Vec::new();
+        encode_dataspace_for_spec_into(&mut ds_bytes, &spec)?;
+        let mut layout_bytes = Vec::new();
+        encode_contiguous_layout_into(
+            &mut layout_bytes,
             data_addr,
             u64::try_from(vlen_payload_size).map_err(|_| {
                 Error::InvalidFormat("vlen string descriptor payload too large".into())
@@ -1963,7 +2046,8 @@ impl<W: Write + Seek> HdfFileWriter<W> {
             self.sizeof_addr,
             self.sizeof_size,
         )?;
-        let fill_value_bytes = encode_fill_value_message(None)?;
+        let mut fill_value_bytes = Vec::new();
+        encode_fill_value_message_into(&mut fill_value_bytes, None)?;
 
         let mut messages: Vec<(u16, Vec<u8>)> = vec![
             (MSG_DATASPACE, ds_bytes),
@@ -1972,16 +2056,28 @@ impl<W: Write + Seek> HdfFileWriter<W> {
             (MSG_LAYOUT, layout_bytes),
         ];
 
-        if attrs.len() > 8 {
+        if attrs_need_dense_storage(attrs)? {
             let (heap_addr, btree_addr) = self.write_dense_attribute_storage(attrs)?;
-            messages.push((
-                MSG_ATTR_INFO,
-                encode_attr_info_message(heap_addr, btree_addr, self.sizeof_addr)?,
-            ));
+            messages.push((MSG_ATTR_INFO, {
+                let mut attr_info = Vec::new();
+                encode_attr_info_message_into(
+                    &mut attr_info,
+                    heap_addr,
+                    btree_addr,
+                    self.sizeof_addr,
+                )?;
+                attr_info
+            }));
         } else {
             for attr in attrs {
-                let attr_bytes =
-                    encode_attribute_message(attr.name, &attr.dtype, attr.shape, attr.data)?;
+                let mut attr_bytes = Vec::new();
+                encode_attribute_message_into(
+                    &mut attr_bytes,
+                    attr.name,
+                    &attr.dtype,
+                    attr.shape,
+                    attr.data,
+                )?;
                 messages.push((MSG_ATTRIBUTE, attr_bytes));
             }
         }
@@ -1999,6 +2095,123 @@ impl<W: Write + Seek> HdfFileWriter<W> {
             .push((parent.to_string(), name.to_string(), oh_addr));
 
         Ok(oh_addr)
+    }
+
+    /// Chunked variable-length UTF-8 string dataset backed by a global heap.
+    pub fn create_chunked_vlen_utf8_string_dataset_with_attrs(
+        &mut self,
+        parent: &str,
+        name: &str,
+        shape: &[u64],
+        strings: &[&str],
+        max_shape: Option<&[u64]>,
+        chunk_dims: &[u64],
+        compression_level: Option<u32>,
+        shuffle: bool,
+        fletcher32: bool,
+        attrs: &[AttrSpec],
+    ) -> Result<u64> {
+        self.ensure_child_name_available(parent, name)?;
+        validate_unique_attr_names(attrs)?;
+
+        let expected_count = shape_element_count(shape)?;
+        let string_count = u64_from_usize_writer(strings.len(), "vlen string count")?;
+        if expected_count != string_count {
+            return Err(Error::InvalidFormat(format!(
+                "vlen string data length {} does not match dataset shape element count {expected_count}",
+                strings.len()
+            )));
+        }
+
+        let data = self.prepare_vlen_utf8_string_data(strings)?;
+        let spec = DatasetSpec {
+            name,
+            shape,
+            max_shape,
+            dtype: DtypeSpec::VarLenUtf8String,
+            data: &data,
+        };
+        self.create_chunked_dataset_with_attrs_and_fill(
+            parent,
+            &spec,
+            chunk_dims,
+            compression_level,
+            shuffle,
+            fletcher32,
+            None,
+            attrs,
+        )
+    }
+
+    fn prepare_vlen_utf8_string_data(&mut self, strings: &[&str]) -> Result<Vec<u8>> {
+        let mut heap_collections: Vec<Vec<&[u8]>> = Vec::new();
+        let mut heap_refs = Vec::with_capacity(strings.len());
+        for value in strings {
+            if heap_collections
+                .last()
+                .map(|objects| objects.len() == MAX_GLOBAL_HEAP_OBJECTS_PER_COLLECTION)
+                .unwrap_or(true)
+            {
+                heap_collections.push(Vec::new());
+            }
+            let collection_index = heap_collections
+                .len()
+                .checked_sub(1)
+                .ok_or_else(|| Error::InvalidFormat("missing global heap collection".into()))?;
+            let objects = heap_collections
+                .last_mut()
+                .expect("global heap collection was just created when missing");
+            objects.push(value.as_bytes());
+            let object_index = u32::try_from(objects.len())
+                .map_err(|_| Error::InvalidFormat("global heap object index exceeds u32".into()))?;
+            heap_refs.push((collection_index, object_index));
+        }
+
+        let mut heap_bytes = Vec::with_capacity(heap_collections.len());
+        for objects in &heap_collections {
+            heap_bytes.push(encode_global_heap_collection(objects, self.sizeof_size)?);
+        }
+
+        let vlen_descriptor_size =
+            usize::try_from(DtypeSpec::VarLenUtf8String.size()).map_err(|_| {
+                Error::InvalidFormat("vlen string descriptor size exceeds usize".into())
+            })?;
+        let vlen_payload_size =
+            strings
+                .len()
+                .checked_mul(vlen_descriptor_size)
+                .ok_or_else(|| {
+                    Error::InvalidFormat("vlen string descriptor payload size overflow".into())
+                })?;
+
+        let mut heap_addrs = Vec::with_capacity(heap_bytes.len());
+        for heap in &heap_bytes {
+            heap_addrs.push(
+                self.allocator.allocate(
+                    u64::try_from(heap.len()).map_err(|_| {
+                        Error::InvalidFormat("global heap collection too large".into())
+                    })?,
+                    8,
+                ),
+            );
+        }
+
+        let mut data = Vec::with_capacity(vlen_payload_size);
+        for (value, (collection_index, object_index)) in strings.iter().zip(heap_refs) {
+            let len = u32::try_from(value.len())
+                .map_err(|_| Error::InvalidFormat("vlen string length exceeds u32".into()))?;
+            let heap_addr = heap_addrs.get(collection_index).copied().ok_or_else(|| {
+                Error::InvalidFormat("missing global heap address for vlen string".into())
+            })?;
+            data.extend_from_slice(&len.to_le_bytes());
+            data.extend_from_slice(&heap_addr.to_le_bytes());
+            data.extend_from_slice(&object_index.to_le_bytes());
+        }
+
+        for (heap_addr, heap) in heap_addrs.iter().copied().zip(&heap_bytes) {
+            self.write_at(heap_addr, heap)?;
+        }
+        Ok(data)
     }
 
     /// Create a dataset with attributes.
@@ -2022,8 +2235,10 @@ impl<W: Write + Seek> HdfFileWriter<W> {
         self.ensure_child_name_available(parent, spec.name)?;
         validate_unique_attr_names(attrs)?;
         validate_dataset_data_len(spec)?;
-        let dtype_bytes = spec.dtype.encode()?;
-        let ds_bytes = encode_dataspace_for_spec(spec)?;
+        let mut dtype_bytes = Vec::new();
+        spec.dtype.encode_into(&mut dtype_bytes)?;
+        let mut ds_bytes = Vec::new();
+        encode_dataspace_for_spec_into(&mut ds_bytes, spec)?;
 
         let data_size = u64_from_usize_writer(spec.data.len(), "dataset data size")?;
         let data_addr = if data_size > 0 {
@@ -2034,9 +2249,16 @@ impl<W: Write + Seek> HdfFileWriter<W> {
             UNDEF_ADDR
         };
 
-        let layout_bytes =
-            encode_contiguous_layout(data_addr, data_size, self.sizeof_addr, self.sizeof_size)?;
-        let fill_value_bytes = encode_fill_value_message(fill)?;
+        let mut layout_bytes = Vec::new();
+        encode_contiguous_layout_into(
+            &mut layout_bytes,
+            data_addr,
+            data_size,
+            self.sizeof_addr,
+            self.sizeof_size,
+        )?;
+        let mut fill_value_bytes = Vec::new();
+        encode_fill_value_message_into(&mut fill_value_bytes, fill)?;
 
         let mut messages: Vec<(u16, Vec<u8>)> = vec![
             (MSG_DATASPACE, ds_bytes),
@@ -2045,16 +2267,28 @@ impl<W: Write + Seek> HdfFileWriter<W> {
             (MSG_LAYOUT, layout_bytes),
         ];
 
-        if attrs.len() > 8 {
+        if attrs_need_dense_storage(attrs)? {
             let (heap_addr, btree_addr) = self.write_dense_attribute_storage(attrs)?;
-            messages.push((
-                MSG_ATTR_INFO,
-                encode_attr_info_message(heap_addr, btree_addr, self.sizeof_addr)?,
-            ));
+            messages.push((MSG_ATTR_INFO, {
+                let mut attr_info = Vec::new();
+                encode_attr_info_message_into(
+                    &mut attr_info,
+                    heap_addr,
+                    btree_addr,
+                    self.sizeof_addr,
+                )?;
+                attr_info
+            }));
         } else {
             for attr in attrs {
-                let attr_bytes =
-                    encode_attribute_message(attr.name, &attr.dtype, attr.shape, attr.data)?;
+                let mut attr_bytes = Vec::new();
+                encode_attribute_message_into(
+                    &mut attr_bytes,
+                    attr.name,
+                    &attr.dtype,
+                    attr.shape,
+                    attr.data,
+                )?;
                 messages.push((MSG_ATTRIBUTE, attr_bytes));
             }
         }
@@ -2224,8 +2458,10 @@ impl<W: Write + Seek> HdfFileWriter<W> {
         self.ensure_child_name_available(parent, spec.name)?;
         validate_unique_attr_names(attrs)?;
         validate_dataset_data_len(spec)?;
-        let dtype_bytes = spec.dtype.encode()?;
-        let ds_bytes = encode_dataspace_for_spec(spec)?;
+        let mut dtype_bytes = Vec::new();
+        spec.dtype.encode_into(&mut dtype_bytes)?;
+        let mut ds_bytes = Vec::new();
+        encode_dataspace_for_spec_into(&mut ds_bytes, spec)?;
         let element_size = usize::try_from(spec.dtype.size())
             .map_err(|_| Error::InvalidFormat("dataset element size exceeds usize".into()))?;
         let ndims = spec.shape.len();
@@ -2249,8 +2485,8 @@ impl<W: Write + Seek> HdfFileWriter<W> {
                 .ok_or_else(|| Error::InvalidFormat("total chunk count overflow".into()))
         })?;
 
-        // Write each chunk and collect (coords, addr, compressed_size)
-        let mut chunk_entries: Vec<(Vec<u64>, u64, u32)> = Vec::new();
+        // Write each chunk and collect v1 B-tree entries.
+        let mut chunk_entries: Vec<ChunkBTreeEntry> = Vec::with_capacity(total_chunks);
 
         for chunk_idx in 0..total_chunks {
             // Calculate chunk coordinates
@@ -2280,13 +2516,17 @@ impl<W: Write + Seek> HdfFileWriter<W> {
             // Apply filters in forward order
             let mut filtered = chunk_buf;
             if shuffle {
-                filtered = crate::filters::shuffle::shuffle(&filtered, element_size)?;
+                let mut shuffled = vec![0u8; filtered.len()];
+                crate::filters::shuffle::shuffle_into(&filtered, element_size, &mut shuffled)?;
+                filtered = shuffled;
             }
             if let Some(level) = compression_level {
-                filtered = crate::filters::deflate::compress(&filtered, level)?;
+                let mut compressed = Vec::new();
+                crate::filters::deflate::compress_into(&filtered, level, &mut compressed)?;
+                filtered = compressed;
             }
             if fletcher32 {
-                filtered = crate::filters::fletcher32::append_checksum(&filtered)?;
+                crate::filters::fletcher32::append_checksum_in_place(&mut filtered)?;
             }
 
             let compressed_size = u32::try_from(filtered.len())
@@ -2299,22 +2539,35 @@ impl<W: Write + Seek> HdfFileWriter<W> {
             );
             self.write_at(addr, &filtered)?;
 
-            chunk_entries.push((coords, addr, compressed_size));
+            chunk_entries.push(ChunkBTreeEntry {
+                coords,
+                chunk_size: compressed_size,
+                filter_mask: 0,
+                child_addr: addr,
+            });
         }
 
         // Write v1 B-tree for chunk index
         let element_size = u32::try_from(element_size)
             .map_err(|_| Error::InvalidFormat("chunk element size exceeds u32".into()))?;
-        let btree_addr = self.write_chunk_btree_v1(&chunk_entries, ndims, element_size)?;
+        let btree_addr = self.write_chunk_btree_entries_v1(&chunk_entries, ndims, element_size)?;
 
         // Encode layout message (v3 chunked)
-        let layout_bytes =
-            encode_chunked_layout_v3(btree_addr, chunk_dims, element_size, self.sizeof_addr)?;
+        let mut layout_bytes = Vec::new();
+        encode_chunked_layout_v3_into(
+            &mut layout_bytes,
+            btree_addr,
+            chunk_dims,
+            element_size,
+            self.sizeof_addr,
+        )?;
 
         // Encode filter pipeline message
-        let pipeline_bytes = encode_filter_pipeline(compression_level, shuffle, fletcher32)?;
+        let mut pipeline_bytes = Vec::new();
+        encode_filter_pipeline_into(&mut pipeline_bytes, compression_level, shuffle, fletcher32)?;
 
-        let fill_value_bytes = encode_fill_value_message(fill)?;
+        let mut fill_value_bytes = Vec::new();
+        encode_fill_value_message_into(&mut fill_value_bytes, fill)?;
 
         let mut messages: Vec<(u16, Vec<u8>)> = vec![
             (MSG_DATASPACE, ds_bytes),
@@ -2326,18 +2579,31 @@ impl<W: Write + Seek> HdfFileWriter<W> {
             messages.push((MSG_FILTER_PIPELINE, pipeline_bytes));
         }
 
-        if attrs.len() > 8 {
+        if attrs_need_dense_storage(attrs)? {
             let (heap_addr, btree_addr) = self.write_dense_attribute_storage(attrs)?;
-            messages.push((
-                MSG_ATTR_INFO,
-                encode_attr_info_message(heap_addr, btree_addr, self.sizeof_addr)?,
-            ));
+            messages.push((MSG_ATTR_INFO, {
+                let mut attr_info = Vec::new();
+                encode_attr_info_message_into(
+                    &mut attr_info,
+                    heap_addr,
+                    btree_addr,
+                    self.sizeof_addr,
+                )?;
+                attr_info
+            }));
         } else {
             for attr in attrs {
-                messages.push((
-                    MSG_ATTRIBUTE,
-                    encode_attribute_message(attr.name, &attr.dtype, attr.shape, attr.data)?,
-                ));
+                messages.push((MSG_ATTRIBUTE, {
+                    let mut attr_msg = Vec::new();
+                    encode_attribute_message_into(
+                        &mut attr_msg,
+                        attr.name,
+                        &attr.dtype,
+                        attr.shape,
+                        attr.data,
+                    )?;
+                    attr_msg
+                }));
             }
         }
 
@@ -2477,25 +2743,6 @@ impl<W: Write + Seek> HdfFileWriter<W> {
         Ok(())
     }
 
-    /// Write a v1 B-tree leaf node for chunk index.
-    fn write_chunk_btree_v1(
-        &mut self,
-        chunks: &[(Vec<u64>, u64, u32)],
-        ndims: usize,
-        element_size: u32,
-    ) -> Result<u64> {
-        let entries: Vec<ChunkBTreeEntry> = chunks
-            .iter()
-            .map(|(coords, addr, compressed_size)| ChunkBTreeEntry {
-                coords: coords.clone(),
-                chunk_size: *compressed_size,
-                filter_mask: 0,
-                child_addr: *addr,
-            })
-            .collect();
-        self.write_chunk_btree_entries_v1(&entries, ndims, element_size)
-    }
-
     /// Write the leaf entries of a v1 chunk B-tree.
     fn write_chunk_btree_entries_v1(
         &mut self,
@@ -2508,49 +2755,75 @@ impl<W: Write + Seek> HdfFileWriter<W> {
             u64_from_usize_writer(node_size, "chunk B-tree node size")?,
             8,
         );
-        let final_coords = entries[entries.len() - 1].coords.clone();
+        let final_coords = entries[entries.len() - 1].coords.as_slice();
 
         if entries.len() <= 64 {
             let leaf =
-                self.encode_chunk_btree_node_v1(0, entries, &final_coords, ndims, element_size)?;
+                self.encode_chunk_btree_node_v1(0, entries, final_coords, ndims, element_size)?;
             self.write_at(root_addr, &leaf)?;
             return Ok(root_addr);
         }
 
-        let leaf_count = entries.len().div_ceil(64);
-        if leaf_count > 64 {
-            return Err(Error::Unsupported(
-                "writer chunk B-tree currently supports at most a two-level root".into(),
-            ));
-        }
+        let (root_level, root_entries) =
+            self.write_chunk_btree_v1_child_level(entries, 0, ndims, element_size, node_size)?;
+        let root = self.encode_chunk_btree_node_v1(
+            root_level,
+            &root_entries,
+            final_coords,
+            ndims,
+            element_size,
+        )?;
+        self.write_at(root_addr, &root)?;
+        Ok(root_addr)
+    }
 
-        let mut root_entries = Vec::with_capacity(leaf_count);
-        for leaf_entries in entries.chunks(64) {
-            let leaf_addr = self.allocator.allocate(
+    fn write_chunk_btree_v1_child_level(
+        &mut self,
+        entries: &[ChunkBTreeEntry],
+        child_level: u8,
+        ndims: usize,
+        element_size: u32,
+        node_size: usize,
+    ) -> Result<(u8, Vec<ChunkBTreeEntry>)> {
+        let parent_level = child_level
+            .checked_add(1)
+            .ok_or_else(|| Error::InvalidFormat("chunk B-tree level overflow".into()))?;
+        let child_count = entries.len().div_ceil(64);
+        let mut parent_entries = Vec::with_capacity(child_count);
+
+        for child_entries in entries.chunks(64) {
+            let child_addr = self.allocator.allocate(
                 u64_from_usize_writer(node_size, "chunk B-tree node size")?,
                 8,
             );
-            let leaf_final_coords = leaf_entries[leaf_entries.len() - 1].coords.clone();
-            let leaf = self.encode_chunk_btree_node_v1(
-                0,
-                leaf_entries,
-                &leaf_final_coords,
+            let child_final_coords = child_entries[child_entries.len() - 1].coords.as_slice();
+            let child = self.encode_chunk_btree_node_v1(
+                child_level,
+                child_entries,
+                child_final_coords,
                 ndims,
                 element_size,
             )?;
-            self.write_at(leaf_addr, &leaf)?;
-            root_entries.push(ChunkBTreeEntry {
-                coords: leaf_entries[0].coords.clone(),
-                chunk_size: leaf_entries[0].chunk_size,
-                filter_mask: leaf_entries[0].filter_mask,
-                child_addr: leaf_addr,
+            self.write_at(child_addr, &child)?;
+            parent_entries.push(ChunkBTreeEntry {
+                coords: child_entries[0].coords.clone(),
+                chunk_size: child_entries[0].chunk_size,
+                filter_mask: child_entries[0].filter_mask,
+                child_addr,
             });
         }
 
-        let root =
-            self.encode_chunk_btree_node_v1(1, &root_entries, &final_coords, ndims, element_size)?;
-        self.write_at(root_addr, &root)?;
-        Ok(root_addr)
+        if parent_entries.len() <= 64 {
+            Ok((parent_level, parent_entries))
+        } else {
+            self.write_chunk_btree_v1_child_level(
+                &parent_entries,
+                parent_level,
+                ndims,
+                element_size,
+                node_size,
+            )
+        }
     }
 
     /// Compute the encoded size of one v1 chunk B-tree node.
@@ -2634,23 +2907,14 @@ impl<W: Write + Seek> HdfFileWriter<W> {
     }
 
     /// Write the fractal-heap and B-tree storage for dense links (mirrors `H5G__dense_create`).
-    fn write_dense_link_storage(&mut self, links: &[(String, u64)]) -> Result<(u64, u64)> {
-        let mut payloads = Vec::with_capacity(links.len());
-        let mut managed_size = 0u64;
-        for (name, addr) in links {
-            let link_bytes = encode_dense_link_message(name, *addr, self.sizeof_addr)?;
-            managed_size = managed_size
-                .checked_add(u64_from_usize_writer(
-                    link_bytes.len(),
-                    "dense link payload size",
-                )?)
-                .ok_or_else(|| Error::InvalidFormat("dense link heap size overflow".into()))?;
-            payloads.push((name.as_str(), link_bytes));
-        }
-
+    fn write_dense_link_storage(&mut self, links: &[(String, Vec<u8>)]) -> Result<(u64, u64)> {
+        let payloads: Vec<Vec<u8>> = links
+            .iter()
+            .map(|(_, link_bytes)| link_bytes.clone())
+            .collect();
         let (heap_addr, heap_ids) = self.write_managed_fractal_heap(&payloads, 7)?;
         let mut records = Vec::with_capacity(payloads.len());
-        for ((name, _), heap_id) in payloads.iter().zip(heap_ids) {
+        for ((name, _), heap_id) in links.iter().zip(heap_ids) {
             let record_len =
                 checked_usize_sum_writer(&[4, heap_id.len()], "dense link record size")?;
             let mut record = Vec::with_capacity(record_len);
@@ -2669,14 +2933,20 @@ impl<W: Write + Seek> HdfFileWriter<W> {
         validate_unique_attr_names(attrs)?;
         let mut payloads = Vec::with_capacity(attrs.len());
         for attr in attrs {
-            let attr_bytes =
-                encode_attribute_message(attr.name, &attr.dtype, attr.shape, attr.data)?;
-            payloads.push((attr.name, attr_bytes));
+            let mut attr_bytes = Vec::new();
+            encode_attribute_message_into(
+                &mut attr_bytes,
+                attr.name,
+                &attr.dtype,
+                attr.shape,
+                attr.data,
+            )?;
+            payloads.push(attr_bytes);
         }
 
         let (heap_addr, heap_ids) = self.write_managed_fractal_heap(&payloads, 8)?;
         let mut records = Vec::with_capacity(payloads.len());
-        for (creation_order, ((name, _), heap_id)) in payloads.iter().zip(heap_ids).enumerate() {
+        for (creation_order, (attr, heap_id)) in attrs.iter().zip(heap_ids).enumerate() {
             let record_len =
                 checked_usize_sum_writer(&[heap_id.len(), 9], "dense attribute record size")?;
             let mut record = Vec::with_capacity(record_len);
@@ -2689,7 +2959,7 @@ impl<W: Write + Seek> HdfFileWriter<W> {
                     })?
                     .to_le_bytes(),
             );
-            record.extend_from_slice(&dense_name_hash(name).to_le_bytes());
+            record.extend_from_slice(&dense_name_hash(attr.name).to_le_bytes());
             records.push(record);
         }
         records.sort_by_key(|record| {
@@ -2707,7 +2977,7 @@ impl<W: Write + Seek> HdfFileWriter<W> {
     /// Write a minimal managed fractal heap containing the given records.
     fn write_managed_fractal_heap(
         &mut self,
-        payloads: &[(&str, Vec<u8>)],
+        payloads: &[Vec<u8>],
         heap_id_len: u16,
     ) -> Result<(u64, Vec<Vec<u8>>)> {
         let offset_bytes = 4usize;
@@ -2725,10 +2995,11 @@ impl<W: Write + Seek> HdfFileWriter<W> {
                 "managed heap ID length {heap_id_len} leaves unsupported length byte count {length_bytes}"
             )));
         }
-        let payload_bytes = payloads.iter().try_fold(0usize, |acc, (_, payload)| {
+        let payload_bytes = payloads.iter().try_fold(0usize, |acc, payload| {
             acc.checked_add(payload.len())
                 .ok_or_else(|| Error::InvalidFormat("managed heap payload size overflow".into()))
         })?;
+        let max_payload_len = payloads.iter().map(Vec::len).max().unwrap_or(0);
         let needed_block_size = 25usize
             .checked_add(payload_bytes)
             .ok_or_else(|| Error::InvalidFormat("managed heap block size overflow".into()))?;
@@ -2752,7 +3023,7 @@ impl<W: Write + Seek> HdfFileWriter<W> {
         direct.extend_from_slice(&0u32.to_le_bytes());
 
         let mut heap_ids = Vec::with_capacity(payloads.len());
-        for (_, payload) in payloads {
+        for payload in payloads {
             let offset = u32::try_from(direct.len()).map_err(|_| {
                 Error::InvalidFormat("managed heap object offset exceeds u32".into())
             })?;
@@ -2780,16 +3051,10 @@ impl<W: Write + Seek> HdfFileWriter<W> {
             .copy_from_slice(&checksum.to_le_bytes());
         self.write_at(direct_addr, &direct)?;
 
-        let used_managed_space = u64_from_usize_writer(
-            direct.iter().rposition(|byte| *byte != 0).unwrap_or(20),
-            "managed heap used space",
-        )?
-        .checked_add(1)
-        .ok_or_else(|| Error::InvalidFormat("managed heap used space overflow".into()))?;
         let heap = self.encode_minimal_fractal_heap(
             heap_id_len,
             payloads.len(),
-            used_managed_space,
+            u64_from_usize_writer(max_payload_len, "managed heap max payload length")?,
             u64_from_usize_writer(block_size, "fractal heap direct block size")?,
             direct_addr,
         )?;
@@ -2820,20 +3085,23 @@ impl<W: Write + Seek> HdfFileWriter<W> {
         &self,
         heap_id_len: u16,
         managed_nobjs: usize,
-        _managed_size: u64,
+        max_managed_obj_size: u64,
         managed_alloc_size: u64,
         root_block_addr: u64,
     ) -> Result<Vec<u8>> {
         let mut buf = Vec::new();
         let free_space = 0u64;
         let managed_nobjs = u64_from_usize_writer(managed_nobjs, "managed heap object count")?;
+        let max_managed_obj_size = u32::try_from(max_managed_obj_size.max(4096)).map_err(|_| {
+            Error::Unsupported("managed heap payload exceeds u32 max object size".into())
+        })?;
 
         buf.extend_from_slice(b"FRHP");
         buf.push(0);
         buf.extend_from_slice(&heap_id_len.to_le_bytes());
         buf.extend_from_slice(&0u16.to_le_bytes());
         buf.push(0x02);
-        buf.extend_from_slice(&4096u32.to_le_bytes());
+        buf.extend_from_slice(&max_managed_obj_size.to_le_bytes());
         append_encoded_size(&mut buf, 0, self.sizeof_size)?;
         append_encoded_addr(&mut buf, UNDEF_ADDR, self.sizeof_addr)?;
         append_encoded_size(&mut buf, free_space, self.sizeof_size)?;
@@ -2848,7 +3116,7 @@ impl<W: Write + Seek> HdfFileWriter<W> {
         append_encoded_size(&mut buf, 0, self.sizeof_size)?;
         buf.extend_from_slice(&4u16.to_le_bytes());
         append_encoded_size(&mut buf, managed_alloc_size, self.sizeof_size)?;
-        append_encoded_size(&mut buf, 65536, self.sizeof_size)?;
+        append_encoded_size(&mut buf, managed_alloc_size.max(65536), self.sizeof_size)?;
         buf.extend_from_slice(&32u16.to_le_bytes());
         buf.extend_from_slice(&1u16.to_le_bytes());
         append_encoded_addr(&mut buf, root_block_addr, self.sizeof_addr)?;
@@ -2964,22 +3232,50 @@ impl<W: Write + Seek> HdfFileWriter<W> {
                 })
                 .collect();
 
-            let has_special_links = self
-                .special_links
-                .iter()
-                .any(|(parent, _, _)| *parent == path);
-            let has_hard_links = self.hard_links.iter().any(|(parent, _, _)| *parent == path);
             let has_group_attrs = self
                 .pending_group_attr_specs
                 .get(&path)
                 .is_some_and(|attrs| !attrs.is_empty());
 
-            if group_links.is_empty()
-                && !has_special_links
-                && !has_hard_links
-                && !has_group_attrs
-                && path != "/"
-            {
+            let mut link_records = Vec::new();
+            for (name, addr) in &group_links {
+                link_records.push(EncodedLinkRecord {
+                    name: name.clone(),
+                    compact_message: encode_link_message(name, *addr, self.sizeof_addr)?,
+                    dense_message: encode_dense_link_message(name, *addr, self.sizeof_addr)?,
+                });
+            }
+
+            for (parent, name, link_data) in &self.special_links {
+                if *parent == path {
+                    link_records.push(EncodedLinkRecord {
+                        name: name.clone(),
+                        compact_message: link_data.clone(),
+                        dense_message: link_data.clone(),
+                    });
+                }
+            }
+
+            // Resolve explicit hard-link aliases after child groups have been
+            // finalized, because group object headers may have moved.
+            for (parent, name, target_path) in &self.hard_links {
+                if *parent == path {
+                    let target_addr = self.object_addr_for_path(target_path).ok_or_else(|| {
+                        Error::InvalidFormat(format!("hard link target '{target_path}' not found"))
+                    })?;
+                    link_records.push(EncodedLinkRecord {
+                        name: name.clone(),
+                        compact_message: encode_link_message(name, target_addr, self.sizeof_addr)?,
+                        dense_message: encode_dense_link_message(
+                            name,
+                            target_addr,
+                            self.sizeof_addr,
+                        )?,
+                    });
+                }
+            }
+
+            if link_records.is_empty() && !has_group_attrs && path != "/" {
                 continue;
             }
 
@@ -2988,43 +3284,34 @@ impl<W: Write + Seek> HdfFileWriter<W> {
             // name index and heap IDs that point directly at link payloads.
             let mut messages: Vec<(u16, Vec<u8>)> = Vec::new();
 
-            if group_links.len() > 8 {
-                let (heap_addr, btree_addr) = self.write_dense_link_storage(&group_links)?;
+            if link_records.len() > 8 {
+                let dense_links: Vec<(String, Vec<u8>)> = link_records
+                    .iter()
+                    .map(|link| (link.name.clone(), link.dense_message.clone()))
+                    .collect();
+                let (heap_addr, btree_addr) = self.write_dense_link_storage(&dense_links)?;
                 messages.push((MSG_GROUP_INFO, vec![0, 0]));
-                messages.push((
-                    MSG_LINK_INFO,
-                    encode_link_info_message(heap_addr, btree_addr, self.sizeof_addr)?,
-                ));
+                let mut link_info = Vec::new();
+                encode_link_info_message_into(
+                    &mut link_info,
+                    heap_addr,
+                    btree_addr,
+                    self.sizeof_addr,
+                )?;
+                messages.push((MSG_LINK_INFO, link_info));
             } else {
                 messages.push((MSG_GROUP_INFO, vec![0, 0]));
-                let link_info = encode_link_info_message(UNDEF_ADDR, UNDEF_ADDR, self.sizeof_addr)?;
+                let mut link_info = Vec::new();
+                encode_link_info_message_into(
+                    &mut link_info,
+                    UNDEF_ADDR,
+                    UNDEF_ADDR,
+                    self.sizeof_addr,
+                )?;
                 messages.push((MSG_LINK_INFO, link_info));
 
-                for (name, addr) in &group_links {
-                    let link_bytes = encode_link_message(name, *addr, self.sizeof_addr)?;
-                    messages.push((MSG_LINK, link_bytes));
-                }
-            }
-
-            // Add special links (soft/external) for this group
-            for (parent, _, link_data) in &self.special_links {
-                if *parent == path {
-                    messages.push((MSG_LINK, link_data.clone()));
-                }
-            }
-
-            // Add explicit hard-link aliases after resolving final group
-            // addresses. Dataset addresses are stable; group object headers
-            // may have been rewritten earlier in this finalize pass.
-            for (parent, name, target_path) in &self.hard_links {
-                if *parent == path {
-                    let target_addr = self.object_addr_for_path(target_path).ok_or_else(|| {
-                        Error::InvalidFormat(format!("hard link target '{target_path}' not found"))
-                    })?;
-                    messages.push((
-                        MSG_LINK,
-                        encode_link_message(name, target_addr, self.sizeof_addr)?,
-                    ));
+                for link in &link_records {
+                    messages.push((MSG_LINK, link.compact_message.clone()));
                 }
             }
 
@@ -3035,21 +3322,37 @@ impl<W: Write + Seek> HdfFileWriter<W> {
                     messages.push((*msg_type, attr_data.clone()));
                 }
 
-                if self.pending_root_attr_specs.len() > 8 {
-                    let owned_attrs = self.pending_root_attr_specs.clone();
-                    let attr_specs: Vec<AttrSpec<'_>> = owned_attrs
-                        .iter()
-                        .map(OwnedAttrSpec::as_attr_spec)
-                        .collect();
-                    let (heap_addr, btree_addr) =
-                        self.write_dense_attribute_storage(&attr_specs)?;
-                    messages.push((
-                        MSG_ATTR_INFO,
-                        encode_attr_info_message(heap_addr, btree_addr, self.sizeof_addr)?,
-                    ));
+                let root_attr_specs: Vec<AttrSpec<'_>> = self
+                    .pending_root_attr_specs
+                    .iter()
+                    .map(OwnedAttrSpec::as_attr_spec)
+                    .collect();
+                if attrs_need_dense_storage(&root_attr_specs)? {
+                    let root_attrs = std::mem::take(&mut self.pending_root_attr_specs);
+                    let result: Result<()> = (|| {
+                        let attr_specs: Vec<AttrSpec<'_>> =
+                            root_attrs.iter().map(OwnedAttrSpec::as_attr_spec).collect();
+                        let (heap_addr, btree_addr) =
+                            self.write_dense_attribute_storage(&attr_specs)?;
+                        messages.push((MSG_ATTR_INFO, {
+                            let mut attr_info = Vec::new();
+                            encode_attr_info_message_into(
+                                &mut attr_info,
+                                heap_addr,
+                                btree_addr,
+                                self.sizeof_addr,
+                            )?;
+                            attr_info
+                        }));
+                        Ok(())
+                    })();
+                    self.pending_root_attr_specs = root_attrs;
+                    result?;
                 } else {
                     for attr in &self.pending_root_attr_specs {
-                        let attr_bytes = encode_attribute_message(
+                        let mut attr_bytes = Vec::new();
+                        encode_attribute_message_into(
+                            &mut attr_bytes,
                             &attr.name,
                             &attr.dtype,
                             &attr.shape,
@@ -3060,29 +3363,43 @@ impl<W: Write + Seek> HdfFileWriter<W> {
                 }
             }
 
-            if let Some(group_attrs) = self.pending_group_attr_specs.get(&path).cloned() {
-                if group_attrs.len() > 8 {
+            if let Some(group_attrs) = self.pending_group_attr_specs.remove(&path) {
+                let result: Result<()> = (|| {
                     let attr_specs: Vec<AttrSpec<'_>> = group_attrs
                         .iter()
                         .map(OwnedAttrSpec::as_attr_spec)
                         .collect();
-                    let (heap_addr, btree_addr) =
-                        self.write_dense_attribute_storage(&attr_specs)?;
-                    messages.push((
-                        MSG_ATTR_INFO,
-                        encode_attr_info_message(heap_addr, btree_addr, self.sizeof_addr)?,
-                    ));
-                } else {
-                    for attr in &group_attrs {
-                        let attr_bytes = encode_attribute_message(
-                            &attr.name,
-                            &attr.dtype,
-                            &attr.shape,
-                            &attr.data,
-                        )?;
-                        messages.push((MSG_ATTRIBUTE, attr_bytes));
+                    if attrs_need_dense_storage(&attr_specs)? {
+                        let (heap_addr, btree_addr) =
+                            self.write_dense_attribute_storage(&attr_specs)?;
+                        messages.push((MSG_ATTR_INFO, {
+                            let mut attr_info = Vec::new();
+                            encode_attr_info_message_into(
+                                &mut attr_info,
+                                heap_addr,
+                                btree_addr,
+                                self.sizeof_addr,
+                            )?;
+                            attr_info
+                        }));
+                    } else {
+                        for attr in &group_attrs {
+                            let mut attr_bytes = Vec::new();
+                            encode_attribute_message_into(
+                                &mut attr_bytes,
+                                &attr.name,
+                                &attr.dtype,
+                                &attr.shape,
+                                &attr.data,
+                            )?;
+                            messages.push((MSG_ATTRIBUTE, attr_bytes));
+                        }
                     }
-                }
+                    Ok(())
+                })();
+                self.pending_group_attr_specs
+                    .insert(path.clone(), group_attrs);
+                result?;
             }
 
             let msg_refs: Vec<(u16, &[u8])> =
@@ -3173,8 +3490,8 @@ fn child_path(parent: &str, name: &str) -> String {
 mod tests {
     use super::{
         ceil_div_nonzero_u64, checked_next_power_of_two, checked_usize_sum_writer,
-        dense_record_hash, encode_global_heap_collection, read_u64_le_at, CompoundFieldSpec,
-        DtypeSpec, FillValueSpec, HdfFileWriter,
+        dense_record_hash, encode_global_heap_collection, read_encoded_size_le_at, read_u64_le_at,
+        CompoundFieldSpec, DtypeSpec, FillValueSpec, HdfFileWriter,
     };
     use crate::io::reader::UNDEF_ADDR;
     use std::io::Cursor;
@@ -3233,6 +3550,35 @@ mod tests {
 
         assert_eq!(collection_size, 4096);
         assert_eq!(free_size, 4096 - 80);
+    }
+
+    #[test]
+    fn global_heap_collection_uses_configured_size_width() {
+        let heap =
+            encode_global_heap_collection(&[b"alpha".to_vec(), vec![1, 2, 3], Vec::new()], 2)
+                .unwrap();
+        let collection_size =
+            read_encoded_size_le_at(&heap, 8, 2, "test global heap collection size")
+                .expect("collection size field should decode");
+        let first_object_size =
+            read_encoded_size_le_at(&heap, 18, 2, "test global heap first object size")
+                .expect("object size field should decode");
+        let free_size = read_encoded_size_le_at(&heap, 64, 2, "test global heap free size")
+            .expect("free size field should decode");
+
+        assert_eq!(collection_size, 4096);
+        assert_eq!(first_object_size, 5);
+        assert_eq!(free_size, 4096 - 56);
+        assert_eq!(&heap[20..25], b"alpha");
+    }
+
+    #[test]
+    fn global_heap_collection_rejects_too_narrow_size_width() {
+        let err = encode_global_heap_collection(&[vec![0; 256]], 1).unwrap_err();
+        assert!(
+            err.to_string().contains("does not fit in 1 bytes"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -3303,19 +3649,34 @@ mod tests {
         assert!(super::encode_link_name_len(&mut Vec::new(), 256, 0).is_err());
         assert!(super::encode_link_name_len(&mut Vec::new(), 65_536, 1).is_err());
         if usize::BITS > u32::BITS {
-            let too_large = usize::try_from(u64::from(u32::MAX) + 1)
+            let eight_byte_len = usize::try_from(u64::from(u32::MAX) + 1)
                 .expect("test value should fit on this target");
-            assert!(super::encode_link_name_len(&mut Vec::new(), too_large, 2).is_err());
+            assert_eq!(super::link_name_size_flag(eight_byte_len).unwrap(), 3);
+            assert!(super::encode_link_name_len(&mut Vec::new(), eight_byte_len, 2).is_err());
+            let mut encoded = Vec::new();
+            super::encode_link_name_len(&mut encoded, eight_byte_len, 3).unwrap();
+            assert_eq!(encoded, (u64::from(u32::MAX) + 1).to_le_bytes());
         }
-        assert!(super::encode_contiguous_layout(0, 0, 8, 0).is_err());
-        assert!(super::encode_contiguous_layout(0, 0, 8, 9).is_err());
-        assert!(super::encode_chunked_layout_v3(0, &[u64::from(u32::MAX) + 1], 1, 8).is_err());
-        assert!(super::encode_chunked_layout_v3(0, &[0], 1, 8).is_err());
-        assert!(super::encode_fill_value_message(Some(FillValueSpec {
-            alloc_time: 4,
-            fill_time: 0,
-            value: None,
-        }))
+        assert!(super::encode_link_name_len(&mut Vec::new(), 1, 4).is_err());
+        assert!(super::encode_contiguous_layout_into(&mut Vec::new(), 0, 0, 8, 0).is_err());
+        assert!(super::encode_contiguous_layout_into(&mut Vec::new(), 0, 0, 8, 9).is_err());
+        assert!(super::encode_chunked_layout_v3_into(
+            &mut Vec::new(),
+            0,
+            &[u64::from(u32::MAX) + 1],
+            1,
+            8
+        )
+        .is_err());
+        assert!(super::encode_chunked_layout_v3_into(&mut Vec::new(), 0, &[0], 1, 8).is_err());
+        assert!(super::encode_fill_value_message_into(
+            &mut Vec::new(),
+            Some(FillValueSpec {
+                alloc_time: 4,
+                fill_time: 0,
+                value: None,
+            })
+        )
         .is_err());
     }
 }

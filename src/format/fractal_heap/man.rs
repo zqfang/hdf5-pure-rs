@@ -9,7 +9,10 @@ use crate::error::{Error, Result};
 use crate::io::reader::HdfReader;
 
 use super::iblock::{FilteredIndirectBlock, IndirectBlock};
-use super::FractalHeapHeader;
+use super::{
+    DirectBlockSpan, FilteredIndirectBlockCacheKey, FractalHeapHeader,
+    FractalHeapManagedObjectCache, IndirectBlockCacheKey,
+};
 
 impl FractalHeapHeader {
     /// Read a managed (type 0) object.
@@ -18,6 +21,74 @@ impl FractalHeapHeader {
         reader: &mut HdfReader<R>,
         heap_id: &[u8],
     ) -> Result<Vec<u8>> {
+        let (offset, length) = self.decode_managed_heap_id(heap_id)?;
+
+        if self.current_root_rows == 0 {
+            self.read_from_direct_block(
+                reader,
+                self.root_block_addr,
+                self.start_block_size,
+                self.root_direct_filtered_size,
+                self.root_direct_filter_mask,
+                offset,
+                length,
+            )
+        } else {
+            self.read_from_indirect_block(reader, self.root_block_addr, offset, length)
+        }
+    }
+
+    pub(super) fn read_managed_with_cache<R: Read + Seek>(
+        &self,
+        reader: &mut HdfReader<R>,
+        heap_id: &[u8],
+        cache: &mut FractalHeapManagedObjectCache,
+    ) -> Result<Vec<u8>> {
+        let (offset, length) = self.decode_managed_heap_id(heap_id)?;
+
+        if let Some(span) = cache.lookup_direct_span(offset) {
+            let block_addr = span.block_addr;
+            let block_size = span.block_size;
+            let filtered_size = span.filtered_size;
+            let filter_mask = span.filter_mask;
+            let local_offset = offset - span.start;
+            return self.read_from_direct_block_cached(
+                reader,
+                block_addr,
+                block_size,
+                filtered_size,
+                filter_mask,
+                local_offset,
+                length,
+                cache,
+            );
+        }
+
+        if self.current_root_rows == 0 {
+            // Root is a direct block -- offset is relative to block start
+            self.read_from_direct_block_cached(
+                reader,
+                self.root_block_addr,
+                self.start_block_size,
+                self.root_direct_filtered_size,
+                self.root_direct_filter_mask,
+                offset,
+                length,
+                cache,
+            )
+        } else {
+            // Root is an indirect block -- need to find which direct block contains the offset
+            self.read_from_indirect_block_cached(
+                reader,
+                self.root_block_addr,
+                offset,
+                length,
+                cache,
+            )
+        }
+    }
+
+    fn decode_managed_heap_id(&self, heap_id: &[u8]) -> Result<(u64, u64)> {
         // Managed object heap ID:
         // byte 0: version(2 bits) + type(2 bits) + reserved(4 bits)
         // then: offset (ceil(max_heap_size/8) bytes) + length (remaining bytes)
@@ -35,9 +106,6 @@ impl FractalHeapHeader {
         let length =
             read_le_u64_prefix(length_window, length_window.len().min(8), "heap ID length")?;
 
-        // Bound checks matching libhdf5's `H5HF__man_op_real`:
-        //  - offset must be < 2^max_heap_size (the heap's address space)
-        //  - object size must fit in the managed object size limit
         if self.max_heap_size < 64 && offset >= (1u64 << self.max_heap_size) {
             return Err(Error::InvalidFormat(format!(
                 "fractal heap object offset {offset} exceeds 2^{} address space",
@@ -51,21 +119,7 @@ impl FractalHeapHeader {
             )));
         }
 
-        if self.current_root_rows == 0 {
-            // Root is a direct block -- offset is relative to block start
-            self.read_from_direct_block(
-                reader,
-                self.root_block_addr,
-                self.start_block_size,
-                self.root_direct_filtered_size,
-                self.root_direct_filter_mask,
-                offset,
-                length,
-            )
-        } else {
-            // Root is an indirect block -- need to find which direct block contains the offset
-            self.read_from_indirect_block(reader, self.root_block_addr, offset, length)
-        }
+        Ok((offset, length))
     }
 
     /// Read a managed object from the indirect block at `block_addr`,
@@ -89,6 +143,31 @@ impl FractalHeapHeader {
             0,
             offset,
             length,
+        )
+    }
+
+    pub(super) fn read_from_indirect_block_cached<R: Read + Seek>(
+        &self,
+        reader: &mut HdfReader<R>,
+        block_addr: u64,
+        offset: u64,
+        length: u64,
+        cache: &mut FractalHeapManagedObjectCache,
+    ) -> Result<Vec<u8>> {
+        if self.io_filter_len > 0 {
+            return self.read_from_filtered_indirect_block_cached(
+                reader, block_addr, offset, length, cache,
+            );
+        }
+
+        self.read_from_indirect_block_rows_cached(
+            reader,
+            block_addr,
+            usize::from(self.current_root_rows),
+            0,
+            offset,
+            length,
+            cache,
         )
     }
 
@@ -168,6 +247,89 @@ impl FractalHeapHeader {
         )))
     }
 
+    pub(super) fn lookup_in_indirect_block_cached<R: Read + Seek>(
+        &self,
+        reader: &mut HdfReader<R>,
+        iblock: &IndirectBlock,
+        block_start: u64,
+        offset: u64,
+        length: u64,
+        cache: &mut FractalHeapManagedObjectCache,
+    ) -> Result<Vec<u8>> {
+        let width = usize::from(self.table_width);
+        let max_direct_rows = self.max_direct_rows_checked()?;
+        let mut current_heap_offset = block_start;
+        let mut entry_index = 0usize;
+
+        for row in 0..iblock.nrows {
+            if row < max_direct_rows {
+                let block_span = self.checked_row_block_size(row)?;
+                for _ in 0..width {
+                    let child_addr = iblock.child_addrs[entry_index];
+                    entry_index += 1;
+
+                    if crate::io::reader::is_undef_addr(child_addr) {
+                        current_heap_offset =
+                            checked_add_heap_offset(current_heap_offset, block_span)?;
+                        continue;
+                    }
+
+                    let block_end = checked_add_heap_offset(current_heap_offset, block_span)?;
+                    if offset >= current_heap_offset && offset < block_end {
+                        let local_offset = offset - current_heap_offset;
+                        cache.insert_direct_span(DirectBlockSpan {
+                            start: current_heap_offset,
+                            end: block_end,
+                            block_addr: child_addr,
+                            block_size: block_span,
+                            filtered_size: None,
+                            filter_mask: 0,
+                        });
+                        return self.read_from_direct_block_cached(
+                            reader,
+                            child_addr,
+                            block_span,
+                            None,
+                            0,
+                            local_offset,
+                            length,
+                            cache,
+                        );
+                    }
+
+                    current_heap_offset = block_end;
+                }
+            } else {
+                let child_rows = self.child_indirect_rows(row)?;
+                let child_span = self.indirect_data_span(reader, child_rows)?;
+                for _ in 0..width {
+                    let child_addr = iblock.child_addrs[entry_index];
+                    entry_index += 1;
+                    let child_end = checked_add_heap_offset(current_heap_offset, child_span)?;
+                    if offset >= current_heap_offset && offset < child_end {
+                        if crate::io::reader::is_undef_addr(child_addr) {
+                            break;
+                        }
+                        return self.read_from_indirect_block_rows_cached(
+                            reader,
+                            child_addr,
+                            child_rows,
+                            current_heap_offset,
+                            offset,
+                            length,
+                            cache,
+                        );
+                    }
+                    current_heap_offset = child_end;
+                }
+            }
+        }
+
+        Err(Error::InvalidFormat(format!(
+            "fractal heap offset {offset} not found in indirect block"
+        )))
+    }
+
     /// Drive `decode_indirect_block` + `lookup_in_indirect_block` — the
     /// C-side composition is `H5HF__man_iblock_protect` (which loads &
     /// deserializes the iblock) followed by the lookup loop in
@@ -183,6 +345,34 @@ impl FractalHeapHeader {
     ) -> Result<Vec<u8>> {
         let iblock = self.decode_indirect_block(reader, block_addr, nrows)?;
         self.lookup_in_indirect_block(reader, &iblock, block_start, offset, length)
+    }
+
+    pub(super) fn read_from_indirect_block_rows_cached<R: Read + Seek>(
+        &self,
+        reader: &mut HdfReader<R>,
+        block_addr: u64,
+        nrows: usize,
+        block_start: u64,
+        offset: u64,
+        length: u64,
+        cache: &mut FractalHeapManagedObjectCache,
+    ) -> Result<Vec<u8>> {
+        let key = IndirectBlockCacheKey { block_addr, nrows };
+        let iblock = if let Some(iblock) = cache.indirect_blocks.remove(&key) {
+            iblock
+        } else {
+            self.decode_indirect_block(reader, block_addr, nrows)?
+        };
+        let result = self.lookup_in_indirect_block_cached(
+            reader,
+            &iblock,
+            block_start,
+            offset,
+            length,
+            cache,
+        );
+        cache.insert_indirect_block(key, iblock);
+        result
     }
 
     /// Walk a decoded filtered indirect block to locate the heap object
@@ -211,10 +401,7 @@ impl FractalHeapHeader {
         for row in 0..iblock.nrows {
             let block_size = self.checked_row_block_size(row)?;
 
-            if block_size > self.max_direct_block_size {
-                entry_index = entry_index.checked_add(width).ok_or_else(|| {
-                    Error::InvalidFormat("fractal heap filtered entry index overflow".into())
-                })?; // indirect-row entries carry no payload to consume here
+            if row >= iblock.direct_rows || block_size > self.max_direct_block_size {
                 continue;
             }
 
@@ -222,7 +409,11 @@ impl FractalHeapHeader {
                 Error::InvalidFormat("fractal heap direct block header exceeds block size".into())
             })?;
             for _ in 0..width {
-                let entry = &iblock.entries[entry_index];
+                let entry = iblock.entries.get(entry_index).ok_or_else(|| {
+                    Error::InvalidFormat(
+                        "fractal heap filtered direct entry table is truncated".into(),
+                    )
+                })?;
                 entry_index += 1;
                 if crate::io::reader::is_undef_addr(entry.addr) {
                     current_heap_offset =
@@ -250,6 +441,79 @@ impl FractalHeapHeader {
         )))
     }
 
+    pub(super) fn lookup_in_filtered_indirect_block_cached<R: Read + Seek>(
+        &self,
+        reader: &mut HdfReader<R>,
+        iblock: &FilteredIndirectBlock,
+        offset: u64,
+        length: u64,
+        cache: &mut FractalHeapManagedObjectCache,
+    ) -> Result<Vec<u8>> {
+        let width = usize::from(self.table_width);
+        let dblock_header_size = checked_add_heap_offset(
+            checked_add_heap_offset(5, u64::from(self.sizeof_addr))?,
+            checked_add_heap_offset(
+                u64::try_from(iblock.block_offset_bytes).map_err(|_| {
+                    Error::InvalidFormat("filtered indirect block offset width overflow".into())
+                })?,
+                if self.has_checksum { 4 } else { 0 },
+            )?,
+        )?;
+        let mut current_heap_offset = 0u64;
+        let mut entry_index = 0usize;
+
+        for row in 0..iblock.nrows {
+            let block_size = self.checked_row_block_size(row)?;
+
+            if row >= iblock.direct_rows || block_size > self.max_direct_block_size {
+                continue;
+            }
+
+            let data_capacity = block_size.checked_sub(dblock_header_size).ok_or_else(|| {
+                Error::InvalidFormat("fractal heap direct block header exceeds block size".into())
+            })?;
+            for _ in 0..width {
+                let entry = iblock.entries.get(entry_index).ok_or_else(|| {
+                    Error::InvalidFormat(
+                        "fractal heap filtered direct entry table is truncated".into(),
+                    )
+                })?;
+                entry_index += 1;
+                if crate::io::reader::is_undef_addr(entry.addr) {
+                    current_heap_offset =
+                        checked_add_heap_offset(current_heap_offset, data_capacity)?;
+                    continue;
+                }
+                let block_end = checked_add_heap_offset(current_heap_offset, data_capacity)?;
+                if offset >= current_heap_offset && offset < block_end {
+                    cache.insert_direct_span(DirectBlockSpan {
+                        start: current_heap_offset,
+                        end: block_end,
+                        block_addr: entry.addr,
+                        block_size,
+                        filtered_size: Some(entry.filtered_size),
+                        filter_mask: entry.filter_mask,
+                    });
+                    return self.read_from_direct_block_cached(
+                        reader,
+                        entry.addr,
+                        block_size,
+                        Some(entry.filtered_size),
+                        entry.filter_mask,
+                        offset - current_heap_offset,
+                        length,
+                        cache,
+                    );
+                }
+                current_heap_offset = block_end;
+            }
+        }
+
+        Err(Error::InvalidFormat(format!(
+            "filtered fractal heap offset {offset} not found in indirect block"
+        )))
+    }
+
     /// Drive `decode_filtered_indirect_block` + `lookup_in_filtered_…` —
     /// C-side composition is `H5HF__man_iblock_protect` + the filtered
     /// branch of `H5HF__man_op_real`.
@@ -262,6 +526,26 @@ impl FractalHeapHeader {
     ) -> Result<Vec<u8>> {
         let iblock = self.decode_filtered_indirect_block(reader, block_addr)?;
         self.lookup_in_filtered_indirect_block(reader, &iblock, offset, length)
+    }
+
+    pub(super) fn read_from_filtered_indirect_block_cached<R: Read + Seek>(
+        &self,
+        reader: &mut HdfReader<R>,
+        block_addr: u64,
+        offset: u64,
+        length: u64,
+        cache: &mut FractalHeapManagedObjectCache,
+    ) -> Result<Vec<u8>> {
+        let key = FilteredIndirectBlockCacheKey { block_addr };
+        let iblock = if let Some(iblock) = cache.filtered_indirect_blocks.remove(&key) {
+            iblock
+        } else {
+            self.decode_filtered_indirect_block(reader, block_addr)?
+        };
+        let result =
+            self.lookup_in_filtered_indirect_block_cached(reader, &iblock, offset, length, cache);
+        cache.insert_filtered_indirect_block(key, iblock);
+        result
     }
 }
 

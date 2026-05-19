@@ -1,19 +1,18 @@
 use std::io::{Seek, SeekFrom, Write};
 
 use crate::error::{Error, Result};
-use crate::format::btree_v2::{self, BTreeV2Header};
+use crate::format::btree_v2::BTreeV2Header;
 use crate::format::checksum::checksum_metadata;
 use crate::format::fractal_heap::FractalHeapHeader;
 use crate::format::messages::attribute::AttributeMessage;
 use crate::format::messages::attribute_info::AttributeInfoMessage;
 use crate::format::object_header::{
-    self, ObjectHeader, HDR_ATTR_STORE_PHASE_CHANGE, HDR_CHUNK0_SIZE_MASK, HDR_STORE_TIMES,
-    HDR_V2_KNOWN_FLAGS,
+    self, HDR_ATTR_STORE_PHASE_CHANGE, HDR_CHUNK0_SIZE_MASK, HDR_STORE_TIMES, HDR_V2_KNOWN_FLAGS,
 };
 
 use super::MutableFile;
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct CompactAttributeMessageLocation {
     msg_type_offset: u64,
     msg_data_offset: u64,
@@ -22,12 +21,12 @@ struct CompactAttributeMessageLocation {
     raw_data: Vec<u8>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct DenseAttributeLocation {
     attr_info_addr: u64,
     heap: FractalHeapHeader,
     btree: BTreeV2Header,
-    records: Vec<Vec<u8>>,
+    leaf_records: Vec<u8>,
     record_index: usize,
     object_offset: u64,
     raw_data: Vec<u8>,
@@ -115,7 +114,7 @@ impl MutableFile {
             return Ok(());
         }
         match self.find_compact_attribute_rename_location(object_addr, old_name, new_name) {
-            Ok(location) => {
+            Ok(mut location) => {
                 let (name_offset, name_size) =
                     Self::compact_attribute_name_field(&location.raw_data)?;
                 if new_name.len() + 1 != name_size {
@@ -130,10 +129,14 @@ impl MutableFile {
                     .checked_add(name_offset_u64)
                     .ok_or_else(|| Error::InvalidFormat("attribute name offset overflow".into()))?;
 
-                let mut encoded_name = vec![0u8; name_size];
-                encoded_name[..new_name.len()].copy_from_slice(new_name.as_bytes());
+                let encoded_name = encode_attribute_name_in_place(
+                    &mut location.raw_data,
+                    name_offset,
+                    name_size,
+                    new_name,
+                )?;
                 self.write_handle.seek(SeekFrom::Start(file_name_offset))?;
-                self.write_handle.write_all(&encoded_name)?;
+                self.write_handle.write_all(encoded_name)?;
                 self.rewrite_oh_checksum(location.oh_start, location.oh_check_len)?;
             }
             Err(Error::Unsupported(message)) if message.contains("dense attributes") => {
@@ -207,7 +210,8 @@ impl MutableFile {
         let reader = &mut guard.reader;
         reader.seek(oh_addr)?;
 
-        let first_bytes = reader.read_bytes(4)?;
+        let mut first_bytes = [0u8; 4];
+        reader.read_bytes_into(&mut first_bytes)?;
         if first_bytes != [b'O', b'H', b'D', b'R'] {
             return Err(Error::Unsupported(
                 "attribute mutation currently supports only v2 object headers".into(),
@@ -273,7 +277,8 @@ impl MutableFile {
             }
 
             if msg_type == object_header::MSG_ATTRIBUTE {
-                let data = reader.read_bytes(msg_size)?;
+                let mut data = vec![0u8; msg_size];
+                reader.read_bytes_into(&mut data)?;
                 let attr = AttributeMessage::decode(&data)?;
                 if reject_duplicate_name.is_some_and(|name| attr.name == name) {
                     return Err(Error::InvalidFormat(format!(
@@ -324,14 +329,8 @@ impl MutableFile {
         reject_duplicate_name: Option<&str>,
     ) -> Result<DenseAttributeLocation> {
         let mut guard = self.inner.lock();
-        let oh = ObjectHeader::read_at(&mut guard.reader, object_addr)?;
-        let attr_info_raw = oh
-            .messages
-            .iter()
-            .find(|msg| msg.msg_type == object_header::MSG_ATTR_INFO)
-            .ok_or_else(|| Error::InvalidFormat(format!("attribute '{target_name}' not found")))?;
         let attr_info =
-            AttributeInfoMessage::decode(&attr_info_raw.data, guard.superblock.sizeof_addr)?;
+            Self::read_dense_attribute_info_message(&mut guard.reader, object_addr, target_name)?;
         if !attr_info.has_dense_storage() {
             return Err(Error::InvalidFormat(format!(
                 "attribute '{target_name}' not found"
@@ -356,10 +355,12 @@ impl MutableFile {
                 "mutating non-leaf dense attribute name indexes is not implemented".into(),
             ));
         }
-        let records = btree_v2::collect_all_records(&mut guard.reader, attr_info.name_btree_addr)?;
+        let mut leaf_records = Vec::new();
+        Self::read_dense_attribute_leaf_records_into(&mut guard.reader, &btree, &mut leaf_records)?;
         let heap_id_len = usize::from(heap.heap_id_len);
         let mut found = None;
-        for (idx, record) in records.iter().enumerate() {
+        let record_size = usize::from(btree.record_size);
+        for (idx, record) in leaf_records.chunks_exact(record_size).enumerate() {
             let heap_id = checked_window(record, 0, heap_id_len, "dense attribute heap ID")?;
             let raw_data = heap.read_managed_object(&mut guard.reader, heap_id)?;
             let attr = AttributeMessage::decode(&raw_data)?;
@@ -371,23 +372,41 @@ impl MutableFile {
             }
             if attr.name == target_name {
                 let object_offset = managed_heap_object_offset(&heap, heap_id)?;
-                found = Some(DenseAttributeLocation {
-                    attr_info_addr: attr_info.name_btree_addr,
-                    heap: heap.clone(),
-                    btree: btree.clone(),
-                    records: records.clone(),
-                    record_index: idx,
-                    object_offset,
-                    raw_data,
-                });
+                found = Some((idx, object_offset, raw_data));
             }
         }
 
-        found.ok_or_else(|| Error::InvalidFormat(format!("attribute '{target_name}' not found")))
+        let (record_index, object_offset, raw_data) = found
+            .ok_or_else(|| Error::InvalidFormat(format!("attribute '{target_name}' not found")))?;
+        Ok(DenseAttributeLocation {
+            attr_info_addr: attr_info.name_btree_addr,
+            heap,
+            btree,
+            leaf_records,
+            record_index,
+            object_offset,
+            raw_data,
+        })
     }
 
     fn delete_dense_attribute(&mut self, mut location: DenseAttributeLocation) -> Result<()> {
-        location.records.remove(location.record_index);
+        let record_size = usize::from(location.btree.record_size);
+        let start = location
+            .record_index
+            .checked_mul(record_size)
+            .ok_or_else(|| Error::InvalidFormat("dense attribute record offset overflow".into()))?;
+        let end = start
+            .checked_add(record_size)
+            .ok_or_else(|| Error::InvalidFormat("dense attribute record offset overflow".into()))?;
+        if end > location.leaf_records.len() {
+            return Err(Error::InvalidFormat(
+                "dense attribute record index is invalid".into(),
+            ));
+        }
+        location.leaf_records.copy_within(end.., start);
+        location
+            .leaf_records
+            .truncate(location.leaf_records.len() - record_size);
         self.rewrite_dense_attribute_name_index(&location)
     }
 
@@ -411,14 +430,28 @@ impl MutableFile {
             .checked_add(location.object_offset)
             .and_then(|offset| offset.checked_add(name_offset_u64))
             .ok_or_else(|| Error::InvalidFormat("dense attribute name offset overflow".into()))?;
-        let mut encoded_name = vec![0u8; name_size];
-        encoded_name[..new_name.len()].copy_from_slice(new_name.as_bytes());
         self.write_handle.seek(SeekFrom::Start(file_name_offset))?;
-        self.write_handle.write_all(&encoded_name)?;
+        {
+            let encoded_name = encode_attribute_name_in_place(
+                &mut location.raw_data,
+                name_offset,
+                name_size,
+                new_name,
+            )?;
+            self.write_handle.write_all(encoded_name)?;
+        }
 
+        let record_size = usize::from(location.btree.record_size);
+        let record_start = location
+            .record_index
+            .checked_mul(record_size)
+            .ok_or_else(|| Error::InvalidFormat("dense attribute record offset overflow".into()))?;
+        let record_end = record_start
+            .checked_add(record_size)
+            .ok_or_else(|| Error::InvalidFormat("dense attribute record offset overflow".into()))?;
         let record = location
-            .records
-            .get_mut(location.record_index)
+            .leaf_records
+            .get_mut(record_start..record_end)
             .ok_or_else(|| {
                 Error::InvalidFormat("dense attribute record index is invalid".into())
             })?;
@@ -427,17 +460,23 @@ impl MutableFile {
             .checked_add(4)
             .ok_or_else(|| Error::InvalidFormat("dense attribute hash offset overflow".into()))?;
         record[hash_pos..hash_end].copy_from_slice(&dense_name_hash(new_name).to_le_bytes());
-        location.records.sort_by_key(|record| {
-            dense_attribute_record_hash_pos(&location.heap, record)
-                .ok()
-                .and_then(|pos| read_u32_le_at(record, pos, "dense attribute record hash").ok())
-                .unwrap_or(u32::MAX)
-        });
+        Self::reposition_dense_attribute_record_by_hash(
+            &location.heap,
+            &mut location.leaf_records,
+            location.record_index,
+            record_size,
+        )?;
 
+        let encoded_name = checked_window(
+            &location.raw_data,
+            name_offset,
+            name_size,
+            "dense attribute encoded name",
+        )?;
         self.rewrite_dense_attribute_direct_block_checksum(
             &location.heap,
             file_name_offset,
-            &encoded_name,
+            encoded_name,
         )?;
         self.rewrite_dense_attribute_name_index(&location)
     }
@@ -446,41 +485,26 @@ impl MutableFile {
         &mut self,
         location: &DenseAttributeLocation,
     ) -> Result<()> {
-        let record_count_u16 =
-            Self::usize_to_u16(location.records.len(), "dense attribute record count")?;
-        let record_count_u64 =
-            Self::usize_to_u64(location.records.len(), "dense attribute record count")?;
         let record_size = usize::from(location.btree.record_size);
-        if location
-            .records
-            .iter()
-            .any(|record| record.len() != record_size)
-        {
+        if record_size == 0 || location.leaf_records.len() % record_size != 0 {
             return Err(Error::InvalidFormat(
                 "dense attribute records have inconsistent sizes".into(),
             ));
         }
+        let record_count = location.leaf_records.len() / record_size;
+        let record_count_u16 = Self::usize_to_u16(record_count, "dense attribute record count")?;
+        let record_count_u64 = Self::usize_to_u64(record_count, "dense attribute record count")?;
 
         let mut leaf = Vec::with_capacity(
             6usize
-                .checked_add(
-                    record_size
-                        .checked_mul(location.records.len())
-                        .ok_or_else(|| {
-                            Error::InvalidFormat(
-                                "dense attribute leaf records size overflow".into(),
-                            )
-                        })?,
-                )
+                .checked_add(location.leaf_records.len())
                 .and_then(|len| len.checked_add(4))
                 .ok_or_else(|| Error::InvalidFormat("dense attribute leaf size overflow".into()))?,
         );
         leaf.extend_from_slice(b"BTLF");
         leaf.push(0);
         leaf.push(location.btree.tree_type);
-        for record in &location.records {
-            leaf.extend_from_slice(record);
-        }
+        leaf.extend_from_slice(&location.leaf_records);
         let checksum = checksum_metadata(&leaf);
         leaf.extend_from_slice(&checksum.to_le_bytes());
         self.write_handle
@@ -489,7 +513,13 @@ impl MutableFile {
 
         let sa = usize::from(self.superblock.sizeof_addr);
         let ss = usize::from(self.superblock.sizeof_size);
-        let mut header = Vec::new();
+        let header_capacity = 22usize
+            .checked_add(sa)
+            .and_then(|len| len.checked_add(ss))
+            .ok_or_else(|| {
+                Error::InvalidFormat("dense attribute B-tree header size overflow".into())
+            })?;
+        let mut header = Vec::with_capacity(header_capacity);
         header.extend_from_slice(b"BTHD");
         header.push(0);
         header.push(location.btree.tree_type);
@@ -498,14 +528,17 @@ impl MutableFile {
         header.extend_from_slice(&0u16.to_le_bytes());
         header.push(location.btree.split_pct);
         header.push(location.btree.merge_pct);
-        header.extend_from_slice(&Self::encode_uint_le(
+        let mut scratch = [0u8; 8];
+        header.extend_from_slice(Self::encode_uint_le_into(
             location.btree.root_addr,
+            &mut scratch,
             sa,
             "dense attribute B-tree root address",
         )?);
         header.extend_from_slice(&record_count_u16.to_le_bytes());
-        header.extend_from_slice(&Self::encode_uint_le(
+        header.extend_from_slice(Self::encode_uint_le_into(
             record_count_u64,
+            &mut scratch,
             ss,
             "dense attribute B-tree total record count",
         )?);
@@ -514,6 +547,192 @@ impl MutableFile {
         self.write_handle
             .seek(SeekFrom::Start(location.attr_info_addr))?;
         self.write_handle.write_all(&header)?;
+        Ok(())
+    }
+
+    fn read_dense_attribute_info_message<R: std::io::Read + Seek>(
+        reader: &mut crate::io::reader::HdfReader<R>,
+        oh_addr: u64,
+        target_name: &str,
+    ) -> Result<AttributeInfoMessage> {
+        reader.seek(oh_addr)?;
+
+        let mut first_bytes = [0u8; 4];
+        reader.read_bytes_into(&mut first_bytes)?;
+        if first_bytes != [b'O', b'H', b'D', b'R'] {
+            return Err(Error::Unsupported(
+                "attribute mutation currently supports only v2 object headers".into(),
+            ));
+        }
+
+        let version = reader.read_u8()?;
+        if version != 2 {
+            return Err(Error::Unsupported(
+                "attribute mutation currently supports only v2 object headers".into(),
+            ));
+        }
+
+        let flags = reader.read_u8()?;
+        if flags & !HDR_V2_KNOWN_FLAGS != 0 {
+            return Err(Error::InvalidFormat(format!(
+                "object header v2 flags contain reserved bits: {flags:#04x}"
+            )));
+        }
+        if flags & HDR_STORE_TIMES != 0 {
+            reader.skip(16)?;
+        }
+        if flags & HDR_ATTR_STORE_PHASE_CHANGE != 0 {
+            reader.skip(4)?;
+        }
+
+        let chunk0_size_bytes = 1u8 << (flags & HDR_CHUNK0_SIZE_MASK);
+        let chunk0_data_size = reader.read_uint(chunk0_size_bytes)?;
+        let chunk0_data_start = reader.position()?;
+        let chunk0_data_end = chunk0_data_start
+            .checked_add(chunk0_data_size)
+            .ok_or_else(|| Error::InvalidFormat("object-header chunk range overflow".into()))?;
+
+        while reader.position()? < chunk0_data_end {
+            let msg_header_pos = reader.position()?;
+            if msg_header_pos
+                .checked_add(4)
+                .is_none_or(|end| end > chunk0_data_end)
+            {
+                break;
+            }
+
+            let msg_type = u16::from(reader.read_u8()?);
+            let msg_size = usize::from(reader.read_u16()?);
+            let _msg_flags = reader.read_u8()?;
+            if flags & object_header::HDR_ATTR_CRT_ORDER_TRACKED != 0 {
+                reader.skip(2)?;
+            }
+
+            let msg_data_offset = reader.position()?;
+            let msg_size_u64 = Self::usize_to_u64(msg_size, "object-header message size")?;
+            if msg_data_offset
+                .checked_add(msg_size_u64)
+                .is_none_or(|end| end > chunk0_data_end)
+            {
+                return Err(Error::InvalidFormat(
+                    "object-header message payload exceeds chunk".into(),
+                ));
+            }
+
+            if msg_type == object_header::MSG_ATTR_INFO {
+                let mut data = vec![0u8; msg_size];
+                reader.read_bytes_into(&mut data)?;
+                return AttributeInfoMessage::decode(&data, reader.sizeof_addr());
+            }
+            reader.skip(msg_size_u64)?;
+        }
+
+        Err(Error::InvalidFormat(format!(
+            "attribute '{target_name}' not found"
+        )))
+    }
+
+    fn read_dense_attribute_leaf_records_into<R: std::io::Read + Seek>(
+        reader: &mut crate::io::reader::HdfReader<R>,
+        btree: &BTreeV2Header,
+        records: &mut Vec<u8>,
+    ) -> Result<()> {
+        let record_size = usize::from(btree.record_size);
+        let record_count = usize::from(btree.root_nrecords);
+        let records_len = record_size
+            .checked_mul(record_count)
+            .ok_or_else(|| Error::InvalidFormat("dense attribute leaf records overflow".into()))?;
+        let check_len = 6usize
+            .checked_add(records_len)
+            .ok_or_else(|| Error::InvalidFormat("dense attribute leaf size overflow".into()))?;
+        let total_len = check_len
+            .checked_add(4)
+            .ok_or_else(|| Error::InvalidFormat("dense attribute leaf size overflow".into()))?;
+
+        records.clear();
+        records.resize(total_len, 0);
+        reader.seek(btree.root_addr)?;
+        reader.read_bytes_into(records)?;
+        if records.get(..4) != Some(&b"BTLF"[..]) {
+            return Err(Error::InvalidFormat(
+                "invalid dense attribute B-tree leaf magic".into(),
+            ));
+        }
+        if records.get(4).copied() != Some(0) || records.get(5).copied() != Some(btree.tree_type) {
+            return Err(Error::InvalidFormat(
+                "dense attribute B-tree leaf header does not match index".into(),
+            ));
+        }
+        let stored = read_u32_le_at(records, check_len, "dense attribute leaf checksum")?;
+        let computed = checksum_metadata(&records[..check_len]);
+        if stored != computed {
+            return Err(Error::InvalidFormat(format!(
+                "dense attribute leaf checksum mismatch: stored={stored:#010x}, computed={computed:#010x}"
+            )));
+        }
+        records.drain(..6);
+        records.truncate(records_len);
+        Ok(())
+    }
+
+    fn reposition_dense_attribute_record_by_hash(
+        heap: &FractalHeapHeader,
+        records: &mut Vec<u8>,
+        record_index: usize,
+        record_size: usize,
+    ) -> Result<()> {
+        if record_size == 0 || records.len() % record_size != 0 {
+            return Err(Error::InvalidFormat(
+                "dense attribute records have inconsistent sizes".into(),
+            ));
+        }
+        let record_count = records.len() / record_size;
+        if record_index >= record_count {
+            return Err(Error::InvalidFormat(
+                "dense attribute record index is invalid".into(),
+            ));
+        }
+        let start = record_index
+            .checked_mul(record_size)
+            .ok_or_else(|| Error::InvalidFormat("dense attribute record offset overflow".into()))?;
+        let end = start
+            .checked_add(record_size)
+            .ok_or_else(|| Error::InvalidFormat("dense attribute record offset overflow".into()))?;
+        let record = records.get(start..end).ok_or_else(|| {
+            Error::InvalidFormat("dense attribute record index is invalid".into())
+        })?;
+        let hash_pos = dense_attribute_record_hash_pos(heap, record)?;
+        let changed_hash = read_u32_le_at(record, hash_pos, "dense attribute record hash")?;
+
+        let mut insert_index = record_count - 1;
+        let mut logical_idx = 0usize;
+        for (idx, record) in records.chunks_exact(record_size).enumerate() {
+            if idx == record_index {
+                continue;
+            }
+            let hash_pos = dense_attribute_record_hash_pos(heap, record)?;
+            let hash = read_u32_le_at(record, hash_pos, "dense attribute record hash")?;
+            if changed_hash < hash {
+                insert_index = logical_idx;
+                break;
+            }
+            logical_idx += 1;
+        }
+
+        if insert_index == record_index {
+            return Ok(());
+        }
+        let insert_pos = insert_index
+            .checked_mul(record_size)
+            .ok_or_else(|| Error::InvalidFormat("dense attribute record offset overflow".into()))?;
+        if insert_index < record_index {
+            records[insert_pos..end].rotate_right(record_size);
+        } else {
+            let rotate_end = insert_pos.checked_add(record_size).ok_or_else(|| {
+                Error::InvalidFormat("dense attribute record offset overflow".into())
+            })?;
+            records[start..rotate_end].rotate_left(record_size);
+        }
         Ok(())
     }
 
@@ -534,7 +753,8 @@ impl MutableFile {
             .ok_or_else(|| Error::InvalidFormat("direct block checksum offset overflow".into()))?;
         let mut guard = self.inner.lock();
         guard.reader.seek(heap.root_block_addr)?;
-        let mut block = guard.reader.read_bytes(block_size)?;
+        let mut block = vec![0u8; block_size];
+        guard.reader.read_bytes_into(&mut block)?;
         drop(guard);
         let patch_start = patched_addr
             .checked_sub(heap.root_block_addr)
@@ -588,6 +808,24 @@ fn read_u32_le_at(raw: &[u8], pos: usize, context: &str) -> Result<u32> {
         .try_into()
         .map_err(|_| Error::InvalidFormat(format!("{context} is truncated")))?;
     Ok(u32::from_le_bytes(bytes))
+}
+
+fn encode_attribute_name_in_place<'a>(
+    raw: &'a mut [u8],
+    name_offset: usize,
+    name_size: usize,
+    name: &str,
+) -> Result<&'a [u8]> {
+    let name_field = raw
+        .get_mut(
+            name_offset..name_offset.checked_add(name_size).ok_or_else(|| {
+                Error::InvalidFormat("attribute name field offset overflow".into())
+            })?,
+        )
+        .ok_or_else(|| Error::InvalidFormat("attribute name field exceeds message".into()))?;
+    name_field.fill(0);
+    name_field[..name.len()].copy_from_slice(name.as_bytes());
+    Ok(name_field)
 }
 
 fn managed_heap_object_offset(heap: &FractalHeapHeader, heap_id: &[u8]) -> Result<u64> {

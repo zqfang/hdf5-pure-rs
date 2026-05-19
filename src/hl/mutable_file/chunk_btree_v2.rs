@@ -36,15 +36,6 @@ impl MutableFile {
         let expected_record_size =
             Self::btree_v2_chunk_record_size(sa, filtered, chunk_size_len, scaled_coords.len())?;
 
-        let new_record = Self::encode_btree_v2_chunk_record(
-            chunk_addr,
-            chunk_size,
-            &scaled_coords,
-            filtered,
-            chunk_size_len,
-            sa,
-        )?;
-
         let mut guard = self.inner.lock();
         let reader = &mut guard.reader;
         let header = BTreeV2Header::read_at(reader, index_addr)?;
@@ -61,35 +52,68 @@ impl MutableFile {
             )));
         }
 
-        let raw_records = crate::format::btree_v2::collect_all_records(reader, index_addr)?;
-        let mut sortable_records = Vec::with_capacity(raw_records.len() + 1);
-        let mut replacing = false;
-        for record in raw_records {
-            let existing_scaled = Self::decode_btree_v2_scaled_coords(
-                &record,
+        let mut records = Vec::new();
+        let expected_records = usize::try_from(header.total_records)
+            .map_err(|_| Error::InvalidFormat("v2 B-tree record count exceeds usize".into()))?;
+        records.reserve(expected_records.saturating_add(1));
+        crate::format::btree_v2::collect_all_records_into(reader, index_addr, &mut records)?;
+        match Self::find_btree_v2_chunk_record_index(
+            &records,
+            &scaled_coords,
+            filtered,
+            chunk_size_len,
+            sa,
+        )? {
+            Ok(index) => Self::encode_btree_v2_chunk_record_into(
+                chunk_addr,
+                chunk_size,
+                &scaled_coords,
                 filtered,
                 chunk_size_len,
                 sa,
-                scaled_coords.len(),
-            )?;
-            if existing_scaled == scaled_coords {
-                sortable_records.push((existing_scaled, new_record.clone()));
-                replacing = true;
-            } else {
-                sortable_records.push((existing_scaled, record));
+                &mut records[index],
+            )?,
+            Err(index) => {
+                let new_record = Self::encode_btree_v2_chunk_record(
+                    chunk_addr,
+                    chunk_size,
+                    &scaled_coords,
+                    filtered,
+                    chunk_size_len,
+                    sa,
+                )?;
+                records.insert(index, new_record);
             }
         }
-        if !replacing {
-            sortable_records.push((scaled_coords, new_record));
-        }
-        sortable_records.sort_by(|a, b| a.0.cmp(&b.0));
-        let records: Vec<Vec<u8>> = sortable_records
-            .into_iter()
-            .map(|(_, record)| record)
-            .collect();
         drop(guard);
 
         self.rebuild_btree_v2_chunk_tree(index_addr, &header, &records)
+    }
+
+    fn find_btree_v2_chunk_record_index(
+        records: &[Vec<u8>],
+        scaled_coords: &[u64],
+        filtered: bool,
+        chunk_size_len: usize,
+        sizeof_addr: usize,
+    ) -> Result<std::result::Result<usize, usize>> {
+        let mut left = 0usize;
+        let mut right = records.len();
+        while left < right {
+            let mid = left + (right - left) / 2;
+            match Self::cmp_btree_v2_scaled_coords(
+                &records[mid],
+                scaled_coords,
+                filtered,
+                chunk_size_len,
+                sizeof_addr,
+            )? {
+                std::cmp::Ordering::Less => left = mid + 1,
+                std::cmp::Ordering::Equal => return Ok(Ok(mid)),
+                std::cmp::Ordering::Greater => right = mid,
+            }
+        }
+        Ok(Err(left))
     }
 
     fn rebuild_btree_v2_chunk_tree(
@@ -167,7 +191,7 @@ impl MutableFile {
                 let separator = records.get(record_pos).ok_or_else(|| {
                     Error::InvalidFormat("invalid v2 B-tree chunk leaf distribution".into())
                 })?;
-                separators.push(separator.clone());
+                separators.push(separator.as_slice());
                 record_pos = record_pos.checked_add(1).ok_or_else(|| {
                     Error::InvalidFormat("v2 B-tree rebuild record offset overflow".into())
                 })?;
@@ -240,7 +264,7 @@ impl MutableFile {
     fn encode_btree_v2_depth1_internal(
         &self,
         header: &BTreeV2Header,
-        separators: &[Vec<u8>],
+        separators: &[&[u8]],
         children: &[(u64, u16)],
     ) -> Result<Vec<u8>> {
         if children.len() != separators.len() + 1 {
@@ -260,8 +284,24 @@ impl MutableFile {
         )?);
         let sa = usize::from(self.superblock.sizeof_addr);
         let record_size = usize::from(header.record_size);
+        let pointer_size = sa
+            .checked_add(child_nrecords_size)
+            .ok_or_else(|| Error::InvalidFormat("v2 B-tree pointer size overflow".into()))?;
 
-        let mut node = Vec::new();
+        let node_capacity =
+            6usize
+                .checked_add(separators.len().checked_mul(record_size).ok_or_else(|| {
+                    Error::InvalidFormat("v2 B-tree internal size overflow".into())
+                })?)
+                .and_then(|value| {
+                    children
+                        .len()
+                        .checked_mul(pointer_size)
+                        .and_then(|children_bytes| value.checked_add(children_bytes))
+                })
+                .and_then(|value| value.checked_add(4))
+                .ok_or_else(|| Error::InvalidFormat("v2 B-tree internal size overflow".into()))?;
+        let mut node = Vec::with_capacity(node_capacity);
         node.extend_from_slice(b"BTIN");
         node.push(0);
         node.push(header.tree_type);
@@ -273,14 +313,17 @@ impl MutableFile {
             }
             node.extend_from_slice(record);
         }
+        let mut encoded = [0u8; 8];
         for &(child_addr, child_nrecords) in children {
-            node.extend_from_slice(&Self::encode_uint_le(
+            node.extend_from_slice(Self::encode_uint_le_into(
                 child_addr,
+                &mut encoded,
                 sa,
                 "v2 B-tree child address",
             )?);
-            node.extend_from_slice(&Self::encode_uint_le(
+            node.extend_from_slice(Self::encode_uint_le_into(
                 u64::from(child_nrecords),
+                &mut encoded,
                 child_nrecords_size,
                 "v2 B-tree child record count",
             )?);
@@ -294,7 +337,7 @@ impl MutableFile {
     fn append_btree_v2_depth1_internal(
         &mut self,
         header: &BTreeV2Header,
-        separators: &[Vec<u8>],
+        separators: &[&[u8]],
         children: &[(u64, u16)],
     ) -> Result<u64> {
         let node = self.encode_btree_v2_depth1_internal(header, separators, children)?;
@@ -375,8 +418,10 @@ impl MutableFile {
         self.write_handle.seek(SeekFrom::Start(depth_pos))?;
         self.write_handle.write_all(&new_depth.to_le_bytes())?;
         self.write_handle.seek(SeekFrom::Start(root_addr_pos))?;
-        self.write_handle.write_all(&Self::encode_uint_le(
+        let mut encoded = [0u8; 8];
+        self.write_handle.write_all(Self::encode_uint_le_into(
             new_root_addr,
+            &mut encoded,
             sa,
             "v2 B-tree root address",
         )?)?;
@@ -391,7 +436,8 @@ impl MutableFile {
         })?;
         let mut guard = self.inner.lock();
         guard.reader.seek(header_addr)?;
-        let mut header_bytes = guard.reader.read_bytes(check_len)?;
+        let mut header_bytes = vec![0u8; check_len];
+        guard.reader.read_bytes_into(&mut header_bytes)?;
         drop(guard);
         let depth_offset = Self::checked_header_relative_offset(depth_pos, header_addr)?;
         let root_addr_offset = Self::checked_header_relative_offset(root_addr_pos, header_addr)?;
@@ -401,12 +447,17 @@ impl MutableFile {
         Self::header_window_mut(&mut header_bytes, depth_offset, 2)?
             .copy_from_slice(&new_depth.to_le_bytes());
         Self::header_window_mut(&mut header_bytes, root_addr_offset, sa)?.copy_from_slice(
-            &Self::encode_uint_le(new_root_addr, sa, "v2 B-tree root address")?,
+            Self::encode_uint_le_into(new_root_addr, &mut encoded, sa, "v2 B-tree root address")?,
         );
         Self::header_window_mut(&mut header_bytes, root_nrecords_offset, 2)?
             .copy_from_slice(&new_root_nrecords.to_le_bytes());
         Self::header_window_mut(&mut header_bytes, total_offset, ss)?.copy_from_slice(
-            &Self::encode_uint_le(new_total_records, ss, "v2 B-tree total record count")?,
+            Self::encode_uint_le_into(
+                new_total_records,
+                &mut encoded,
+                ss,
+                "v2 B-tree total record count",
+            )?,
         );
         let checksum = checksum_metadata(&header_bytes);
         self.write_handle.seek(SeekFrom::Start(checksum_pos))?;
@@ -460,15 +511,55 @@ impl MutableFile {
         chunk_size_len: usize,
         sizeof_addr: usize,
     ) -> Result<Vec<u8>> {
-        let mut record = Vec::new();
-        record.extend_from_slice(&Self::encode_uint_le(
+        let expected_record_size = Self::btree_v2_chunk_record_size(
+            sizeof_addr,
+            filtered,
+            chunk_size_len,
+            scaled_coords.len(),
+        )?;
+        let mut record = Vec::with_capacity(expected_record_size);
+        Self::encode_btree_v2_chunk_record_into(
             addr,
+            chunk_size,
+            scaled_coords,
+            filtered,
+            chunk_size_len,
+            sizeof_addr,
+            &mut record,
+        )?;
+        Ok(record)
+    }
+
+    fn encode_btree_v2_chunk_record_into(
+        addr: u64,
+        chunk_size: u64,
+        scaled_coords: &[u64],
+        filtered: bool,
+        chunk_size_len: usize,
+        sizeof_addr: usize,
+        record: &mut Vec<u8>,
+    ) -> Result<()> {
+        let expected_record_size = Self::btree_v2_chunk_record_size(
+            sizeof_addr,
+            filtered,
+            chunk_size_len,
+            scaled_coords.len(),
+        )?;
+        record.clear();
+        if record.capacity() < expected_record_size {
+            record.reserve_exact(expected_record_size - record.capacity());
+        }
+        let mut encoded = [0u8; 8];
+        record.extend_from_slice(Self::encode_uint_le_into(
+            addr,
+            &mut encoded,
             sizeof_addr,
             "v2 B-tree chunk address",
         )?);
         if filtered {
-            record.extend_from_slice(&Self::encode_uint_le(
+            record.extend_from_slice(Self::encode_uint_le_into(
                 chunk_size,
+                &mut encoded,
                 chunk_size_len,
                 "v2 B-tree chunk size",
             )?);
@@ -477,9 +568,10 @@ impl MutableFile {
         for &coord in scaled_coords {
             record.extend_from_slice(&coord.to_le_bytes());
         }
-        Ok(record)
+        Ok(())
     }
 
+    #[cfg(test)]
     fn decode_btree_v2_scaled_coords(
         record: &[u8],
         filtered: bool,
@@ -521,6 +613,50 @@ impl MutableFile {
             pos = next;
         }
         Ok(coords)
+    }
+
+    fn cmp_btree_v2_scaled_coords(
+        record: &[u8],
+        scaled_coords: &[u64],
+        filtered: bool,
+        chunk_size_len: usize,
+        sizeof_addr: usize,
+    ) -> Result<std::cmp::Ordering> {
+        let mut pos = sizeof_addr;
+        if record.len() < pos {
+            return Err(Error::InvalidFormat(
+                "truncated v2 B-tree chunk address".into(),
+            ));
+        }
+        if filtered {
+            pos = pos
+                .checked_add(chunk_size_len)
+                .and_then(|value| value.checked_add(4))
+                .ok_or_else(|| Error::InvalidFormat("v2 B-tree record offset overflow".into()))?;
+        }
+        let coords_end = pos
+            .checked_add(
+                scaled_coords.len().checked_mul(8).ok_or_else(|| {
+                    Error::InvalidFormat("v2 B-tree record offset overflow".into())
+                })?,
+            )
+            .ok_or_else(|| Error::InvalidFormat("v2 B-tree record offset overflow".into()))?;
+        if record.len() < coords_end {
+            return Err(Error::InvalidFormat(
+                "truncated v2 B-tree scaled chunk coordinates".into(),
+            ));
+        }
+
+        for &scaled_coord in scaled_coords {
+            let next = pos
+                .checked_add(8)
+                .ok_or_else(|| Error::InvalidFormat("v2 B-tree record offset overflow".into()))?;
+            match Self::read_le_uint(&record[pos..next])?.cmp(&scaled_coord) {
+                std::cmp::Ordering::Equal => pos = next,
+                ordering => return Ok(ordering),
+            }
+        }
+        Ok(std::cmp::Ordering::Equal)
     }
 
     fn scaled_chunk_coords(chunk_coords: &[u64], chunk_dims: &[u64]) -> Result<Vec<u64>> {
@@ -620,6 +756,37 @@ mod tests {
         let header = test_header(8);
         let result = MutableFile::encode_btree_v2_leaf(&header, &[vec![0; 7]]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn encode_btree_v2_chunk_record_into_reuses_existing_buffer() {
+        let scaled_coords = [2, 3];
+        let expected = MutableFile::encode_btree_v2_chunk_record(
+            0x0102_0304,
+            0x0506,
+            &scaled_coords,
+            true,
+            2,
+            4,
+        )
+        .unwrap();
+        let mut record = Vec::with_capacity(expected.len());
+        record.extend_from_slice(&[0xff; 3]);
+        let capacity = record.capacity();
+
+        MutableFile::encode_btree_v2_chunk_record_into(
+            0x0102_0304,
+            0x0506,
+            &scaled_coords,
+            true,
+            2,
+            4,
+            &mut record,
+        )
+        .unwrap();
+
+        assert_eq!(record, expected);
+        assert_eq!(record.capacity(), capacity);
     }
 
     #[test]

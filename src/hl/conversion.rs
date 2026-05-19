@@ -140,11 +140,37 @@ impl ReadConversion {
         }
     }
 
-    pub(crate) fn bytes_to_vec<T: H5Type>(&self, mut bytes: Vec<u8>) -> Result<Vec<T>> {
+    pub(crate) fn bytes_into_vec<T: H5Type>(&self, mut bytes: Vec<u8>) -> Result<Vec<T>> {
         match self.kind {
             ConversionKind::SameSizeBytes => {
                 self.convert_bytes_in_place(&mut bytes);
                 types::bytes_to_vec(bytes)
+            }
+            _ => self.converted_bytes_into_vec(&bytes),
+        }
+    }
+
+    pub(crate) fn bytes_to_vec<T: H5Type>(&self, bytes: Vec<u8>) -> Result<Vec<T>> {
+        self.bytes_into_vec(bytes)
+    }
+
+    pub(crate) fn bytes_into_slice<T: H5Type>(&self, bytes: &[u8], out: &mut [T]) -> Result<()> {
+        let raw_out = types::slice_as_bytes_mut(out);
+        self.bytes_into_raw_out(bytes, raw_out)
+    }
+
+    fn bytes_into_raw_out(&self, bytes: &[u8], raw_out: &mut [u8]) -> Result<()> {
+        match self.kind {
+            ConversionKind::SameSizeBytes => {
+                if raw_out.len() != bytes.len() {
+                    return Err(Error::InvalidFormat(format!(
+                        "typed output buffer has {} bytes, expected {}",
+                        raw_out.len(),
+                        bytes.len()
+                    )));
+                }
+                raw_out.copy_from_slice(bytes);
+                self.convert_bytes_in_place(raw_out);
             }
             ConversionKind::Integer {
                 src_size,
@@ -152,69 +178,129 @@ impl ReadConversion {
                 dst_size,
                 dst_signed,
             } => {
-                let converted = convert_integer_bytes(
-                    &bytes,
+                convert_integer_bytes_into(
+                    bytes,
                     src_size,
                     src_signed,
                     self.byte_order,
+                    raw_out,
                     dst_size,
                     dst_signed,
                 )?;
-                types::bytes_to_vec(converted)
             }
             ConversionKind::FloatToFloat { src_size, dst_size } => {
-                let converted = convert_float_bytes(&bytes, src_size, self.byte_order, dst_size)?;
-                types::bytes_to_vec(converted)
+                convert_float_bytes_into(bytes, src_size, self.byte_order, raw_out, dst_size)?;
             }
             ConversionKind::IntegerToFloat {
                 src_size,
                 src_signed,
                 dst_size,
             } => {
-                let converted = convert_integer_to_float_bytes(
-                    &bytes,
+                convert_integer_to_float_bytes_into(
+                    bytes,
                     src_size,
                     src_signed,
                     self.byte_order,
+                    raw_out,
                     dst_size,
                 )?;
-                types::bytes_to_vec(converted)
             }
             ConversionKind::FloatToInteger {
                 src_size,
                 dst_size,
                 dst_signed,
             } => {
-                let converted = convert_float_to_integer_bytes(
-                    &bytes,
+                convert_float_to_integer_bytes_into(
+                    bytes,
                     src_size,
                     self.byte_order,
+                    raw_out,
                     dst_size,
                     dst_signed,
                 )?;
-                types::bytes_to_vec(converted)
+            }
+        }
+        Ok(())
+    }
+
+    fn converted_bytes_into_vec<T: H5Type>(&self, bytes: &[u8]) -> Result<Vec<T>> {
+        let elem_size = T::type_size();
+        if elem_size == 0 {
+            return Err(Error::Other("zero-size type".into()));
+        }
+        let count = converted_element_count(bytes.len(), self.source_element_size()?)?;
+        let out_len = count
+            .checked_mul(elem_size)
+            .ok_or_else(|| Error::InvalidFormat("typed conversion output size overflow".into()))?;
+
+        let mut values = Vec::<T>::with_capacity(count);
+        // SAFETY: The vector has capacity for `count` values, `out_len` is
+        // exactly `count * size_of::<T>()`, and the conversion routines fully
+        // initialize the byte range before `set_len`.
+        let raw_out =
+            unsafe { std::slice::from_raw_parts_mut(values.as_mut_ptr() as *mut u8, out_len) };
+        self.bytes_into_raw_out(bytes, raw_out)?;
+        // SAFETY: `bytes_into_raw_out` initialized every byte of each element
+        // and `T: H5Type` guarantees a byte-addressable `Copy` representation.
+        unsafe {
+            values.set_len(count);
+        }
+        Ok(values)
+    }
+
+    fn source_element_size(&self) -> Result<usize> {
+        match self.kind {
+            ConversionKind::SameSizeBytes => Ok(self.element_size),
+            ConversionKind::Integer { src_size, .. }
+            | ConversionKind::FloatToFloat { src_size, .. }
+            | ConversionKind::IntegerToFloat { src_size, .. }
+            | ConversionKind::FloatToInteger { src_size, .. } => {
+                if src_size == 0 {
+                    Err(Error::InvalidFormat(
+                        "conversion source element size is zero".into(),
+                    ))
+                } else {
+                    Ok(src_size)
+                }
             }
         }
     }
 
-    pub(crate) fn bytes_to_scalar<T: H5Type>(&self, bytes: Vec<u8>) -> Result<T> {
-        let values = self.bytes_to_vec::<T>(bytes)?;
-        values
-            .first()
-            .copied()
-            .ok_or_else(|| Error::InvalidFormat("no data for scalar read".into()))
+    pub(crate) fn bytes_to_scalar_from_slice<T: H5Type>(&self, bytes: &[u8]) -> Result<T> {
+        if bytes.len() != self.element_size {
+            return Err(Error::InvalidFormat(format!(
+                "scalar read has {} bytes, expected {}",
+                bytes.len(),
+                self.element_size
+            )));
+        }
+
+        let mut value = std::mem::MaybeUninit::<T>::uninit();
+        // SAFETY: The raw byte view covers one uninitialized `T`; conversion
+        // writes exactly `T::type_size()` bytes before `assume_init`.
+        let raw_out = unsafe {
+            std::slice::from_raw_parts_mut(value.as_mut_ptr() as *mut u8, T::type_size())
+        };
+        self.bytes_into_raw_out(bytes, raw_out)?;
+        // SAFETY: `bytes_into_raw_out` initialized the complete object bytes.
+        Ok(unsafe { value.assume_init() })
     }
 
-    fn convert_bytes_in_place(&self, bytes: &mut [u8]) {
+    pub(crate) fn is_same_size_bytes(&self) -> bool {
+        matches!(self.kind, ConversionKind::SameSizeBytes)
+    }
+
+    pub(crate) fn convert_bytes_in_place(&self, bytes: &mut [u8]) {
         maybe_swap_elements(bytes, self.element_size, self.byte_order);
     }
 }
 
-pub(crate) fn convert_between_datatypes(
+pub(crate) fn convert_between_datatypes_into(
     bytes: &[u8],
     source: &DatatypeMessage,
     destination: &DatatypeMessage,
-) -> Result<Vec<u8>> {
+    out: &mut Vec<u8>,
+) -> Result<()> {
     let src_size = usize::try_from(source.size)
         .map_err(|_| Error::InvalidFormat("source datatype size does not fit in usize".into()))?;
     let dst_size = usize::try_from(destination.size).map_err(|_| {
@@ -224,7 +310,7 @@ pub(crate) fn convert_between_datatypes(
         (
             DatatypeClass::FixedPoint | DatatypeClass::Enum | DatatypeClass::BitField,
             DatatypeClass::FixedPoint | DatatypeClass::Enum | DatatypeClass::BitField,
-        ) => convert_integer_bytes_to_order(
+        ) => convert_integer_bytes_to_order_into(
             bytes,
             src_size,
             source.is_signed().unwrap_or(false),
@@ -232,51 +318,78 @@ pub(crate) fn convert_between_datatypes(
             dst_size,
             destination.is_signed().unwrap_or(false),
             destination.byte_order(),
+            out,
         ),
         (
             DatatypeClass::FixedPoint | DatatypeClass::Enum | DatatypeClass::BitField,
             DatatypeClass::FloatingPoint,
-        ) => convert_integer_to_float_bytes_to_order(
+        ) => convert_integer_to_float_bytes_to_order_into(
             bytes,
             src_size,
             source.is_signed().unwrap_or(false),
             source.byte_order(),
             dst_size,
             destination.byte_order(),
+            out,
         ),
         (
             DatatypeClass::FloatingPoint,
             DatatypeClass::FixedPoint | DatatypeClass::Enum | DatatypeClass::BitField,
-        ) => convert_float_to_integer_bytes_to_order(
+        ) => convert_float_to_integer_bytes_to_order_into(
             bytes,
             src_size,
             source.byte_order(),
             dst_size,
             destination.is_signed().unwrap_or(false),
             destination.byte_order(),
+            out,
         ),
         (DatatypeClass::FloatingPoint, DatatypeClass::FloatingPoint) => {
-            convert_float_bytes_to_order(
+            convert_float_bytes_to_order_into(
                 bytes,
                 src_size,
                 source.byte_order(),
                 dst_size,
                 destination.byte_order(),
+                out,
             )
         }
         _ if source.class == destination.class && src_size == dst_size => {
-            let mut out = bytes.to_vec();
+            out.clear();
+            out.extend_from_slice(bytes);
             if source.byte_order() != destination.byte_order() {
-                maybe_swap_elements(&mut out, src_size, source.byte_order());
-                maybe_swap_elements(&mut out, dst_size, destination.byte_order());
+                maybe_swap_elements(out, src_size, source.byte_order());
+                maybe_swap_elements(out, dst_size, destination.byte_order());
             }
-            Ok(out)
+            Ok(())
         }
         _ => Err(Error::Unsupported(format!(
             "virtual dataset datatype conversion from {:?} size {} to {:?} size {} is not supported",
             source.class, source.size, destination.class, destination.size
         ))),
     }
+}
+
+pub(crate) fn convert_between_datatypes(
+    bytes: &[u8],
+    source: &DatatypeMessage,
+    destination: &DatatypeMessage,
+) -> Result<Vec<u8>> {
+    let dst_size = usize::try_from(destination.size).map_err(|_| {
+        Error::InvalidFormat("destination datatype size does not fit in usize".into())
+    })?;
+    let capacity = if source.size == 0 {
+        0
+    } else {
+        bytes
+            .len()
+            .checked_div(source.size as usize)
+            .and_then(|len| len.checked_mul(dst_size))
+            .unwrap_or(0)
+    };
+    let mut out = Vec::with_capacity(capacity);
+    convert_between_datatypes_into(bytes, source, destination, &mut out)?;
+    Ok(out)
 }
 
 fn target_integer<T: H5Type>() -> Option<(bool, usize)> {
@@ -317,20 +430,30 @@ fn target_float<T: H5Type>() -> Option<usize> {
     }
 }
 
-fn convert_integer_bytes(
+fn convert_integer_bytes_into(
     bytes: &[u8],
     src_size: usize,
     src_signed: bool,
     src_order: Option<ByteOrder>,
+    out: &mut [u8],
     dst_size: usize,
     dst_signed: bool,
-) -> Result<Vec<u8>> {
-    convert_integer_bytes_to_order(
-        bytes, src_size, src_signed, src_order, dst_size, dst_signed, None,
-    )
+) -> Result<()> {
+    validate_integer_conversion_buffers(bytes, src_size, out, dst_size)?;
+    for (idx, chunk) in bytes.chunks_exact(src_size).enumerate() {
+        let value = if src_signed {
+            IntegerValue::Signed(read_signed(chunk, src_order))
+        } else {
+            IntegerValue::Unsigned(read_unsigned(chunk, src_order))
+        };
+        let raw = clamp_integer(value, dst_size, dst_signed);
+        let dst = conversion_output_window(out, idx, dst_size)?;
+        write_uint_ordered(dst, raw, None);
+    }
+    Ok(())
 }
 
-fn convert_integer_bytes_to_order(
+fn convert_integer_bytes_to_order_into(
     bytes: &[u8],
     src_size: usize,
     src_signed: bool,
@@ -338,7 +461,8 @@ fn convert_integer_bytes_to_order(
     dst_size: usize,
     dst_signed: bool,
     dst_order: Option<ByteOrder>,
-) -> Result<Vec<u8>> {
+    out: &mut Vec<u8>,
+) -> Result<()> {
     if src_size == 0 || dst_size == 0 || src_size > 16 || dst_size > 16 {
         return Err(Error::Unsupported(
             "integer conversion supports 1..=16 byte integer payloads".into(),
@@ -351,7 +475,8 @@ fn convert_integer_bytes_to_order(
         )));
     }
 
-    let mut out = vec![0u8; conversion_output_len(bytes.len(), src_size, dst_size)?];
+    out.clear();
+    out.resize(conversion_output_len(bytes.len(), src_size, dst_size)?, 0);
     for (idx, chunk) in bytes.chunks_exact(src_size).enumerate() {
         let value = if src_signed {
             IntegerValue::Signed(read_signed(chunk, src_order))
@@ -359,10 +484,10 @@ fn convert_integer_bytes_to_order(
             IntegerValue::Unsigned(read_unsigned(chunk, src_order))
         };
         let raw = clamp_integer(value, dst_size, dst_signed);
-        let dst = conversion_output_window(&mut out, idx, dst_size)?;
+        let dst = conversion_output_window(out.as_mut_slice(), idx, dst_size)?;
         write_uint_ordered(dst, raw, dst_order);
     }
-    Ok(out)
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -472,6 +597,7 @@ fn write_uint_ordered(bytes: &mut [u8], value: u128, byte_order: Option<ByteOrde
     maybe_swap_elements(bytes, bytes.len(), byte_order);
 }
 
+#[cfg(test)]
 fn convert_float_bytes(
     bytes: &[u8],
     src_size: usize,
@@ -481,6 +607,25 @@ fn convert_float_bytes(
     convert_float_bytes_to_order(bytes, src_size, src_order, dst_size, None)
 }
 
+fn convert_float_bytes_into(
+    bytes: &[u8],
+    src_size: usize,
+    src_order: Option<ByteOrder>,
+    out: &mut [u8],
+    dst_size: usize,
+) -> Result<()> {
+    validate_float_size(src_size, "source")?;
+    validate_float_size(dst_size, "target")?;
+    validate_conversion_buffers(bytes, src_size, out, dst_size, "source float")?;
+    for (idx, chunk) in bytes.chunks_exact(src_size).enumerate() {
+        let value = read_float(chunk, src_size, src_order)?;
+        let dst = conversion_output_window(out, idx, dst_size)?;
+        write_float_ordered(dst, value, None)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 fn convert_float_bytes_to_order(
     bytes: &[u8],
     src_size: usize,
@@ -488,6 +633,19 @@ fn convert_float_bytes_to_order(
     dst_size: usize,
     dst_order: Option<ByteOrder>,
 ) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    convert_float_bytes_to_order_into(bytes, src_size, src_order, dst_size, dst_order, &mut out)?;
+    Ok(out)
+}
+
+fn convert_float_bytes_to_order_into(
+    bytes: &[u8],
+    src_size: usize,
+    src_order: Option<ByteOrder>,
+    dst_size: usize,
+    dst_order: Option<ByteOrder>,
+    out: &mut Vec<u8>,
+) -> Result<()> {
     validate_float_size(src_size, "source")?;
     validate_float_size(dst_size, "target")?;
     if bytes.len() % src_size != 0 {
@@ -496,15 +654,17 @@ fn convert_float_bytes_to_order(
             bytes.len()
         )));
     }
-    let mut out = vec![0u8; conversion_output_len(bytes.len(), src_size, dst_size)?];
+    out.clear();
+    out.resize(conversion_output_len(bytes.len(), src_size, dst_size)?, 0);
     for (idx, chunk) in bytes.chunks_exact(src_size).enumerate() {
         let value = read_float(chunk, src_size, src_order)?;
-        let dst = conversion_output_window(&mut out, idx, dst_size)?;
+        let dst = conversion_output_window(out.as_mut_slice(), idx, dst_size)?;
         write_float_ordered(dst, value, dst_order)?;
     }
-    Ok(out)
+    Ok(())
 }
 
+#[cfg(test)]
 fn convert_integer_to_float_bytes(
     bytes: &[u8],
     src_size: usize,
@@ -515,6 +675,34 @@ fn convert_integer_to_float_bytes(
     convert_integer_to_float_bytes_to_order(bytes, src_size, src_signed, src_order, dst_size, None)
 }
 
+fn convert_integer_to_float_bytes_into(
+    bytes: &[u8],
+    src_size: usize,
+    src_signed: bool,
+    src_order: Option<ByteOrder>,
+    out: &mut [u8],
+    dst_size: usize,
+) -> Result<()> {
+    if src_size == 0 || src_size > 16 {
+        return Err(Error::Unsupported(
+            "integer-to-float conversion supports 1..=16 byte integer payloads".into(),
+        ));
+    }
+    validate_float_size(dst_size, "target")?;
+    validate_conversion_buffers(bytes, src_size, out, dst_size, "source integer")?;
+    for (idx, chunk) in bytes.chunks_exact(src_size).enumerate() {
+        let value = if src_signed {
+            read_signed(chunk, src_order) as f64
+        } else {
+            read_unsigned(chunk, src_order) as f64
+        };
+        let dst = conversion_output_window(out, idx, dst_size)?;
+        write_float_ordered(dst, value, None)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 fn convert_integer_to_float_bytes_to_order(
     bytes: &[u8],
     src_size: usize,
@@ -523,6 +711,22 @@ fn convert_integer_to_float_bytes_to_order(
     dst_size: usize,
     dst_order: Option<ByteOrder>,
 ) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    convert_integer_to_float_bytes_to_order_into(
+        bytes, src_size, src_signed, src_order, dst_size, dst_order, &mut out,
+    )?;
+    Ok(out)
+}
+
+fn convert_integer_to_float_bytes_to_order_into(
+    bytes: &[u8],
+    src_size: usize,
+    src_signed: bool,
+    src_order: Option<ByteOrder>,
+    dst_size: usize,
+    dst_order: Option<ByteOrder>,
+    out: &mut Vec<u8>,
+) -> Result<()> {
     if src_size == 0 || src_size > 16 {
         return Err(Error::Unsupported(
             "integer-to-float conversion supports 1..=16 byte integer payloads".into(),
@@ -535,19 +739,21 @@ fn convert_integer_to_float_bytes_to_order(
             bytes.len()
         )));
     }
-    let mut out = vec![0u8; conversion_output_len(bytes.len(), src_size, dst_size)?];
+    out.clear();
+    out.resize(conversion_output_len(bytes.len(), src_size, dst_size)?, 0);
     for (idx, chunk) in bytes.chunks_exact(src_size).enumerate() {
         let value = if src_signed {
             read_signed(chunk, src_order) as f64
         } else {
             read_unsigned(chunk, src_order) as f64
         };
-        let dst = conversion_output_window(&mut out, idx, dst_size)?;
+        let dst = conversion_output_window(out.as_mut_slice(), idx, dst_size)?;
         write_float_ordered(dst, value, dst_order)?;
     }
-    Ok(out)
+    Ok(())
 }
 
+#[cfg(test)]
 fn convert_float_to_integer_bytes(
     bytes: &[u8],
     src_size: usize,
@@ -558,6 +764,31 @@ fn convert_float_to_integer_bytes(
     convert_float_to_integer_bytes_to_order(bytes, src_size, src_order, dst_size, dst_signed, None)
 }
 
+fn convert_float_to_integer_bytes_into(
+    bytes: &[u8],
+    src_size: usize,
+    src_order: Option<ByteOrder>,
+    out: &mut [u8],
+    dst_size: usize,
+    dst_signed: bool,
+) -> Result<()> {
+    validate_float_size(src_size, "source")?;
+    if dst_size == 0 || dst_size > 16 {
+        return Err(Error::Unsupported(
+            "float-to-integer conversion supports 1..=16 byte integer targets".into(),
+        ));
+    }
+    validate_conversion_buffers(bytes, src_size, out, dst_size, "source float")?;
+    for (idx, chunk) in bytes.chunks_exact(src_size).enumerate() {
+        let value = read_float(chunk, src_size, src_order)?;
+        let raw = clamp_float_to_integer(value, dst_size, dst_signed);
+        let dst = conversion_output_window(out, idx, dst_size)?;
+        write_uint_ordered(dst, raw, None);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 fn convert_float_to_integer_bytes_to_order(
     bytes: &[u8],
     src_size: usize,
@@ -566,6 +797,22 @@ fn convert_float_to_integer_bytes_to_order(
     dst_signed: bool,
     dst_order: Option<ByteOrder>,
 ) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    convert_float_to_integer_bytes_to_order_into(
+        bytes, src_size, src_order, dst_size, dst_signed, dst_order, &mut out,
+    )?;
+    Ok(out)
+}
+
+fn convert_float_to_integer_bytes_to_order_into(
+    bytes: &[u8],
+    src_size: usize,
+    src_order: Option<ByteOrder>,
+    dst_size: usize,
+    dst_signed: bool,
+    dst_order: Option<ByteOrder>,
+    out: &mut Vec<u8>,
+) -> Result<()> {
     validate_float_size(src_size, "source")?;
     if dst_size == 0 || dst_size > 16 {
         return Err(Error::Unsupported(
@@ -578,20 +825,72 @@ fn convert_float_to_integer_bytes_to_order(
             bytes.len()
         )));
     }
-    let mut out = vec![0u8; conversion_output_len(bytes.len(), src_size, dst_size)?];
+    out.clear();
+    out.resize(conversion_output_len(bytes.len(), src_size, dst_size)?, 0);
     for (idx, chunk) in bytes.chunks_exact(src_size).enumerate() {
         let value = read_float(chunk, src_size, src_order)?;
         let raw = clamp_float_to_integer(value, dst_size, dst_signed);
-        let dst = conversion_output_window(&mut out, idx, dst_size)?;
+        let dst = conversion_output_window(out.as_mut_slice(), idx, dst_size)?;
         write_uint_ordered(dst, raw, dst_order);
     }
-    Ok(out)
+    Ok(())
 }
 
 fn conversion_output_len(byte_len: usize, src_size: usize, dst_size: usize) -> Result<usize> {
     (byte_len / src_size)
         .checked_mul(dst_size)
         .ok_or_else(|| Error::InvalidFormat("conversion output size overflow".into()))
+}
+
+fn converted_element_count(byte_len: usize, src_size: usize) -> Result<usize> {
+    if src_size == 0 {
+        return Err(Error::InvalidFormat(
+            "conversion source element size is zero".into(),
+        ));
+    }
+    if byte_len % src_size != 0 {
+        return Err(Error::InvalidFormat(format!(
+            "byte count {byte_len} is not a multiple of source element size {src_size}"
+        )));
+    }
+    Ok(byte_len / src_size)
+}
+
+fn validate_integer_conversion_buffers(
+    bytes: &[u8],
+    src_size: usize,
+    out: &[u8],
+    dst_size: usize,
+) -> Result<()> {
+    if src_size == 0 || dst_size == 0 || src_size > 16 || dst_size > 16 {
+        return Err(Error::Unsupported(
+            "integer conversion supports 1..=16 byte integer payloads".into(),
+        ));
+    }
+    validate_conversion_buffers(bytes, src_size, out, dst_size, "source integer")
+}
+
+fn validate_conversion_buffers(
+    bytes: &[u8],
+    src_size: usize,
+    out: &[u8],
+    dst_size: usize,
+    source_name: &str,
+) -> Result<()> {
+    if bytes.len() % src_size != 0 {
+        return Err(Error::InvalidFormat(format!(
+            "byte count {} is not a multiple of {source_name} size {src_size}",
+            bytes.len()
+        )));
+    }
+    let expected = conversion_output_len(bytes.len(), src_size, dst_size)?;
+    if out.len() != expected {
+        return Err(Error::InvalidFormat(format!(
+            "conversion output buffer has {} bytes, expected {expected}",
+            out.len()
+        )));
+    }
+    Ok(())
 }
 
 fn conversion_output_window(out: &mut [u8], idx: usize, dst_size: usize) -> Result<&mut [u8]> {
@@ -746,7 +1045,7 @@ mod tests {
         let datatype = fixed_type(16, false, ByteOrder::BigEndian);
         let conversion = ReadConversion::for_dataset::<u128>(&datatype).unwrap();
         let raw = 0x0102_0304_0506_0708_1112_1314_1516_1718u128.to_be_bytes();
-        let values = conversion.bytes_to_vec::<u128>(raw.to_vec()).unwrap();
+        let values = conversion.bytes_into_vec::<u128>(raw.to_vec()).unwrap();
         assert_eq!(values, vec![0x0102_0304_0506_0708_1112_1314_1516_1718u128]);
     }
 
@@ -755,8 +1054,28 @@ mod tests {
         let datatype = fixed_type(8, true, ByteOrder::LittleEndian);
         let conversion = ReadConversion::for_dataset::<i128>(&datatype).unwrap();
         let raw = (-42i64).to_le_bytes();
-        let values = conversion.bytes_to_vec::<i128>(raw.to_vec()).unwrap();
+        let values = conversion.bytes_into_vec::<i128>(raw.to_vec()).unwrap();
         assert_eq!(values, vec![-42i128]);
+    }
+
+    #[test]
+    fn converted_numeric_vec_writes_final_typed_storage() {
+        let datatype = fixed_type(2, true, ByteOrder::LittleEndian);
+        let conversion = ReadConversion::for_dataset::<i32>(&datatype).unwrap();
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&(-7i16).to_le_bytes());
+        raw.extend_from_slice(&42i16.to_le_bytes());
+        let values = conversion.bytes_into_vec::<i32>(raw).unwrap();
+        assert_eq!(values, vec![-7, 42]);
+    }
+
+    #[test]
+    fn converted_scalar_writes_stack_storage() {
+        let datatype = fixed_type(2, false, ByteOrder::LittleEndian);
+        let conversion = ReadConversion::for_dataset::<u32>(&datatype).unwrap();
+        let raw = 513u16.to_le_bytes();
+        let value = conversion.bytes_to_scalar_from_slice::<u32>(&raw).unwrap();
+        assert_eq!(value, 513);
     }
 
     #[test]
@@ -764,7 +1083,7 @@ mod tests {
         let datatype = float_type(8, ByteOrder::LittleEndian);
         let conversion = ReadConversion::for_dataset::<u128>(&datatype).unwrap();
         let raw = f64::INFINITY.to_le_bytes();
-        let values = conversion.bytes_to_vec::<u128>(raw.to_vec()).unwrap();
+        let values = conversion.bytes_into_vec::<u128>(raw.to_vec()).unwrap();
         assert_eq!(values, vec![u128::MAX]);
     }
 
@@ -773,7 +1092,7 @@ mod tests {
         let datatype = fixed_type(16, false, ByteOrder::LittleEndian);
         let conversion = ReadConversion::for_dataset::<i128>(&datatype).unwrap();
         let raw = u128::MAX.to_le_bytes();
-        let values = conversion.bytes_to_vec::<i128>(raw.to_vec()).unwrap();
+        let values = conversion.bytes_into_vec::<i128>(raw.to_vec()).unwrap();
         assert_eq!(values, vec![i128::MAX]);
     }
 

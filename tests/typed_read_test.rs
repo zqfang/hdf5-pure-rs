@@ -4,16 +4,35 @@ use hdf5_pure_rust::File;
 fn test_read_typed_f64() {
     let f = File::open("tests/data/datasets_v0.h5").unwrap();
     let ds = f.dataset("float64_1d").unwrap();
-    let values: Vec<f64> = ds.read::<f64>().unwrap();
-    assert_eq!(values, vec![1.0, 2.0, 3.0, 4.0, 5.0]);
+    let mut values = [0.0f64; 5];
+    ds.read_into(&mut values).unwrap();
+    assert_eq!(values, [1.0, 2.0, 3.0, 4.0, 5.0]);
 }
 
 #[test]
 fn test_read_typed_i32() {
     let f = File::open("tests/data/datasets_v0.h5").unwrap();
     let ds = f.dataset("int32_1d").unwrap();
-    let values: Vec<i32> = ds.read::<i32>().unwrap();
-    assert_eq!(values, vec![10, 20, 30]);
+    let mut values = [0i32; 3];
+    ds.read_into(&mut values).unwrap();
+    assert_eq!(values, [10, 20, 30]);
+}
+
+#[test]
+fn test_dataset_read_into_uses_caller_buffers() {
+    let f = File::open("tests/data/datasets_v0.h5").unwrap();
+    let ds = f.dataset("int32_1d").unwrap();
+
+    let mut raw = [0u8; 12];
+    ds.read_raw_into(&mut raw).unwrap();
+    assert_eq!(raw, [10, 0, 0, 0, 20, 0, 0, 0, 30, 0, 0, 0]);
+
+    let mut values = [0i32; 3];
+    ds.read_into(&mut values).unwrap();
+    assert_eq!(values, [10, 20, 30]);
+
+    let mut too_short = [0i32; 2];
+    assert!(ds.read_into(&mut too_short).is_err());
 }
 
 #[test]
@@ -73,11 +92,11 @@ fn test_raw_message_inspection_apis() {
 
     let dtype = ds.raw_datatype_message().unwrap();
     assert_eq!(dtype.size, 8);
-    assert_eq!(ds.dtype().unwrap().raw_message().size, 8);
+    assert_eq!(ds.dtype().unwrap().raw_message_ref().size, 8);
 
     let space = ds.raw_dataspace_message().unwrap();
     assert_eq!(space.dims, vec![5]);
-    assert_eq!(ds.space().unwrap().raw_message().dims, vec![5]);
+    assert_eq!(ds.space().unwrap().raw_message_ref().dims, vec![5]);
 
     let plist = ds.create_plist().unwrap();
     assert!(plist.filters.is_empty());
@@ -105,7 +124,8 @@ fn test_read_chunked_typed() {
     let plist = ds.create_plist().unwrap();
     assert!(plist.chunk_opts().is_none() || plist.chunk_opts() == Some(0));
 
-    let values: Vec<f32> = ds.read::<f32>().unwrap();
+    let mut values = [0.0f32; 100];
+    ds.read_into(&mut values).unwrap();
     assert_eq!(values.len(), 100);
     for (i, v) in values.iter().enumerate() {
         assert_eq!(*v, i as f32);
@@ -128,10 +148,30 @@ fn test_attr_read_typed() {
 fn test_attr_read_array_typed() {
     let f = File::open("tests/data/attrs.h5").unwrap();
     let attr = f.attr("array_attr").unwrap();
-    let values: Vec<f64> = attr.read::<f64>().unwrap();
-    assert_eq!(values, vec![1.0, 2.0, 3.0]);
-    let values32: Vec<f32> = attr.read::<f32>().unwrap();
-    assert_eq!(values32, vec![1.0, 2.0, 3.0]);
+    let mut values = [0.0f64; 3];
+    attr.read_into(&mut values).unwrap();
+    assert_eq!(values, [1.0, 2.0, 3.0]);
+    let mut values32 = [0.0f32; 3];
+    attr.read_into(&mut values32).unwrap();
+    assert_eq!(values32, [1.0, 2.0, 3.0]);
+}
+
+#[test]
+fn test_attribute_read_into_uses_caller_buffers() {
+    let f = File::open("tests/data/attrs.h5").unwrap();
+    let attr = f.attr("array_attr").unwrap();
+
+    let mut raw = vec![0; attr.raw_data().len()];
+    attr.read_raw_into(&mut raw).unwrap();
+    assert_eq!(raw, attr.raw_data());
+
+    let mut values = [0.0f64; 3];
+    attr.read_into(&mut values).unwrap();
+    assert_eq!(values, [1.0, 2.0, 3.0]);
+
+    let mut values32 = [0.0f32; 3];
+    attr.read_into(&mut values32).unwrap();
+    assert_eq!(values32, [1.0, 2.0, 3.0]);
 }
 
 #[test]
@@ -139,6 +179,7 @@ fn test_read_wrong_type_size() {
     let f = File::open("tests/data/strings.h5").unwrap();
     let ds = f.dataset("fixed_str").unwrap();
     // Fixed strings are not part of the numeric conversion table.
-    let result = ds.read::<u64>();
+    let mut value = [0u64; 1];
+    let result = ds.read_into(&mut value);
     assert!(result.is_err());
 }

@@ -5,7 +5,10 @@
 
 #![allow(dead_code)]
 
-use std::io::{Read, Seek};
+use std::{
+    fmt,
+    io::{Read, Seek},
+};
 
 use crate::error::{Error, Result};
 use crate::format::checksum::checksum_metadata;
@@ -26,8 +29,12 @@ pub(super) struct ExtArrayDataBlockPrefix {
 }
 
 /// Format a data-block prefix for debug printing.
-pub(super) fn dblock_debug(prefix: &ExtArrayDataBlockPrefix) -> String {
-    format!(
+pub(super) fn write_dblock_debug(
+    prefix: &ExtArrayDataBlockPrefix,
+    out: &mut impl fmt::Write,
+) -> fmt::Result {
+    write!(
+        out,
         "ExtArrayDataBlockPrefix(pages={}, prefix_size={})",
         prefix.pages, prefix.prefix_size
     )
@@ -53,7 +60,11 @@ pub(super) fn cache_dblock_image_len(
 }
 
 /// Serialize a dirty data block to its on-disk image (prefix + payload + checksum).
-pub(super) fn cache_dblock_serialize(prefix: &[u8], payload: &[u8]) -> Result<Vec<u8>> {
+pub(super) fn cache_dblock_serialize_into(
+    prefix: &[u8],
+    payload: &[u8],
+    out: &mut Vec<u8>,
+) -> Result<()> {
     let image_len = prefix
         .len()
         .checked_add(payload.len())
@@ -61,12 +72,13 @@ pub(super) fn cache_dblock_serialize(prefix: &[u8], payload: &[u8]) -> Result<Ve
         .ok_or_else(|| {
             Error::InvalidFormat("extensible array data block image length overflow".into())
         })?;
-    let mut out = Vec::with_capacity(image_len);
+    out.clear();
+    out.reserve(image_len);
     out.extend_from_slice(prefix);
     out.extend_from_slice(payload);
     let checksum = crate::format::checksum::checksum_metadata(&out);
     out.extend_from_slice(&checksum.to_le_bytes());
-    Ok(out)
+    Ok(())
 }
 
 /// Handle metadata-cache action notifications for a data block.
@@ -109,13 +121,14 @@ pub(super) fn cache_dblk_page_deserialize(payload: &[u8]) -> Result<&[u8]> {
 }
 
 /// Serialize a data-block page to its on-disk image (payload + checksum).
-pub(super) fn cache_dblk_page_serialize(payload: &[u8]) -> Result<Vec<u8>> {
+pub(super) fn cache_dblk_page_serialize_into(payload: &[u8], out: &mut Vec<u8>) -> Result<()> {
     let image_len = cache_dblk_page_image_len(payload.len())?;
-    let mut out = Vec::with_capacity(image_len);
+    out.clear();
+    out.reserve(image_len);
     out.extend_from_slice(payload);
     let checksum = crate::format::checksum::checksum_metadata(&out);
     out.extend_from_slice(&checksum.to_le_bytes());
-    Ok(out)
+    Ok(())
 }
 
 /// Handle metadata-cache action notifications for a data-block page.
@@ -199,8 +212,9 @@ pub(super) fn decode_data_block_prefix<R: Read + Seek>(
     data_block_elements: usize,
 ) -> Result<ExtArrayDataBlockPrefix> {
     reader.seek(data_block_addr)?;
-    let magic = reader.read_bytes(4)?;
-    if magic != b"EADB" {
+    let mut magic = [0u8; 4];
+    reader.read_bytes_into(&mut magic)?;
+    if magic != *b"EADB" {
         return Err(Error::InvalidFormat(
             "invalid extensible array data block magic".into(),
         ));
@@ -290,6 +304,36 @@ pub(super) fn append_data_block_elements<R: Read + Seek>(
     count: usize,
     elements: &mut Vec<FixedArrayElement>,
 ) -> Result<()> {
+    let mut checksum_scratch = Vec::new();
+    append_data_block_elements_with_scratch(
+        reader,
+        header_addr,
+        header,
+        filtered,
+        chunk_size_len,
+        data_block_addr,
+        data_block_elements,
+        page_init,
+        count,
+        elements,
+        &mut checksum_scratch,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn append_data_block_elements_with_scratch<R: Read + Seek>(
+    reader: &mut HdfReader<R>,
+    header_addr: u64,
+    header: &ExtensibleArrayHeader,
+    filtered: bool,
+    chunk_size_len: usize,
+    data_block_addr: u64,
+    data_block_elements: usize,
+    page_init: Option<&[u8]>,
+    count: usize,
+    elements: &mut Vec<FixedArrayElement>,
+    checksum_scratch: &mut Vec<u8>,
+) -> Result<()> {
     if count == 0 {
         return Ok(());
     }
@@ -325,7 +369,12 @@ pub(super) fn append_data_block_elements<R: Read + Seek>(
                 "extensible array unread data block span",
             )?)?;
         }
-        verify_reader_checksum(reader, data_block_addr, "extensible array data block")?;
+        verify_reader_checksum_with_scratch(
+            reader,
+            data_block_addr,
+            "extensible array data block",
+            checksum_scratch,
+        )?;
     } else {
         let page_payload = super::checked_usize_mul(
             header.data_block_page_elements,
@@ -368,7 +417,12 @@ pub(super) fn append_data_block_elements<R: Read + Seek>(
                 for _ in 0..page_elements {
                     elements.push(read_element(reader, filtered, chunk_size_len)?);
                 }
-                verify_reader_checksum(reader, page_addr, "extensible array data block page")?;
+                verify_reader_checksum_with_scratch(
+                    reader,
+                    page_addr,
+                    "extensible array data block page",
+                    checksum_scratch,
+                )?;
             } else {
                 super::append_fill_elements(header, page_elements, elements)?;
             }
@@ -385,6 +439,16 @@ fn verify_reader_checksum<R: Read + Seek>(
     start: u64,
     context: &str,
 ) -> Result<()> {
+    let mut scratch = Vec::new();
+    verify_reader_checksum_with_scratch(reader, start, context, &mut scratch)
+}
+
+fn verify_reader_checksum_with_scratch<R: Read + Seek>(
+    reader: &mut HdfReader<R>,
+    start: u64,
+    context: &str,
+    scratch: &mut Vec<u8>,
+) -> Result<()> {
     let checksum_pos = reader.position()?;
     let stored = reader.read_u32()?;
     let check_len = usize::try_from(
@@ -394,8 +458,10 @@ fn verify_reader_checksum<R: Read + Seek>(
     )
     .map_err(|_| Error::InvalidFormat(format!("{context} checksum span is too large")))?;
     reader.seek(start)?;
-    let bytes = reader.read_bytes(check_len)?;
-    let computed = checksum_metadata(&bytes);
+    scratch.clear();
+    scratch.resize(check_len, 0);
+    reader.read_bytes_into(scratch)?;
+    let computed = checksum_metadata(scratch);
     if stored != computed {
         return Err(Error::InvalidFormat(format!(
             "{context} checksum mismatch: stored={stored:#010x}, computed={computed:#010x}"
@@ -545,7 +611,8 @@ mod tests {
     #[test]
     fn extensible_array_page_cache_serializes_and_validates_checksum() {
         let payload = 55u64.to_le_bytes();
-        let image = cache_dblk_page_serialize(&payload).unwrap();
+        let mut image = Vec::new();
+        cache_dblk_page_serialize_into(&payload, &mut image).unwrap();
         assert_eq!(
             cache_dblk_page_image_len(payload.len()).unwrap(),
             image.len()

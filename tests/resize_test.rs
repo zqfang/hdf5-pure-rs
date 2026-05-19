@@ -1,4 +1,15 @@
-use hdf5_pure_rust::{File, MutableFile, WritableFile};
+use hdf5_pure_rust::{Dataset, File, H5Type, MutableFile, Result, WritableFile};
+
+fn dataset_shape_into(ds: &Dataset, shape: &mut Vec<u64>) -> Result<()> {
+    ds.shape_into(shape)
+}
+
+fn dataset_read_into<T>(ds: &Dataset, values: &mut [T]) -> Result<()>
+where
+    T: H5Type,
+{
+    ds.read_into(values)
+}
 
 #[test]
 fn test_resize_chunked_dataset() {
@@ -21,8 +32,11 @@ fn test_resize_chunked_dataset() {
     {
         let f = File::open(&path).unwrap();
         let ds = f.dataset("data").unwrap();
-        assert_eq!(ds.shape().unwrap(), vec![10]);
-        let vals: Vec<f64> = ds.read::<f64>().unwrap();
+        let mut shape = Vec::new();
+        dataset_shape_into(&ds, &mut shape).unwrap();
+        assert_eq!(shape, vec![10]);
+        let mut vals = vec![0.0; ds.size().unwrap() as usize];
+        dataset_read_into(&ds, &mut vals).unwrap();
         assert_eq!(vals.len(), 10);
         assert_eq!(vals[0], 1.0);
         assert_eq!(vals[9], 10.0);
@@ -38,8 +52,11 @@ fn test_resize_chunked_dataset() {
     {
         let f = File::open(&path).unwrap();
         let ds = f.dataset("data").unwrap();
-        assert_eq!(ds.shape().unwrap(), vec![7]);
-        let vals: Vec<f64> = ds.read::<f64>().unwrap();
+        let mut shape = Vec::new();
+        dataset_shape_into(&ds, &mut shape).unwrap();
+        assert_eq!(shape, vec![7]);
+        let mut vals = vec![0.0; ds.size().unwrap() as usize];
+        dataset_read_into(&ds, &mut vals).unwrap();
         assert_eq!(vals.len(), 7);
         assert_eq!(vals[0], 1.0);
         assert_eq!(vals[6], 7.0);
@@ -55,8 +72,11 @@ fn test_resize_chunked_dataset() {
     {
         let f = File::open(&path).unwrap();
         let ds = f.dataset("data").unwrap();
-        assert_eq!(ds.shape().unwrap(), vec![15]);
-        let vals: Vec<f64> = ds.read::<f64>().unwrap();
+        let mut shape = Vec::new();
+        dataset_shape_into(&ds, &mut shape).unwrap();
+        assert_eq!(shape, vec![15]);
+        let mut vals = vec![0.0; ds.size().unwrap() as usize];
+        dataset_read_into(&ds, &mut vals).unwrap();
         assert_eq!(vals.len(), 15);
         assert_eq!(vals[0], 1.0);
         // Original data preserved in existing chunks
@@ -141,7 +161,9 @@ fn test_mutable_file_deletes_compact_attributes() {
         let ds = f.dataset("metadata/values").unwrap();
         assert!(ds.attr_exists("dataset_keep").unwrap());
         assert!(!ds.attr_exists("dataset_drop").unwrap());
-        assert_eq!(ds.read::<i32>().unwrap(), vec![10, 20]);
+        let mut values = vec![0; ds.size().unwrap() as usize];
+        dataset_read_into(&ds, &mut values).unwrap();
+        assert_eq!(values, vec![10, 20]);
     }
 }
 
@@ -248,7 +270,9 @@ fn test_mutable_file_mutates_group_and_dataset_dense_attributes() {
             .unwrap(),
         40
     );
-    assert_eq!(dataset.read::<i32>().unwrap(), vec![1, 2, 3]);
+    let mut values = vec![0; dataset.size().unwrap() as usize];
+    dataset_read_into(&dataset, &mut values).unwrap();
+    assert_eq!(values, vec![1, 2, 3]);
 }
 
 #[test]
@@ -308,7 +332,9 @@ fn test_mutable_file_renames_compact_attributes_same_length() {
         assert!(!ds.attr_exists("dsold").unwrap());
         assert!(ds.attr_exists("dsnew").unwrap());
         assert_eq!(ds.attr("dsnew").unwrap().read_scalar::<i32>().unwrap(), 14);
-        assert_eq!(ds.read::<i32>().unwrap(), vec![10, 20]);
+        let mut values = vec![0; ds.size().unwrap() as usize];
+        dataset_read_into(&ds, &mut values).unwrap();
+        assert_eq!(values, vec![10, 20]);
     }
 }
 
@@ -343,7 +369,9 @@ fn test_resize_then_write_appended_chunk() {
 
     {
         let f = File::open(&path).unwrap();
-        let vals: Vec<i32> = f.dataset("data").unwrap().read::<i32>().unwrap();
+        let ds = f.dataset("data").unwrap();
+        let mut vals = vec![0; ds.size().unwrap() as usize];
+        dataset_read_into(&ds, &mut vals).unwrap();
         assert_eq!(vals, (0..15).collect::<Vec<_>>());
     }
 }
@@ -371,7 +399,9 @@ fn test_resize_shrink_hides_removed_chunks() {
 
     {
         let f = File::open(&path).unwrap();
-        let vals: Vec<i32> = f.dataset("data").unwrap().read::<i32>().unwrap();
+        let ds = f.dataset("data").unwrap();
+        let mut vals = vec![0; ds.size().unwrap() as usize];
+        dataset_read_into(&ds, &mut vals).unwrap();
         assert_eq!(vals, vec![0, 1, 2, 3, 4, 5]);
     }
 }
@@ -401,7 +431,9 @@ fn test_resize_grow_uses_chunked_fill_value() {
 
     {
         let f = File::open(&path).unwrap();
-        let vals: Vec<i32> = f.dataset("data").unwrap().read::<i32>().unwrap();
+        let ds = f.dataset("data").unwrap();
+        let mut vals = vec![0; ds.size().unwrap() as usize];
+        dataset_read_into(&ds, &mut vals).unwrap();
         assert_eq!(vals, vec![0, 1, 2, 3, 4, -7, -7, -7, -7, -7]);
     }
 }
@@ -436,7 +468,9 @@ fn test_write_chunk_replaces_existing_chunk() {
 
     {
         let f = File::open(&path).unwrap();
-        let vals: Vec<i32> = f.dataset("data").unwrap().read::<i32>().unwrap();
+        let ds = f.dataset("data").unwrap();
+        let mut vals = vec![0; ds.size().unwrap() as usize];
+        dataset_read_into(&ds, &mut vals).unwrap();
         assert_eq!(vals, vec![0, 1, 2, 3, 4, 100, 101, 102, 103, 104]);
     }
 }
@@ -485,7 +519,9 @@ fn test_write_chunk_splits_full_v1_btree_leaf() {
 
     {
         let f = File::open(&path).unwrap();
-        let vals: Vec<i32> = f.dataset("data").unwrap().read::<i32>().unwrap();
+        let ds = f.dataset("data").unwrap();
+        let mut vals = vec![0; ds.size().unwrap() as usize];
+        dataset_read_into(&ds, &mut vals).unwrap();
         assert_eq!(vals, (0..330).collect::<Vec<_>>());
     }
 }
@@ -510,7 +546,9 @@ fn test_write_chunk_replaces_existing_v4_fixed_array_chunk() {
 
     {
         let f = File::open(&path).unwrap();
-        let vals: Vec<i32> = f.dataset("fixed_array").unwrap().read::<i32>().unwrap();
+        let ds = f.dataset("fixed_array").unwrap();
+        let mut vals = vec![0; ds.size().unwrap() as usize];
+        dataset_read_into(&ds, &mut vals).unwrap();
         let mut expected: Vec<i32> = (0..100).collect();
         expected[..10].copy_from_slice(&(1000..1010).collect::<Vec<_>>());
         assert_eq!(vals, expected);
@@ -538,7 +576,9 @@ fn test_resize_then_write_appended_v4_btree2_chunk() {
 
     {
         let f = File::open(&path).unwrap();
-        let vals: Vec<i32> = f.dataset("btree_v2").unwrap().read::<i32>().unwrap();
+        let ds = f.dataset("btree_v2").unwrap();
+        let mut vals = vec![0; ds.size().unwrap() as usize];
+        dataset_read_into(&ds, &mut vals).unwrap();
         assert_eq!(vals.len(), 96);
         assert_eq!(&vals[..64], &(0..64).collect::<Vec<_>>());
         assert_eq!(&vals[64..68], &[64, 65, 66, 67]);
@@ -584,11 +624,9 @@ fn test_resize_then_write_appended_v4_extensible_array_chunk() {
 
     {
         let f = File::open(&path).unwrap();
-        let vals: Vec<f64> = f
-            .dataset("extensible_array")
-            .unwrap()
-            .read::<f64>()
-            .unwrap();
+        let ds = f.dataset("extensible_array").unwrap();
+        let mut vals = vec![0.0; ds.size().unwrap() as usize];
+        dataset_read_into(&ds, &mut vals).unwrap();
         let expected: Vec<f64> = (0..100).map(|value| value as f64).collect();
         assert_eq!(vals, expected);
     }
@@ -632,11 +670,9 @@ fn test_resize_then_write_v4_extensible_array_into_super_block() {
 
     {
         let f = File::open(&path).unwrap();
-        let vals: Vec<f64> = f
-            .dataset("extensible_array")
-            .unwrap()
-            .read::<f64>()
-            .unwrap();
+        let ds = f.dataset("extensible_array").unwrap();
+        let mut vals = vec![0.0; ds.size().unwrap() as usize];
+        dataset_read_into(&ds, &mut vals).unwrap();
         let expected: Vec<f64> = (0..4_900).map(|value| value as f64).collect();
         assert_eq!(vals, expected);
     }
@@ -685,7 +721,9 @@ fn test_write_chunk_replaces_filtered_chunk() {
 
     {
         let f = File::open(&path).unwrap();
-        let vals: Vec<i32> = f.dataset("data").unwrap().read::<i32>().unwrap();
+        let ds = f.dataset("data").unwrap();
+        let mut vals = vec![0; ds.size().unwrap() as usize];
+        dataset_read_into(&ds, &mut vals).unwrap();
         let mut expected: Vec<i32> = (0..20).collect();
         expected[5..10].copy_from_slice(&(1000..1005).collect::<Vec<_>>());
         assert_eq!(vals, expected);
@@ -712,11 +750,9 @@ fn test_write_chunk_replaces_fletcher32_chunk() {
 
     {
         let f = File::open(&path).unwrap();
-        let vals: Vec<f32> = f
-            .dataset("chunked_fletcher")
-            .unwrap()
-            .read::<f32>()
-            .unwrap();
+        let ds = f.dataset("chunked_fletcher").unwrap();
+        let mut vals = vec![0.0; ds.size().unwrap() as usize];
+        dataset_read_into(&ds, &mut vals).unwrap();
         let mut expected: Vec<f32> = (0..100).map(|value| value as f32).collect();
         expected[25..50]
             .copy_from_slice(&(1000..1025).map(|value| value as f32).collect::<Vec<_>>());
@@ -783,11 +819,17 @@ fn test_mutable_file_read() {
 
     {
         let mf = MutableFile::open_rw(&path).unwrap();
-        let names = mf.member_names().unwrap();
+        let mut names = Vec::new();
+        mf.visit_member_names(|name| {
+            names.push(name.to_string());
+            Ok(())
+        })
+        .unwrap();
         assert!(names.contains(&"values".to_string()));
 
         let ds = mf.dataset("values").unwrap();
-        let vals: Vec<f32> = ds.read::<f32>().unwrap();
+        let mut vals = vec![0.0; ds.size().unwrap() as usize];
+        dataset_read_into(&ds, &mut vals).unwrap();
         assert_eq!(vals, vec![1.0, 2.0, 3.0]);
     }
 }

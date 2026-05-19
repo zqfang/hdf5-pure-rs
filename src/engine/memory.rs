@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use crate::error::{Error, Result};
 
 pub fn memcpy(dst: &mut [u8], src: &[u8]) -> Result<()> {
@@ -18,16 +20,34 @@ pub fn realloc(mut buf: Vec<u8>, new_size: usize) -> Vec<u8> {
     buf
 }
 
-pub fn xstrdup(value: &str) -> String {
-    value.to_string()
+pub fn xstrdup_ref(value: &str) -> &str {
+    value
 }
 
-pub fn strdup(value: &str) -> String {
-    value.to_string()
+pub fn xstrdup_into(value: &str, out: &mut String) {
+    out.clear();
+    out.push_str(value);
 }
 
-pub fn strndup(value: &str, max_len: usize) -> String {
-    value.chars().take(max_len).collect()
+pub fn strdup_ref(value: &str) -> &str {
+    value
+}
+
+pub fn strdup_into(value: &str, out: &mut String) {
+    xstrdup_into(value, out);
+}
+
+pub fn strndup_cow(value: &str, max_len: usize) -> Cow<'_, str> {
+    let mut char_indices = value.char_indices();
+    match char_indices.nth(max_len) {
+        Some((end, _)) => Cow::Borrowed(&value[..end]),
+        None => Cow::Borrowed(value),
+    }
+}
+
+pub fn strndup_into(value: &str, max_len: usize, out: &mut String) {
+    out.clear();
+    out.push_str(&strndup_cow(value, max_len));
 }
 
 pub fn xfree_const<T>(_value: T) {}
@@ -52,7 +72,7 @@ impl WrappedBuffer {
         self.actual.clear();
     }
 
-    pub fn unwrap(self) -> Vec<u8> {
+    pub fn into_inner(self) -> Vec<u8> {
         self.actual
     }
 }
@@ -67,5 +87,18 @@ mod tests {
         assert_eq!(wb.actual(), b"abc");
         wb.actual_clear();
         assert!(wb.actual().is_empty());
+    }
+
+    #[test]
+    fn string_dup_helpers_can_borrow_or_reuse_storage() {
+        assert!(matches!(strndup_cow("abc", 3), Cow::Borrowed("abc")));
+        assert!(matches!(strndup_cow("abc", 2), Cow::Borrowed("ab")));
+        assert_eq!(strndup_cow("abc", 2).as_ref(), "ab");
+
+        let mut out = String::from("old");
+        xstrdup_into("new", &mut out);
+        assert_eq!(out, "new");
+        strndup_into("abcdef", 4, &mut out);
+        assert_eq!(out, "abcd");
     }
 }

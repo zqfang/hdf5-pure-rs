@@ -1,16 +1,9 @@
 use crate::error::{Error, Result};
 
-/// Unshuffle bytes (reverse the shuffle filter).
+/// Unshuffle bytes into a provided output buffer.
 ///
 /// Shuffle rearranges bytes so that byte 0 of all elements comes first,
 /// then byte 1 of all elements, etc. Unshuffle reverses this.
-pub fn unshuffle(data: &[u8], element_size: usize) -> Result<Vec<u8>> {
-    let mut out = vec![0u8; data.len()];
-    unshuffle_into(data, element_size, &mut out)?;
-    Ok(out)
-}
-
-/// Unshuffle bytes into a provided output buffer.
 pub fn unshuffle_into(data: &[u8], element_size: usize, out: &mut [u8]) -> Result<()> {
     if out.len() != data.len() {
         return Err(crate::error::Error::InvalidFormat(
@@ -79,15 +72,19 @@ pub fn unshuffle_into(data: &[u8], element_size: usize, out: &mut [u8]) -> Resul
     Ok(())
 }
 
-/// Shuffle bytes for compression.
-pub fn shuffle(data: &[u8], element_size: usize) -> Result<Vec<u8>> {
+/// Shuffle bytes for compression into a provided output buffer.
+pub fn shuffle_into(data: &[u8], element_size: usize, out: &mut [u8]) -> Result<()> {
+    if out.len() != data.len() {
+        return Err(crate::error::Error::InvalidFormat(
+            "shuffle output length mismatch".into(),
+        ));
+    }
     if element_size <= 1 || data.is_empty() {
-        return Ok(data.to_vec());
+        out.copy_from_slice(data);
+        return Ok(());
     }
 
     let n_elements = data.len() / element_size;
-    let mut out = vec![0u8; data.len()];
-
     for i in 0..n_elements {
         for j in 0..element_size {
             let dst = shuffle_index(j, n_elements, i)?;
@@ -97,8 +94,12 @@ pub fn shuffle(data: &[u8], element_size: usize) -> Result<Vec<u8>> {
     }
     let grouped = n_elements * element_size;
     out[grouped..].copy_from_slice(&data[grouped..]);
+    Ok(())
+}
 
-    Ok(out)
+/// Return true when shuffle/unshuffle would leave the byte stream unchanged.
+pub fn is_noop(data_len: usize, element_size: usize) -> bool {
+    element_size <= 1 || data_len / element_size <= 1
 }
 
 /// Validate and return the shuffle element size for local filter setup.
@@ -111,13 +112,19 @@ pub fn set_local_shuffle(element_size: usize) -> Result<usize> {
     Ok(element_size)
 }
 
-/// HDF5 shuffle filter entry point: reverse unshuffles, forward shuffles.
-pub fn filter_shuffle(data: &[u8], element_size: usize, reverse: bool) -> Result<Vec<u8>> {
+/// HDF5 shuffle filter entry point: reverse unshuffles, forward shuffles,
+/// writing into a caller-provided buffer.
+pub fn filter_shuffle_into(
+    data: &[u8],
+    element_size: usize,
+    reverse: bool,
+    out: &mut [u8],
+) -> Result<()> {
     let element_size = set_local_shuffle(element_size)?;
     if reverse {
-        unshuffle(data, element_size)
+        unshuffle_into(data, element_size, out)
     } else {
-        shuffle(data, element_size)
+        shuffle_into(data, element_size, out)
     }
 }
 
@@ -134,16 +141,20 @@ mod tests {
     #[test]
     fn test_shuffle_roundtrip() {
         let data = vec![1, 2, 3, 4, 5, 6, 7, 8]; // 2 elements of 4 bytes each
-        let shuffled = shuffle(&data, 4).unwrap();
-        let unshuffled = unshuffle(&shuffled, 4).unwrap();
+        let mut shuffled = vec![0; data.len()];
+        shuffle_into(&data, 4, &mut shuffled).unwrap();
+        let mut unshuffled = vec![0; shuffled.len()];
+        unshuffle_into(&shuffled, 4, &mut unshuffled).unwrap();
         assert_eq!(unshuffled, data);
     }
 
     #[test]
     fn test_shuffle_roundtrip_preserves_trailing_bytes() {
         let data = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
-        let shuffled = shuffle(&data, 4).unwrap();
-        let unshuffled = unshuffle(&shuffled, 4).unwrap();
+        let mut shuffled = vec![0; data.len()];
+        shuffle_into(&data, 4, &mut shuffled).unwrap();
+        let mut unshuffled = vec![0; shuffled.len()];
+        unshuffle_into(&shuffled, 4, &mut unshuffled).unwrap();
         assert_eq!(unshuffled, data);
     }
 
@@ -154,5 +165,14 @@ mod tests {
             err.to_string().contains("shuffle index overflow"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn shuffle_noop_detects_single_or_smaller_element_payloads() {
+        assert!(is_noop(0, 4));
+        assert!(is_noop(1, 1));
+        assert!(is_noop(3, 4));
+        assert!(is_noop(4, 4));
+        assert!(!is_noop(8, 4));
     }
 }

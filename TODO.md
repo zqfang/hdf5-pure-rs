@@ -1,167 +1,125 @@
-# TODO: hdf5-pure-rust
+# TODO: Remaining Feature Work
 
-Current status: 939 tests, 0 failures, 0 warnings.
+This file tracks active feature gaps for `hdf5-pure-rust`. Historical audit
+notes and completed migration details should live outside this active backlog.
 
-This file tracks the remaining translation and release work. Completed audit
-history has been moved out of the active backlog; unsupported-feature details
-live in `analysis/unsupported_features.md`, and raw `ccc-rs missing`
-classification lives in `analysis/ccc_missing_roadmap.md`.
+## Drop-In API Gaps
 
-## P0: Release Blockers
+- [ ] Implement `Group::create_group` for existing files opened through
+  `File::open_rw`.
+- [ ] Implement `Group::link_soft`, `Group::link_hard`, and
+  `Group::link_external` for existing files opened through `File::open_rw`.
+- [ ] Implement `Group::new_dataset` and `Group::new_dataset_builder` for
+  existing files opened through `File::open_rw`.
+- [ ] Generalize `Group::relink` beyond same-group, same-size compact link
+  renames.
+- [ ] Implement `Dataspace::encode`.
+- [ ] Decide whether `File::start_swmr` and `OpenMode::ReadSWMR` should remain
+  explicit unsupported boundaries or grow real SWMR behavior.
+- [ ] Replace placeholder-level FCPL/FAPL behavior with meaningful property-list
+  effects where they map to this pure-Rust backend.
 
-- [ ] Run the release checklist before publishing:
-  fixture regeneration, default and feature test matrix, README feature
-  review, crate packaging, and dependency/license checks.
+## Existing-File Mutation
 
-## P1: Remaining Translation Parity
+- [ ] Add dense-link same-size rename support.
+- [ ] Add dense-link non-hard unlink support.
+- [ ] Extend hard-link deletion beyond the current safe compact cases by
+  emitting and maintaining persistent object refcount messages.
+- [ ] Add support for link-name size changes by rewriting or repacking metadata.
+- [ ] Add cross-group relink support with parent propagation.
+- [ ] Add v1 symbol-table group mutation only after SNOD, B-tree, local-heap
+  write-location tracking, refcounts, and free-space semantics are modeled.
+- [ ] Add root-only existing-file `create_group` for v2/v3 compact root groups
+  as the first creation slice.
+- [ ] Add root-only existing-file soft/external link creation.
+- [ ] Add root-only existing-file simple dataset creation.
+- [ ] Generalize existing-file creation from root-only to nested groups by
+  propagating rewritten parent addresses up to the root and updating the
+  superblock.
 
-These items are the remaining libhdf5 feature families that are still plausible
-translation work within this crate's intended scope.
+## Reader And Format Coverage
 
-- [x] Close the small raw CCC gaps before broad subsystem work.
-  The raw `H5A*`, `H5T*`, and `H5O*` missing-symbol entries are closed in the
-  current workspace. `H5Tget_*` datatype accessors and the public
-  `H5Oget_info*` / `H5Oget_comment*` object queries now have exact Rust entry
-  points for audit mapping; shared-message `H5O__shared_*` entry points also
-  use the existing table/reference model, including configured address-width
-  decode. The first object-message and object-header-cache pass expands
-  append/write/remove/iterate/share/checksum behavior on the existing
-  `ObjectHeaderState` model. The next H5O pass expanded object-table
-  refcount/traversal/token/debug behavior and moved filter-pipeline message
-  decode/copy/reset/debug into the exact `H5O__pline_*` entry points. A follow-up
-  H5O pass tightened compact attribute name matching and mutation, expanded
-  `H5O__attr_*` decode/copy/debug behavior, and gave chunk/allocation helpers
-  real null-gap merging, creation-index maintenance, and release/unprotect
-  effects. Later H5O passes expanded refcount/mtime/fsinfo/stab/sdspace message
-  routines plus object-header copy/flush/refresh behavior on the current
-  in-memory model, then object lifecycle/info, link/link-info/attribute-info,
-  external-file-list copy/encode/decode, and fill-value decode/copy/reset/free
-  paths. Follow-up message/shared/free passes expanded owned
-  free/copy/remove/delete/flush normalization, direct shared-message default
-  decode/encode/size/link/copy callbacks, object-message free callbacks,
-  object-info/copy wrappers, continuation/group/refcount/free callbacks, and
-  dataset/datatype/name callbacks. The latest object pass corrected group
-  storage accounting to follow the C link-info versus symbol-table branch,
-  expanded shared-read/message allocation/iteration/flush behavior, and moved
-  small refcount/shared-message-table/filter-pipeline/driver-info callbacks
-  away from one-line aliases into direct field-level translations. The newest
-  pass inlined object-header prefix validation, tightened v2 continuation chunk
-  message scanning, and expanded data-layout decode/encode/copy-file checks
-  from decoded fields while preserving exact raw round-trips for decoded
-  messages. The follow-up H5O pass replaced boolean/debug placeholders with
-  object-header invariant checks, added address-deduplicating visit behavior,
-  expanded committed-datatype copy tracking, packed object-header messages
-  forward across null gaps, rebuilt object-header copy/allocation routines
-  from normalized message streams, and expanded datatype decode/encode/debug
-  callbacks with class-specific validation and C-style flag/property reporting.
-  The next parity pass added dense-group storage deletion and the remaining
-  property-list raw entries (`H5P__free_prop`, `H5P__dcrt_layout_del`, and
-  `H5Pset_dataset_io_hyperslab_selection`) with direct Rust property-list
-  behavior. The latest cleanup pass added the remaining raw cache/VFD/dataset
-  callback entries for clean-list marking, mirror uint8 transmit encoding,
-  earray index dumping, and the explicit MPI/VOL unsupported boundaries that
-  remain outside this crate's runtime scope. The datatype follow-up expanded
-  `H5T__set_precision`, `H5T__set_offset`, and `H5T__set_size` to adjust
-  atomic datatype storage size, bit offsets, precision, fixed/string variable
-  sizing, and compound shrink validation with C-style invalid-class/read-only
-  checks; it also added enum-aware `H5Tget_member_index` behavior, direct
-  variable-length string query coverage, exact little-endian bit-region
-  behavior for `H5T__bit_copy`, `H5T__bit_set`, and `H5T__bit_find`, C-style
-  class/read-only validation for `H5Tset_cset`, `H5Tset_strpad`, and
-  `H5Tset_tag`, fixed/vlen string cset and padding flag accessors, and
-  validated numeric setter behavior for `H5Tset_fields`, `H5Tset_norm`,
-  `H5Tset_inpad`, `H5Tset_sign`, and `H5Tset_pad`; it replaced the
-  `H5Tinsert` unsupported boundary with validated compound member encoding,
-  added bit-range carry/borrow/negation behavior for `H5T__bit_inc`,
-  `H5T__bit_dec`, and `H5T__bit_neg`, replaced native-float
-  `H5T__bit_cmp`/`H5T__fix_order` byte-copy stand-ins with the C
-  permutation/masked-bit logic, expanded disk-backed reference and vlen
-  callbacks to encode/decode reference headers, blob sizes, legacy object
-  tokens, dataset-region token/space payloads, and vlen length-prefixed
-  blobs, translated `H5T__reverse_order`/`H5T__conv_order_opt` byte-order
-  handling for little-endian, big-endian atomic, big-endian complex, and VAX
-  pair ordering, added C-style `H5T__conv_float_find_special`
-  zero/infinity/NaN/sign classification, translated `H5T_set_version` file
-  low/high-bound datatype encoding checks, expanded `H5T_is_vl_storage` to
-  recurse through compound/array/enum datatype messages and reference members,
-  aligned `H5T_is_sensible` with the C empty-compound/empty-enum checks,
-  expanded `H5T__enum_nameof`, `H5T__enum_valueof`, and `H5T__enum_insert`
-  with sorted lookup and duplicate name/value rejection,
-  expanded `H5T_noop_conv` over the datatype registry's no-op path checks,
-  replaced the `H5T__sort_value` and `H5T__sort_name` byte-copy placeholders
-  with in-place compound/enum member sorting and map reordering,
-  tightened `H5T_nameof`, `H5T_own_vol_obj`, and `H5T_path_match` around the
-  runtime datatype state and owned VOL-object marker,
-  and removed the duplicate unsupported precision placeholder from the support
-  module. Current CCC status: raw
-  `missing_in_rust` is empty; `H5A*`/`H5T*`/`H5O*`/`H5G*`/`H5P*` missing
-  entries all remain at zero, total partial findings are 2457, and `H5O*`
-  partial/stub findings are also at zero after the latest object pass. The
-  remaining partial flags from this datatype batch are wrapper/runtime-scale
-  mismatches rather than raw absence, including `H5Tis_variable_str` delegating
-  to the exact internal variable-string predicate while the C public wrapper
-  carries registration and identifier plumbing not mirrored by the crate
-  runtime. Treat any future one-line helper aliases in these families as
-  incomplete unless the underlying behavior is represented by a real Rust
-  implementation or an explicit, documented unsupported boundary.
+- [ ] Add SZIP support if a suitable pure-Rust decoder becomes available;
+  otherwise keep the explicit unsupported boundary pinned by tests.
+- [ ] Add BLOSC support if a suitable pure-Rust implementation is acceptable;
+  otherwise keep the explicit unsupported boundary pinned by tests.
+- [ ] Broaden ScaleOffset and NBit coverage to the full practical libhdf5
+  parameter space.
+- [ ] Add HDF5 datatype message v5 support.
+- [ ] Add typed read support for HDF5 time datatypes if needed by real fixtures.
+- [ ] Broaden datatype conversion behavior beyond the current supported numeric,
+  string, enum, compound, reference, and VDS conversion paths.
+- [ ] Broaden VDS mapping, selection, missing-source, and conversion coverage.
+- [ ] Broaden chunk-index mutation support beyond the current append/replace
+  cases for fixed-array, extensible-array, and v2 B-tree indexes.
+
+## Writer Coverage
+
 - [ ] Broaden writer-side modern chunk-index parity.
-  New chunked datasets are still created with v1 B-tree indexes. Remaining
-  work is creation and growth for fixed-array, extensible-array, and deeper
-  v2-B-tree chunk indexes, plus the full modern-index mutation matrix.
-- [ ] Broaden filter parity where practical.
-  SZip remains unsupported unless a pure-Rust decoder is added. NBit and
-  ScaleOffset have broad fixture coverage, but not the full libhdf5 parameter
-  space.
-- [ ] Broaden datatype-conversion parity if user-facing conversion scope
-  expands.
-  Current reads support the crate's shared numeric conversion path and
-  recursive compound value extraction, but not the full libhdf5 `H5T__conv_*`
-  engine, packing helpers, or conversion-path selection behavior.
-- [ ] Broaden attribute mutation and iteration parity if the public writer/API
-  surface expands.
-  Compact attributes can be deleted and renamed in place. Writer-created dense
-  attributes can be deleted and same-size renamed for the supported
-  root-direct, depth-0 name-index layout. Remaining work includes indirect or
-  filtered dense heaps, non-leaf name indexes, creation-order indexes, growing
-  renames that require metadata repacking, and broader mutation APIs.
+- [ ] Create new chunked datasets with fixed-array, extensible-array, or v2
+  B-tree indexes where appropriate instead of always using v1 B-tree indexes.
+- [ ] Add growth support for modern chunk indexes.
+- [ ] Remove writer limits that libhdf5 does not impose by implementing
+  multi-level v1 chunk B-tree creation instead of the current two-level writer
+  cap.
+- [ ] Add sparse/fill-only chunked dataset creation and streaming chunk
+  insertion so huge logical datasets do not require a full in-memory payload or
+  full chunk enumeration.
+- [ ] Allow vlen UTF-8 datasets to use chunked storage and filters by writing
+  chunked 16-byte heap descriptors while keeping string payloads in heap
+  storage.
+- [ ] Add vlen UTF-8 fill values by encoding a null or heap-backed vlen
+  descriptor in the fill-value message.
+- [ ] Make global-heap collection encoding width-aware instead of assuming
+  8-byte size fields, if superblock size-width configurability is added.
+- [ ] Remove arbitrary 4 GiB caps from global-heap object and reference-region
+  helpers where the on-disk size fields can represent larger payloads; keep
+  allocation/streaming checks at the real boundary.
+- [ ] Add object-header continuation chunk writing and/or repacking so large
+  metadata messages and long compact-message lists do not fail at the current
+  single-chunk boundary.
+- [ ] Route oversized attributes to dense attribute storage even when attribute
+  count is below the compact-to-dense threshold.
+- [ ] Generalize dense link and dense attribute storage beyond one leaf B-tree
+  node and one direct fractal-heap block; support internal nodes, wider heap
+  offsets, larger heap IDs, and indirect/filtered heap blocks.
+- [ ] Build dense link storage from one unified link list so soft, external,
+  hard-link aliases, and object links can all densify together instead of only
+  densifying ordinary object links.
+- [ ] Support 8-byte v2 link-name length encoding for link names larger than
+  the current 4-byte length-field writer path.
+- [ ] Fix `H5T__set_size` for large fixed-length string datatypes so string
+  sizes are not constrained by the fixed-point precision `u16` path.
+- [ ] Add broader h5dump/h5py round-trip coverage for each newly expanded writer
+  feature before declaring it supported.
 
-## P2: Compatibility Coverage
+## Compatibility And Test Coverage
 
-- [ ] Add broader explicit unsupported API stubs for low-level libhdf5 entry
-  points that do not map to this crate's high-level API.
-  Good candidates are additional `H5F*`, `H5FD*`, `H5VL*`, `H5ES*`, `H5PL*`,
-  and `H5M*` surfaces where the useful behavior is a stable
-  `Error::Unsupported` instead of silent absence or accidental fallback.
-- [ ] Extend deterministic property/config parsing for unsupported VFDs.
-  Add or broaden encode/decode, validation, and malformed-buffer tests for
-  family, multi, splitter, log, onion, subfiling, HDFS, and ROS3/S3 settings
-  while keeping actual driver I/O explicitly unsupported.
-- [ ] Add a real SZip fixture if a pure-Rust decoder becomes available, or keep
-  the explicit unsupported error surface pinned.
-- [ ] Add additional generated malformed fixtures for NBit and ScaleOffset
-  edge-parameter combinations beyond the current unit and parity coverage.
-- [ ] Add broader h5dump/h5py round-trip coverage for every newly expanded
-  writer feature before declaring it supported.
-- [ ] Add deeper libhdf5 path-normalization coverage for soft-link traversal if
-  link-resolution parity becomes a public compatibility goal.
+- [ ] Keep hdf5-metno public functions present and not deprecated.
+- [ ] Add explicit unsupported API stubs for low-level libhdf5 entry points that
+  do not map to this crate's high-level API, especially additional `H5F*`,
+  `H5FD*`, `H5VL*`, `H5ES*`, `H5PL*`, and `H5M*` surfaces.
+- [ ] Extend deterministic property/config parsing for unsupported VFDs:
+  family, multi, splitter, log, onion, subfiling, HDFS, ROS3/S3, and related
+  malformed-buffer tests.
+- [ ] Add generated malformed fixtures for remaining NBit and ScaleOffset edge
+  cases.
+- [ ] Add deeper soft-link path-normalization coverage if link-resolution parity
+  becomes a public compatibility goal.
 - [ ] Add deeper fractal-heap growth and checksum-corruption coverage if dense
-  storage mutation support expands beyond the current layouts.
+  storage mutation expands beyond the current layouts.
 
-## Explicitly Out Of Scope
+## Explicitly Out Of Scope For Now
 
-These libhdf5 families still appear in raw missing-symbol reports, but they are
-not translation targets for this crate:
+These are not blocked by Rust; they are outside this crate's current runtime
+scope unless a real use case appears.
 
-- MPI / parallel HDF5 / distributed selection paths (`H5_mpi*`, `H5S__mpio*`,
-  parallel `H5D*`). If local parallelism is added later, use Rayon in Rust.
-- VOL, async, plugin, and connector infrastructure (`H5VL*`, `H5ES*`,
-  `H5PL*`).
-- Alternative VFD and cloud/network driver runtime parity, including HDFS,
-  ROS3/S3, Direct, broad core/stdio behavior, onion, subfiling, family, multi,
-  splitter, and log drivers beyond deterministic config parsing and explicit
-  unsupported errors.
-- Map API parity (`H5M*`).
-- Broad package-init, free-list, and thread-runtime machinery (`H5FL*`,
-  broad `H5TS*`) unless this crate grows a direct need for those surfaces.
-- Full C-library metadata-cache runtime behavior, SWMR runtime behavior, file
-  mounting, and public APIs that do not map to this crate's high-level API.
+- MPI, parallel HDF5, and distributed dataset/selection I/O.
+- VOL, async, plugin, and connector infrastructure.
+- Alternative VFD runtime parity for cloud/network/distributed drivers beyond
+  deterministic config parsing and explicit unsupported errors.
+- Map API parity.
+- Broad package-init, free-list, and thread-runtime machinery that has no
+  high-level pure-Rust API use.
+- Full C-library metadata-cache runtime behavior, file mounting, and public APIs
+  that do not map to this crate's high-level API.

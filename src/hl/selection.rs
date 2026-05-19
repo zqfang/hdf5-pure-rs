@@ -1,4 +1,7 @@
-use std::ops::{Range, RangeFrom, RangeFull, RangeTo};
+use std::{
+    fmt,
+    ops::{Range, RangeFrom, RangeFull, RangeTo},
+};
 
 use crate::{Error, Result};
 
@@ -18,6 +21,9 @@ pub enum Selection {
     /// A contiguous range along each dimension.
     Slice(Vec<SliceInfo>),
 }
+
+/// hdf5-metno compatibility raw-selection alias backed by this crate's selection type.
+pub type RawSelection = Selection;
 
 /// HDF5-style selection class.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,21 +54,38 @@ pub struct HyperslabDim {
 /// Iterator over selected coordinates in row-major order.
 #[derive(Debug, Clone)]
 pub struct SelectionPointIter {
-    points: Vec<Vec<u64>>,
+    kind: SelectionPointIterKind,
     index: usize,
+    len: usize,
+    current: Vec<u64>,
+    yielded: Vec<u64>,
+}
+
+#[derive(Debug, Clone)]
+enum SelectionPointIterKind {
+    Points(Vec<Vec<u64>>),
+    All {
+        ds_shape: Vec<u64>,
+    },
+    Slice {
+        slices: Vec<SliceInfo>,
+        out_shape: Vec<u64>,
+    },
+    Hyperslab {
+        dims: Vec<HyperslabDim>,
+        out_shape: Vec<u64>,
+    },
 }
 
 impl Iterator for SelectionPointIter {
     type Item = Vec<u64>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let point = self.points.get(self.index)?.clone();
-        self.index += 1;
-        Some(point)
+        self.select_iter_next_ref().map(<[u64]>::to_vec)
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let remaining = self.points.len().saturating_sub(self.index);
+        let remaining = self.len.saturating_sub(self.index);
         (remaining, Some(remaining))
     }
 }
@@ -70,24 +93,172 @@ impl Iterator for SelectionPointIter {
 impl ExactSizeIterator for SelectionPointIter {}
 
 impl SelectionPointIter {
+    fn new(selection: &Selection, ds_shape: &[u64]) -> Result<Self> {
+        let len = selection.selected_point_len(ds_shape)?;
+        let kind = match selection {
+            Selection::None => SelectionPointIterKind::Points(Vec::new()),
+            Selection::Points(points) => SelectionPointIterKind::Points(points.clone()),
+            Selection::All => SelectionPointIterKind::All {
+                ds_shape: ds_shape.to_vec(),
+            },
+            Selection::Slice(slices) => SelectionPointIterKind::Slice {
+                slices: slices.clone(),
+                out_shape: slices.iter().map(SliceInfo::count).collect(),
+            },
+            Selection::Hyperslab(dims) => SelectionPointIterKind::Hyperslab {
+                dims: dims.clone(),
+                out_shape: dims.iter().map(HyperslabDim::output_count).collect(),
+            },
+        };
+        let mut iter = Self {
+            kind,
+            index: 0,
+            len,
+            current: Vec::new(),
+            yielded: Vec::new(),
+        };
+        iter.refresh_current()?;
+        Ok(iter)
+    }
+
+    fn refresh_current(&mut self) -> Result<()> {
+        if self.index >= self.len {
+            self.current.clear();
+            return Ok(());
+        }
+        Self::coordinate_at(&self.kind, self.index, &mut self.current)
+    }
+
+    fn coordinate_at(
+        kind: &SelectionPointIterKind,
+        index: usize,
+        out: &mut Vec<u64>,
+    ) -> Result<()> {
+        match kind {
+            SelectionPointIterKind::Points(points) => {
+                out.clear();
+                if let Some(point) = points.get(index) {
+                    out.extend_from_slice(point);
+                }
+                Ok(())
+            }
+            SelectionPointIterKind::All { ds_shape } => {
+                row_major_coord_from_index(index, ds_shape, out)
+            }
+            SelectionPointIterKind::Slice { slices, out_shape } => {
+                row_major_coord_from_index(index, out_shape, out)?;
+                for (coord, slice) in out.iter_mut().zip(slices) {
+                    *coord = slice
+                        .start
+                        .checked_add(coord.checked_mul(slice.step).ok_or_else(|| {
+                            Error::InvalidFormat("selection coordinate overflow".into())
+                        })?)
+                        .ok_or_else(|| {
+                            Error::InvalidFormat("selection coordinate overflow".into())
+                        })?;
+                }
+                Ok(())
+            }
+            SelectionPointIterKind::Hyperslab { dims, out_shape } => {
+                row_major_coord_from_index(index, out_shape, out)?;
+                for (coord, dim) in out.iter_mut().zip(dims) {
+                    let selected_block = *coord / dim.block;
+                    let selected_offset = *coord % dim.block;
+                    *coord = dim
+                        .start
+                        .checked_add(selected_block.checked_mul(dim.stride).ok_or_else(|| {
+                            Error::InvalidFormat("hyperslab coordinate overflow".into())
+                        })?)
+                        .and_then(|coord| coord.checked_add(selected_offset))
+                        .ok_or_else(|| {
+                            Error::InvalidFormat("hyperslab coordinate overflow".into())
+                        })?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Return the current selected coordinate without advancing the iterator.
+    pub fn select_iter_current(&self) -> Option<&[u64]> {
+        match &self.kind {
+            SelectionPointIterKind::Points(points) => points.get(self.index).map(Vec::as_slice),
+            _ if self.index < self.len => Some(self.current.as_slice()),
+            _ => None,
+        }
+    }
+
     /// Return the number of elements remaining in this selection iterator.
     pub fn select_iter_nelmts(&self) -> usize {
         self.len()
     }
 
-    /// Return the next selected coordinate.
-    pub fn select_iter_next(&mut self) -> Option<Vec<u64>> {
-        self.next()
+    /// Return the next selected coordinate by borrowing iterator storage.
+    pub fn select_iter_next_ref(&mut self) -> Option<&[u64]> {
+        if self.index >= self.len {
+            return None;
+        }
+        if Self::coordinate_at(&self.kind, self.index, &mut self.yielded).is_err() {
+            return None;
+        }
+        self.index += 1;
+        if self.refresh_current().is_err() {
+            return None;
+        }
+        Some(self.yielded.as_slice())
     }
 
-    /// Return up to `max_points` remaining selected coordinates.
-    pub fn select_iter_get_seq_list(&mut self, max_points: usize) -> Vec<Vec<u64>> {
-        self.take(max_points).collect()
+    /// Copy the next selected coordinate into `out`.
+    ///
+    /// Returns `Ok(false)` when the iterator is exhausted.
+    pub fn select_iter_next_into(&mut self, out: &mut [u64]) -> Result<bool> {
+        let Some(point) = self.select_iter_next_ref() else {
+            return Ok(false);
+        };
+        if out.len() < point.len() {
+            return Err(Error::InvalidFormat(
+                "selection coordinate buffer is too small".into(),
+            ));
+        }
+        out[..point.len()].copy_from_slice(point);
+        Ok(true)
+    }
+
+    /// Copy up to `max_points` remaining selected coordinates into flat storage.
+    ///
+    /// Coordinates are written contiguously as `point0_dim0, point0_dim1, ...`.
+    /// The return value is the number of complete points copied.
+    pub fn select_iter_get_seq_list_into(
+        &mut self,
+        max_points: usize,
+        out: &mut [u64],
+    ) -> Result<usize> {
+        let Some(rank) = self.select_iter_current().map(<[u64]>::len) else {
+            return Ok(0);
+        };
+        let capacity = if rank == 0 {
+            max_points
+        } else {
+            out.len() / rank
+        };
+        let count = max_points
+            .min(capacity)
+            .min(self.len.saturating_sub(self.index));
+        for dst_idx in 0..count {
+            let start = dst_idx
+                .checked_mul(rank)
+                .ok_or_else(|| Error::InvalidFormat("selection buffer offset overflow".into()))?;
+            if !self.select_iter_next_into(&mut out[start..start + rank])? {
+                return Ok(dst_idx);
+            }
+        }
+        Ok(count)
     }
 
     /// Reset this selection iterator to the first selected coordinate.
     pub fn select_iter_reset(&mut self) {
         self.index = 0;
+        let _ = self.refresh_current();
     }
 
     /// Explicit release hook for parity with HDF5's selection iterator API.
@@ -98,34 +269,33 @@ impl SelectionPointIter {
         self.len()
     }
 
-    /// Hyperslab-specific iterator next-coordinate alias.
-    pub fn hyper_iter_next(&mut self) -> Option<Vec<u64>> {
-        self.next()
+    /// Hyperslab-specific borrowed next-coordinate alias.
+    pub fn hyper_iter_next_ref(&mut self) -> Option<&[u64]> {
+        self.select_iter_next_ref()
     }
 
-    /// Hyperslab-specific iterator next-block alias.
-    pub fn hyper_iter_next_block(&mut self) -> Option<Vec<u64>> {
-        self.next()
+    /// Hyperslab-specific copy-into next-coordinate alias.
+    pub fn hyper_iter_next_into(&mut self, out: &mut [u64]) -> Result<bool> {
+        self.select_iter_next_into(out)
     }
 
-    /// Hyperslab-specific iterator sequence-list alias.
-    pub fn hyper_iter_get_seq_list(&mut self, max_points: usize) -> Vec<Vec<u64>> {
-        self.take(max_points).collect()
+    /// Hyperslab-specific borrowed next-block alias.
+    pub fn hyper_iter_next_block_ref(&mut self) -> Option<&[u64]> {
+        self.select_iter_next_ref()
     }
 
-    /// Hyperslab-specific optimized sequence-list alias.
-    pub fn hyper_iter_get_seq_list_opt(&mut self, max_points: usize) -> Vec<Vec<u64>> {
-        self.hyper_iter_get_seq_list(max_points)
+    /// Hyperslab-specific copy-into next-block alias.
+    pub fn hyper_iter_next_block_into(&mut self, out: &mut [u64]) -> Result<bool> {
+        self.select_iter_next_into(out)
     }
 
-    /// Hyperslab-specific single-block sequence-list alias.
-    pub fn hyper_iter_get_seq_list_single(&mut self, max_points: usize) -> Vec<Vec<u64>> {
-        self.hyper_iter_get_seq_list(max_points)
-    }
-
-    /// Hyperslab-specific generic sequence-list alias.
-    pub fn hyper_iter_get_seq_list_gen(&mut self, max_points: usize) -> Vec<Vec<u64>> {
-        self.hyper_iter_get_seq_list(max_points)
+    /// Hyperslab-specific copy-into sequence-list alias.
+    pub fn hyper_iter_get_seq_list_into(
+        &mut self,
+        max_points: usize,
+        out: &mut [u64],
+    ) -> Result<usize> {
+        self.select_iter_get_seq_list_into(max_points, out)
     }
 
     /// Hyperslab-specific iterator release alias.
@@ -133,7 +303,7 @@ impl SelectionPointIter {
 
     /// Point-specific iterator coordinate alias.
     pub fn point_iter_coords(&self) -> Option<&[u64]> {
-        self.points.get(self.index).map(Vec::as_slice)
+        self.select_iter_current()
     }
 
     /// Point-specific iterator element count alias.
@@ -141,19 +311,33 @@ impl SelectionPointIter {
         self.len()
     }
 
-    /// Point-specific iterator next-coordinate alias.
-    pub fn point_iter_next(&mut self) -> Option<Vec<u64>> {
-        self.next()
+    /// Point-specific borrowed next-coordinate alias.
+    pub fn point_iter_next_ref(&mut self) -> Option<&[u64]> {
+        self.select_iter_next_ref()
     }
 
-    /// Point-specific iterator next-block alias.
-    pub fn point_iter_next_block(&mut self) -> Option<Vec<u64>> {
-        self.next()
+    /// Point-specific copy-into next-coordinate alias.
+    pub fn point_iter_next_into(&mut self, out: &mut [u64]) -> Result<bool> {
+        self.select_iter_next_into(out)
     }
 
-    /// Point-specific iterator sequence-list alias.
-    pub fn point_iter_get_seq_list(&mut self, max_points: usize) -> Vec<Vec<u64>> {
-        self.take(max_points).collect()
+    /// Point-specific borrowed next-block alias.
+    pub fn point_iter_next_block_ref(&mut self) -> Option<&[u64]> {
+        self.select_iter_next_ref()
+    }
+
+    /// Point-specific copy-into next-block alias.
+    pub fn point_iter_next_block_into(&mut self, out: &mut [u64]) -> Result<bool> {
+        self.select_iter_next_into(out)
+    }
+
+    /// Point-specific copy-into sequence-list alias.
+    pub fn point_iter_get_seq_list_into(
+        &mut self,
+        max_points: usize,
+        out: &mut [u64],
+    ) -> Result<usize> {
+        self.select_iter_get_seq_list_into(max_points, out)
     }
 
     /// Point-specific iterator release alias.
@@ -424,17 +608,12 @@ impl Selection {
 
     /// Initialize an all-selection iterator.
     pub fn all_iter_init(ds_shape: &[u64]) -> Result<SelectionPointIter> {
-        Selection::All.iter_points(ds_shape)
-    }
-
-    /// Return the first coordinate for an all-selection iterator.
-    pub fn all_iter_coords(ds_shape: &[u64]) -> Result<Option<Vec<u64>>> {
-        Ok(Self::all_iter_init(ds_shape)?.next())
+        SelectionPointIter::new(&Selection::All, ds_shape)
     }
 
     /// Return the first block for an all-selection iterator.
     pub fn all_iter_block(ds_shape: &[u64]) -> Option<(Vec<u64>, Vec<u64>)> {
-        Selection::All.bounds(ds_shape)
+        Selection::All.bounds_owned(ds_shape)
     }
 
     /// Return the all-selection element count.
@@ -444,22 +623,12 @@ impl Selection {
 
     /// Return whether an all-selection has another block.
     pub fn all_iter_has_next_block(ds_shape: &[u64]) -> bool {
-        Selection::All.bounds(ds_shape).is_some()
-    }
-
-    /// Return the next all-selection coordinate.
-    pub fn all_iter_next(iter: &mut SelectionPointIter) -> Option<Vec<u64>> {
-        iter.next()
+        ds_shape.is_empty() || !ds_shape.contains(&0)
     }
 
     /// Return the next all-selection block.
     pub fn all_iter_next_block(ds_shape: &[u64]) -> Option<(Vec<u64>, Vec<u64>)> {
-        Selection::All.bounds(ds_shape)
-    }
-
-    /// Return up to `max_points` all-selection coordinates.
-    pub fn all_iter_get_seq_list(ds_shape: &[u64], max_points: usize) -> Result<Vec<Vec<u64>>> {
-        Ok(Self::all_iter_init(ds_shape)?.take(max_points).collect())
+        Selection::All.bounds_owned(ds_shape)
     }
 
     /// All-selection iterator release alias.
@@ -501,7 +670,7 @@ impl Selection {
 
     /// All-selection bounds alias.
     pub fn all_bounds(ds_shape: &[u64]) -> Option<(Vec<u64>, Vec<u64>)> {
-        Selection::All.bounds(ds_shape)
+        Selection::All.bounds_owned(ds_shape)
     }
 
     /// All-selection offset alias.
@@ -635,6 +804,41 @@ impl Selection {
         matches!(self, Selection::All)
     }
 
+    /// hdf5-metno compatibility layer: construct a selection from this crate's raw-selection alias; do not remove.
+    pub fn from_raw(selection: RawSelection) -> Result<Self> {
+        Ok(selection)
+    }
+
+    /// hdf5-metno compatibility layer: return required input rank when known; do not remove.
+    pub fn in_ndim(&self) -> Option<usize> {
+        match self {
+            Selection::All | Selection::None => None,
+            Selection::Points(points) => points.first().map(Vec::len),
+            Selection::Hyperslab(dims) => Some(dims.len()),
+            Selection::Slice(slices) => Some(slices.len()),
+        }
+    }
+
+    /// hdf5-metno compatibility layer: return output rank when known; do not remove.
+    pub fn out_ndim(&self) -> Option<usize> {
+        match self {
+            Selection::All | Selection::None => None,
+            Selection::Points(_) => Some(1),
+            Selection::Hyperslab(dims) => Some(usize::from(!dims.is_empty())),
+            Selection::Slice(slices) => Some(slices.len()),
+        }
+    }
+
+    /// hdf5-metno compatibility layer: classify explicit point selections; do not remove.
+    pub fn is_points(&self) -> bool {
+        matches!(self, Selection::Points(_))
+    }
+
+    /// hdf5-metno compatibility layer: classify hyperslab-like selections; do not remove.
+    pub fn is_hyperslab(&self) -> bool {
+        matches!(self, Selection::Hyperslab(_) | Selection::Slice(_))
+    }
+
     /// Return the HDF5-style selection class.
     pub fn selection_type(&self) -> SelectionType {
         match self {
@@ -650,22 +854,21 @@ impl Selection {
         self.selection_type()
     }
 
-    /// Serialize this selection with an explicit class tag.
-    pub fn encode1(&self) -> Result<Vec<u8>> {
-        let mut out = Vec::new();
+    /// Serialize this selection with an explicit class tag into caller storage.
+    pub fn encode1_into(&self, out: &mut Vec<u8>) -> Result<()> {
         match self {
             Selection::None => out.push(0),
             Selection::All => out.push(1),
             Selection::Points(_) => {
                 out.push(2);
-                out.extend(self.point_serialize()?);
+                self.point_serialize_into(out)?;
             }
             Selection::Hyperslab(_) | Selection::Slice(_) => {
                 out.push(3);
-                out.extend(self.hyper_serialize()?);
+                self.hyper_serialize_into(out)?;
             }
         }
-        Ok(out)
+        Ok(())
     }
 
     /// Explicit selection copy operation.
@@ -673,14 +876,15 @@ impl Selection {
         self.clone()
     }
 
-    /// Compute the output shape for this selection given the dataset shape.
-    pub fn output_shape(&self, ds_shape: &[u64]) -> Vec<u64> {
+    /// Compute the output shape for this selection into caller storage.
+    pub fn output_shape_into(&self, ds_shape: &[u64], out: &mut Vec<u64>) {
+        out.clear();
         match self {
-            Selection::None => vec![0],
-            Selection::All => ds_shape.to_vec(),
-            Selection::Points(points) => vec![u64::try_from(points.len()).unwrap_or(u64::MAX)],
-            Selection::Hyperslab(dims) => dims.iter().map(HyperslabDim::output_count).collect(),
-            Selection::Slice(slices) => slices.iter().map(|s| s.count()).collect(),
+            Selection::None => out.push(0),
+            Selection::All => out.extend_from_slice(ds_shape),
+            Selection::Points(points) => out.push(u64::try_from(points.len()).unwrap_or(u64::MAX)),
+            Selection::Hyperslab(dims) => out.extend(dims.iter().map(HyperslabDim::output_count)),
+            Selection::Slice(slices) => out.extend(slices.iter().map(|s| s.count())),
         }
     }
 
@@ -727,34 +931,64 @@ impl Selection {
                         .all(|(&coord, &extent)| coord < extent)
             });
         }
-        self.materialize_points(ds_shape).is_ok()
+        self.visit_points(ds_shape, |point| {
+            linear_index(point, ds_shape)?;
+            Ok(())
+        })
+        .is_ok()
     }
 
-    /// Return inclusive selection bounds as `(start, end)` coordinates.
-    pub fn bounds(&self, ds_shape: &[u64]) -> Option<(Vec<u64>, Vec<u64>)> {
+    /// Copy inclusive selection bounds into caller storage.
+    pub fn bounds_into(&self, ds_shape: &[u64], start: &mut Vec<u64>, end: &mut Vec<u64>) -> bool {
+        start.clear();
+        end.clear();
         match self {
-            Selection::None => None,
+            Selection::None => false,
             Selection::All => {
                 if ds_shape.contains(&0) {
-                    None
+                    false
                 } else if ds_shape.is_empty() {
-                    Some((Vec::new(), Vec::new()))
+                    true
                 } else {
-                    Some((
-                        vec![0; ds_shape.len()],
-                        ds_shape.iter().map(|&dim| dim - 1).collect(),
-                    ))
+                    start.resize(ds_shape.len(), 0);
+                    end.extend(ds_shape.iter().map(|&dim| dim - 1));
+                    true
                 }
             }
-            Selection::Points(points) => point_bounds(points),
-            Selection::Hyperslab(dims) => hyperslab_bounds(dims),
-            Selection::Slice(slices) => slice_bounds(slices),
+            Selection::Points(points) => {
+                if !point_bounds_into(points, start, end) {
+                    return false;
+                }
+                true
+            }
+            Selection::Hyperslab(dims) => {
+                if !hyperslab_bounds_into(dims, start, end) {
+                    return false;
+                }
+                true
+            }
+            Selection::Slice(slices) => {
+                if !slice_bounds_into(slices, start, end) {
+                    return false;
+                }
+                true
+            }
+        }
+    }
+
+    fn bounds_owned(&self, ds_shape: &[u64]) -> Option<(Vec<u64>, Vec<u64>)> {
+        let mut start = Vec::new();
+        let mut end = Vec::new();
+        if self.bounds_into(ds_shape, &mut start, &mut end) {
+            Some((start, end))
+        } else {
+            None
         }
     }
 
     /// Internal selection-bounds helper.
     pub fn select_bounds_internal(&self, ds_shape: &[u64]) -> Option<(Vec<u64>, Vec<u64>)> {
-        self.bounds(ds_shape)
+        self.bounds_owned(ds_shape)
     }
 
     /// Return the number of hyperslab blocks, if this is a hyperslab-like
@@ -788,21 +1022,78 @@ impl Selection {
         }
     }
 
-    /// Return hyperslab block start/end pairs, if this is a hyperslab-like
-    /// selection.
-    pub fn hyperslab_blocklist(
+    /// Visit hyperslab block start/end pairs without materializing a block list.
+    ///
+    /// Returns `Ok(false)` when called for a point selection. `start` and `end`
+    /// are inclusive coordinates and are reused between callback calls.
+    pub fn visit_hyperslab_blocks<F>(&self, ds_shape: &[u64], mut callback: F) -> Result<bool>
+    where
+        F: FnMut(&[u64], &[u64]) -> Result<()>,
+    {
+        match self {
+            Selection::Points(_) => Ok(false),
+            Selection::None => Ok(true),
+            Selection::All => {
+                let mut start = Vec::new();
+                let mut end = Vec::new();
+                if self.bounds_into(ds_shape, &mut start, &mut end) {
+                    callback(&start, &end)?;
+                }
+                Ok(true)
+            }
+            Selection::Hyperslab(dims) => {
+                visit_hyperslab_blocks(dims, &mut callback)?;
+                Ok(true)
+            }
+            Selection::Slice(slices) => {
+                visit_slice_blocks(slices, &mut callback)?;
+                Ok(true)
+            }
+        }
+    }
+
+    /// Copy hyperslab block start/end pairs into caller-provided flat buffers.
+    ///
+    /// Returns `Ok(None)` when called for a point selection. Otherwise returns
+    /// the number of complete blocks copied. Coordinates are written
+    /// contiguously per block.
+    pub fn hyperslab_blocklist_into(
         &self,
         ds_shape: &[u64],
-    ) -> Result<Option<Vec<(Vec<u64>, Vec<u64>)>>> {
+        starts: &mut [u64],
+        ends: &mut [u64],
+    ) -> Result<Option<usize>> {
+        let Some(rank) = self.hyperslab_block_rank(ds_shape) else {
+            return Ok(None);
+        };
+        let capacity = if rank == 0 {
+            usize::MAX
+        } else {
+            starts.len().min(ends.len()) / rank
+        };
+        let mut copied = 0usize;
+        self.visit_hyperslab_blocks(ds_shape, |start, end| {
+            if copied >= capacity {
+                return Ok(());
+            }
+            let offset = copied
+                .checked_mul(rank)
+                .ok_or_else(|| Error::InvalidFormat("hyperslab block buffer overflow".into()))?;
+            starts[offset..offset + rank].copy_from_slice(start);
+            ends[offset..offset + rank].copy_from_slice(end);
+            copied += 1;
+            Ok(())
+        })?;
+        Ok(Some(copied))
+    }
+
+    fn hyperslab_block_rank(&self, ds_shape: &[u64]) -> Option<usize> {
         match self {
-            Selection::Points(_) => Ok(None),
-            Selection::None => Ok(Some(Vec::new())),
-            Selection::All => Ok(Some(match self.bounds(ds_shape) {
-                Some(bounds) => vec![bounds],
-                None => Vec::new(),
-            })),
-            Selection::Hyperslab(dims) => hyperslab_blocklist(dims).map(Some),
-            Selection::Slice(slices) => slice_blocklist(slices).map(Some),
+            Selection::Points(_) => None,
+            Selection::None => Some(0),
+            Selection::All => Some(ds_shape.len()),
+            Selection::Hyperslab(dims) => Some(dims.len()),
+            Selection::Slice(slices) => Some(slices.len()),
         }
     }
 
@@ -820,6 +1111,43 @@ impl Selection {
             Selection::Points(points) => Some(points),
             _ => None,
         }
+    }
+
+    /// Iterate over explicit element-selection points as borrowed slices.
+    pub fn element_points(&self) -> Option<impl ExactSizeIterator<Item = &[u64]>> {
+        match self {
+            Selection::Points(points) => Some(points.iter().map(Vec::as_slice)),
+            _ => None,
+        }
+    }
+
+    /// Copy explicit element-selection coordinates into flat caller storage.
+    ///
+    /// Returns `Ok(None)` when called for a non-point selection. Otherwise
+    /// returns the number of complete points copied.
+    pub fn element_pointlist_into(&self, out: &mut [u64]) -> Result<Option<usize>> {
+        let Selection::Points(points) = self else {
+            return Ok(None);
+        };
+        let rank = points.first().map_or(0, Vec::len);
+        let capacity = if rank == 0 {
+            points.len()
+        } else {
+            out.len() / rank
+        };
+        let copied = capacity.min(points.len());
+        for (idx, point) in points.iter().take(copied).enumerate() {
+            if point.len() != rank {
+                return Err(Error::InvalidFormat(
+                    "point selection contains mixed ranks".into(),
+                ));
+            }
+            let offset = idx
+                .checked_mul(rank)
+                .ok_or_else(|| Error::InvalidFormat("point buffer offset overflow".into()))?;
+            out[offset..offset + rank].copy_from_slice(point);
+        }
+        Ok(Some(copied))
     }
 
     /// Return encoded size/version metadata for a point selection.
@@ -848,7 +1176,7 @@ impl Selection {
     }
 
     /// Serialize an explicit point selection.
-    pub fn point_serialize(&self) -> Result<Vec<u8>> {
+    pub fn point_serialize_into(&self, out: &mut Vec<u8>) -> Result<()> {
         let Selection::Points(points) = self else {
             return Err(Error::InvalidFormat(
                 "selection is not a point selection".into(),
@@ -857,9 +1185,8 @@ impl Selection {
         let rank = points.first().map_or(0, Vec::len);
         let rank_u64 = usize_to_u64(rank, "point selection rank")?;
         let point_count_u64 = usize_to_u64(points.len(), "point selection point count")?;
-        let mut out = Vec::with_capacity(self.point_serial_size()?);
-        push_u64(&mut out, rank_u64);
-        push_u64(&mut out, point_count_u64);
+        push_u64(out, rank_u64);
+        push_u64(out, point_count_u64);
         for point in points {
             if point.len() != rank {
                 return Err(Error::InvalidFormat(
@@ -867,10 +1194,10 @@ impl Selection {
                 ));
             }
             for &coord in point {
-                push_u64(&mut out, coord);
+                push_u64(out, coord);
             }
         }
-        Ok(out)
+        Ok(())
     }
 
     /// Deserialize an explicit point selection.
@@ -933,14 +1260,15 @@ impl Selection {
                 }
             }
             _ => {
-                let points = self.materialize_points(ds_shape)?;
+                self.bounded_materialized_point_count(ds_shape)?;
                 let mut min = None::<u64>;
                 let mut max = None::<u64>;
-                for point in &points {
+                self.visit_points(ds_shape, |point| {
                     let idx = linear_index(point, ds_shape)?;
                     min = Some(min.map_or(idx, |value| value.min(idx)));
                     max = Some(max.map_or(idx, |value| value.max(idx)));
-                }
+                    Ok(())
+                })?;
                 Ok(min.zip(max))
             }
         }
@@ -955,10 +1283,12 @@ impl Selection {
             Selection::None => Ok(true),
             Selection::All => Ok(true),
             _ => {
-                let mut indexes = Vec::new();
-                for point in self.materialize_points(ds_shape)? {
-                    indexes.push(linear_index(&point, ds_shape)?);
-                }
+                let count = self.bounded_materialized_point_count(ds_shape)?;
+                let mut indexes = Vec::with_capacity(count);
+                self.visit_points(ds_shape, |point| {
+                    indexes.push(linear_index(point, ds_shape)?);
+                    Ok(())
+                })?;
                 if indexes.is_empty() {
                     return Ok(true);
                 }
@@ -985,7 +1315,11 @@ impl Selection {
 
     /// Return whether two selections produce the same selected shape.
     pub fn select_shape_same(&self, other: &Selection, ds_shape: &[u64]) -> bool {
-        self.output_shape(ds_shape) == other.output_shape(ds_shape)
+        let mut left = Vec::new();
+        let mut right = Vec::new();
+        self.output_shape_into(ds_shape, &mut left);
+        other.output_shape_into(ds_shape, &mut right);
+        left == right
     }
 
     /// Public selected-shape comparison alias.
@@ -997,8 +1331,17 @@ impl Selection {
     pub fn combine_or(&self, other: &Selection, ds_shape: &[u64]) -> Result<Selection> {
         use std::collections::BTreeSet;
 
-        let mut points: BTreeSet<_> = self.materialize_points(ds_shape)?.into_iter().collect();
-        points.extend(other.materialize_points(ds_shape)?);
+        let mut points = BTreeSet::new();
+        self.bounded_materialized_point_count(ds_shape)?;
+        other.bounded_materialized_point_count(ds_shape)?;
+        self.visit_points(ds_shape, |point| {
+            points.insert(point.to_vec());
+            Ok(())
+        })?;
+        other.visit_points(ds_shape, |point| {
+            points.insert(point.to_vec());
+            Ok(())
+        })?;
         Ok(points_to_selection(points.into_iter().collect()))
     }
 
@@ -1020,13 +1363,16 @@ impl Selection {
 
     /// Combine two selections with set intersection, returning explicit points.
     pub fn combine_and(&self, other: &Selection, ds_shape: &[u64]) -> Result<Selection> {
-        use std::collections::BTreeSet;
-
-        let lhs: BTreeSet<_> = self.materialize_points(ds_shape)?.into_iter().collect();
-        let rhs: BTreeSet<_> = other.materialize_points(ds_shape)?.into_iter().collect();
-        Ok(points_to_selection(
-            lhs.intersection(&rhs).cloned().collect(),
-        ))
+        let lhs = self.collect_point_set(ds_shape)?;
+        other.bounded_materialized_point_count(ds_shape)?;
+        let mut points = std::collections::BTreeSet::new();
+        other.visit_points(ds_shape, |point| {
+            if lhs.contains(point) {
+                points.insert(point.to_vec());
+            }
+            Ok(())
+        })?;
+        Ok(points_to_selection(points.into_iter().collect()))
     }
 
     /// Public modify-selection alias. This applies the same union operation
@@ -1042,81 +1388,147 @@ impl Selection {
 
     /// Combine two selections with symmetric difference, returning explicit points.
     pub fn combine_xor(&self, other: &Selection, ds_shape: &[u64]) -> Result<Selection> {
-        let lhs: std::collections::BTreeSet<_> =
-            self.materialize_points(ds_shape)?.into_iter().collect();
-        let rhs: std::collections::BTreeSet<_> =
-            other.materialize_points(ds_shape)?.into_iter().collect();
-        Ok(points_to_selection(
-            lhs.symmetric_difference(&rhs).cloned().collect(),
-        ))
+        let mut lhs = self.collect_point_set(ds_shape)?;
+        for point in other.collect_point_set(ds_shape)? {
+            if !lhs.remove(point.as_slice()) {
+                lhs.insert(point);
+            }
+        }
+        Ok(points_to_selection(lhs.into_iter().collect()))
     }
 
     /// Subtract `other` from this selection, returning explicit points.
     pub fn combine_and_not(&self, other: &Selection, ds_shape: &[u64]) -> Result<Selection> {
-        use std::collections::BTreeSet;
-
-        let lhs: BTreeSet<_> = self.materialize_points(ds_shape)?.into_iter().collect();
-        let rhs: BTreeSet<_> = other.materialize_points(ds_shape)?.into_iter().collect();
-        Ok(points_to_selection(lhs.difference(&rhs).cloned().collect()))
+        let rhs = other.collect_point_set(ds_shape)?;
+        self.bounded_materialized_point_count(ds_shape)?;
+        let mut points = std::collections::BTreeSet::new();
+        self.visit_points(ds_shape, |point| {
+            if !rhs.contains(point) {
+                points.insert(point.to_vec());
+            }
+            Ok(())
+        })?;
+        Ok(points_to_selection(points.into_iter().collect()))
     }
 
-    /// Materialize selected coordinates in row-major order.
-    pub fn materialize_points(&self, ds_shape: &[u64]) -> Result<Vec<Vec<u64>>> {
-        let count = self
-            .selected_count(ds_shape)
-            .ok_or_else(|| Error::InvalidFormat("selection point count overflow".into()))?;
-        let count = usize::try_from(count)
-            .map_err(|_| Error::InvalidFormat("selection point count does not fit usize".into()))?;
+    fn intersects(&self, other: &Selection, ds_shape: &[u64]) -> Result<bool> {
+        let lhs = self.collect_point_set(ds_shape)?;
+        other.bounded_materialized_point_count(ds_shape)?;
+        let mut found = false;
+        other.visit_points(ds_shape, |point| {
+            found |= lhs.contains(point);
+            Ok(())
+        })?;
+        Ok(found)
+    }
+
+    fn bounded_materialized_point_count(&self, ds_shape: &[u64]) -> Result<usize> {
+        let count = self.selected_point_len(ds_shape)?;
         if count > MAX_MATERIALIZED_SELECTION_POINTS {
             return Err(Error::Unsupported(format!(
                 "selection materialization exceeds {MAX_MATERIALIZED_SELECTION_POINTS} points"
             )));
         }
-
-        match self {
-            Selection::None => Ok(Vec::new()),
-            Selection::All => materialize_all_points(ds_shape),
-            Selection::Points(points) => Ok(points.clone()),
-            Selection::Slice(slices) => materialize_slice_points(slices),
-            Selection::Hyperslab(dims) => materialize_hyperslab_points(dims),
-        }
+        Ok(count)
     }
 
-    /// Return a bounded iterator over selected coordinates in row-major order.
-    pub fn iter_points(&self, ds_shape: &[u64]) -> Result<SelectionPointIter> {
-        Ok(SelectionPointIter {
-            points: self.materialize_points(ds_shape)?,
-            index: 0,
-        })
+    fn selected_point_len(&self, ds_shape: &[u64]) -> Result<usize> {
+        let count = self
+            .selected_count(ds_shape)
+            .ok_or_else(|| Error::InvalidFormat("selection point count overflow".into()))?;
+        usize::try_from(count)
+            .map_err(|_| Error::InvalidFormat("selection point count does not fit usize".into()))
+    }
+
+    fn collect_point_set(&self, ds_shape: &[u64]) -> Result<std::collections::BTreeSet<Vec<u64>>> {
+        self.bounded_materialized_point_count(ds_shape)?;
+        let mut points = std::collections::BTreeSet::new();
+        self.visit_points(ds_shape, |point| {
+            points.insert(point.to_vec());
+            Ok(())
+        })?;
+        Ok(points)
     }
 
     /// Initialize a bounded HDF5-style selection iterator.
     pub fn select_iter_init(&self, ds_shape: &[u64]) -> Result<SelectionPointIter> {
-        self.iter_points(ds_shape)
+        SelectionPointIter::new(self, ds_shape)
     }
 
     /// Initialize a hyperslab-specific iterator.
     pub fn hyper_iter_init(&self, ds_shape: &[u64]) -> Result<SelectionPointIter> {
         require_hyperslab_like(self)?;
-        self.iter_points(ds_shape)
-    }
-
-    /// Return the first point of a hyperslab iterator block.
-    pub fn hyper_iter_block(&self, ds_shape: &[u64]) -> Result<Option<Vec<u64>>> {
-        require_hyperslab_like(self)?;
-        Ok(self.materialize_points(ds_shape)?.into_iter().next())
+        SelectionPointIter::new(self, ds_shape)
     }
 
     /// Return whether a hyperslab iterator has another block.
     pub fn hyper_iter_has_next_block(&self, ds_shape: &[u64]) -> Result<bool> {
         require_hyperslab_like(self)?;
-        Ok(!self.materialize_points(ds_shape)?.is_empty())
+        self.selected_count(ds_shape)
+            .map(|count| count != 0)
+            .ok_or_else(|| Error::InvalidFormat("selection point count overflow".into()))
     }
 
     /// Initialize a point-specific iterator.
     pub fn point_iter_init(&self, ds_shape: &[u64]) -> Result<SelectionPointIter> {
         require_point_selection(self)?;
-        self.iter_points(ds_shape)
+        SelectionPointIter::new(self, ds_shape)
+    }
+
+    /// Visit each selected coordinate in row-major order.
+    pub fn visit_points<F>(&self, ds_shape: &[u64], mut callback: F) -> Result<()>
+    where
+        F: FnMut(&[u64]) -> Result<()>,
+    {
+        match self {
+            Selection::None => Ok(()),
+            Selection::All => visit_all_points(ds_shape, &mut callback),
+            Selection::Points(points) => {
+                for point in points {
+                    callback(point)?;
+                }
+                Ok(())
+            }
+            Selection::Slice(slices) => visit_slice_points(slices, &mut callback),
+            Selection::Hyperslab(dims) => visit_hyperslab_points(dims, &mut callback),
+        }
+    }
+
+    /// Copy selected coordinates into flat caller-provided storage.
+    ///
+    /// Coordinates are written contiguously per point. Returns the number of
+    /// complete points copied.
+    pub fn copy_points_into(&self, ds_shape: &[u64], out: &mut [u64]) -> Result<usize> {
+        let rank = match self {
+            Selection::None => return Ok(0),
+            Selection::All => ds_shape.len(),
+            Selection::Points(points) => points.first().map_or(ds_shape.len(), Vec::len),
+            Selection::Slice(slices) => slices.len(),
+            Selection::Hyperslab(dims) => dims.len(),
+        };
+        let capacity = if rank == 0 {
+            usize::MAX
+        } else {
+            out.len() / rank
+        };
+        let mut copied = 0usize;
+        self.visit_points(ds_shape, |point| {
+            if point.len() != rank {
+                return Err(Error::InvalidFormat(
+                    "selection contains mixed coordinate ranks".into(),
+                ));
+            }
+            if copied >= capacity {
+                return Ok(());
+            }
+            let offset = copied
+                .checked_mul(rank)
+                .ok_or_else(|| Error::InvalidFormat("selection buffer offset overflow".into()))?;
+            out[offset..offset + rank].copy_from_slice(point);
+            copied += 1;
+            Ok(())
+        })?;
+        Ok(copied)
     }
 
     /// Visit each selected coordinate in row-major order.
@@ -1124,10 +1536,7 @@ impl Selection {
     where
         F: FnMut(&[u64]) -> Result<()>,
     {
-        for point in self.materialize_points(ds_shape)? {
-            callback(&point)?;
-        }
-        Ok(())
+        self.visit_points(ds_shape, |point| callback(point))
     }
 
     /// Project this selection onto a subset of dimensions.
@@ -1147,11 +1556,20 @@ impl Selection {
             }
         }
 
-        let points = self.materialize_points(ds_shape)?;
-        let projected: BTreeSet<Vec<u64>> = points
-            .into_iter()
-            .map(|point| kept_dims.iter().map(|&dim| point[dim]).collect())
-            .collect();
+        let point_count = self.bounded_materialized_point_count(ds_shape)?;
+        if kept_dims.is_empty() {
+            return Ok(if point_count == 0 {
+                Selection::None
+            } else {
+                Selection::Points(vec![Vec::new()])
+            });
+        }
+
+        let mut projected: BTreeSet<Vec<u64>> = BTreeSet::new();
+        self.visit_points(ds_shape, |point| {
+            projected.insert(kept_dims.iter().map(|&dim| point[dim]).collect());
+            Ok(())
+        })?;
         Ok(points_to_selection(projected.into_iter().collect()))
     }
 
@@ -1171,8 +1589,48 @@ impl Selection {
         ds_shape: &[u64],
         kept_dims: &[usize],
     ) -> Result<Selection> {
-        self.combine_and(other, ds_shape)?
-            .project(ds_shape, kept_dims)
+        use std::collections::BTreeSet;
+
+        for &dim in kept_dims {
+            if dim >= ds_shape.len() {
+                return Err(Error::InvalidFormat(format!(
+                    "projected dimension {dim} is out of bounds for rank {}",
+                    ds_shape.len()
+                )));
+            }
+        }
+
+        self.bounded_materialized_point_count(ds_shape)?;
+        other.bounded_materialized_point_count(ds_shape)?;
+
+        let rhs = other.collect_point_set(ds_shape)?;
+        if rhs.is_empty() {
+            return Ok(Selection::None);
+        }
+
+        if kept_dims.is_empty() {
+            let mut intersects = false;
+            self.visit_points(ds_shape, |point| {
+                if rhs.contains(point) {
+                    intersects = true;
+                }
+                Ok(())
+            })?;
+            return Ok(if intersects {
+                Selection::Points(vec![Vec::new()])
+            } else {
+                Selection::None
+            });
+        }
+
+        let mut projected: BTreeSet<Vec<u64>> = BTreeSet::new();
+        self.visit_points(ds_shape, |point| {
+            if rhs.contains(point) {
+                projected.insert(kept_dims.iter().map(|&dim| point[dim]).collect());
+            }
+            Ok(())
+        })?;
+        Ok(points_to_selection(projected.into_iter().collect()))
     }
 
     /// Public intersection-projection alias.
@@ -1235,77 +1693,67 @@ impl Selection {
         Selection::Hyperslab(dims)
     }
 
-    /// Copy hyperslab span dimensions.
-    pub fn hyper_copy_span_helper(&self) -> Result<Vec<HyperslabDim>> {
+    /// Copy hyperslab span dimensions into caller storage.
+    pub fn hyper_copy_span_into(&self, out: &mut Vec<HyperslabDim>) -> Result<()> {
+        out.clear();
         match self {
-            Selection::Hyperslab(dims) => Ok(dims.clone()),
-            Selection::Slice(slices) => Ok(slices
-                .iter()
-                .map(|slice| HyperslabDim::new(slice.start, slice.step, slice.count(), 1))
-                .collect()),
-            _ => Err(Error::InvalidFormat(
-                "selection is not hyperslab-like".into(),
-            )),
+            Selection::Hyperslab(dims) => out.extend_from_slice(dims),
+            Selection::Slice(slices) => out.extend(
+                slices
+                    .iter()
+                    .map(|slice| HyperslabDim::new(slice.start, slice.step, slice.count(), 1)),
+            ),
+            _ => {
+                return Err(Error::InvalidFormat(
+                    "selection is not hyperslab-like".into(),
+                ));
+            }
         }
-    }
-
-    /// Copy hyperslab span dimensions.
-    pub fn hyper_copy_span(&self) -> Result<Vec<HyperslabDim>> {
-        self.hyper_copy_span_helper()
+        Ok(())
     }
 
     /// Compare hyperslab span dimensions for equality.
     pub fn hyper_cmp_spans(&self, other: &Selection) -> bool {
-        self.hyper_copy_span_helper().ok() == other.hyper_copy_span_helper().ok()
+        let mut left = Vec::new();
+        let mut right = Vec::new();
+        self.hyper_copy_span_into(&mut left).ok() == other.hyper_copy_span_into(&mut right).ok()
+            && left == right
     }
 
-    /// Render hyperslab span dimensions for diagnostics.
-    pub fn hyper_print_spans_helper(&self) -> Result<String> {
-        Ok(format!("{:?}", self.hyper_copy_span_helper()?))
+    /// Render hyperslab span dimensions for diagnostics into a formatter.
+    pub fn hyper_print_spans_fmt(&self, out: &mut impl fmt::Write) -> Result<()> {
+        let mut dims = Vec::new();
+        self.hyper_copy_span_into(&mut dims)?;
+        write!(out, "{dims:?}")
+            .map_err(|_| Error::InvalidFormat("failed to format hyperslab spans".into()))
     }
 
-    /// Render hyperslab spans for diagnostics.
-    pub fn hyper_print_spans(&self) -> Result<String> {
-        self.hyper_print_spans_helper()
-    }
-
-    /// Render selection spans for diagnostics.
-    pub fn space_print_spans(&self) -> Result<String> {
+    /// Render selection spans for diagnostics into a formatter.
+    pub fn space_print_spans_fmt(&self, out: &mut impl fmt::Write) -> Result<()> {
         match self {
-            Selection::Hyperslab(_) | Selection::Slice(_) => self.hyper_print_spans(),
-            _ => Ok(format!("{:?}", self.selection_type())),
+            Selection::Hyperslab(_) | Selection::Slice(_) => self.hyper_print_spans_fmt(out),
+            _ => write!(out, "{:?}", self.selection_type())
+                .map_err(|_| Error::InvalidFormat("failed to format selection spans".into())),
         }
     }
 
-    /// Render hyperslab dimension info for diagnostics.
-    pub fn hyper_print_diminfo_helper(&self) -> Result<String> {
-        let dims = self.hyper_copy_span_helper()?;
-        Ok(dims
-            .iter()
-            .enumerate()
-            .map(|(idx, dim)| {
-                format!(
-                    "{idx}:start={},stride={},count={},block={}",
-                    dim.start, dim.stride, dim.count, dim.block
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(";"))
-    }
-
-    /// Render hyperslab dimension info for diagnostics.
-    pub fn hyper_print_diminfo(&self) -> Result<String> {
-        self.hyper_print_diminfo_helper()
-    }
-
-    /// Depth-first span diagnostic alias.
-    pub fn hyper_print_spans_dfs(&self) -> Result<String> {
-        self.hyper_print_spans()
-    }
-
-    /// Depth-first space diagnostic alias.
-    pub fn hyper_print_space_dfs(&self) -> Result<String> {
-        self.space_print_spans()
+    /// Render hyperslab dimension info for diagnostics into a formatter.
+    pub fn hyper_print_diminfo_fmt(&self, out: &mut impl fmt::Write) -> Result<()> {
+        let mut dims = Vec::new();
+        self.hyper_copy_span_into(&mut dims)?;
+        for (idx, dim) in dims.iter().enumerate() {
+            if idx != 0 {
+                out.write_char(';')
+                    .map_err(|_| Error::InvalidFormat("failed to format hyperslab dims".into()))?;
+            }
+            write!(
+                out,
+                "{idx}:start={},stride={},count={},block={}",
+                dim.start, dim.stride, dim.count, dim.block
+            )
+            .map_err(|_| Error::InvalidFormat("failed to format hyperslab dims".into()))?;
+        }
+        Ok(())
     }
 
     /// Release hyperslab span state. The pure Rust selection is consumed.
@@ -1333,13 +1781,15 @@ impl Selection {
         self.hyper_span_nblocks(ds_shape)
     }
 
-    /// Hyperslab-specific blocklist alias.
-    pub fn hyper_span_blocklist(
+    /// Hyperslab-specific copy-into blocklist alias.
+    pub fn hyper_span_blocklist_into(
         &self,
         ds_shape: &[u64],
-    ) -> Result<Option<Vec<(Vec<u64>, Vec<u64>)>>> {
+        starts: &mut [u64],
+        ends: &mut [u64],
+    ) -> Result<Option<usize>> {
         require_hyperslab_like(self)?;
-        self.hyperslab_blocklist(ds_shape)
+        self.hyperslab_blocklist_into(ds_shape, starts, ends)
     }
 
     /// Hyperslab block-intersection helper.
@@ -1349,23 +1799,26 @@ impl Selection {
         start: &[u64],
         end: &[u64],
     ) -> bool {
-        is_hyperslab_like(self)
-            && self
-                .materialize_points(ds_shape)
-                .map(|points| {
-                    points
-                        .iter()
-                        .any(|point| point_is_inside_block(point, start, end))
-                })
-                .unwrap_or(false)
+        if !is_hyperslab_like(self) {
+            return false;
+        }
+        let mut intersects = false;
+        self.visit_points(ds_shape, |point| {
+            intersects |= point_is_inside_block(point, start, end);
+            Ok(())
+        })
+        .is_ok()
+            && intersects
     }
 
-    /// Internal selected-hyperslab blocklist alias.
-    pub fn get_select_hyper_blocklist_internal(
+    /// Internal selected-hyperslab copy-into blocklist alias.
+    pub fn get_select_hyper_blocklist_into_internal(
         &self,
         ds_shape: &[u64],
-    ) -> Result<Option<Vec<(Vec<u64>, Vec<u64>)>>> {
-        self.hyper_span_blocklist(ds_shape)
+        starts: &mut [u64],
+        ends: &mut [u64],
+    ) -> Result<Option<usize>> {
+        self.hyper_span_blocklist_into(ds_shape, starts, ends)
     }
 
     /// Internal selected-element pointlist alias.
@@ -1376,7 +1829,7 @@ impl Selection {
     /// Hyperslab-specific bounds alias.
     pub fn hyper_bounds(&self, ds_shape: &[u64]) -> Option<(Vec<u64>, Vec<u64>)> {
         if is_hyperslab_like(self) {
-            self.bounds(ds_shape)
+            self.bounds_owned(ds_shape)
         } else {
             None
         }
@@ -1492,11 +1945,16 @@ impl Selection {
 
     /// Hyperslab coordinate-to-span alias.
     pub fn hyper_coord_to_span(&self, coord: &[u64], ds_shape: &[u64]) -> bool {
-        is_hyperslab_like(self)
-            && self
-                .materialize_points(ds_shape)
-                .map(|points| points.iter().any(|point| point == coord))
-                .unwrap_or(false)
+        if !is_hyperslab_like(self) {
+            return false;
+        }
+        let mut found = false;
+        self.visit_points(ds_shape, |point| {
+            found |= point == coord;
+            Ok(())
+        })
+        .is_ok()
+            && found
     }
 
     /// Hyperslab add-span-element alias.
@@ -1525,11 +1983,14 @@ impl Selection {
         end: &[u64],
     ) -> Result<Selection> {
         require_hyperslab_like(self)?;
-        let points = self
-            .materialize_points(ds_shape)?
-            .into_iter()
-            .filter(|point| point_is_inside_block(point, start, end))
-            .collect();
+        self.bounded_materialized_point_count(ds_shape)?;
+        let mut points = Vec::new();
+        self.visit_points(ds_shape, |point| {
+            if point_is_inside_block(point, start, end) {
+                points.push(point.to_vec());
+            }
+            Ok(())
+        })?;
         Ok(points_to_selection(points))
     }
 
@@ -1553,7 +2014,7 @@ impl Selection {
         other: &Selection,
         ds_shape: &[u64],
     ) -> Result<Selection> {
-        if self.combine_and(other, ds_shape)?.selected_count(ds_shape) != Some(0) {
+        if self.intersects(other, ds_shape)? {
             return Err(Error::InvalidFormat(
                 "hyperslab selections are not disjoint".into(),
             ));
@@ -1564,11 +2025,6 @@ impl Selection {
     /// Build a hyperslab selection from span dimensions.
     pub fn hyper_make_spans(dims: Vec<HyperslabDim>) -> Selection {
         Selection::Hyperslab(dims)
-    }
-
-    /// Update derived hyperslab dimension info.
-    pub fn hyper_update_diminfo(&self) -> Result<Vec<HyperslabDim>> {
-        self.hyper_copy_span_helper()
     }
 
     /// Rebuild hyperslab spans.
@@ -1589,7 +2045,7 @@ impl Selection {
 
     /// Return whether two selections overlap.
     pub fn check_spans_overlap(&self, other: &Selection, ds_shape: &[u64]) -> Result<bool> {
-        Ok(self.combine_and(other, ds_shape)?.selected_count(ds_shape) != Some(0))
+        self.intersects(other, ds_shape)
     }
 
     /// Fill new-space selection metadata.
@@ -1698,14 +2154,18 @@ impl Selection {
     }
 
     /// Iterate a projected intersection into explicit points.
-    pub fn hyper_proj_int_iterate(
+    pub fn hyper_proj_int_visit<F>(
         &self,
         other: &Selection,
         ds_shape: &[u64],
         kept_dims: &[usize],
-    ) -> Result<Vec<Vec<u64>>> {
+        callback: F,
+    ) -> Result<()>
+    where
+        F: FnMut(&[u64]) -> Result<()>,
+    {
         self.hyper_proj_int_build_proj(other, ds_shape, kept_dims)?
-            .materialize_points(&projected_shape(ds_shape, kept_dims))
+            .visit_points(&projected_shape(ds_shape, kept_dims), callback)
     }
 
     /// Hyperslab-specific projected intersection alias.
@@ -1755,7 +2215,8 @@ impl Selection {
 
     /// Test hook for dimension-info status.
     pub fn get_diminfo_status_test(&self) -> bool {
-        self.hyper_copy_span_helper().is_ok()
+        let mut dims = Vec::new();
+        self.hyper_copy_span_into(&mut dims).is_ok()
     }
 
     /// Check internal span-tail consistency.
@@ -1785,7 +2246,8 @@ impl Selection {
 
     /// Return serialized hyperslab payload size.
     pub fn hyper_get_enc_size_real(&self) -> Result<usize> {
-        let dims = self.hyper_copy_span_helper()?;
+        let mut dims = Vec::new();
+        self.hyper_copy_span_into(&mut dims)?;
         let words = 1usize
             .checked_add(dims.len().checked_mul(4).ok_or_else(|| {
                 Error::InvalidFormat("hyperslab serialization size overflow".into())
@@ -1796,23 +2258,18 @@ impl Selection {
             .ok_or_else(|| Error::InvalidFormat("hyperslab serialization size overflow".into()))
     }
 
-    /// Serialize hyperslab span dimensions.
-    pub fn hyper_serialize_helper(&self) -> Result<Vec<u8>> {
-        self.hyper_serialize()
-    }
-
-    /// Serialize hyperslab span dimensions.
-    pub fn hyper_serialize(&self) -> Result<Vec<u8>> {
-        let dims = self.hyper_copy_span_helper()?;
-        let mut out = Vec::with_capacity(self.hyper_get_enc_size_real()?);
-        push_u64(&mut out, usize_to_u64(dims.len(), "hyperslab rank")?);
+    /// Serialize hyperslab span dimensions into caller-provided storage.
+    pub fn hyper_serialize_into(&self, out: &mut Vec<u8>) -> Result<()> {
+        let mut dims = Vec::new();
+        self.hyper_copy_span_into(&mut dims)?;
+        push_u64(out, usize_to_u64(dims.len(), "hyperslab rank")?);
         for dim in dims {
-            push_u64(&mut out, dim.start);
-            push_u64(&mut out, dim.stride);
-            push_u64(&mut out, dim.count);
-            push_u64(&mut out, dim.block);
+            push_u64(out, dim.start);
+            push_u64(out, dim.stride);
+            push_u64(out, dim.count);
+            push_u64(out, dim.block);
         }
-        Ok(out)
+        Ok(())
     }
 
     /// Deserialize hyperslab span dimensions.
@@ -1873,10 +2330,14 @@ impl Selection {
 
     /// Return the first unlimited dimension touched by this selection.
     pub fn select_unlim_dim(&self, max_dims: &[u64]) -> Option<usize> {
-        let touched = self.touched_dims(max_dims.len());
-        touched
-            .into_iter()
-            .find(|&dim| max_dims.get(dim).copied() == Some(u64::MAX))
+        let touched = match self {
+            Selection::None => 0,
+            Selection::All => max_dims.len(),
+            Selection::Points(points) => points.first().map_or(0, Vec::len),
+            Selection::Hyperslab(dims) => dims.len(),
+            Selection::Slice(slices) => slices.len(),
+        };
+        (0..touched).find(|&dim| max_dims.get(dim).copied() == Some(u64::MAX))
     }
 
     /// Count selected elements after dropping unlimited dimensions.
@@ -1896,11 +2357,12 @@ impl Selection {
             .enumerate()
             .filter_map(|(idx, &max_dim)| (max_dim != u64::MAX).then_some(idx))
             .collect();
-        let points = self.materialize_points(ds_shape)?;
-        let projected: BTreeSet<Vec<u64>> = points
-            .into_iter()
-            .map(|point| kept_dims.iter().map(|&dim| point[dim]).collect())
-            .collect();
+        self.bounded_materialized_point_count(ds_shape)?;
+        let mut projected: BTreeSet<Vec<u64>> = BTreeSet::new();
+        self.visit_points(ds_shape, |point| {
+            projected.insert(kept_dims.iter().map(|&dim| point[dim]).collect());
+            Ok(())
+        })?;
         u64::try_from(projected.len())
             .map_err(|_| Error::InvalidFormat("non-unlimited element count overflow".into()))
     }
@@ -1912,14 +2374,57 @@ impl Selection {
 
     /// Apply unsigned per-dimension offsets to this finite selection.
     pub fn select_adjust_unsigned(&self, offsets: &[u64]) -> Result<Selection> {
-        let offsets: Result<Vec<_>> = offsets
-            .iter()
-            .map(|&offset| {
-                i64::try_from(offset)
-                    .map_err(|_| Error::InvalidFormat("selection offset exceeds i64".into()))
-            })
-            .collect();
-        self.shift(&offsets?)
+        match self {
+            Selection::None => Ok(Selection::None),
+            Selection::All => {
+                if offsets.iter().all(|&offset| offset == 0) {
+                    Ok(Selection::All)
+                } else {
+                    Err(Error::Unsupported(
+                        "nonzero offset for an all-selection requires persistent offset state"
+                            .into(),
+                    ))
+                }
+            }
+            Selection::Points(points) => {
+                let shifted = points
+                    .iter()
+                    .map(|point| shift_coords_unsigned(point, offsets))
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(Selection::Points(shifted))
+            }
+            Selection::Hyperslab(dims) => {
+                check_rank("hyperslab selection", dims.len(), offsets.len())?;
+                let shifted = dims
+                    .iter()
+                    .zip(offsets)
+                    .map(|(dim, &offset)| {
+                        Ok(HyperslabDim {
+                            start: shift_coord_unsigned(dim.start, offset)?,
+                            stride: dim.stride,
+                            count: dim.count,
+                            block: dim.block,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(Selection::Hyperslab(shifted))
+            }
+            Selection::Slice(slices) => {
+                check_rank("slice selection", slices.len(), offsets.len())?;
+                let shifted = slices
+                    .iter()
+                    .zip(offsets)
+                    .map(|(slice, &offset)| {
+                        Ok(SliceInfo {
+                            start: shift_coord_unsigned(slice.start, offset)?,
+                            end: shift_coord_unsigned(slice.end, offset)?,
+                            step: slice.step,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(Selection::Slice(shifted))
+            }
+        }
     }
 
     /// Apply signed per-dimension offsets to this finite selection.
@@ -1947,36 +2452,29 @@ impl Selection {
                 buffer.len()
             )));
         }
-        for point in self.materialize_points(ds_shape)? {
-            let idx = usize::try_from(linear_index(&point, ds_shape)?)
+        self.visit_points(ds_shape, |point| {
+            let idx = usize::try_from(linear_index(point, ds_shape)?)
                 .map_err(|_| Error::InvalidFormat("selection linear index exceeds usize".into()))?;
             buffer[idx] = value.clone();
+            Ok(())
+        })
+    }
+
+    /// Normalize into concrete SliceInfo per dimension.
+    pub fn to_slices_into(&self, ds_shape: &[u64], out: &mut Vec<SliceInfo>) {
+        out.clear();
+        match self {
+            Selection::All => out.extend(ds_shape.iter().map(|&d| SliceInfo::new(0, d))),
+            Selection::Slice(slices) => out.extend_from_slice(slices),
+            Selection::None | Selection::Points(_) | Selection::Hyperslab(_) => {}
         }
-        Ok(())
     }
 
     /// Normalize into concrete SliceInfo per dimension.
     pub fn to_slices(&self, ds_shape: &[u64]) -> Vec<SliceInfo> {
-        match self {
-            Selection::None => Vec::new(),
-            Selection::All => ds_shape.iter().map(|&d| SliceInfo::new(0, d)).collect(),
-            Selection::Points(_) => Vec::new(),
-            Selection::Hyperslab(_) => Vec::new(),
-            Selection::Slice(slices) => slices.clone(),
-        }
-    }
-
-    fn touched_dims(&self, rank: usize) -> Vec<usize> {
-        match self {
-            Selection::None => Vec::new(),
-            Selection::All => (0..rank).collect(),
-            Selection::Points(points) => points
-                .first()
-                .map(|point| (0..point.len()).collect())
-                .unwrap_or_default(),
-            Selection::Hyperslab(dims) => (0..dims.len()).collect(),
-            Selection::Slice(slices) => (0..slices.len()).collect(),
-        }
+        let mut out = Vec::new();
+        self.to_slices_into(ds_shape, &mut out);
+        out
     }
 
     fn shift(&self, offsets: &[i64]) -> Result<Selection> {
@@ -2084,38 +2582,46 @@ pub fn H5S_select_release(_selection: Selection) {}
 
 #[allow(non_snake_case)]
 pub fn H5S_select_serial_size(selection: &Selection) -> Result<usize> {
-    Ok(selection.encode1()?.len())
+    Ok(1 + match selection {
+        Selection::None | Selection::All => 0,
+        Selection::Points(_) => selection.point_serial_size()?,
+        Selection::Hyperslab(_) | Selection::Slice(_) => selection.hyper_get_enc_size_real()?,
+    })
 }
 
 #[allow(non_snake_case)]
-pub fn H5S_select_serialize(selection: &Selection) -> Result<Vec<u8>> {
-    selection.encode1()
+pub fn H5S_select_serialize_into(selection: &Selection, out: &mut Vec<u8>) -> Result<()> {
+    selection.encode1_into(out)
 }
 
 #[allow(non_snake_case)]
-pub fn H5S__encode(selection: &Selection) -> Result<Vec<u8>> {
-    selection.encode1()
+pub fn H5S__encode_into(selection: &Selection, out: &mut Vec<u8>) -> Result<()> {
+    selection.encode1_into(out)
 }
 
 #[allow(non_snake_case)]
-pub fn H5Sencode1(selection: &Selection) -> Result<Vec<u8>> {
-    selection.encode1()
+pub fn H5Sencode1_into(selection: &Selection, out: &mut Vec<u8>) -> Result<()> {
+    selection.encode1_into(out)
 }
 
 #[allow(non_snake_case)]
-pub fn H5Sget_select_bounds(
+pub fn H5Sget_select_bounds_into(
     selection: &Selection,
     ds_shape: &[u64],
-) -> Option<(Vec<u64>, Vec<u64>)> {
-    selection.bounds(ds_shape)
+    start: &mut Vec<u64>,
+    end: &mut Vec<u64>,
+) -> bool {
+    selection.bounds_into(ds_shape, start, end)
 }
 
 #[allow(non_snake_case)]
-pub fn H5S_get_select_bounds(
+pub fn H5S_get_select_bounds_into(
     selection: &Selection,
     ds_shape: &[u64],
-) -> Option<(Vec<u64>, Vec<u64>)> {
-    H5Sget_select_bounds(selection, ds_shape)
+    start: &mut Vec<u64>,
+    end: &mut Vec<u64>,
+) -> bool {
+    H5Sget_select_bounds_into(selection, ds_shape, start, end)
 }
 
 #[allow(non_snake_case)]
@@ -2193,11 +2699,13 @@ pub fn H5Sget_select_hyper_nblocks(selection: &Selection, ds_shape: &[u64]) -> O
 }
 
 #[allow(non_snake_case)]
-pub fn H5Sget_select_hyper_blocklist(
+pub fn H5Sget_select_hyper_blocklist_into(
     selection: &Selection,
     ds_shape: &[u64],
-) -> Result<Option<Vec<(Vec<u64>, Vec<u64>)>>> {
-    selection.hyperslab_blocklist(ds_shape)
+    starts: &mut [u64],
+    ends: &mut [u64],
+) -> Result<Option<usize>> {
+    selection.hyperslab_blocklist_into(ds_shape, starts, ends)
 }
 
 #[allow(non_snake_case)]
@@ -2208,6 +2716,14 @@ pub fn H5Sget_select_elem_npoints(selection: &Selection) -> Option<u64> {
 #[allow(non_snake_case)]
 pub fn H5Sget_select_elem_pointlist(selection: &Selection) -> Option<&[Vec<u64>]> {
     selection.element_pointlist()
+}
+
+#[allow(non_snake_case)]
+pub fn H5Sget_select_elem_pointlist_into(
+    selection: &Selection,
+    out: &mut [u64],
+) -> Result<Option<usize>> {
+    selection.element_pointlist_into(out)
 }
 
 #[allow(non_snake_case)]
@@ -2222,10 +2738,12 @@ pub fn H5S_select_intersect_block(
     start: &[u64],
     end: &[u64],
 ) -> Result<bool> {
-    Ok(selection
-        .materialize_points(ds_shape)?
-        .iter()
-        .any(|point| point_is_inside_block(point, start, end)))
+    let mut intersects = false;
+    selection.visit_points(ds_shape, |point| {
+        intersects |= point_is_inside_block(point, start, end);
+        Ok(())
+    })?;
+    Ok(intersects)
 }
 
 #[allow(non_snake_case)]
@@ -2283,16 +2801,22 @@ pub fn H5S_select_iter_nelmts(iter: &SelectionPointIter) -> usize {
 }
 
 #[allow(non_snake_case)]
-pub fn H5S_select_iter_next(iter: &mut SelectionPointIter) -> Option<Vec<u64>> {
-    iter.select_iter_next()
+pub fn H5S_select_iter_next_ref(iter: &mut SelectionPointIter) -> Option<&[u64]> {
+    iter.select_iter_next_ref()
 }
 
 #[allow(non_snake_case)]
-pub fn H5S_select_iter_get_seq_list(
+pub fn H5S_select_iter_next_into(iter: &mut SelectionPointIter, out: &mut [u64]) -> Result<bool> {
+    iter.select_iter_next_into(out)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S_select_iter_get_seq_list_into(
     iter: &mut SelectionPointIter,
     max_points: usize,
-) -> Vec<Vec<u64>> {
-    iter.select_iter_get_seq_list(max_points)
+    out: &mut [u64],
+) -> Result<usize> {
+    iter.select_iter_get_seq_list_into(max_points, out)
 }
 
 #[allow(non_snake_case)]
@@ -2311,6 +2835,15 @@ where
     F: FnMut(&[u64]) -> Result<()>,
 {
     selection.select_iterate(ds_shape, callback)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S_select_copy_points_into(
+    selection: &Selection,
+    ds_shape: &[u64],
+    out: &mut [u64],
+) -> Result<usize> {
+    selection.copy_points_into(ds_shape, out)
 }
 
 #[allow(non_snake_case)]
@@ -2450,7 +2983,7 @@ pub fn H5S__none_iter_nelmts() -> usize {
 
 #[allow(non_snake_case)]
 pub fn H5S__none_iter_get_seq_list() -> Vec<Vec<u64>> {
-    Selection::none_iter_get_seq_list()
+    Vec::new()
 }
 
 #[allow(non_snake_case)]
@@ -2534,8 +3067,9 @@ pub fn H5S__all_iter_init(ds_shape: &[u64]) -> Result<SelectionPointIter> {
 }
 
 #[allow(non_snake_case)]
-pub fn H5S__all_iter_coords(ds_shape: &[u64]) -> Result<Option<Vec<u64>>> {
-    Selection::all_iter_coords(ds_shape)
+pub fn H5S__all_iter_coords_into(ds_shape: &[u64], out: &mut [u64]) -> Result<bool> {
+    let mut iter = Selection::all_iter_init(ds_shape)?;
+    iter.select_iter_next_into(out)
 }
 
 #[allow(non_snake_case)]
@@ -2554,8 +3088,13 @@ pub fn H5S__all_iter_has_next_block(ds_shape: &[u64]) -> bool {
 }
 
 #[allow(non_snake_case)]
-pub fn H5S__all_iter_next(iter: &mut SelectionPointIter) -> Option<Vec<u64>> {
-    Selection::all_iter_next(iter)
+pub fn H5S__all_iter_next_ref(iter: &mut SelectionPointIter) -> Option<&[u64]> {
+    iter.select_iter_next_ref()
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__all_iter_next_into(iter: &mut SelectionPointIter, out: &mut [u64]) -> Result<bool> {
+    iter.select_iter_next_into(out)
 }
 
 #[allow(non_snake_case)]
@@ -2564,8 +3103,13 @@ pub fn H5S__all_iter_next_block(ds_shape: &[u64]) -> Option<(Vec<u64>, Vec<u64>)
 }
 
 #[allow(non_snake_case)]
-pub fn H5S__all_iter_get_seq_list(ds_shape: &[u64], max_points: usize) -> Result<Vec<Vec<u64>>> {
-    Selection::all_iter_get_seq_list(ds_shape, max_points)
+pub fn H5S__all_iter_get_seq_list_into(
+    ds_shape: &[u64],
+    max_points: usize,
+    out: &mut [u64],
+) -> Result<usize> {
+    let mut iter = Selection::all_iter_init(ds_shape)?;
+    iter.select_iter_get_seq_list_into(max_points, out)
 }
 
 #[allow(non_snake_case)]
@@ -2669,21 +3213,35 @@ pub fn H5S__point_iter_nelmts(iter: &SelectionPointIter) -> usize {
 }
 
 #[allow(non_snake_case)]
-pub fn H5S__point_iter_next(iter: &mut SelectionPointIter) -> Option<Vec<u64>> {
-    iter.point_iter_next()
+pub fn H5S__point_iter_next_ref(iter: &mut SelectionPointIter) -> Option<&[u64]> {
+    iter.point_iter_next_ref()
 }
 
 #[allow(non_snake_case)]
-pub fn H5S__point_iter_next_block(iter: &mut SelectionPointIter) -> Option<Vec<u64>> {
-    iter.point_iter_next_block()
+pub fn H5S__point_iter_next_into(iter: &mut SelectionPointIter, out: &mut [u64]) -> Result<bool> {
+    iter.point_iter_next_into(out)
 }
 
 #[allow(non_snake_case)]
-pub fn H5S__point_iter_get_seq_list(
+pub fn H5S__point_iter_next_block_ref(iter: &mut SelectionPointIter) -> Option<&[u64]> {
+    iter.point_iter_next_block_ref()
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__point_iter_next_block_into(
+    iter: &mut SelectionPointIter,
+    out: &mut [u64],
+) -> Result<bool> {
+    iter.point_iter_next_block_into(out)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__point_iter_get_seq_list_into(
     iter: &mut SelectionPointIter,
     max_points: usize,
-) -> Vec<Vec<u64>> {
-    iter.point_iter_get_seq_list(max_points)
+    out: &mut [u64],
+) -> Result<usize> {
+    iter.point_iter_get_seq_list_into(max_points, out)
 }
 
 #[allow(non_snake_case)]
@@ -2712,8 +3270,8 @@ pub fn H5S__point_serial_size(selection: &Selection) -> Result<usize> {
 }
 
 #[allow(non_snake_case)]
-pub fn H5S__point_serialize(selection: &Selection) -> Result<Vec<u8>> {
-    selection.point_serialize()
+pub fn H5S__point_serialize_into(selection: &Selection, out: &mut Vec<u8>) -> Result<()> {
+    selection.point_serialize_into(out)
 }
 
 #[allow(non_snake_case)]
@@ -2786,8 +3344,13 @@ pub fn H5S__hyper_iter_init(selection: &Selection, ds_shape: &[u64]) -> Result<S
 }
 
 #[allow(non_snake_case)]
-pub fn H5S__hyper_iter_block(selection: &Selection, ds_shape: &[u64]) -> Result<Option<Vec<u64>>> {
-    selection.hyper_iter_block(ds_shape)
+pub fn H5S__hyper_iter_block_into(
+    selection: &Selection,
+    ds_shape: &[u64],
+    out: &mut [u64],
+) -> Result<bool> {
+    let mut iter = selection.hyper_iter_init(ds_shape)?;
+    iter.hyper_iter_next_into(out)
 }
 
 #[allow(non_snake_case)]
@@ -2796,61 +3359,40 @@ pub fn H5S__hyper_iter_has_next_block(selection: &Selection, ds_shape: &[u64]) -
 }
 
 #[allow(non_snake_case)]
-pub fn H5S__hyper_iter_next(iter: &mut SelectionPointIter) -> Option<Vec<u64>> {
-    iter.hyper_iter_next()
+pub fn H5S__hyper_iter_next_ref(iter: &mut SelectionPointIter) -> Option<&[u64]> {
+    iter.hyper_iter_next_ref()
 }
 
 #[allow(non_snake_case)]
-pub fn H5S__hyper_iter_next_block(iter: &mut SelectionPointIter) -> Option<Vec<u64>> {
-    iter.hyper_iter_next_block()
+pub fn H5S__hyper_iter_next_into(iter: &mut SelectionPointIter, out: &mut [u64]) -> Result<bool> {
+    iter.hyper_iter_next_into(out)
 }
 
 #[allow(non_snake_case)]
-pub fn H5S__hyper_iter_get_seq_list(
+pub fn H5S__hyper_iter_next_block_ref(iter: &mut SelectionPointIter) -> Option<&[u64]> {
+    iter.hyper_iter_next_block_ref()
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__hyper_iter_next_block_into(
+    iter: &mut SelectionPointIter,
+    out: &mut [u64],
+) -> Result<bool> {
+    iter.hyper_iter_next_block_into(out)
+}
+
+#[allow(non_snake_case)]
+pub fn H5S__hyper_iter_get_seq_list_into(
     iter: &mut SelectionPointIter,
     max_points: usize,
-) -> Vec<Vec<u64>> {
-    iter.hyper_iter_get_seq_list(max_points)
-}
-
-#[allow(non_snake_case)]
-pub fn H5S__hyper_iter_get_seq_list_gen(
-    iter: &mut SelectionPointIter,
-    max_points: usize,
-) -> Vec<Vec<u64>> {
-    iter.hyper_iter_get_seq_list_gen(max_points)
-}
-
-#[allow(non_snake_case)]
-pub fn H5S__hyper_get_seq_list_gen(
-    selection: &Selection,
-    ds_shape: &[u64],
-    max_points: usize,
-) -> Result<Vec<Vec<u64>>> {
-    Ok(selection
-        .hyper_iter_init(ds_shape)?
-        .hyper_iter_get_seq_list_gen(max_points))
+    out: &mut [u64],
+) -> Result<usize> {
+    iter.hyper_iter_get_seq_list_into(max_points, out)
 }
 
 #[allow(non_snake_case)]
 pub fn H5S__hyper_iter_nelmts(iter: &SelectionPointIter) -> usize {
     iter.hyper_iter_nelmts()
-}
-
-#[allow(non_snake_case)]
-pub fn H5S__hyper_iter_get_seq_list_opt(
-    iter: &mut SelectionPointIter,
-    max_points: usize,
-) -> Vec<Vec<u64>> {
-    iter.hyper_iter_get_seq_list_opt(max_points)
-}
-
-#[allow(non_snake_case)]
-pub fn H5S__hyper_iter_get_seq_list_single(
-    iter: &mut SelectionPointIter,
-    max_points: usize,
-) -> Vec<Vec<u64>> {
-    iter.hyper_iter_get_seq_list_single(max_points)
 }
 
 #[allow(non_snake_case)]
@@ -2874,13 +3416,8 @@ pub fn H5S__hyper_new_span_info(dims: Vec<HyperslabDim>) -> Selection {
 }
 
 #[allow(non_snake_case)]
-pub fn H5S__hyper_copy_span_helper(selection: &Selection) -> Result<Vec<HyperslabDim>> {
-    selection.hyper_copy_span_helper()
-}
-
-#[allow(non_snake_case)]
-pub fn H5S__hyper_copy_span(selection: &Selection) -> Result<Vec<HyperslabDim>> {
-    selection.hyper_copy_span()
+pub fn H5S__hyper_copy_span_into(selection: &Selection, out: &mut Vec<HyperslabDim>) -> Result<()> {
+    selection.hyper_copy_span_into(out)
 }
 
 #[allow(non_snake_case)]
@@ -2889,38 +3426,21 @@ pub fn H5S__hyper_cmp_spans(left: &Selection, right: &Selection) -> bool {
 }
 
 #[allow(non_snake_case)]
-pub fn H5S__hyper_print_spans(selection: &Selection) -> Result<String> {
-    selection.hyper_print_spans()
+pub fn H5S__hyper_print_spans_fmt(selection: &Selection, out: &mut impl fmt::Write) -> Result<()> {
+    selection.hyper_print_spans_fmt(out)
 }
 
 #[allow(non_snake_case)]
-pub fn H5S__hyper_print_spans_helper(selection: &Selection) -> Result<String> {
-    selection.hyper_print_spans_helper()
+pub fn H5S__space_print_spans_fmt(selection: &Selection, out: &mut impl fmt::Write) -> Result<()> {
+    selection.space_print_spans_fmt(out)
 }
 
 #[allow(non_snake_case)]
-pub fn H5S__space_print_spans(selection: &Selection) -> Result<String> {
-    selection.space_print_spans()
-}
-
-#[allow(non_snake_case)]
-pub fn H5S__hyper_print_diminfo(selection: &Selection) -> Result<String> {
-    selection.hyper_print_diminfo()
-}
-
-#[allow(non_snake_case)]
-pub fn H5S__hyper_print_diminfo_helper(selection: &Selection) -> Result<String> {
-    selection.hyper_print_diminfo_helper()
-}
-
-#[allow(non_snake_case)]
-pub fn H5S__hyper_print_spans_dfs(selection: &Selection) -> Result<String> {
-    selection.hyper_print_spans_dfs()
-}
-
-#[allow(non_snake_case)]
-pub fn H5S__hyper_print_space_dfs(selection: &Selection) -> Result<String> {
-    selection.hyper_print_space_dfs()
+pub fn H5S__hyper_print_diminfo_fmt(
+    selection: &Selection,
+    out: &mut impl fmt::Write,
+) -> Result<()> {
+    selection.hyper_print_diminfo_fmt(out)
 }
 
 #[allow(non_snake_case)]
@@ -2944,13 +3464,8 @@ pub fn H5S__hyper_get_version_enc_size(selection: &Selection) -> Result<(u8, usi
 }
 
 #[allow(non_snake_case)]
-pub fn H5S__hyper_serialize(selection: &Selection) -> Result<Vec<u8>> {
-    selection.hyper_serialize()
-}
-
-#[allow(non_snake_case)]
-pub fn H5S__hyper_serialize_helper(selection: &Selection) -> Result<Vec<u8>> {
-    selection.hyper_serialize_helper()
+pub fn H5S__hyper_serialize_into(selection: &Selection, out: &mut Vec<u8>) -> Result<()> {
+    selection.hyper_serialize_into(out)
 }
 
 #[allow(non_snake_case)]
@@ -2974,11 +3489,13 @@ pub fn H5S__hyper_span_nblocks(selection: &Selection, ds_shape: &[u64]) -> Optio
 }
 
 #[allow(non_snake_case)]
-pub fn H5S__hyper_span_blocklist(
+pub fn H5S__hyper_span_blocklist_into(
     selection: &Selection,
     ds_shape: &[u64],
-) -> Result<Option<Vec<(Vec<u64>, Vec<u64>)>>> {
-    selection.hyper_span_blocklist(ds_shape)
+    starts: &mut [u64],
+    ends: &mut [u64],
+) -> Result<Option<usize>> {
+    selection.hyper_span_blocklist_into(ds_shape, starts, ends)
 }
 
 #[allow(non_snake_case)]
@@ -2987,11 +3504,13 @@ pub fn H5S__get_select_hyper_nblocks(selection: &Selection, ds_shape: &[u64]) ->
 }
 
 #[allow(non_snake_case)]
-pub fn H5S__get_select_hyper_blocklist(
+pub fn H5S__get_select_hyper_blocklist_into(
     selection: &Selection,
     ds_shape: &[u64],
-) -> Result<Option<Vec<(Vec<u64>, Vec<u64>)>>> {
-    selection.get_select_hyper_blocklist_internal(ds_shape)
+    starts: &mut [u64],
+    ends: &mut [u64],
+) -> Result<Option<usize>> {
+    selection.get_select_hyper_blocklist_into_internal(ds_shape, starts, ends)
 }
 
 #[allow(non_snake_case)]
@@ -3078,8 +3597,11 @@ pub fn H5S__hyper_regular_and_single_block(selection: &Selection, ds_shape: &[u6
 }
 
 #[allow(non_snake_case)]
-pub fn H5S__hyper_get_regular_hyperslab(selection: &Selection) -> Result<Vec<HyperslabDim>> {
-    selection.hyper_copy_span_helper()
+pub fn H5S__hyper_get_regular_hyperslab_into(
+    selection: &Selection,
+    out: &mut Vec<HyperslabDim>,
+) -> Result<()> {
+    selection.hyper_copy_span_into(out)
 }
 
 #[allow(non_snake_case)]
@@ -3140,8 +3662,11 @@ pub fn H5S__hyper_make_spans(dims: Vec<HyperslabDim>) -> Selection {
 }
 
 #[allow(non_snake_case)]
-pub fn H5S__hyper_update_diminfo(selection: &Selection) -> Result<Vec<HyperslabDim>> {
-    selection.hyper_update_diminfo()
+pub fn H5S__hyper_update_diminfo_into(
+    selection: &Selection,
+    out: &mut Vec<HyperslabDim>,
+) -> Result<()> {
+    selection.hyper_copy_span_into(out)
 }
 
 #[allow(non_snake_case)]
@@ -3256,13 +3781,17 @@ pub fn H5S__hyper_proj_int_build_proj(
 }
 
 #[allow(non_snake_case)]
-pub fn H5S__hyper_proj_int_iterate(
+pub fn H5S__hyper_proj_int_visit<F>(
     left: &Selection,
     right: &Selection,
     ds_shape: &[u64],
     kept_dims: &[usize],
-) -> Result<Vec<Vec<u64>>> {
-    left.hyper_proj_int_iterate(right, ds_shape, kept_dims)
+    callback: F,
+) -> Result<()>
+where
+    F: FnMut(&[u64]) -> Result<()>,
+{
+    left.hyper_proj_int_visit(right, ds_shape, kept_dims, callback)
 }
 
 #[allow(non_snake_case)]
@@ -3415,6 +3944,15 @@ fn shift_coords(point: &[u64], offsets: &[i64]) -> Result<Vec<u64>> {
         .collect()
 }
 
+fn shift_coords_unsigned(point: &[u64], offsets: &[u64]) -> Result<Vec<u64>> {
+    check_rank("point selection", point.len(), offsets.len())?;
+    point
+        .iter()
+        .zip(offsets)
+        .map(|(&coord, &offset)| shift_coord_unsigned(coord, offset))
+        .collect()
+}
+
 fn shift_coord(coord: u64, offset: i64) -> Result<u64> {
     if offset >= 0 {
         coord
@@ -3425,6 +3963,12 @@ fn shift_coord(coord: u64, offset: i64) -> Result<u64> {
             .checked_sub(offset.unsigned_abs())
             .ok_or_else(|| Error::InvalidFormat("selection coordinate underflow".into()))
     }
+}
+
+fn shift_coord_unsigned(coord: u64, offset: u64) -> Result<u64> {
+    coord
+        .checked_add(offset)
+        .ok_or_else(|| Error::InvalidFormat("selection coordinate overflow".into()))
 }
 
 fn push_u64(out: &mut Vec<u8>, value: u64) {
@@ -3526,42 +4070,94 @@ fn linear_index(point: &[u64], ds_shape: &[u64]) -> Result<u64> {
     Ok(idx)
 }
 
-fn materialize_all_points(ds_shape: &[u64]) -> Result<Vec<Vec<u64>>> {
+fn row_major_coord_from_index(index: usize, shape: &[u64], out: &mut Vec<u64>) -> Result<()> {
+    out.clear();
+    out.resize(shape.len(), 0);
+    if shape.is_empty() {
+        return Ok(());
+    }
+
+    let mut remainder = usize_to_u64(index, "selection iterator index")?;
+    for dim in (0..shape.len()).rev() {
+        let extent = shape[dim];
+        if extent == 0 {
+            return Err(Error::InvalidFormat(
+                "selection iterator shape contains zero extent".into(),
+            ));
+        }
+        out[dim] = remainder % extent;
+        remainder /= extent;
+    }
+    if remainder == 0 {
+        Ok(())
+    } else {
+        Err(Error::InvalidFormat(
+            "selection iterator index exceeds shape".into(),
+        ))
+    }
+}
+
+fn visit_all_points<F>(ds_shape: &[u64], callback: &mut F) -> Result<()>
+where
+    F: FnMut(&[u64]) -> Result<()>,
+{
     if ds_shape.contains(&0) {
-        return Ok(Vec::new());
+        return Ok(());
     }
     if ds_shape.is_empty() {
-        return Ok(vec![Vec::new()]);
+        return callback(&[]);
     }
-    let slices: Vec<_> = ds_shape.iter().map(|&dim| SliceInfo::new(0, dim)).collect();
-    materialize_slice_points(&slices)
+    let mut current = vec![0u64; ds_shape.len()];
+    visit_all_points_recursive(ds_shape, 0, &mut current, callback)
 }
 
-fn materialize_slice_points(slices: &[SliceInfo]) -> Result<Vec<Vec<u64>>> {
+fn visit_all_points_recursive<F>(
+    ds_shape: &[u64],
+    dim: usize,
+    current: &mut [u64],
+    callback: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&[u64]) -> Result<()>,
+{
+    if dim == ds_shape.len() {
+        return callback(current);
+    }
+    for coord in 0..ds_shape[dim] {
+        current[dim] = coord;
+        visit_all_points_recursive(ds_shape, dim + 1, current, callback)?;
+    }
+    Ok(())
+}
+
+fn visit_slice_points<F>(slices: &[SliceInfo], callback: &mut F) -> Result<()>
+where
+    F: FnMut(&[u64]) -> Result<()>,
+{
     if slices.iter().any(|slice| slice.count() == 0) {
-        return Ok(Vec::new());
+        return Ok(());
     }
-    let mut points = Vec::new();
     let mut current = vec![0u64; slices.len()];
-    push_slice_points(slices, 0, &mut current, &mut points)?;
-    Ok(points)
+    visit_slice_points_recursive(slices, 0, &mut current, callback)
 }
 
-fn push_slice_points(
+fn visit_slice_points_recursive<F>(
     slices: &[SliceInfo],
     dim: usize,
     current: &mut [u64],
-    points: &mut Vec<Vec<u64>>,
-) -> Result<()> {
+    callback: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&[u64]) -> Result<()>,
+{
     if dim == slices.len() {
-        points.push(current.to_vec());
-        return Ok(());
+        return callback(current);
     }
     let slice = &slices[dim];
     let mut coord = slice.start;
     while coord < slice.end {
         current[dim] = coord;
-        push_slice_points(slices, dim + 1, current, points)?;
+        visit_slice_points_recursive(slices, dim + 1, current, callback)?;
         coord = coord
             .checked_add(slice.step)
             .ok_or_else(|| Error::InvalidFormat("selection coordinate overflow".into()))?;
@@ -3569,28 +4165,31 @@ fn push_slice_points(
     Ok(())
 }
 
-fn materialize_hyperslab_points(dims: &[HyperslabDim]) -> Result<Vec<Vec<u64>>> {
+fn visit_hyperslab_points<F>(dims: &[HyperslabDim], callback: &mut F) -> Result<()>
+where
+    F: FnMut(&[u64]) -> Result<()>,
+{
     if dims
         .iter()
         .any(|dim| dim.count == 0 || dim.block == 0 || dim.stride == 0)
     {
-        return Ok(Vec::new());
+        return Ok(());
     }
-    let mut points = Vec::new();
     let mut current = vec![0u64; dims.len()];
-    push_hyperslab_points(dims, 0, &mut current, &mut points)?;
-    Ok(points)
+    visit_hyperslab_points_recursive(dims, 0, &mut current, callback)
 }
 
-fn push_hyperslab_points(
+fn visit_hyperslab_points_recursive<F>(
     dims: &[HyperslabDim],
     dim: usize,
     current: &mut [u64],
-    points: &mut Vec<Vec<u64>>,
-) -> Result<()> {
+    callback: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&[u64]) -> Result<()>,
+{
     if dim == dims.len() {
-        points.push(current.to_vec());
-        return Ok(());
+        return callback(current);
     }
     let selection = &dims[dim];
     for block_idx in 0..selection.count {
@@ -3606,33 +4205,36 @@ fn push_hyperslab_points(
             current[dim] = block_start
                 .checked_add(offset)
                 .ok_or_else(|| Error::InvalidFormat("hyperslab coordinate overflow".into()))?;
-            push_hyperslab_points(dims, dim + 1, current, points)?;
+            visit_hyperslab_points_recursive(dims, dim + 1, current, callback)?;
         }
     }
     Ok(())
 }
 
-fn slice_blocklist(slices: &[SliceInfo]) -> Result<Vec<(Vec<u64>, Vec<u64>)>> {
+fn visit_slice_blocks<F>(slices: &[SliceInfo], callback: &mut F) -> Result<()>
+where
+    F: FnMut(&[u64], &[u64]) -> Result<()>,
+{
     if slices.iter().any(|slice| slice.count() == 0) {
-        return Ok(Vec::new());
+        return Ok(());
     }
-    let mut blocks = Vec::new();
     let mut start = vec![0u64; slices.len()];
     let mut end = vec![0u64; slices.len()];
-    push_slice_blocks(slices, 0, &mut start, &mut end, &mut blocks)?;
-    Ok(blocks)
+    visit_slice_blocks_recursive(slices, 0, &mut start, &mut end, callback)
 }
 
-fn push_slice_blocks(
+fn visit_slice_blocks_recursive<F>(
     slices: &[SliceInfo],
     dim: usize,
     start: &mut [u64],
     end: &mut [u64],
-    blocks: &mut Vec<(Vec<u64>, Vec<u64>)>,
-) -> Result<()> {
+    callback: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&[u64], &[u64]) -> Result<()>,
+{
     if dim == slices.len() {
-        blocks.push((start.to_vec(), end.to_vec()));
-        return Ok(());
+        return callback(start, end);
     }
 
     let slice = &slices[dim];
@@ -3642,15 +4244,14 @@ fn push_slice_blocks(
             .end
             .checked_sub(1)
             .ok_or_else(|| Error::InvalidFormat("slice block end underflow".into()))?;
-        push_slice_blocks(slices, dim + 1, start, end, blocks)?;
-        return Ok(());
+        return visit_slice_blocks_recursive(slices, dim + 1, start, end, callback);
     }
 
     let mut coord = slice.start;
     while coord < slice.end {
         start[dim] = coord;
         end[dim] = coord;
-        push_slice_blocks(slices, dim + 1, start, end, blocks)?;
+        visit_slice_blocks_recursive(slices, dim + 1, start, end, callback)?;
         coord = coord
             .checked_add(slice.step)
             .ok_or_else(|| Error::InvalidFormat("slice block coordinate overflow".into()))?;
@@ -3658,30 +4259,33 @@ fn push_slice_blocks(
     Ok(())
 }
 
-fn hyperslab_blocklist(dims: &[HyperslabDim]) -> Result<Vec<(Vec<u64>, Vec<u64>)>> {
+fn visit_hyperslab_blocks<F>(dims: &[HyperslabDim], callback: &mut F) -> Result<()>
+where
+    F: FnMut(&[u64], &[u64]) -> Result<()>,
+{
     if dims
         .iter()
         .any(|dim| dim.count == 0 || dim.block == 0 || dim.stride == 0)
     {
-        return Ok(Vec::new());
+        return Ok(());
     }
-    let mut blocks = Vec::new();
     let mut start = vec![0u64; dims.len()];
     let mut end = vec![0u64; dims.len()];
-    push_hyperslab_blocks(dims, 0, &mut start, &mut end, &mut blocks)?;
-    Ok(blocks)
+    visit_hyperslab_blocks_recursive(dims, 0, &mut start, &mut end, callback)
 }
 
-fn push_hyperslab_blocks(
+fn visit_hyperslab_blocks_recursive<F>(
     dims: &[HyperslabDim],
     dim: usize,
     start: &mut [u64],
     end: &mut [u64],
-    blocks: &mut Vec<(Vec<u64>, Vec<u64>)>,
-) -> Result<()> {
+    callback: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&[u64], &[u64]) -> Result<()>,
+{
     if dim == dims.len() {
-        blocks.push((start.to_vec(), end.to_vec()));
-        return Ok(());
+        return callback(start, end);
     }
 
     let selection = &dims[dim];
@@ -3700,68 +4304,93 @@ fn push_hyperslab_blocks(
             .ok_or_else(|| Error::InvalidFormat("hyperslab block overflow".into()))?;
         start[dim] = block_start;
         end[dim] = block_end;
-        push_hyperslab_blocks(dims, dim + 1, start, end, blocks)?;
+        visit_hyperslab_blocks_recursive(dims, dim + 1, start, end, callback)?;
     }
     Ok(())
 }
 
-fn slice_bounds(slices: &[SliceInfo]) -> Option<(Vec<u64>, Vec<u64>)> {
+fn slice_bounds_into(slices: &[SliceInfo], start: &mut Vec<u64>, end: &mut Vec<u64>) -> bool {
     if slices.iter().any(|slice| slice.count() == 0) {
-        return None;
+        return false;
     }
-    let mut end = Vec::with_capacity(slices.len());
+    start.reserve(slices.len());
+    end.reserve(slices.len());
     for slice in slices {
-        end.push(
-            slice
-                .count()
-                .checked_sub(1)?
-                .checked_mul(slice.step)?
-                .checked_add(slice.start)?,
-        );
+        let Some(last) = slice
+            .count()
+            .checked_sub(1)
+            .and_then(|value| value.checked_mul(slice.step))
+            .and_then(|value| value.checked_add(slice.start))
+        else {
+            start.clear();
+            end.clear();
+            return false;
+        };
+        start.push(slice.start);
+        end.push(last);
     }
-    Some((slices.iter().map(|slice| slice.start).collect(), end))
+    true
 }
 
-fn hyperslab_bounds(dims: &[HyperslabDim]) -> Option<(Vec<u64>, Vec<u64>)> {
+fn hyperslab_bounds_into(dims: &[HyperslabDim], start: &mut Vec<u64>, end: &mut Vec<u64>) -> bool {
     if dims
         .iter()
         .any(|dim| dim.count == 0 || dim.block == 0 || dim.stride == 0)
     {
-        return None;
+        return false;
     }
-    let mut end = Vec::with_capacity(dims.len());
+    start.reserve(dims.len());
+    end.reserve(dims.len());
     for dim in dims {
-        end.push(
-            dim.count
-                .checked_sub(1)?
-                .checked_mul(dim.stride)?
-                .checked_add(dim.block)?
-                .checked_sub(1)?
-                .checked_add(dim.start)?,
-        );
+        let Some(last) = dim
+            .count
+            .checked_sub(1)
+            .and_then(|value| value.checked_mul(dim.stride))
+            .and_then(|value| value.checked_add(dim.block))
+            .and_then(|value| value.checked_sub(1))
+            .and_then(|value| value.checked_add(dim.start))
+        else {
+            start.clear();
+            end.clear();
+            return false;
+        };
+        start.push(dim.start);
+        end.push(last);
     }
-    Some((dims.iter().map(|dim| dim.start).collect(), end))
+    true
 }
 
-fn point_bounds(points: &[Vec<u64>]) -> Option<(Vec<u64>, Vec<u64>)> {
-    let first = points.first()?;
-    let mut start = first.clone();
-    let mut end = first.clone();
+fn point_bounds_into(points: &[Vec<u64>], start: &mut Vec<u64>, end: &mut Vec<u64>) -> bool {
+    let Some(first) = points.first() else {
+        return false;
+    };
+    start.extend_from_slice(first);
+    end.extend_from_slice(first);
     for point in &points[1..] {
         if point.len() != start.len() {
-            return None;
+            start.clear();
+            end.clear();
+            return false;
         }
         for (dim, &coord) in point.iter().enumerate() {
             start[dim] = start[dim].min(coord);
             end[dim] = end[dim].max(coord);
         }
     }
-    Some((start, end))
+    true
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn selection_bounds(selection: &Selection, ds_shape: &[u64]) -> Option<(Vec<u64>, Vec<u64>)> {
+        let mut start = Vec::new();
+        let mut end = Vec::new();
+        selection
+            .bounds_into(ds_shape, &mut start, &mut end)
+            .then_some((start, end))
+    }
 
     #[test]
     fn hyperslab_selected_count_reports_overflow() {
@@ -3798,23 +4427,26 @@ mod tests {
         assert_eq!(left.modify_select(&right, &[4]).unwrap(), combined);
 
         let mut iter = combined.select_iter_init(&[4]).unwrap();
-        assert_eq!(iter.select_iter_next(), Some(vec![0]));
-        assert_eq!(iter.select_iter_next(), Some(vec![1]));
+        assert_eq!(iter.select_iter_next_ref(), Some(&[0][..]));
+        assert_eq!(iter.select_iter_next_ref(), Some(&[1][..]));
         iter.select_iter_reset();
-        assert_eq!(iter.select_iter_next(), Some(vec![0]));
+        assert_eq!(iter.select_iter_next_ref(), Some(&[0][..]));
     }
 
     #[test]
     fn selection_serialization_aliases_roundtrip() {
         let points = Selection::select_elements(vec![vec![1, 2], vec![3, 4]]);
         assert!(points.mpio_point_type());
-        let encoded_points = points.encode1().unwrap();
+        let mut encoded_points = Vec::new();
+        points.encode1_into(&mut encoded_points).unwrap();
         assert_eq!(
             Selection::select_deserialize(&encoded_points).unwrap(),
             points
         );
+        let mut point_payload = Vec::new();
+        points.point_serialize_into(&mut point_payload).unwrap();
         assert_eq!(
-            Selection::point_deserialize(&points.point_serialize().unwrap()).unwrap(),
+            Selection::point_deserialize(&point_payload).unwrap(),
             points
         );
         assert_eq!(points.point_get_version_enc_size().unwrap().0, 1);
@@ -3825,28 +4457,34 @@ mod tests {
             HyperslabDim::new(1, 1, 3, 1),
         ]);
         assert!(hyper.mpio_reg_hyper_type());
-        let encoded_hyper = hyper.encode1().unwrap();
+        let mut encoded_hyper = Vec::new();
+        hyper.encode1_into(&mut encoded_hyper).unwrap();
         assert_eq!(
             Selection::select_deserialize(&encoded_hyper).unwrap(),
             hyper
         );
-        assert_eq!(
-            Selection::hyper_deserialize(&hyper.hyper_serialize().unwrap()).unwrap(),
-            hyper
-        );
+        let mut hyper_payload = Vec::new();
+        hyper.hyper_serialize_into(&mut hyper_payload).unwrap();
+        assert_eq!(Selection::hyper_deserialize(&hyper_payload).unwrap(), hyper);
         assert_eq!(hyper.hyper_get_version_enc_size().unwrap().0, 1);
         assert!(Selection::hyper_deserialize(&u64::MAX.to_le_bytes()).is_err());
         assert_eq!(hyper.hyper_spans_nelem(&[4, 4]), Some(6));
         assert!(hyper.hyper_coord_to_span(&[0, 1], &[4, 4]));
         assert!(hyper.hyper_spans_shape_same(&hyper, &[4, 4]));
-        assert!(hyper.hyper_print_diminfo().unwrap().contains("start=0"));
-        assert!(hyper.space_print_spans().unwrap().contains("HyperslabDim"));
+        let mut diminfo = String::new();
+        hyper.hyper_print_diminfo_fmt(&mut diminfo).unwrap();
+        assert!(diminfo.contains("start=0"));
+        let mut spans = String::new();
+        hyper.space_print_spans_fmt(&mut spans).unwrap();
+        assert!(spans.contains("HyperslabDim"));
 
         let mut editable = Selection::select_hyperslab(vec![Selection::hyper_new_span(0, 1, 1, 1)]);
         editable
             .hyper_add_span_element(HyperslabDim::new(1, 1, 1, 1))
             .unwrap();
-        assert_eq!(editable.hyper_copy_span().unwrap().len(), 2);
+        let mut copied = Vec::new();
+        editable.hyper_copy_span_into(&mut copied).unwrap();
+        assert_eq!(copied.len(), 2);
     }
 
     #[test]
@@ -3866,14 +4504,25 @@ mod tests {
         assert_eq!(H5Sget_select_npoints(&selection, &ds_shape), Some(4));
         assert_eq!(H5S_get_select_npoints(&selection, &ds_shape), Some(4));
         assert!(H5Sselect_valid(&selection, &ds_shape));
-        assert_eq!(
-            H5Sget_select_bounds(&selection, &ds_shape),
-            Some((vec![0, 1], vec![1, 2]))
-        );
-        assert_eq!(
-            H5S_get_select_bounds(&selection, &ds_shape),
-            Some((vec![0, 1], vec![1, 2]))
-        );
+        let mut bound_start = Vec::new();
+        let mut bound_end = Vec::new();
+        assert!(H5Sget_select_bounds_into(
+            &selection,
+            &ds_shape,
+            &mut bound_start,
+            &mut bound_end
+        ));
+        assert_eq!(bound_start, vec![0, 1]);
+        assert_eq!(bound_end, vec![1, 2]);
+        bound_start.clear();
+        bound_end.clear();
+        assert!(H5S_get_select_bounds_into(
+            &selection,
+            &ds_shape,
+            &mut bound_start,
+            &mut bound_end
+        ));
+        assert_eq!((bound_start, bound_end), (vec![0, 1], vec![1, 2]));
         assert_eq!(
             H5S_get_select_unlim_dim(&selection, &[4, u64::MAX]),
             Some(1)
@@ -3908,15 +4557,15 @@ mod tests {
             Selection::Hyperslab(vec![HyperslabDim::new(1, 1, 1, 1)])
         );
         assert_eq!(H5Sget_select_hyper_nblocks(&selection, &ds_shape), Some(4));
+        let mut starts = vec![0; 8];
+        let mut ends = vec![0; 8];
         assert_eq!(
-            H5Sget_select_hyper_blocklist(&selection, &ds_shape).unwrap(),
-            Some(vec![
-                (vec![0, 1], vec![0, 1]),
-                (vec![0, 2], vec![0, 2]),
-                (vec![1, 1], vec![1, 1]),
-                (vec![1, 2], vec![1, 2])
-            ])
+            H5Sget_select_hyper_blocklist_into(&selection, &ds_shape, &mut starts, &mut ends)
+                .unwrap(),
+            Some(4)
         );
+        assert_eq!(starts, vec![0, 1, 0, 2, 1, 1, 1, 2]);
+        assert_eq!(ends, vec![0, 1, 0, 2, 1, 1, 1, 2]);
         let point_selection = Selection::Points(vec![vec![0, 0], vec![3, 3]]);
         assert_eq!(H5Sget_select_elem_npoints(&point_selection), Some(2));
         assert_eq!(
@@ -3932,28 +4581,39 @@ mod tests {
 
         let adjusted = H5S_select_adjust_u(&selection, &[1, 0]).unwrap();
         assert_eq!(
-            H5Sget_select_bounds(&adjusted, &ds_shape),
+            selection_bounds(&adjusted, &ds_shape),
             Some((vec![1, 1], vec![2, 2]))
         );
         let adjusted = H5Sselect_adjust(&selection, &[0, -1]).unwrap();
         assert_eq!(
-            H5Sget_select_bounds(&adjusted, &ds_shape),
+            selection_bounds(&adjusted, &ds_shape),
             Some((vec![0, 0], vec![1, 1]))
         );
 
-        let encoded = selection.encode1().unwrap();
+        let mut encoded = Vec::new();
+        selection.encode1_into(&mut encoded).unwrap();
         assert_eq!(H5S_select_serial_size(&selection).unwrap(), encoded.len());
-        assert_eq!(H5S_select_serialize(&selection).unwrap(), encoded);
-        assert_eq!(H5S__encode(&selection).unwrap(), encoded);
-        assert_eq!(H5Sencode1(&selection).unwrap(), encoded);
+        let mut encoded_via_h5s = Vec::new();
+        H5S_select_serialize_into(&selection, &mut encoded_via_h5s).unwrap();
+        assert_eq!(encoded_via_h5s, encoded);
+        encoded_via_h5s.clear();
+        H5S__encode_into(&selection, &mut encoded_via_h5s).unwrap();
+        assert_eq!(encoded_via_h5s, encoded);
+        encoded_via_h5s.clear();
+        H5Sencode1_into(&selection, &mut encoded_via_h5s).unwrap();
+        assert_eq!(encoded_via_h5s, encoded);
         assert_eq!(H5S_select_deserialize(&encoded).unwrap(), selection);
         assert_eq!(H5S__decode(&encoded).unwrap(), selection);
         H5S_select_release(selection.clone());
         let projected = H5S_select_project_simple(&selection, &ds_shape, &[1]).unwrap();
-        assert_eq!(
-            projected.materialize_points(&[4]).unwrap(),
-            vec![vec![1], vec![2]]
-        );
+        let mut projected_points = Vec::new();
+        projected
+            .visit_points(&[4], |point| {
+                projected_points.push(point.to_vec());
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(projected_points, vec![vec![1], vec![2]]);
         assert_eq!(
             H5S_select_project_scalar(&selection, &ds_shape).unwrap(),
             Selection::Points(vec![vec![]])
@@ -3967,13 +4627,15 @@ mod tests {
         let mut iter = H5S_select_iter_init(&selection, &ds_shape).unwrap();
         assert_eq!(H5S_select_iter_coords(&iter), Some(&[0, 1][..]));
         assert_eq!(H5S_select_iter_nelmts(&iter), 4);
-        assert_eq!(H5S_select_iter_next(&mut iter), Some(vec![0, 1]));
+        assert_eq!(H5S_select_iter_next_ref(&mut iter), Some(&[0, 1][..]));
+        let mut seq = vec![0; 4];
         assert_eq!(
-            H5S_select_iter_get_seq_list(&mut iter, 2),
-            vec![vec![0, 2], vec![1, 1]]
+            H5S_select_iter_get_seq_list_into(&mut iter, 2, &mut seq).unwrap(),
+            2
         );
+        assert_eq!(seq, vec![0, 2, 1, 1]);
         H5Ssel_iter_reset(&mut iter);
-        assert_eq!(H5S_select_iter_next(&mut iter), Some(vec![0, 1]));
+        assert_eq!(H5S_select_iter_next_ref(&mut iter), Some(&[0, 1][..]));
         H5S_select_iter_release(iter);
 
         let mut visited = Vec::new();
@@ -4058,22 +4720,26 @@ mod tests {
 
         let ds_shape = [2, 3];
         let mut all_iter = H5S__all_iter_init(&ds_shape).unwrap();
-        assert_eq!(H5S__all_iter_coords(&ds_shape).unwrap(), Some(vec![0, 0]));
+        let mut all_coords = vec![u64::MAX; 2];
+        assert!(H5S__all_iter_coords_into(&ds_shape, &mut all_coords).unwrap());
+        assert_eq!(all_coords, vec![0, 0]);
         assert_eq!(
             H5S__all_iter_block(&ds_shape),
             Some((vec![0, 0], vec![1, 2]))
         );
         assert_eq!(H5S__all_iter_nelmts(&ds_shape).unwrap(), 6);
         assert!(H5S__all_iter_has_next_block(&ds_shape));
-        assert_eq!(H5S__all_iter_next(&mut all_iter), Some(vec![0, 0]));
+        assert_eq!(H5S__all_iter_next_ref(&mut all_iter), Some(&[0, 0][..]));
         assert_eq!(
             H5S__all_iter_next_block(&ds_shape),
             Some((vec![0, 0], vec![1, 2]))
         );
+        let mut all_seq = vec![0; 6];
         assert_eq!(
-            H5S__all_iter_get_seq_list(&ds_shape, 3).unwrap(),
-            vec![vec![0, 0], vec![0, 1], vec![0, 2]]
+            H5S__all_iter_get_seq_list_into(&ds_shape, 3, &mut all_seq).unwrap(),
+            3
         );
+        assert_eq!(all_seq, vec![0, 0, 0, 1, 0, 2]);
         H5S__all_iter_release(all_iter);
         H5S__all_release();
         assert_eq!(H5S__all_copy(), Selection::All);
@@ -4099,22 +4765,25 @@ mod tests {
         let mut point_iter = H5S__point_iter_init(&points, &ds_shape).unwrap();
         assert_eq!(H5S__point_iter_coords(&point_iter), Some(&[0, 1][..]));
         assert_eq!(H5S__point_iter_nelmts(&point_iter), 2);
-        assert_eq!(H5S__point_iter_next(&mut point_iter), Some(vec![0, 1]));
+        assert_eq!(H5S__point_iter_next_ref(&mut point_iter), Some(&[0, 1][..]));
         assert_eq!(
-            H5S__point_iter_next_block(&mut point_iter),
-            Some(vec![1, 2])
+            H5S__point_iter_next_block_ref(&mut point_iter),
+            Some(&[1, 2][..])
         );
         let mut point_iter = H5S__point_iter_init(&points, &ds_shape).unwrap();
+        let mut point_seq = vec![0; 4];
         assert_eq!(
-            H5S__point_iter_get_seq_list(&mut point_iter, 2),
-            vec![vec![0, 1], vec![1, 2]]
+            H5S__point_iter_get_seq_list_into(&mut point_iter, 2, &mut point_seq).unwrap(),
+            2
         );
+        assert_eq!(point_seq, vec![0, 1, 1, 2]);
         H5S__point_iter_release(point_iter);
         assert_eq!(H5S__point_copy(&points).unwrap(), points);
         H5S__point_add(&mut points, vec![0, 2]).unwrap();
         assert_eq!(points.selected_count(&ds_shape), Some(3));
         assert_eq!(H5S__point_get_version_enc_size(&points).unwrap().0, 1);
-        let point_payload = H5S__point_serialize(&points).unwrap();
+        let mut point_payload = Vec::new();
+        H5S__point_serialize_into(&points, &mut point_payload).unwrap();
         assert_eq!(
             H5S__point_serial_size(&points).unwrap(),
             point_payload.len()
@@ -4125,7 +4794,7 @@ mod tests {
             Some(&[vec![0, 1], vec![1, 2], vec![0, 2]][..])
         );
         assert_eq!(
-            H5S__point_offset(&points, &[1, 0]).unwrap().bounds(&[3, 3]),
+            selection_bounds(&H5S__point_offset(&points, &[1, 0]).unwrap(), &[3, 3]),
             Some((vec![1, 1], vec![2, 2]))
         );
         assert_eq!(H5S__point_unlim_dim(&points, &[2, u64::MAX]), Some(1));
@@ -4135,15 +4804,11 @@ mod tests {
         assert!(H5S__point_shape_same(&points, &points, &ds_shape));
         assert!(H5S__point_intersect_block(&points, &[1, 2], &[1, 2]));
         assert_eq!(
-            H5S__point_adjust_u(&points, &[1, 0])
-                .unwrap()
-                .bounds(&[3, 3]),
+            selection_bounds(&H5S__point_adjust_u(&points, &[1, 0]).unwrap(), &[3, 3]),
             Some((vec![1, 1], vec![2, 2]))
         );
         assert_eq!(
-            H5S__point_adjust_s(&points, &[0, -1])
-                .unwrap()
-                .bounds(&ds_shape),
+            selection_bounds(&H5S__point_adjust_s(&points, &[0, -1]).unwrap(), &ds_shape),
             Some((vec![0, 0], vec![1, 1]))
         );
         assert_eq!(
@@ -4160,42 +4825,52 @@ mod tests {
             HyperslabDim::new(1, 1, 2, 1),
         ]);
         let mut hyper_iter = H5S__hyper_iter_init(&hyper, &ds_shape).unwrap();
-        assert_eq!(
-            H5S__hyper_iter_block(&hyper, &ds_shape).unwrap(),
-            Some(vec![0, 1])
-        );
+        let mut hyper_block = vec![u64::MAX; 2];
+        assert!(H5S__hyper_iter_block_into(&hyper, &ds_shape, &mut hyper_block).unwrap());
+        assert_eq!(hyper_block, vec![0, 1]);
         assert!(H5S__hyper_iter_has_next_block(&hyper, &ds_shape).unwrap());
-        assert_eq!(H5S__hyper_iter_next(&mut hyper_iter), Some(vec![0, 1]));
+        assert_eq!(H5S__hyper_iter_next_ref(&mut hyper_iter), Some(&[0, 1][..]));
         assert_eq!(
-            H5S__hyper_iter_next_block(&mut hyper_iter),
-            Some(vec![0, 2])
+            H5S__hyper_iter_next_block_ref(&mut hyper_iter),
+            Some(&[0, 2][..])
         );
         let mut hyper_iter = H5S__hyper_iter_init(&hyper, &ds_shape).unwrap();
+        let mut hyper_seq = vec![0; 4];
         assert_eq!(
-            H5S__hyper_iter_get_seq_list(&mut hyper_iter, 2),
-            vec![vec![0, 1], vec![0, 2]]
+            H5S__hyper_iter_get_seq_list_into(&mut hyper_iter, 2, &mut hyper_seq).unwrap(),
+            2
         );
+        assert_eq!(hyper_seq, vec![0, 1, 0, 2]);
         let mut hyper_iter = H5S__hyper_iter_init(&hyper, &ds_shape).unwrap();
+        let mut hyper_seq = vec![0; 2];
         assert_eq!(
-            H5S__hyper_iter_get_seq_list_gen(&mut hyper_iter, 1),
-            vec![vec![0, 1]]
+            H5S__hyper_iter_get_seq_list_into(&mut hyper_iter, 1, &mut hyper_seq).unwrap(),
+            1
         );
+        assert_eq!(hyper_seq, vec![0, 1]);
         let mut hyper_iter = H5S__hyper_iter_init(&hyper, &ds_shape).unwrap();
+        let mut hyper_seq = vec![0; 2];
         assert_eq!(
-            H5S__hyper_iter_get_seq_list_opt(&mut hyper_iter, 1),
-            vec![vec![0, 1]]
+            H5S__hyper_iter_get_seq_list_into(&mut hyper_iter, 1, &mut hyper_seq).unwrap(),
+            1
         );
+        assert_eq!(hyper_seq, vec![0, 1]);
         let mut hyper_iter = H5S__hyper_iter_init(&hyper, &ds_shape).unwrap();
+        let mut hyper_seq = vec![0; 2];
         assert_eq!(
-            H5S__hyper_iter_get_seq_list_single(&mut hyper_iter, 1),
-            vec![vec![0, 1]]
+            H5S__hyper_iter_get_seq_list_into(&mut hyper_iter, 1, &mut hyper_seq).unwrap(),
+            1
         );
+        assert_eq!(hyper_seq, vec![0, 1]);
         assert_eq!(H5S__hyper_iter_nelmts(&hyper_iter), 3);
         H5S__hyper_iter_release(hyper_iter);
+        let mut hyper_iter = H5S__hyper_iter_init(&hyper, &ds_shape).unwrap();
+        let mut hyper_seq = vec![0; 4];
         assert_eq!(
-            H5S__hyper_get_seq_list_gen(&hyper, &ds_shape, 2).unwrap(),
-            vec![vec![0, 1], vec![0, 2]]
+            H5S__hyper_iter_get_seq_list_into(&mut hyper_iter, 2, &mut hyper_seq).unwrap(),
+            2
         );
+        assert_eq!(hyper_seq, vec![0, 1, 0, 2]);
         assert_eq!(H5S__hyper_copy(&hyper).unwrap(), hyper);
         assert_eq!(
             H5S__hyper_new_span(0, 1, 1, 1),
@@ -4205,55 +4880,41 @@ mod tests {
             H5S__hyper_new_span_info(vec![HyperslabDim::new(0, 1, 1, 1)]),
             Selection::Hyperslab(vec![HyperslabDim::new(0, 1, 1, 1)])
         );
-        assert_eq!(H5S__hyper_copy_span(&hyper).unwrap().len(), 2);
-        assert_eq!(H5S__hyper_copy_span_helper(&hyper).unwrap().len(), 2);
+        let mut copied_spans = Vec::new();
+        H5S__hyper_copy_span_into(&hyper, &mut copied_spans).unwrap();
+        assert_eq!(copied_spans.len(), 2);
         assert!(H5S__hyper_cmp_spans(&hyper, &hyper));
-        assert!(H5S__hyper_print_spans_helper(&hyper)
-            .unwrap()
-            .contains("HyperslabDim"));
-        assert!(H5S__hyper_print_spans(&hyper)
-            .unwrap()
-            .contains("HyperslabDim"));
-        assert!(H5S__space_print_spans(&hyper)
-            .unwrap()
-            .contains("HyperslabDim"));
-        assert!(H5S__hyper_print_diminfo_helper(&hyper)
-            .unwrap()
-            .contains("start=0"));
-        assert!(H5S__hyper_print_diminfo(&hyper)
-            .unwrap()
-            .contains("start=0"));
-        assert!(H5S__hyper_print_spans_dfs(&hyper)
-            .unwrap()
-            .contains("HyperslabDim"));
-        assert!(H5S__hyper_print_space_dfs(&hyper)
-            .unwrap()
-            .contains("HyperslabDim"));
+        let mut rendered = String::new();
+        H5S__hyper_print_spans_fmt(&hyper, &mut rendered).unwrap();
+        assert!(rendered.contains("HyperslabDim"));
+        rendered.clear();
+        H5S__space_print_spans_fmt(&hyper, &mut rendered).unwrap();
+        assert!(rendered.contains("HyperslabDim"));
+        rendered.clear();
+        H5S__hyper_print_diminfo_fmt(&hyper, &mut rendered).unwrap();
+        assert!(rendered.contains("start=0"));
+        let mut hyper_payload = Vec::new();
+        H5S__hyper_serialize_into(&hyper, &mut hyper_payload).unwrap();
         assert_eq!(
             H5S__hyper_get_enc_size_real(&hyper).unwrap(),
-            H5S__hyper_serialize(&hyper).unwrap().len()
+            hyper_payload.len()
         );
         assert_eq!(H5S__hyper_get_version_enc_size(&hyper).unwrap().0, 1);
-        let hyper_payload = H5S__hyper_serialize(&hyper).unwrap();
-        assert_eq!(H5S__hyper_serialize_helper(&hyper).unwrap(), hyper_payload);
         assert_eq!(H5S__hyper_deserialize(&hyper_payload).unwrap(), hyper);
         assert_eq!(H5S__hyper_decode(&hyper_payload).unwrap(), hyper);
         assert!(H5S__hyper_is_valid(&hyper, &ds_shape));
         assert_eq!(H5S__hyper_span_nblocks(&hyper, &ds_shape), Some(4));
         assert_eq!(H5S__get_select_hyper_nblocks(&hyper, &ds_shape), Some(4));
+        let mut starts = vec![0; 8];
+        let mut ends = vec![0; 8];
         assert_eq!(
-            H5S__hyper_span_blocklist(&hyper, &ds_shape)
-                .unwrap()
-                .unwrap()
-                .len(),
-            4
+            H5S__hyper_span_blocklist_into(&hyper, &ds_shape, &mut starts, &mut ends).unwrap(),
+            Some(4)
         );
         assert_eq!(
-            H5S__get_select_hyper_blocklist(&hyper, &ds_shape)
-                .unwrap()
-                .unwrap()
-                .len(),
-            4
+            H5S__get_select_hyper_blocklist_into(&hyper, &ds_shape, &mut starts, &mut ends)
+                .unwrap(),
+            Some(4)
         );
         assert!(H5S__hyper_intersect_block_helper(
             &hyper,
@@ -4266,7 +4927,7 @@ mod tests {
             Some((vec![0, 1], vec![1, 2]))
         );
         assert_eq!(
-            H5S__hyper_offset(&hyper, &[1, 0]).unwrap().bounds(&[3, 3]),
+            selection_bounds(&H5S__hyper_offset(&hyper, &[1, 0]).unwrap(), &[3, 3]),
             Some((vec![1, 1], vec![2, 2]))
         );
         assert_eq!(H5S__hyper_unlim_dim(&hyper, &[2, u64::MAX]), Some(1));
@@ -4285,12 +4946,16 @@ mod tests {
         ));
         assert!(H5S__hyper_spans_shape_same(&hyper, &hyper, &ds_shape));
         assert!(!H5S__hyper_regular_and_single_block(&hyper, &ds_shape));
-        assert_eq!(H5S__hyper_get_regular_hyperslab(&hyper).unwrap().len(), 2);
+        let mut regular_hyperslab = Vec::new();
+        H5S__hyper_get_regular_hyperslab_into(&hyper, &mut regular_hyperslab).unwrap();
+        assert_eq!(regular_hyperslab.len(), 2);
         assert!(H5S__hyper_coord_to_span(&hyper, &[0, 1], &ds_shape));
         let mut editable_hyper = H5S__hyper_make_spans(vec![HyperslabDim::new(0, 1, 1, 1)]);
         H5S_hyper_add_span_element(&mut editable_hyper, HyperslabDim::new(1, 1, 1, 1)).unwrap();
         H5S__hyper_append_span(&mut editable_hyper, HyperslabDim::new(2, 1, 1, 1)).unwrap();
-        assert_eq!(H5S__hyper_update_diminfo(&editable_hyper).unwrap().len(), 3);
+        let mut updated_diminfo = Vec::new();
+        H5S__hyper_update_diminfo_into(&editable_hyper, &mut updated_diminfo).unwrap();
+        assert_eq!(updated_diminfo.len(), 3);
         assert_eq!(H5S__hyper_rebuild_helper(&hyper).unwrap(), hyper);
         assert_eq!(H5S__hyper_rebuild(&hyper).unwrap(), hyper);
         assert_eq!(H5S__hyper_generate_spans(&hyper).unwrap(), hyper);
@@ -4335,39 +5000,39 @@ mod tests {
             Some(2)
         );
         assert_eq!(
-            H5S__hyper_adjust_u(&hyper, &[1, 0])
-                .unwrap()
-                .bounds(&[3, 3]),
+            selection_bounds(&H5S__hyper_adjust_u(&hyper, &[1, 0]).unwrap(), &[3, 3]),
             Some((vec![1, 1], vec![2, 2]))
         );
         assert_eq!(
-            H5S__hyper_adjust_s(&hyper, &[0, -1])
-                .unwrap()
-                .bounds(&ds_shape),
+            selection_bounds(&H5S__hyper_adjust_s(&hyper, &[0, -1]).unwrap(), &ds_shape),
             Some((vec![0, 0], vec![1, 1]))
         );
         assert_eq!(
-            H5S__hyper_adjust_u_helper(&hyper, &[1, 0])
-                .unwrap()
-                .bounds(&[3, 3]),
+            selection_bounds(
+                &H5S__hyper_adjust_u_helper(&hyper, &[1, 0]).unwrap(),
+                &[3, 3]
+            ),
             Some((vec![1, 1], vec![2, 2]))
         );
         assert_eq!(
-            H5S__hyper_adjust_s_helper(&hyper, &[0, -1])
-                .unwrap()
-                .bounds(&ds_shape),
+            selection_bounds(
+                &H5S__hyper_adjust_s_helper(&hyper, &[0, -1]).unwrap(),
+                &ds_shape
+            ),
             Some((vec![0, 0], vec![1, 1]))
         );
         assert_eq!(
-            H5S_hyper_normalize_offset(&hyper, &[1, 0])
-                .unwrap()
-                .bounds(&[3, 3]),
+            selection_bounds(
+                &H5S_hyper_normalize_offset(&hyper, &[1, 0]).unwrap(),
+                &[3, 3]
+            ),
             Some((vec![1, 1], vec![2, 2]))
         );
         assert_eq!(
-            H5S_hyper_denormalize_offset(&hyper, &[1, 0])
-                .unwrap()
-                .bounds(&[3, 3]),
+            selection_bounds(
+                &H5S_hyper_denormalize_offset(&hyper, &[1, 0]).unwrap(),
+                &[3, 3]
+            ),
             Some((vec![1, 1], vec![2, 2]))
         );
         assert_eq!(
@@ -4390,10 +5055,13 @@ mod tests {
             H5S__hyper_proj_int_build_proj(&hyper, &hyper, &ds_shape, &[0]).unwrap(),
             Selection::Points(vec![vec![0], vec![1]])
         );
-        assert_eq!(
-            H5S__hyper_proj_int_iterate(&hyper, &hyper, &ds_shape, &[1]).unwrap(),
-            vec![vec![1], vec![2]]
-        );
+        let mut projected_intersection = Vec::new();
+        H5S__hyper_proj_int_visit(&hyper, &hyper, &ds_shape, &[1], |point| {
+            projected_intersection.push(point.to_vec());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(projected_intersection, vec![vec![1], vec![2]]);
         assert_eq!(
             H5S__hyper_project_intersection(&hyper, &hyper, &ds_shape, &[1]).unwrap(),
             Selection::Points(vec![vec![1], vec![2]])
@@ -4427,5 +5095,86 @@ mod tests {
         assert!(H5S__verify_offsets(&hyper, &[0, 0]));
         H5S__hyper_free_span(hyper.clone());
         H5S__hyper_release(hyper);
+    }
+
+    #[test]
+    fn allocation_aware_selection_apis_borrow_copy_and_visit() {
+        let ds_shape = [2, 3];
+        let hyper = Selection::Hyperslab(vec![
+            HyperslabDim::new(0, 1, 2, 1),
+            HyperslabDim::new(1, 1, 2, 1),
+        ]);
+
+        let mut iter = H5S_select_iter_init(&hyper, &ds_shape).unwrap();
+        assert_eq!(iter.select_iter_current(), Some(&[0, 1][..]));
+        assert_eq!(H5S_select_iter_next_ref(&mut iter), Some(&[0, 1][..]));
+
+        let mut coord = [0; 2];
+        assert!(H5S_select_iter_next_into(&mut iter, &mut coord).unwrap());
+        assert_eq!(coord, [0, 2]);
+
+        let mut coords = [0; 4];
+        assert_eq!(
+            H5S_select_iter_get_seq_list_into(&mut iter, 8, &mut coords).unwrap(),
+            2
+        );
+        assert_eq!(coords, [1, 1, 1, 2]);
+        assert!(!H5S_select_iter_next_into(&mut iter, &mut coord).unwrap());
+
+        let mut copied_points = [0; 8];
+        assert_eq!(
+            H5S_select_copy_points_into(&hyper, &ds_shape, &mut copied_points).unwrap(),
+            4
+        );
+        assert_eq!(copied_points, [0, 1, 0, 2, 1, 1, 1, 2]);
+
+        let mut visited = Vec::new();
+        hyper
+            .visit_points(&ds_shape, |point| {
+                visited.push(point.to_vec());
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            visited,
+            vec![vec![0, 1], vec![0, 2], vec![1, 1], vec![1, 2]]
+        );
+
+        let mut starts = [0; 8];
+        let mut ends = [0; 8];
+        assert_eq!(
+            H5Sget_select_hyper_blocklist_into(&hyper, &ds_shape, &mut starts, &mut ends).unwrap(),
+            Some(4)
+        );
+        assert_eq!(starts, [0, 1, 0, 2, 1, 1, 1, 2]);
+        assert_eq!(ends, [0, 1, 0, 2, 1, 1, 1, 2]);
+
+        let mut visited_blocks = 0;
+        assert!(hyper
+            .visit_hyperslab_blocks(&ds_shape, |start, end| {
+                assert_eq!(start, end);
+                visited_blocks += 1;
+                Ok(())
+            })
+            .unwrap());
+        assert_eq!(visited_blocks, 4);
+
+        let points = Selection::Points(vec![vec![3, 4], vec![5, 6]]);
+        let borrowed: Vec<_> = points.element_points().unwrap().collect();
+        assert_eq!(borrowed, vec![&[3, 4][..], &[5, 6][..]]);
+        let mut flat_points = [0; 4];
+        assert_eq!(
+            H5Sget_select_elem_pointlist_into(&points, &mut flat_points).unwrap(),
+            Some(2)
+        );
+        assert_eq!(flat_points, [3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn regular_selection_iterators_do_not_use_materialization_cap() {
+        let ds_shape = [MAX_MATERIALIZED_SELECTION_POINTS as u64 + 1];
+        let mut iter = Selection::All.select_iter_init(&ds_shape).unwrap();
+        assert_eq!(iter.len(), MAX_MATERIALIZED_SELECTION_POINTS + 1);
+        assert_eq!(iter.select_iter_next_ref(), Some(&[0][..]));
     }
 }

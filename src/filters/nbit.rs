@@ -15,9 +15,17 @@ struct AtomicParms {
     offset: usize,
 }
 
-/// Decompress HDF5 NBit-filtered data using the datatype-aware filter
-/// parameters stored by HDF5's set-local callback.
-pub fn decompress(data: &[u8], client_data: &[u32]) -> Result<Vec<u8>> {
+/// Return a borrowed payload when NBit parameters describe a no-op chunk.
+pub fn decompress_view_if_noop<'a>(
+    data: &'a [u8],
+    client_data: &[u32],
+) -> Result<Option<&'a [u8]>> {
+    can_apply_nbit(client_data)?;
+    Ok((client_data[1] != 0).then_some(data))
+}
+
+/// Decompress HDF5 NBit-filtered data, appending the decoded bytes to `out`.
+pub fn decompress_into(data: &[u8], client_data: &[u32], out: &mut Vec<u8>) -> Result<()> {
     can_apply_nbit(client_data)?;
 
     if client_data.len() < 5 {
@@ -35,7 +43,8 @@ pub fn decompress(data: &[u8], client_data: &[u32]) -> Result<Vec<u8>> {
     }
 
     if client_data[1] != 0 {
-        return Ok(data.to_vec());
+        out.extend_from_slice(data);
+        return Ok(());
     }
 
     let nelmts = nbit_usize(client_data[2], "nbit element count")?;
@@ -43,13 +52,17 @@ pub fn decompress(data: &[u8], client_data: &[u32]) -> Result<Vec<u8>> {
     if dtype_size == 0 {
         return Err(Error::InvalidFormat("nbit datatype size is zero".into()));
     }
-    let mut out =
-        vec![
-            0u8;
-            nelmts
-                .checked_mul(dtype_size)
-                .ok_or_else(|| Error::InvalidFormat("nbit output size overflow".into()))?
-        ];
+    let out_len = nelmts
+        .checked_mul(dtype_size)
+        .ok_or_else(|| Error::InvalidFormat("nbit output size overflow".into()))?;
+    let start = out.len();
+    out.resize(
+        start
+            .checked_add(out_len)
+            .ok_or_else(|| Error::InvalidFormat("nbit output size overflow".into()))?,
+        0,
+    );
+    let out = &mut out[start..];
     let mut stream = BitStream::new(data);
 
     match client_data[3] {
@@ -77,21 +90,21 @@ pub fn decompress(data: &[u8], client_data: &[u32]) -> Result<Vec<u8>> {
             validate_atomic(parms)?;
             for idx in 0..nelmts {
                 let offset = nbit_nested_offset(0, idx, parms.size)?;
-                decompress_atomic(&mut out, offset, &mut stream, parms)?;
+                decompress_atomic(out, offset, &mut stream, parms)?;
             }
         }
         NBIT_ARRAY => {
             for idx in 0..nelmts {
                 let mut pidx = 4usize;
                 let offset = nbit_nested_offset(0, idx, dtype_size)?;
-                decompress_array(&mut out, offset, &mut stream, client_data, &mut pidx)?;
+                decompress_array(out, offset, &mut stream, client_data, &mut pidx)?;
             }
         }
         NBIT_COMPOUND => {
             for idx in 0..nelmts {
                 let mut pidx = 4usize;
                 let offset = nbit_nested_offset(0, idx, dtype_size)?;
-                decompress_compound(&mut out, offset, &mut stream, client_data, &mut pidx)?;
+                decompress_compound(out, offset, &mut stream, client_data, &mut pidx)?;
             }
         }
         other => {
@@ -101,17 +114,15 @@ pub fn decompress(data: &[u8], client_data: &[u32]) -> Result<Vec<u8>> {
         }
     }
 
-    Ok(out)
+    Ok(())
 }
 
-pub fn nbit_decompress(data: &[u8], client_data: &[u32]) -> Result<Vec<u8>> {
-    decompress(data, client_data)
-}
-
-pub fn nbit_compress(data: &[u8], client_data: &[u32]) -> Result<Vec<u8>> {
+/// Compress NBit-filtered data, appending the encoded bytes to `out`.
+pub fn nbit_compress_into(data: &[u8], client_data: &[u32], out: &mut Vec<u8>) -> Result<()> {
     can_apply_nbit(client_data)?;
     if client_data[1] != 0 {
-        return Ok(data.to_vec());
+        out.extend_from_slice(data);
+        return Ok(());
     }
 
     let nelmts = nbit_usize(client_data[2], "nbit element count")?;
@@ -123,7 +134,7 @@ pub fn nbit_compress(data: &[u8], client_data: &[u32]) -> Result<Vec<u8>> {
         return Err(Error::InvalidFormat("nbit input data too short".into()));
     }
 
-    let mut writer = BitWriter::new();
+    let mut writer = BitWriter::new(out);
     match client_data[3] {
         NBIT_ATOMIC => {
             let parms = AtomicParms {
@@ -172,7 +183,8 @@ pub fn nbit_compress(data: &[u8], client_data: &[u32]) -> Result<Vec<u8>> {
             )));
         }
     }
-    Ok(writer.finish())
+    writer.finish();
+    Ok(())
 }
 
 pub fn can_apply_nbit(client_data: &[u32]) -> Result<()> {
@@ -227,7 +239,7 @@ fn nbit_get_parms_atomic(parms: &[u32], pidx: &mut usize, size: usize) -> Result
 fn compress_array(
     input: &[u8],
     data_offset: usize,
-    writer: &mut BitWriter,
+    writer: &mut BitWriter<'_>,
     parms: &[u32],
     pidx: &mut usize,
 ) -> Result<()> {
@@ -293,7 +305,7 @@ fn compress_array(
 fn compress_compound(
     input: &[u8],
     data_offset: usize,
-    writer: &mut BitWriter,
+    writer: &mut BitWriter<'_>,
     parms: &[u32],
     pidx: &mut usize,
 ) -> Result<()> {
@@ -352,7 +364,7 @@ fn compress_one_nooptype(
     input: &[u8],
     offset: usize,
     size: usize,
-    writer: &mut BitWriter,
+    writer: &mut BitWriter<'_>,
 ) -> Result<()> {
     let end = offset
         .checked_add(size)
@@ -566,7 +578,7 @@ fn decompress_atomic(
 fn compress_atomic(
     input: &[u8],
     data_offset: usize,
-    writer: &mut BitWriter,
+    writer: &mut BitWriter<'_>,
     parms: AtomicParms,
 ) -> Result<()> {
     let dtype_bits = parms.size * 8;
@@ -641,7 +653,7 @@ fn compress_atomic_byte(
     k: usize,
     begin: usize,
     end: usize,
-    writer: &mut BitWriter,
+    writer: &mut BitWriter<'_>,
     parms: AtomicParms,
     dtype_bits: usize,
 ) -> Result<()> {
@@ -829,23 +841,23 @@ impl<'a> BitStream<'a> {
     }
 }
 
-struct BitWriter {
-    data: Vec<u8>,
+struct BitWriter<'a> {
+    out: &'a mut Vec<u8>,
     current: u8,
     bits_used: usize,
 }
 
-impl BitWriter {
-    fn new() -> Self {
+impl<'a> BitWriter<'a> {
+    fn new(out: &'a mut Vec<u8>) -> Self {
         Self {
-            data: Vec::new(),
+            out,
             current: 0,
             bits_used: 0,
         }
     }
 
     fn next_byte(&mut self) {
-        self.data.push(self.current);
+        self.out.push(self.current);
         self.current = 0;
         self.bits_used = 0;
     }
@@ -875,11 +887,10 @@ impl BitWriter {
         Ok(())
     }
 
-    fn finish(mut self) -> Vec<u8> {
+    fn finish(mut self) {
         if self.bits_used != 0 {
             self.next_byte();
         }
-        self.data
     }
 }
 
@@ -891,9 +902,14 @@ mod tests {
         vec![8, 0, 1, NBIT_ATOMIC, 2, NBIT_ORDER_LE, precision, offset]
     }
 
+    fn decompress_err(data: &[u8], params: &[u32]) -> Error {
+        let mut out = Vec::new();
+        decompress_into(data, params, &mut out).unwrap_err()
+    }
+
     #[test]
     fn rejects_zero_precision() {
-        let err = decompress(&[], &atomic_params(0, 0)).unwrap_err();
+        let err = decompress_err(&[], &atomic_params(0, 0));
         assert!(
             err.to_string()
                 .contains("invalid nbit datatype precision/offset"),
@@ -903,7 +919,7 @@ mod tests {
 
     #[test]
     fn rejects_precision_larger_than_datatype() {
-        let err = decompress(&[], &atomic_params(17, 0)).unwrap_err();
+        let err = decompress_err(&[], &atomic_params(17, 0));
         assert!(
             err.to_string()
                 .contains("invalid nbit datatype precision/offset"),
@@ -913,7 +929,7 @@ mod tests {
 
     #[test]
     fn rejects_precision_plus_offset_larger_than_datatype() {
-        let err = decompress(&[], &atomic_params(12, 8)).unwrap_err();
+        let err = decompress_err(&[], &atomic_params(12, 8));
         assert!(
             err.to_string()
                 .contains("invalid nbit datatype precision/offset"),
@@ -926,7 +942,7 @@ mod tests {
         let mut params = atomic_params(8, 0);
         params[5] = 99;
         params[2] = 0;
-        let err = decompress(&[], &params).unwrap_err();
+        let err = decompress_err(&[], &params);
         assert!(
             err.to_string().contains("invalid nbit byte order 99"),
             "unexpected error: {err}"
@@ -936,7 +952,7 @@ mod tests {
     #[test]
     fn rejects_zero_top_level_datatype_size() {
         let params = vec![8, 0, 0, NBIT_ATOMIC, 0, NBIT_ORDER_LE, 8, 0];
-        let err = decompress(&[], &params).unwrap_err();
+        let err = decompress_err(&[], &params);
         assert!(
             err.to_string().contains("nbit datatype size is zero"),
             "unexpected error: {err}"
@@ -946,7 +962,7 @@ mod tests {
     #[test]
     fn rejects_zero_nested_array_base_size() {
         let params = vec![7, 0, 1, NBIT_ARRAY, 4, NBIT_ARRAY, 0];
-        let err = decompress(&[], &params).unwrap_err();
+        let err = decompress_err(&[], &params);
         assert!(
             err.to_string()
                 .contains("nbit nested datatype size is zero"),
@@ -957,7 +973,7 @@ mod tests {
     #[test]
     fn rejects_array_size_not_multiple_of_atomic_base_size() {
         let params = vec![10, 0, 1, NBIT_ARRAY, 3, NBIT_ATOMIC, 2, NBIT_ORDER_LE, 8, 0];
-        let err = decompress(&[], &params).unwrap_err();
+        let err = decompress_err(&[], &params);
         assert!(
             err.to_string()
                 .contains("nbit array element size is not a multiple of base size"),
@@ -1011,8 +1027,10 @@ mod tests {
     fn nbit_atomic_compress_roundtrips() {
         let params = atomic_params(12, 2);
         let input = [0b0011_1100, 0b0000_0011];
-        let compressed = nbit_compress(&input, &params).unwrap();
-        let decoded = decompress(&compressed, &params).unwrap();
+        let mut compressed = Vec::new();
+        nbit_compress_into(&input, &params, &mut compressed).unwrap();
+        let mut decoded = Vec::new();
+        decompress_into(&compressed, &params, &mut decoded).unwrap();
         assert_eq!(decoded, input);
     }
 }

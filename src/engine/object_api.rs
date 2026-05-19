@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 
 use crate::error::{Error, Result};
 use crate::format::checksum::checksum_metadata;
@@ -409,10 +410,11 @@ pub fn H5O__shared_post_copy_file(table: &SharedMessageTable) -> SharedMessageTa
 
 /// Return a debug-friendly representation of an object.
 #[allow(non_snake_case)]
-pub fn H5O__shared_debug(table: &SharedMessageTable) -> String {
+pub fn H5O__shared_debug_fmt(table: &SharedMessageTable, out: &mut dyn fmt::Write) -> fmt::Result {
     let total_refs = table.refs.values().copied().sum::<usize>();
     let max_refcount = table.refs.values().copied().max().unwrap_or(0);
-    format!(
+    write!(
+        out,
         "shared_messages={}, total_refs={}, max_refcount={}",
         table.refs.len(),
         total_refs,
@@ -758,15 +760,27 @@ pub fn H5O_msg_get_crt_index(message: &ObjectMessage) -> u16 {
 
 /// Encode an object to its on-disk representation.
 #[allow(non_snake_case)]
+pub fn H5O_msg_encode_into(message: &ObjectMessage, out: &mut Vec<u8>) -> Result<()> {
+    let len = 5usize
+        .checked_add(message.data.len())
+        .ok_or_else(|| Error::InvalidFormat("object message image length overflow".into()))?;
+    out.reserve(len);
+    out.extend_from_slice(&message.msg_type.to_le_bytes());
+    out.push(message.flags);
+    out.extend_from_slice(&message.creation_index.to_le_bytes());
+    out.extend_from_slice(&message.data);
+    Ok(())
+}
+
+/// Encode an object to its on-disk representation.
+#[allow(non_snake_case)]
+#[deprecated(note = "use H5O_msg_encode_into to append into a caller-owned buffer")]
 pub fn H5O_msg_encode(message: &ObjectMessage) -> Result<Vec<u8>> {
     let len = 5usize
         .checked_add(message.data.len())
         .ok_or_else(|| Error::InvalidFormat("object message image length overflow".into()))?;
     let mut out = Vec::with_capacity(len);
-    out.extend_from_slice(&message.msg_type.to_le_bytes());
-    out.push(message.flags);
-    out.extend_from_slice(&message.creation_index.to_le_bytes());
-    out.extend_from_slice(&message.data);
+    H5O_msg_encode_into(message, &mut out)?;
     Ok(out)
 }
 
@@ -918,7 +932,7 @@ pub fn H5O__cache_verify_chksum(image: &[u8], checksum: u32) -> bool {
 
 /// Serialize an object to bytes.
 #[allow(non_snake_case)]
-pub fn H5O__cache_serialize(header: &ObjectHeaderState) -> Result<Vec<u8>> {
+pub fn H5O__cache_serialize_into(header: &ObjectHeaderState, out: &mut Vec<u8>) -> Result<()> {
     let mut len = 0usize;
     for message in &header.messages {
         len = len
@@ -928,11 +942,11 @@ pub fn H5O__cache_serialize(header: &ObjectHeaderState) -> Result<Vec<u8>> {
                 Error::InvalidFormat("object header cache image length overflow".into())
             })?;
     }
-    let mut out = Vec::with_capacity(len);
+    out.reserve(len);
     for message in &header.messages {
-        out.extend_from_slice(&H5O_msg_encode(message)?);
+        H5O_msg_encode_into(message, out)?;
     }
-    Ok(out)
+    Ok(())
 }
 
 /// Object operation: cache get final load size.
@@ -992,7 +1006,16 @@ pub fn H5O__cache_deserialize(image: &[u8]) -> Result<ObjectHeaderPrefixImage> {
 /// Object operation: cache image len.
 #[allow(non_snake_case)]
 pub fn H5O__cache_image_len(header: &ObjectHeaderState) -> Result<usize> {
-    H5O__cache_serialize(header).map(|image| image.len())
+    let mut len = 0usize;
+    for message in &header.messages {
+        len = len
+            .checked_add(5)
+            .and_then(|value| value.checked_add(message.data.len()))
+            .ok_or_else(|| {
+                Error::InvalidFormat("object header cache image length overflow".into())
+            })?;
+    }
+    Ok(len)
 }
 
 /// Object operation: cache notify.
@@ -1071,19 +1094,33 @@ pub fn H5O__cache_chk_image_len(image: &ObjectHeaderChunkImage) -> usize {
 
 /// Serialize an object to bytes.
 #[allow(non_snake_case)]
-pub fn H5O__cache_chk_serialize(image: &ObjectHeaderChunkImage) -> Result<Vec<u8>> {
+pub fn H5O__cache_chk_serialize_into(
+    image: &ObjectHeaderChunkImage,
+    out: &mut Vec<u8>,
+) -> Result<()> {
     validate_object_header_chunk_image(&image.raw)?;
-    let mut out = image.raw.clone();
-    if image.is_v2_continuation && out.starts_with(OBJECT_HEADER_V2_CHUNK_MAGIC) {
-        if out.len() < 8 {
+    let start = out.len();
+    out.extend_from_slice(&image.raw);
+    if image.is_v2_continuation && image.raw.starts_with(OBJECT_HEADER_V2_CHUNK_MAGIC) {
+        let image_len = out.len() - start;
+        if image_len < 8 {
             return Err(Error::InvalidFormat(
                 "object header v2 continuation chunk image is truncated".into(),
             ));
         }
         let checksum_pos = out.len() - 4;
-        let checksum = checksum_metadata(&out[..checksum_pos]);
+        let checksum = checksum_metadata(&out[start..checksum_pos]);
         out[checksum_pos..].copy_from_slice(&checksum.to_le_bytes());
     }
+    Ok(())
+}
+
+/// Serialize an object to bytes.
+#[allow(non_snake_case)]
+#[deprecated(note = "use H5O__cache_chk_serialize_into to append into a caller-owned buffer")]
+pub fn H5O__cache_chk_serialize(image: &ObjectHeaderChunkImage) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(H5O__cache_chk_image_len(image));
+    H5O__cache_chk_serialize_into(image, &mut out)?;
     Ok(out)
 }
 
@@ -1357,18 +1394,28 @@ pub fn H5O__chunk_deserialize(image: &[u8]) -> Result<ObjectHeaderChunkImage> {
 
 /// Encode an object to its on-disk representation.
 #[allow(non_snake_case)]
+pub fn H5O__bogus_encode_ref(data: &[u8]) -> &[u8] {
+    data
+}
+
+/// Encode an object to its on-disk representation.
+#[allow(non_snake_case)]
+#[deprecated(note = "use H5O__bogus_encode_ref to borrow the existing bytes")]
 pub fn H5O__bogus_encode(data: &[u8]) -> Vec<u8> {
-    data.to_vec()
+    H5O__bogus_encode_ref(data).to_vec()
 }
 
 /// Decode an object from its on-disk representation.
 #[allow(non_snake_case)]
+pub fn H5O__bogus_decode_ref(bytes: &[u8]) -> &[u8] {
+    bytes
+}
+
+/// Decode an object from its on-disk representation.
+#[allow(non_snake_case)]
+#[deprecated(note = "use H5O__bogus_decode_ref to borrow the message bytes")]
 pub fn H5O__bogus_decode(bytes: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(bytes.len());
-    for byte in bytes {
-        out.push(*byte);
-    }
-    out
+    H5O__bogus_decode_ref(bytes).to_vec()
 }
 
 /// Object operation: bogus size.
@@ -1379,12 +1426,12 @@ pub fn H5O__bogus_size(data: &[u8]) -> usize {
 
 /// Return a debug-friendly representation of an object.
 #[allow(non_snake_case)]
-pub fn H5O__bogus_debug(data: &[u8]) -> String {
+pub fn H5O__bogus_debug_fmt(data: &[u8], out: &mut dyn fmt::Write) -> fmt::Result {
     let mut value = 0u32;
     for (idx, byte) in data.iter().take(4).enumerate() {
         value |= u32::from(*byte) << (idx * 8);
     }
-    format!("bogus(bytes={}, value={value})", data.len())
+    write!(out, "bogus(bytes={}, value={value})", data.len())
 }
 
 /// Decode an object from its on-disk representation.
@@ -1959,34 +2006,54 @@ pub fn H5O__layout_copy_file(layout: &LayoutObjectMessage) -> LayoutObjectMessag
 
 /// Return a debug-friendly representation of an object.
 #[allow(non_snake_case)]
-pub fn H5O__layout_debug(layout: &LayoutObjectMessage) -> String {
-    let storage = match layout.message.layout_class {
-        crate::format::messages::data_layout::LayoutClass::Compact => layout
-            .message
-            .compact_data
-            .as_ref()
-            .map(|data| data.len())
-            .unwrap_or(0)
-            .to_string(),
-        crate::format::messages::data_layout::LayoutClass::Contiguous => format!(
-            "addr={:?}, size={:?}",
-            layout.message.contiguous_addr, layout.message.contiguous_size
-        ),
-        crate::format::messages::data_layout::LayoutClass::Chunked => format!(
-            "dims={:?}, index={:?}",
-            layout.message.chunk_dims, layout.message.chunk_index_type
-        ),
-        crate::format::messages::data_layout::LayoutClass::Virtual => format!(
-            "heap={:?}, index={:?}",
-            layout.message.virtual_heap_addr, layout.message.virtual_heap_index
-        ),
-    };
-    format!(
-        "layout(version={}, class={:?}, bytes={}, storage={storage})",
+pub fn H5O__layout_debug_fmt(
+    layout: &LayoutObjectMessage,
+    out: &mut dyn fmt::Write,
+) -> fmt::Result {
+    write!(
+        out,
+        "layout(version={}, class={:?}, bytes={}, storage=",
         layout.message.version,
         layout.message.layout_class,
         layout.raw.len()
-    )
+    )?;
+    match layout.message.layout_class {
+        crate::format::messages::data_layout::LayoutClass::Compact => write!(
+            out,
+            "{}",
+            layout
+                .message
+                .compact_data
+                .as_ref()
+                .map(|data| data.len())
+                .unwrap_or(0)
+        )?,
+        crate::format::messages::data_layout::LayoutClass::Contiguous => write!(
+            out,
+            "addr={:?}, size={:?}",
+            layout.message.contiguous_addr, layout.message.contiguous_size
+        )?,
+        crate::format::messages::data_layout::LayoutClass::Chunked => write!(
+            out,
+            "dims={:?}, index={:?}",
+            layout.message.chunk_dims, layout.message.chunk_index_type
+        )?,
+        crate::format::messages::data_layout::LayoutClass::Virtual => write!(
+            out,
+            "heap={:?}, index={:?}",
+            layout.message.virtual_heap_addr, layout.message.virtual_heap_index
+        )?,
+    }
+    out.write_char(')')
+}
+
+/// Return a debug-friendly representation of an object.
+#[allow(non_snake_case)]
+#[deprecated(note = "use H5O__layout_debug_fmt to write into a caller-provided formatter")]
+pub fn H5O__layout_debug(layout: &LayoutObjectMessage) -> String {
+    let mut text = String::new();
+    H5O__layout_debug_fmt(layout, &mut text).expect("writing to String cannot fail");
+    text
 }
 
 /// Decode an object from its on-disk representation.
@@ -2008,9 +2075,16 @@ pub fn H5O__refcount_decode(bytes: &[u8]) -> Result<u32> {
 
 /// Encode an object to its on-disk representation.
 #[allow(non_snake_case)]
+pub fn H5O__refcount_encode_into(refcount: u32, out: &mut Vec<u8>) {
+    out.extend_from_slice(&refcount.to_le_bytes());
+}
+
+/// Encode an object to its on-disk representation.
+#[allow(non_snake_case)]
+#[deprecated(note = "use H5O__refcount_encode_into to append into a caller-owned buffer")]
 pub fn H5O__refcount_encode(refcount: u32) -> Vec<u8> {
     let mut out = Vec::with_capacity(4);
-    out.extend_from_slice(&refcount.to_le_bytes());
+    H5O__refcount_encode_into(refcount, &mut out);
     out
 }
 
@@ -2046,9 +2120,18 @@ pub fn H5O__refcount_pre_copy_file(refcount: u32) -> u32 {
 
 /// Return a debug-friendly representation of an object.
 #[allow(non_snake_case)]
-pub fn H5O__refcount_debug(refcount: u32) -> String {
+pub fn H5O__refcount_debug_fmt(refcount: u32, out: &mut dyn fmt::Write) -> fmt::Result {
     let state = if refcount == 0 { "invalid" } else { "defined" };
-    format!("refcount(value={refcount}, state={state})")
+    write!(out, "refcount(value={refcount}, state={state})")
+}
+
+/// Return a debug-friendly representation of an object.
+#[allow(non_snake_case)]
+#[deprecated(note = "use H5O__refcount_debug_fmt to write into a caller-provided formatter")]
+pub fn H5O__refcount_debug(refcount: u32) -> String {
+    let mut text = String::new();
+    H5O__refcount_debug_fmt(refcount, &mut text).expect("writing to String cannot fail");
+    text
 }
 
 /// Decode an object from its on-disk representation.
@@ -2191,38 +2274,37 @@ pub fn H5O__fsinfo_decode_with_sizes(
 
 /// Encode an object to its on-disk representation.
 #[allow(non_snake_case)]
-pub fn H5O__fsinfo_encode(info: &FsInfoMessage) -> Result<Vec<u8>> {
+pub fn H5O__fsinfo_encode_into(info: &FsInfoMessage, out: &mut Vec<u8>) -> Result<()> {
     if !H5O_fsinfo_check_version(info) {
         return Err(Error::InvalidFormat(format!(
             "file-space info message version {}",
             info.version
         )));
     }
-    let mut out = vec![
-        info.version,
-        info.free_space_strategy,
-        u8::from(info.persist),
-    ];
-    encode_le_uint_width(
-        &mut out,
-        info.threshold,
-        usize::from(info.sizeof_size),
-        "file-space info threshold",
-    )?;
     if info.page_size == 0 || info.page_size > 1024 * 1024 * 1024 {
         return Err(Error::InvalidFormat(
             "file-space info page size is invalid".into(),
         ));
     }
+    out.reserve(H5O__fsinfo_image_len(info)?);
+    out.push(info.version);
+    out.push(info.free_space_strategy);
+    out.push(u8::from(info.persist));
     encode_le_uint_width(
-        &mut out,
+        out,
+        info.threshold,
+        usize::from(info.sizeof_size),
+        "file-space info threshold",
+    )?;
+    encode_le_uint_width(
+        out,
         info.page_size,
         usize::from(info.sizeof_size),
         "file-space info page size",
     )?;
     out.extend_from_slice(&info.pgend_meta_thres.to_le_bytes());
     encode_le_uint_width(
-        &mut out,
+        out,
         info.eoa_pre_fsm_fsalloc,
         usize::from(info.sizeof_addr),
         "file-space info pre-free-space EOA",
@@ -2235,14 +2317,14 @@ pub fn H5O__fsinfo_encode(info: &FsInfoMessage) -> Result<Vec<u8>> {
         }
         for &addr in &info.fs_addr {
             encode_le_uint_width(
-                &mut out,
+                out,
                 addr,
                 usize::from(info.sizeof_addr),
                 "file-space info free-space-manager address",
             )?;
         }
     }
-    Ok(out)
+    Ok(())
 }
 
 /// Return a deep copy of an object.
@@ -2264,8 +2346,35 @@ pub fn H5O__fsinfo_copy(info: &FsInfoMessage) -> FsInfoMessage {
 
 /// Object operation: fsinfo size.
 #[allow(non_snake_case)]
-pub fn H5O__fsinfo_size(_info: &FsInfoMessage) -> Result<usize> {
-    Ok(H5O__fsinfo_encode(_info)?.len())
+pub fn H5O__fsinfo_image_len(info: &FsInfoMessage) -> Result<usize> {
+    if !H5O_fsinfo_check_version(info) {
+        return Err(Error::InvalidFormat(format!(
+            "file-space info message version {}",
+            info.version
+        )));
+    }
+    if info.persist && info.fs_addr.len() != 12 {
+        return Err(Error::InvalidFormat(
+            "file-space info persistent address count is invalid".into(),
+        ));
+    }
+    if !(1..=8).contains(&info.sizeof_addr) || !(1..=8).contains(&info.sizeof_size) {
+        return Err(Error::InvalidFormat(
+            "file-space info address or size width is invalid".into(),
+        ));
+    }
+    let base = 3usize
+        .checked_add(usize::from(info.sizeof_size))
+        .and_then(|value| value.checked_add(usize::from(info.sizeof_size)))
+        .and_then(|value| value.checked_add(2))
+        .and_then(|value| value.checked_add(usize::from(info.sizeof_addr)))
+        .ok_or_else(|| Error::InvalidFormat("file-space info image length overflow".into()))?;
+    if info.persist {
+        base.checked_add(12usize.saturating_mul(usize::from(info.sizeof_addr)))
+            .ok_or_else(|| Error::InvalidFormat("file-space info image length overflow".into()))
+    } else {
+        Ok(base)
+    }
 }
 
 /// Free an object's in-memory resources.
@@ -2286,16 +2395,11 @@ pub fn H5O__fsinfo_free(mut info: FsInfoMessage) {
 
 /// Return a debug-friendly representation of an object.
 #[allow(non_snake_case)]
-pub fn H5O__fsinfo_debug(info: &FsInfoMessage) -> String {
-    let first_persist_addr = info
-        .fs_addr
-        .iter()
-        .find(|&&addr| addr != u64::MAX)
-        .copied()
-        .map(|addr| format!("{addr:#x}"))
-        .unwrap_or_else(|| "none".to_string());
-    format!(
-        "fsinfo(version={}, strategy={}, persist={}, threshold={}, page_size={}, page_end_meta={}, eoa_pre_fsm={}, fs_addr_count={}, first_fs_addr={})",
+pub fn H5O__fsinfo_debug_fmt(info: &FsInfoMessage, out: &mut dyn fmt::Write) -> fmt::Result {
+    let first_persist_addr = info.fs_addr.iter().find(|&&addr| addr != u64::MAX).copied();
+    write!(
+        out,
+        "fsinfo(version={}, strategy={}, persist={}, threshold={}, page_size={}, page_end_meta={}, eoa_pre_fsm={}, fs_addr_count={}, first_fs_addr=",
         info.version,
         info.free_space_strategy,
         info.persist,
@@ -2303,9 +2407,14 @@ pub fn H5O__fsinfo_debug(info: &FsInfoMessage) -> String {
         info.page_size,
         info.pgend_meta_thres,
         info.eoa_pre_fsm_fsalloc,
-        info.fs_addr.len(),
-        first_persist_addr
-    )
+        info.fs_addr.len()
+    )?;
+    if let Some(addr) = first_persist_addr {
+        write!(out, "{addr:#x}")?;
+    } else {
+        out.write_str("none")?;
+    }
+    out.write_char(')')
 }
 
 /// Object operation: fsinfo set version.
@@ -2476,7 +2585,7 @@ pub fn H5O__stab_copy_file(stab: &SymbolTableMessage) -> SymbolTableMessage {
 
 /// Return a debug-friendly representation of an object.
 #[allow(non_snake_case)]
-pub fn H5O__stab_debug(stab: &SymbolTableMessage) -> String {
+pub fn H5O__stab_debug_fmt(stab: &SymbolTableMessage, out: &mut dyn fmt::Write) -> fmt::Result {
     let btree_state = if stab.btree_addr == u64::MAX {
         "undefined"
     } else {
@@ -2487,10 +2596,20 @@ pub fn H5O__stab_debug(stab: &SymbolTableMessage) -> String {
     } else {
         "defined"
     };
-    format!(
+    write!(
+        out,
         "stab(btree={:#x}:{}, heap={:#x}:{})",
         stab.btree_addr, btree_state, stab.heap_addr, heap_state
     )
+}
+
+/// Return a debug-friendly representation of an object.
+#[allow(non_snake_case)]
+#[deprecated(note = "use H5O__stab_debug_fmt to write into a caller-provided formatter")]
+pub fn H5O__stab_debug(stab: &SymbolTableMessage) -> String {
+    let mut text = String::new();
+    H5O__stab_debug_fmt(stab, &mut text).expect("writing to String cannot fail");
+    text
 }
 
 /// Decode an object from its on-disk representation.
@@ -2582,22 +2701,29 @@ pub fn H5O__sdspace_pre_copy_file(space: &DataspaceObjectMessage) -> DataspaceOb
 
 /// Return a debug-friendly representation of an object.
 #[allow(non_snake_case)]
+pub fn H5O__sdspace_debug_fmt(
+    space: &DataspaceObjectMessage,
+    out: &mut dyn fmt::Write,
+) -> fmt::Result {
+    write!(
+        out,
+        "sdspace(version={}, type={:?}, ndims={}, dims={:?}, max_dims=",
+        space.message.version, space.message.space_type, space.message.ndims, space.message.dims
+    )?;
+    match &space.message.max_dims {
+        Some(dims) => write!(out, "{dims:?}")?,
+        None => out.write_str("none")?,
+    }
+    write!(out, ", raw={} bytes)", space.raw.len())
+}
+
+/// Return a debug-friendly representation of an object.
+#[allow(non_snake_case)]
+#[deprecated(note = "use H5O__sdspace_debug_fmt to write into a caller-provided formatter")]
 pub fn H5O__sdspace_debug(space: &DataspaceObjectMessage) -> String {
-    let max_dims = space
-        .message
-        .max_dims
-        .as_ref()
-        .map(|dims| format!("{dims:?}"))
-        .unwrap_or_else(|| "none".to_string());
-    format!(
-        "sdspace(version={}, type={:?}, ndims={}, dims={:?}, max_dims={}, raw={} bytes)",
-        space.message.version,
-        space.message.space_type,
-        space.message.ndims,
-        space.message.dims,
-        max_dims,
-        space.raw.len()
-    )
+    let mut text = String::new();
+    H5O__sdspace_debug_fmt(space, &mut text).expect("writing to String cannot fail");
+    text
 }
 
 /// Link an object.
@@ -2722,7 +2848,7 @@ pub struct ObjectInfo {
 
 /// Object operation: visit3.
 #[allow(non_snake_case)]
-pub fn H5Ovisit3(objects: &BTreeMap<String, ObjectHeaderState>) -> Vec<String> {
+pub fn H5Ovisit3_refs(objects: &BTreeMap<String, ObjectHeaderState>) -> Vec<&str> {
     let mut ordered = Vec::with_capacity(objects.len());
     let mut seen_addrs = BTreeSet::new();
     for (name, header) in objects {
@@ -2749,7 +2875,7 @@ pub fn H5Ovisit3(objects: &BTreeMap<String, ObjectHeaderState>) -> Vec<String> {
             .any(|message| matches!(message.msg_type, 0x0006 | 0x000a | 0x000b | 0x0011));
         ordered.push((
             depth,
-            name.to_string(),
+            name.as_str(),
             header.addr,
             header.refcount,
             has_links,
@@ -2768,11 +2894,21 @@ pub fn H5Ovisit3(objects: &BTreeMap<String, ObjectHeaderState>) -> Vec<String> {
     let mut names = Vec::with_capacity(ordered.len());
     let mut seen_names = BTreeSet::new();
     for (_, name, _, _, _, _) in ordered {
-        if seen_names.insert(name.clone()) {
+        if seen_names.insert(name) {
             names.push(name);
         }
     }
     names
+}
+
+/// Object operation: visit3.
+#[allow(non_snake_case)]
+#[deprecated(note = "use H5Ovisit3_refs to avoid allocating cloned object names")]
+pub fn H5Ovisit3(objects: &BTreeMap<String, ObjectHeaderState>) -> Vec<String> {
+    H5Ovisit3_refs(objects)
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
 }
 
 /// Object operation: are mdc flushes disabled.
@@ -2806,12 +2942,21 @@ pub fn H5Otoken_cmp(left: u64, right: u64) -> std::cmp::Ordering {
 
 /// Object operation: token to str.
 #[allow(non_snake_case)]
-pub fn H5Otoken_to_str(token: u64) -> String {
+pub fn H5Otoken_fmt(token: u64, out: &mut dyn fmt::Write) -> fmt::Result {
     if token == u64::MAX {
-        "UNDEF".to_string()
+        out.write_str("UNDEF")
     } else {
-        format!("{token:#016x}")
+        write!(out, "{token:#016x}")
     }
+}
+
+/// Object operation: token to str.
+#[allow(non_snake_case)]
+#[deprecated(note = "use H5Otoken_fmt to write into a caller-provided formatter")]
+pub fn H5Otoken_to_str(token: u64) -> String {
+    let mut text = String::new();
+    H5Otoken_fmt(token, &mut text).expect("writing to String cannot fail");
+    text
 }
 
 /// Object operation: token from str.
@@ -2824,8 +2969,17 @@ pub fn H5Otoken_from_str(token: &str) -> Result<u64> {
 
 /// Object operation: print time field.
 #[allow(non_snake_case)]
+pub fn H5O__print_time_field_fmt(timestamp: u64, out: &mut dyn fmt::Write) -> fmt::Result {
+    write!(out, "{timestamp}")
+}
+
+/// Object operation: print time field.
+#[allow(non_snake_case)]
+#[deprecated(note = "use H5O__print_time_field_fmt to write into a caller-provided formatter")]
 pub fn H5O__print_time_field(timestamp: u64) -> String {
-    timestamp.to_string()
+    let mut text = String::new();
+    H5O__print_time_field_fmt(timestamp, &mut text).expect("writing to String cannot fail");
+    text
 }
 
 /// Object operation: assert.
@@ -2943,7 +3097,7 @@ pub fn H5O_debug_id(addr: u64) -> String {
 
 /// Return a debug-friendly representation of an object.
 #[allow(non_snake_case)]
-pub fn H5O__debug_real(header: &ObjectHeaderState) -> String {
+pub fn H5O__debug_real_fmt(header: &ObjectHeaderState, out: &mut dyn fmt::Write) -> fmt::Result {
     let mut total_message_bytes = 0usize;
     let mut shared_messages = 0usize;
     let mut null_messages = 0usize;
@@ -2961,7 +3115,8 @@ pub fn H5O__debug_real(header: &ObjectHeaderState) -> String {
         let entry = type_counts.entry(message.msg_type).or_insert(0usize);
         *entry = entry.saturating_add(1);
     }
-    format!(
+    write!(
+        out,
         "object(addr={:#x}, refcount={}, messages={}, message_bytes={}, shared_messages={}, null_messages={}, max_message_size={}, type_counts={:?}, comment={})",
         header.addr,
         header.refcount,
@@ -2977,11 +3132,20 @@ pub fn H5O__debug_real(header: &ObjectHeaderState) -> String {
 
 /// Return a debug-friendly representation of an object.
 #[allow(non_snake_case)]
-pub fn H5O_debug(header: &ObjectHeaderState) -> String {
-    let mut text = H5O__debug_real(header);
+pub fn H5O_debug_fmt(header: &ObjectHeaderState, out: &mut dyn fmt::Write) -> fmt::Result {
+    H5O__debug_real_fmt(header, out)?;
     if header.flush_disabled {
-        text.push_str(", flush_disabled=true");
+        out.write_str(", flush_disabled=true")?;
     }
+    Ok(())
+}
+
+/// Return a debug-friendly representation of an object.
+#[allow(non_snake_case)]
+#[deprecated(note = "use H5O_debug_fmt to write into a caller-provided formatter")]
+pub fn H5O_debug(header: &ObjectHeaderState) -> String {
+    let mut text = String::new();
+    H5O_debug_fmt(header, &mut text).expect("writing to String cannot fail");
     text
 }
 
@@ -3137,13 +3301,17 @@ pub fn H5O__mdci_delete_checked(message: &mut MetadataCacheImageMessage) -> Resu
 
 /// Return a debug-friendly representation of an object.
 #[allow(non_snake_case)]
-pub fn H5O__mdci_debug(message: &MetadataCacheImageMessage) -> String {
+pub fn H5O__mdci_debug_fmt(
+    message: &MetadataCacheImageMessage,
+    out: &mut dyn fmt::Write,
+) -> fmt::Result {
     let status = match is_undefined_addr_width(message.addr, message.sizeof_addr) {
         Ok(true) => "undefined",
         Ok(false) => "defined",
         Err(_) => "invalid-width",
     };
-    format!(
+    write!(
+        out,
         "mdci(version={}, addr={:#x}, size={}, addr_size={}, size_size={}, status={})",
         message.version,
         message.addr,
@@ -3152,6 +3320,15 @@ pub fn H5O__mdci_debug(message: &MetadataCacheImageMessage) -> String {
         message.sizeof_size,
         status
     )
+}
+
+/// Return a debug-friendly representation of an object.
+#[allow(non_snake_case)]
+#[deprecated(note = "use H5O__mdci_debug_fmt to write into a caller-provided formatter")]
+pub fn H5O__mdci_debug(message: &MetadataCacheImageMessage) -> String {
+    let mut text = String::new();
+    H5O__mdci_debug_fmt(message, &mut text).expect("writing to String cannot fail");
+    text
 }
 
 /// Decode an object from its on-disk representation.
@@ -3359,8 +3536,12 @@ pub fn H5O__attr_post_copy_file(message: &AttributeObjectMessage) -> AttributeOb
 
 /// Return a debug-friendly representation of an object.
 #[allow(non_snake_case)]
-pub fn H5O__attr_debug(message: &AttributeObjectMessage) -> String {
-    format!(
+pub fn H5O__attr_debug_fmt(
+    message: &AttributeObjectMessage,
+    out: &mut dyn fmt::Write,
+) -> fmt::Result {
+    write!(
+        out,
         "attr(version={}, name={}, encoding={}, dtype_size={}, rank={}, data={} bytes, raw={} bytes)",
         message.message.version,
         message.message.name,
@@ -3370,6 +3551,15 @@ pub fn H5O__attr_debug(message: &AttributeObjectMessage) -> String {
         message.message.data.len(),
         message.raw_size
     )
+}
+
+/// Return a debug-friendly representation of an object.
+#[allow(non_snake_case)]
+#[deprecated(note = "use H5O__attr_debug_fmt to write into a caller-provided formatter")]
+pub fn H5O__attr_debug(message: &AttributeObjectMessage) -> String {
+    let mut text = String::new();
+    H5O__attr_debug_fmt(message, &mut text).expect("writing to String cannot fail");
+    text
 }
 
 /// Object operation: chunk add.
@@ -5623,22 +5813,39 @@ pub fn H5Oget_native_info_by_idx(
 
 /// Return the comment associated with an object.
 #[allow(non_snake_case)]
-pub fn H5Oget_comment(header: &ObjectHeaderState) -> Option<String> {
+pub fn H5Oget_comment_ref(header: &ObjectHeaderState) -> Option<&str> {
     let comment = header.comment.as_ref()?;
     if comment.is_empty() {
         None
     } else {
-        Some(comment.clone())
+        Some(comment.as_str())
     }
 }
 
 /// Return the comment associated with an object.
 #[allow(non_snake_case)]
+#[deprecated(note = "use H5Oget_comment_ref to borrow the stored comment")]
+pub fn H5Oget_comment(header: &ObjectHeaderState) -> Option<String> {
+    H5Oget_comment_ref(header).map(str::to_owned)
+}
+
+/// Return the comment associated with an object.
+#[allow(non_snake_case)]
+pub fn H5Oget_comment_by_name_ref<'a>(
+    objects: &'a BTreeMap<String, ObjectHeaderState>,
+    name: &str,
+) -> Option<&'a str> {
+    objects.get(name).and_then(H5Oget_comment_ref)
+}
+
+/// Return the comment associated with an object.
+#[allow(non_snake_case)]
+#[deprecated(note = "use H5Oget_comment_by_name_ref to borrow the stored comment")]
 pub fn H5Oget_comment_by_name(
     objects: &BTreeMap<String, ObjectHeaderState>,
     name: &str,
 ) -> Option<String> {
-    objects.get(name).and_then(H5Oget_comment)
+    H5Oget_comment_by_name_ref(objects, name).map(str::to_owned)
 }
 
 /// Return the creation property list for an object.
@@ -5733,17 +5940,17 @@ pub fn H5O_get_rc_and_type(header: &ObjectHeaderState) -> (u32, &'static str) {
 
 /// Visit the entries of an object.
 #[allow(non_snake_case)]
-pub fn H5O__visit_cb(name: &str, _header: &ObjectHeaderState) -> String {
-    if _header.refcount == 0 && _header.messages.is_empty() {
-        String::new()
+pub fn H5O__visit_cb_ref<'a>(name: &'a str, header: &ObjectHeaderState) -> Option<&'a str> {
+    if header.refcount == 0 && header.messages.is_empty() {
+        None
     } else {
-        name.to_string()
+        Some(name)
     }
 }
 
 /// Visit the entries of an object.
 #[allow(non_snake_case)]
-pub fn H5O__visit(objects: &BTreeMap<String, ObjectHeaderState>) -> Vec<String> {
+pub fn H5O__visit_refs(objects: &BTreeMap<String, ObjectHeaderState>) -> Vec<&str> {
     let mut names = Vec::with_capacity(objects.len());
     for (name, header) in objects {
         if header.refcount == 0 && header.messages.is_empty() {
@@ -5755,7 +5962,28 @@ pub fn H5O__visit(objects: &BTreeMap<String, ObjectHeaderState>) -> Vec<String> 
         if header.addr == u64::MAX && header.messages.is_empty() {
             continue;
         }
-        names.push(name.to_string());
+        names.push(name.as_str());
+    }
+    names.sort_unstable();
+    names.dedup();
+    names
+}
+
+/// Visit the entries of an object.
+#[allow(non_snake_case)]
+pub fn H5O__visit_into(objects: BTreeMap<String, ObjectHeaderState>) -> Vec<String> {
+    let mut names = Vec::with_capacity(objects.len());
+    for (name, header) in objects {
+        if header.refcount == 0 && header.messages.is_empty() {
+            continue;
+        }
+        if name.is_empty() {
+            continue;
+        }
+        if header.addr == u64::MAX && header.messages.is_empty() {
+            continue;
+        }
+        names.push(name);
     }
     names.sort();
     names.dedup();
@@ -6381,7 +6609,10 @@ pub fn H5O__attr_create(header: &mut ObjectHeaderState, name: &str, value: &[u8]
 
 /// Open an object.
 #[allow(non_snake_case)]
-pub fn H5O__attr_open_by_name(header: &ObjectHeaderState, name: &str) -> Option<ObjectMessage> {
+pub fn H5O__attr_open_by_name_ref<'a>(
+    header: &'a ObjectHeaderState,
+    name: &str,
+) -> Option<&'a ObjectMessage> {
     if name.is_empty() {
         return None;
     }
@@ -6392,7 +6623,7 @@ pub fn H5O__attr_open_by_name(header: &ObjectHeaderState, name: &str) -> Option<
         }
         let nul = msg.data.iter().position(|byte| *byte == 0)?;
         if msg.data.get(..nul) == Some(needle) {
-            Some(msg.clone())
+            Some(msg)
         } else {
             None
         }
@@ -6401,25 +6632,21 @@ pub fn H5O__attr_open_by_name(header: &ObjectHeaderState, name: &str) -> Option<
 
 /// Open the object at the given index.
 #[allow(non_snake_case)]
-pub fn H5O__attr_open_by_idx_cb(message: &ObjectMessage) -> ObjectMessage {
-    ObjectMessage {
-        msg_type: message.msg_type,
-        flags: message.flags,
-        creation_index: message.creation_index,
-        data: message.data.clone(),
-        shared: message.shared,
-    }
+pub fn H5O__attr_open_by_idx_cb_ref(message: &ObjectMessage) -> &ObjectMessage {
+    message
 }
 
 /// Open the object at the given index.
 #[allow(non_snake_case)]
-pub fn H5O__attr_open_by_idx(header: &ObjectHeaderState, index: usize) -> Option<ObjectMessage> {
+pub fn H5O__attr_open_by_idx_ref(
+    header: &ObjectHeaderState,
+    index: usize,
+) -> Option<&ObjectMessage> {
     header
         .messages
         .iter()
         .filter(|msg| msg.msg_type == 0x000c)
         .nth(index)
-        .cloned()
 }
 
 /// Find an entry in an object.
@@ -6607,12 +6834,12 @@ pub fn H5O__attr_rename_checked(
 
 /// Iterate over the entries of an object.
 #[allow(non_snake_case)]
-pub fn H5O_attr_iterate_real(header: &ObjectHeaderState) -> Vec<ObjectMessage> {
-    let mut attrs: Vec<ObjectMessage> = header
+pub fn H5O_attr_iterate_real_refs(header: &ObjectHeaderState) -> Vec<&ObjectMessage> {
+    let mut attrs: Vec<&ObjectMessage> = header
         .messages
         .iter()
         .filter(|msg| msg.msg_type == 0x000c && msg.data.iter().any(|byte| *byte == 0))
-        .map(H5O__attr_open_by_idx_cb)
+        .map(H5O__attr_open_by_idx_cb_ref)
         .collect();
     attrs.sort_by_key(|msg| msg.creation_index);
     attrs
@@ -6620,11 +6847,11 @@ pub fn H5O_attr_iterate_real(header: &ObjectHeaderState) -> Vec<ObjectMessage> {
 
 /// Iterate over the entries of an object.
 #[allow(non_snake_case)]
-pub fn H5O__attr_iterate(header: &ObjectHeaderState) -> Vec<ObjectMessage> {
+pub fn H5O__attr_iterate_refs(header: &ObjectHeaderState) -> Vec<&ObjectMessage> {
     let mut attrs = Vec::new();
     for message in &header.messages {
         if message.msg_type == 0x000c && message.data.iter().any(|byte| *byte == 0) {
-            attrs.push(H5O__attr_open_by_idx_cb(message));
+            attrs.push(H5O__attr_open_by_idx_cb_ref(message));
         }
     }
     attrs.sort_by_key(|message| message.creation_index);
@@ -7080,7 +7307,7 @@ pub fn H5Oopen_by_addr(
 
 /// Object operation: visit1.
 #[allow(non_snake_case)]
-pub fn H5Ovisit1(objects: &BTreeMap<String, ObjectHeaderState>) -> Vec<String> {
+pub fn H5Ovisit1_refs(objects: &BTreeMap<String, ObjectHeaderState>) -> Vec<&str> {
     let mut ordered = Vec::with_capacity(objects.len());
     let mut seen_addrs = BTreeSet::new();
     for (name, header) in objects {
@@ -7131,7 +7358,7 @@ pub fn H5Ovisit1(objects: &BTreeMap<String, ObjectHeaderState>) -> Vec<String> {
             | usize::from(has_attr);
         ordered.push((
             depth,
-            name.to_string(),
+            name.as_str(),
             header.addr,
             old_info_score,
             legacy_flags,
@@ -7150,7 +7377,7 @@ pub fn H5Ovisit1(objects: &BTreeMap<String, ObjectHeaderState>) -> Vec<String> {
     let mut names = Vec::with_capacity(ordered.len());
     let mut seen_names = BTreeSet::new();
     for (_, name, _, _, _, _) in ordered {
-        if seen_names.insert(name.clone()) {
+        if seen_names.insert(name) {
             names.push(name);
         }
     }
@@ -7159,14 +7386,37 @@ pub fn H5Ovisit1(objects: &BTreeMap<String, ObjectHeaderState>) -> Vec<String> {
 
 /// Visit the entries of an object.
 #[allow(non_snake_case)]
+#[deprecated(note = "use H5Ovisit1_refs to avoid allocating cloned object names")]
+pub fn H5Ovisit1(objects: &BTreeMap<String, ObjectHeaderState>) -> Vec<String> {
+    H5Ovisit1_refs(objects)
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Visit the entries of an object.
+#[allow(non_snake_case)]
+pub fn H5Ovisit_by_name2_refs<'a>(
+    objects: &'a BTreeMap<String, ObjectHeaderState>,
+    prefix: &str,
+) -> Vec<&'a str> {
+    objects
+        .keys()
+        .filter(|name| name.starts_with(prefix))
+        .map(String::as_str)
+        .collect()
+}
+
+/// Visit the entries of an object.
+#[allow(non_snake_case)]
+#[deprecated(note = "use H5Ovisit_by_name2_refs to avoid allocating cloned object names")]
 pub fn H5Ovisit_by_name2(
     objects: &BTreeMap<String, ObjectHeaderState>,
     prefix: &str,
 ) -> Vec<String> {
-    objects
-        .keys()
-        .filter(|name| name.starts_with(prefix))
-        .cloned()
+    H5Ovisit_by_name2_refs(objects, prefix)
+        .into_iter()
+        .map(str::to_owned)
         .collect()
 }
 
@@ -9364,35 +9614,53 @@ pub fn H5O__dtype_size(message: &DatatypeMessage) -> Result<usize> {
 
 /// Decode an object from its on-disk representation.
 #[allow(non_snake_case)]
-pub fn H5O__name_decode(bytes: &[u8]) -> Result<String> {
+pub fn H5O__name_decode_ref(bytes: &[u8]) -> Result<&str> {
     let nul = bytes
         .iter()
         .position(|byte| *byte == 0)
         .unwrap_or(bytes.len());
     std::str::from_utf8(&bytes[..nul])
-        .map(str::to_string)
         .map_err(|_| Error::InvalidFormat("object name is not UTF-8".into()))
+}
+
+/// Decode an object from its on-disk representation.
+#[allow(non_snake_case)]
+#[deprecated(note = "use H5O__name_decode_ref to borrow from the input image")]
+pub fn H5O__name_decode(bytes: &[u8]) -> Result<String> {
+    H5O__name_decode_ref(bytes).map(str::to_owned)
 }
 
 /// Encode an object to its on-disk representation.
 #[allow(non_snake_case)]
+pub fn H5O__name_encode_into(name: &str, out: &mut Vec<u8>) -> Result<()> {
+    let len = name
+        .len()
+        .checked_add(1)
+        .ok_or_else(|| Error::InvalidFormat("object name image length overflow".into()))?;
+    out.reserve(len);
+    out.extend_from_slice(name.as_bytes());
+    out.push(0);
+    Ok(())
+}
+
+/// Encode an object to its on-disk representation.
+#[allow(non_snake_case)]
+#[deprecated(note = "use H5O__name_encode_into to append into a caller-owned buffer")]
 pub fn H5O__name_encode(name: &str) -> Result<Vec<u8>> {
     let len = name
         .len()
         .checked_add(1)
         .ok_or_else(|| Error::InvalidFormat("object name image length overflow".into()))?;
     let mut out = Vec::with_capacity(len);
-    out.extend_from_slice(name.as_bytes());
-    out.push(0);
+    H5O__name_encode_into(name, &mut out)?;
     Ok(out)
 }
 
 /// Return a deep copy of an object.
 #[allow(non_snake_case)]
+#[deprecated(note = "use str::to_owned where an owned copy is actually required")]
 pub fn H5O__name_copy(name: &str) -> String {
-    let mut copied = String::with_capacity(name.len());
-    copied.push_str(name);
-    copied
+    name.to_owned()
 }
 
 /// Object operation: name size.
@@ -9409,15 +9677,25 @@ pub fn H5O__name_reset(name: &mut String) {
 
 /// Return a debug-friendly representation of an object.
 #[allow(non_snake_case)]
-pub fn H5O__name_debug(name: &str) -> String {
+pub fn H5O__name_debug_fmt(name: &str, out: &mut dyn fmt::Write) -> fmt::Result {
     let state = if name.is_empty() { "empty" } else { "set" };
     let nul = name.as_bytes().iter().position(|byte| *byte == 0);
-    format!(
+    write!(
+        out,
         "name(len={}, state={}, nul={:?}, value={name})",
         name.len(),
         state,
         nul
     )
+}
+
+/// Return a debug-friendly representation of an object.
+#[allow(non_snake_case)]
+#[deprecated(note = "use H5O__name_debug_fmt to write into a caller-provided formatter")]
+pub fn H5O__name_debug(name: &str) -> String {
+    let mut text = String::new();
+    H5O__name_debug_fmt(name, &mut text).expect("writing to String cannot fail");
+    text
 }
 
 #[cfg(test)]
@@ -9427,7 +9705,9 @@ mod tests {
     #[test]
     fn object_messages_roundtrip_and_remove() {
         let msg = H5O__msg_alloc(42, b"abc".to_vec());
-        let decoded = H5O_msg_decode(&H5O_msg_encode(&msg).unwrap()).unwrap();
+        let mut encoded = Vec::new();
+        H5O_msg_encode_into(&msg, &mut encoded).unwrap();
+        let decoded = H5O_msg_decode(&encoded).unwrap();
         assert_eq!(decoded.msg_type, 42);
         assert_eq!(decoded.data, b"abc");
 
@@ -9453,14 +9733,16 @@ mod tests {
         };
 
         assert_eq!(H5O_msg_size_oh(&header).unwrap(), 4);
-        let first_image = H5O_msg_encode(&first).unwrap();
+        let mut first_image = Vec::new();
+        H5O_msg_encode_into(&first, &mut first_image).unwrap();
         assert_eq!(first_image.len(), 8);
-        let image = H5O__cache_serialize(&header).unwrap();
-        assert_eq!(
-            image.len(),
-            first_image.len() + H5O_msg_encode(&second).unwrap().len()
-        );
+        let mut image = Vec::new();
+        H5O__cache_serialize_into(&header, &mut image).unwrap();
+        let mut second_image = Vec::new();
+        H5O_msg_encode_into(&second, &mut second_image).unwrap();
+        assert_eq!(image.len(), first_image.len() + second_image.len());
         assert_eq!(&image[..first_image.len()], &first_image);
+        assert_eq!(H5O__cache_image_len(&header).unwrap(), image.len());
     }
 
     #[test]
@@ -9539,7 +9821,9 @@ mod tests {
         assert_eq!(v1_chunk.raw, v1_raw);
         let v1_cached = H5O__cache_chk_deserialize(&v1_raw).unwrap();
         assert_eq!(H5O__cache_chk_image_len(&v1_cached), v1_raw.len());
-        assert_eq!(H5O__cache_chk_serialize(&v1_cached).unwrap(), v1_raw);
+        let mut v1_cached_image = Vec::new();
+        H5O__cache_chk_serialize_into(&v1_cached, &mut v1_cached_image).unwrap();
+        assert_eq!(v1_cached_image, v1_raw);
 
         let mut v2 = b"OCHK".to_vec();
         v2.extend_from_slice(&[0, 0, 0, 0]);
@@ -9550,17 +9834,23 @@ mod tests {
         assert_eq!(v2_chunk.raw, v2);
         let v2_cached = H5O__cache_chk_deserialize(&v2).unwrap();
         assert_eq!(H5O__cache_chk_image_len(&v2_cached), v2.len());
-        assert_eq!(H5O__cache_chk_serialize(&v2_cached).unwrap(), v2);
+        let mut v2_cached_image = Vec::new();
+        H5O__cache_chk_serialize_into(&v2_cached, &mut v2_cached_image).unwrap();
+        assert_eq!(v2_cached_image, v2);
 
         let mut bad = b"OCHK".to_vec();
         bad.extend_from_slice(&[0, 0, 0, 0]);
         bad.extend_from_slice(&0u32.to_le_bytes());
         assert!(H5O__chunk_deserialize(&bad).is_err());
         assert!(H5O__cache_chk_deserialize(&bad).is_err());
-        assert!(H5O__cache_chk_serialize(&ObjectHeaderChunkImage {
-            is_v2_continuation: true,
-            raw: bad,
-        })
+        let mut bad_image = Vec::new();
+        assert!(H5O__cache_chk_serialize_into(
+            &ObjectHeaderChunkImage {
+                is_v2_continuation: true,
+                raw: bad,
+            },
+            &mut bad_image,
+        )
         .is_err());
     }
 
@@ -9671,11 +9961,10 @@ mod tests {
         assert_eq!(fsinfo.threshold, 8);
         assert_eq!(fsinfo.page_size, 4096);
         assert_eq!(fsinfo.eoa_pre_fsm_fsalloc, u64::MAX);
-        assert_eq!(H5O__fsinfo_size(&fsinfo).unwrap(), 29);
-        assert_eq!(
-            H5O__fsinfo_encode(&fsinfo).unwrap(),
-            fsinfo_bytes[..29].to_vec()
-        );
+        assert_eq!(H5O__fsinfo_image_len(&fsinfo).unwrap(), 29);
+        let mut fsinfo_image = Vec::new();
+        H5O__fsinfo_encode_into(&fsinfo, &mut fsinfo_image).unwrap();
+        assert_eq!(fsinfo_image, fsinfo_bytes[..29].to_vec());
 
         let sdspace = H5O__sdspace_decode(&[2, 1, 0, 1, 16, 0, 0, 0, 0, 0, 0, 0]).unwrap();
         assert_eq!(sdspace.message.dims, vec![16]);
@@ -9709,7 +9998,9 @@ mod tests {
         );
         assert!(H5O__mtime_new_encode(u64::from(u32::MAX) + 1).is_err());
         assert_eq!(H5O__refcount_decode(&[7, 0, 0, 0, 0xaa]).unwrap(), 7);
-        assert_eq!(H5O__refcount_encode(7), vec![7, 0, 0, 0]);
+        let mut refcount_image = Vec::new();
+        H5O__refcount_encode_into(7, &mut refcount_image);
+        assert_eq!(refcount_image, vec![7, 0, 0, 0]);
         let mut header = ObjectHeaderState {
             refcount: 1,
             ..ObjectHeaderState::default()
@@ -9751,10 +10042,12 @@ mod tests {
             H5O__btreek_encode(&btreek).unwrap(),
             vec![0, 32, 0, 16, 0, 4, 0]
         );
-        assert_eq!(H5O__name_decode(b"alpha\0ignored").unwrap(), "alpha");
-        assert_eq!(H5O__name_decode(b"alpha").unwrap(), "alpha");
-        assert!(H5O__name_decode(&[0xff, 0]).is_err());
-        assert_eq!(H5O__name_encode("alpha").unwrap(), b"alpha\0".to_vec());
+        assert_eq!(H5O__name_decode_ref(b"alpha\0ignored").unwrap(), "alpha");
+        assert_eq!(H5O__name_decode_ref(b"alpha").unwrap(), "alpha");
+        assert!(H5O__name_decode_ref(&[0xff, 0]).is_err());
+        let mut name_image = Vec::new();
+        H5O__name_encode_into("alpha", &mut name_image).unwrap();
+        assert_eq!(name_image, b"alpha\0".to_vec());
         assert_eq!(H5O__name_size("alpha"), 6);
 
         let mut link_bytes = vec![1, 0, 1, b'x'];
@@ -9989,7 +10282,9 @@ mod tests {
         assert_eq!(attr.message.name, "x");
         assert_eq!(attr.message.data, vec![1, 2, 3, 4]);
         assert_eq!(H5O__attr_size(&attr), attr_bytes.len());
-        assert!(H5O__attr_debug(&attr).contains("name=x"));
+        let mut attr_debug = String::new();
+        H5O__attr_debug_fmt(&attr, &mut attr_debug).unwrap();
+        assert!(attr_debug.contains("name=x"));
 
         let mut cont = Vec::new();
         cont.extend_from_slice(&24u64.to_le_bytes());
@@ -10051,10 +10346,10 @@ mod tests {
 
         assert!(H5O__attr_rename_checked(&mut header, "old", "new").unwrap());
         assert_eq!(
-            H5O__attr_open_by_name(&header, "new").unwrap().data,
+            H5O__attr_open_by_name_ref(&header, "new").unwrap().data,
             b"new\0value"
         );
-        assert!(H5O__attr_open_by_name(&header, "old").is_none());
+        assert!(H5O__attr_open_by_name_ref(&header, "old").is_none());
     }
 
     #[test]
@@ -10065,18 +10360,53 @@ mod tests {
 
         H5O__attr_write(&mut header, "a", b"uno");
         assert_eq!(
-            H5O__attr_open_by_name(&header, "a").unwrap().data,
+            H5O__attr_open_by_name_ref(&header, "a").unwrap().data,
             b"a\0uno"
         );
         assert_eq!(
-            H5O__attr_open_by_name(&header, "ab").unwrap().data,
+            H5O__attr_open_by_name_ref(&header, "ab").unwrap().data,
             b"ab\0two"
         );
 
         assert!(H5O__attr_remove(&mut header, "a"));
-        assert!(H5O__attr_open_by_name(&header, "a").is_none());
-        assert!(H5O__attr_open_by_name(&header, "ab").is_some());
+        assert!(H5O__attr_open_by_name_ref(&header, "a").is_none());
+        assert!(H5O__attr_open_by_name_ref(&header, "ab").is_some());
         assert_eq!(H5O__attr_count_real(&header), 1);
+    }
+
+    #[test]
+    fn borrowed_object_apis_return_existing_storage() {
+        let mut header = ObjectHeaderState::default();
+        H5Oset_comment(&mut header, "comment");
+        H5O__attr_create(&mut header, "b", b"two");
+        H5O__attr_create(&mut header, "a", b"one");
+
+        let comment = H5Oget_comment_ref(&header).unwrap();
+        assert_eq!(comment, "comment");
+        assert_eq!(comment.as_ptr(), header.comment.as_ref().unwrap().as_ptr());
+
+        let attr = H5O__attr_open_by_name_ref(&header, "a").unwrap();
+        assert_eq!(attr.data.as_slice(), b"a\0one");
+        assert_eq!(attr.data.as_ptr(), header.messages[1].data.as_ptr());
+
+        let attrs = H5O__attr_iterate_refs(&header);
+        assert_eq!(
+            attrs
+                .iter()
+                .map(|message| message.creation_index)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+
+        let mut objects = BTreeMap::new();
+        objects.insert("root".to_string(), header);
+        let visited = H5O__visit_refs(&objects);
+        assert_eq!(visited, vec!["root"]);
+        assert_eq!(visited[0].as_ptr(), objects.keys().next().unwrap().as_ptr());
+        assert_eq!(
+            H5Oget_comment_by_name_ref(&objects, "root"),
+            Some("comment")
+        );
     }
 
     #[test]

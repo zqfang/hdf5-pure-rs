@@ -2,7 +2,48 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use hdf5_pure_rust::format::checksum::checksum_metadata;
-use hdf5_pure_rust::File;
+use hdf5_pure_rust::{Dataset, File, H5Type, IntoSelection};
+
+fn dataset_len(ds: &Dataset) -> hdf5_pure_rust::Result<usize> {
+    Ok(usize::try_from(ds.size()?).unwrap())
+}
+
+fn read_dataset_into<T: H5Type>(ds: &Dataset, values: &mut [T]) -> hdf5_pure_rust::Result<()> {
+    ds.read_into(values)
+}
+
+fn assert_dataset_values<T>(ds: &Dataset, expected: &[T]) -> hdf5_pure_rust::Result<()>
+where
+    T: H5Type + Default + PartialEq + std::fmt::Debug,
+{
+    let mut values = (0..dataset_len(ds)?)
+        .map(|_| T::default())
+        .collect::<Vec<_>>();
+    read_dataset_into(ds, &mut values)?;
+    assert_eq!(values, expected);
+    Ok(())
+}
+
+fn assert_shape(ds: &Dataset, expected: &[u64]) {
+    let space = ds.space().unwrap();
+    assert_eq!(space.shape(), expected);
+}
+
+fn read_dataset_slice_into<T: H5Type, S: IntoSelection>(
+    ds: &Dataset,
+    sel: S,
+    values: &mut [T],
+) -> hdf5_pure_rust::Result<()> {
+    ds.read_slice_into(sel, values)
+}
+
+fn read_dataset_field_into<T: H5Type>(
+    ds: &Dataset,
+    field_name: &str,
+    values: &mut [T],
+) -> hdf5_pure_rust::Result<()> {
+    ds.read_field_into(field_name, values)
+}
 
 fn corrupt_metadata_checksum(src: impl AsRef<Path>, magic: &[u8]) -> (tempfile::TempDir, PathBuf) {
     let dir = tempfile::tempdir().unwrap();
@@ -64,11 +105,10 @@ fn patch_filtered_fixed_array_to_implicit(src: impl AsRef<Path>) -> (tempfile::T
 
 fn assert_chunk_index_checksum_error(path: &Path, dataset: &str, expected: &str) {
     let f = File::open(path).unwrap();
-    let err = f
-        .dataset(dataset)
-        .unwrap()
-        .read::<i32>()
-        .expect_err("corrupt chunk index checksum should fail");
+    let ds = f.dataset(dataset).unwrap();
+    let mut values = vec![0i32; dataset_len(&ds).unwrap()];
+    let err =
+        read_dataset_into(&ds, &mut values).expect_err("corrupt chunk index checksum should fail");
     assert!(
         err.to_string().contains(expected),
         "unexpected error: {err}"
@@ -78,17 +118,21 @@ fn assert_chunk_index_checksum_error(path: &Path, dataset: &str, expected: &str)
 #[test]
 fn test_v4_fixed_array_chunks_read() {
     let f = File::open("tests/data/hdf5_ref/v4_fixed_array_chunks.h5").unwrap();
-    let vals: Vec<i32> = f.dataset("fixed_array").unwrap().read::<i32>().unwrap();
-    assert_eq!(vals, (0..100).collect::<Vec<_>>());
+    assert_dataset_values::<i32>(
+        &f.dataset("fixed_array").unwrap(),
+        &(0..100).collect::<Vec<_>>(),
+    )
+    .unwrap();
 }
 
 #[test]
 fn test_v4_fixed_array_3d_edge_chunks_read() {
     let f = File::open("tests/data/hdf5_ref/v4_fixed_array_3d_edges.h5").unwrap();
     let ds = f.dataset("fixed_array_3d_edges").unwrap();
-    assert_eq!(ds.shape().unwrap(), vec![5, 7, 4]);
+    assert_shape(&ds, &[5, 7, 4]);
 
-    let vals: Vec<i32> = ds.read::<i32>().unwrap();
+    let mut vals = vec![0i32; dataset_len(&ds).unwrap()];
+    read_dataset_into(&ds, &mut vals).unwrap();
     assert_eq!(vals.len(), 5 * 7 * 4);
     assert_eq!(vals[0], 0);
     assert_eq!(vals[3], 3);
@@ -108,11 +152,9 @@ fn test_v4_fixed_array_header_checksum_corruption_fails() {
 #[test]
 fn test_v4_paged_fixed_array_chunks_read() {
     let f = File::open("tests/data/hdf5_ref/v4_fixed_array_paged_chunks.h5").unwrap();
-    let vals: Vec<i32> = f
-        .dataset("fixed_array_paged")
-        .unwrap()
-        .read::<i32>()
-        .unwrap();
+    let ds = f.dataset("fixed_array_paged").unwrap();
+    let mut vals = vec![0i32; dataset_len(&ds).unwrap()];
+    read_dataset_into(&ds, &mut vals).unwrap();
     assert_eq!(vals.len(), 4096);
     assert_eq!(vals[0], 0);
     assert_eq!(vals[1024], 1024);
@@ -122,11 +164,9 @@ fn test_v4_paged_fixed_array_chunks_read() {
 #[test]
 fn test_v4_paged_fixed_array_absent_pages_use_fill_value() {
     let f = File::open("tests/data/hdf5_ref/v4_fixed_array_paged_sparse.h5").unwrap();
-    let vals: Vec<i32> = f
-        .dataset("fixed_array_paged_sparse")
-        .unwrap()
-        .read::<i32>()
-        .unwrap();
+    let ds = f.dataset("fixed_array_paged_sparse").unwrap();
+    let mut vals = vec![0i32; dataset_len(&ds).unwrap()];
+    read_dataset_into(&ds, &mut vals).unwrap();
 
     assert_eq!(vals.len(), 4096);
     assert_eq!(vals[0], 11);
@@ -140,12 +180,11 @@ fn test_v4_paged_fixed_array_absent_pages_use_fill_value() {
 #[test]
 fn test_v4_filtered_fixed_array_chunks_read() {
     let f = File::open("tests/data/hdf5_ref/v4_filtered_chunked.h5").unwrap();
-    let vals: Vec<i16> = f
-        .dataset("filtered_chunked")
-        .unwrap()
-        .read::<i16>()
-        .unwrap();
-    assert_eq!(vals, (0..64).collect::<Vec<_>>());
+    assert_dataset_values::<i16>(
+        &f.dataset("filtered_chunked").unwrap(),
+        &(0..64).collect::<Vec<_>>(),
+    )
+    .unwrap();
 }
 
 #[test]
@@ -153,10 +192,9 @@ fn test_filtered_implicit_chunk_index_fixture_is_rejected() {
     let (_dir, path) =
         patch_filtered_fixed_array_to_implicit("tests/data/hdf5_ref/v4_filtered_chunked.h5");
     let f = File::open(&path).unwrap();
-    let err = f
-        .dataset("filtered_chunked")
-        .unwrap()
-        .read::<i16>()
+    let ds = f.dataset("filtered_chunked").unwrap();
+    let mut values = vec![0i16; dataset_len(&ds).unwrap()];
+    let err = read_dataset_into(&ds, &mut values)
         .expect_err("filtered implicit chunk index should be rejected");
     assert!(
         err.to_string()
@@ -169,9 +207,10 @@ fn test_filtered_implicit_chunk_index_fixture_is_rejected() {
 fn test_v4_implicit_2d_edge_chunks_read() {
     let f = File::open("tests/data/hdf5_ref/v4_implicit_2d_edge_chunks.h5").unwrap();
     let ds = f.dataset("implicit_2d_edge").unwrap();
-    assert_eq!(ds.shape().unwrap(), vec![5, 7]);
+    assert_shape(&ds, &[5, 7]);
 
-    let vals: Vec<i32> = ds.read::<i32>().unwrap();
+    let mut vals = vec![0i32; dataset_len(&ds).unwrap()];
+    read_dataset_into(&ds, &mut vals).unwrap();
     assert_eq!(vals.len(), 5 * 7);
     assert_eq!(vals[0], 0);
     assert_eq!(vals[6], 6);
@@ -183,11 +222,9 @@ fn test_v4_implicit_2d_edge_chunks_read() {
 #[test]
 fn test_sparse_chunked_fill_value_read() {
     let f = File::open("tests/data/hdf5_ref/sparse_chunked_fill_value.h5").unwrap();
-    let vals: Vec<i32> = f
-        .dataset("sparse_chunked_fill")
-        .unwrap()
-        .read::<i32>()
-        .unwrap();
+    let ds = f.dataset("sparse_chunked_fill").unwrap();
+    let mut vals = vec![0i32; dataset_len(&ds).unwrap()];
+    read_dataset_into(&ds, &mut vals).unwrap();
 
     let mut expected = vec![-7; 4 * 6];
     for row in 0..2 {
@@ -201,11 +238,9 @@ fn test_sparse_chunked_fill_value_read() {
 #[test]
 fn test_sparse_chunked_partial_read_combines_present_chunks_and_fill_value() {
     let f = File::open("tests/data/hdf5_ref/sparse_chunked_fill_value.h5").unwrap();
-    let vals: Vec<i32> = f
-        .dataset("sparse_chunked_fill")
-        .unwrap()
-        .read_slice::<i32, _>((1..4, 2..6))
-        .unwrap();
+    let ds = f.dataset("sparse_chunked_fill").unwrap();
+    let mut vals = vec![0i32; 12];
+    read_dataset_slice_into(&ds, (1..4, 2..6), &mut vals).unwrap();
 
     assert_eq!(
         vals,
@@ -220,11 +255,9 @@ fn test_sparse_chunked_partial_read_combines_present_chunks_and_fill_value() {
 #[test]
 fn test_filtered_chunk_mask_skips_unapplied_filters() {
     let f = File::open("tests/data/hdf5_ref/filtered_chunk_filter_mask.h5").unwrap();
-    let vals: Vec<i32> = f
-        .dataset("filtered_chunk_filter_mask")
-        .unwrap()
-        .read::<i32>()
-        .unwrap();
+    let ds = f.dataset("filtered_chunk_filter_mask").unwrap();
+    let mut vals = vec![0i32; dataset_len(&ds).unwrap()];
+    read_dataset_into(&ds, &mut vals).unwrap();
 
     let mut expected = vec![-7; 4 * 6];
     for row in 0..2 {
@@ -240,59 +273,58 @@ fn test_filtered_chunk_mask_skips_unapplied_filters() {
 fn test_filtered_single_chunk_mask_skips_unapplied_filters() {
     let f = File::open("tests/data/hdf5_ref/filtered_single_chunk_filter_mask.h5").unwrap();
     let ds = f.dataset("filtered_single_chunk_filter_mask").unwrap();
-    assert_eq!(ds.shape().unwrap(), vec![2, 3]);
+    assert_shape(&ds, &[2, 3]);
 
-    let vals: Vec<i32> = ds.read::<i32>().unwrap();
-    assert_eq!(vals, (0..6).collect::<Vec<_>>());
+    assert_dataset_values::<i32>(&ds, &(0..6).collect::<Vec<_>>()).unwrap();
 }
 
 #[test]
 fn test_filtered_chunk_mask_skips_middle_filter_in_pipeline() {
     let f = File::open("tests/data/hdf5_ref/filtered_middle_filter_mask.h5").unwrap();
     let ds = f.dataset("filtered_middle_filter_mask").unwrap();
-    assert_eq!(ds.shape().unwrap(), vec![6]);
+    assert_shape(&ds, &[6]);
 
-    let vals: Vec<i32> = ds.read_slice::<i32, _>(2..5).unwrap();
+    let mut vals = vec![0i32; 3];
+    read_dataset_slice_into(&ds, 2..5, &mut vals).unwrap();
     assert_eq!(vals, vec![2, 3, 4]);
 }
 
 #[test]
 fn test_multi_filter_scaleoffset_shuffle_deflate_order() {
     let f = File::open("tests/data/hdf5_ref/multi_filter_orders.h5").unwrap();
-    let vals: Vec<i32> = f
-        .dataset("scaleoffset_shuffle_deflate")
-        .unwrap()
-        .read::<i32>()
-        .unwrap();
-    assert_eq!(vals, (0..32).collect::<Vec<_>>());
+    assert_dataset_values::<i32>(
+        &f.dataset("scaleoffset_shuffle_deflate").unwrap(),
+        &(0..32).collect::<Vec<_>>(),
+    )
+    .unwrap();
 }
 
 #[test]
 fn test_multi_filter_shuffle_deflate_fletcher_order() {
     let f = File::open("tests/data/hdf5_ref/multi_filter_orders.h5").unwrap();
-    let vals: Vec<i32> = f
-        .dataset("shuffle_deflate_fletcher")
-        .unwrap()
-        .read::<i32>()
-        .unwrap();
-    assert_eq!(vals, (0..32).collect::<Vec<_>>());
+    assert_dataset_values::<i32>(
+        &f.dataset("shuffle_deflate_fletcher").unwrap(),
+        &(0..32).collect::<Vec<_>>(),
+    )
+    .unwrap();
 }
 
 #[test]
 fn test_multi_filter_nbit_deflate_order() {
     let f = File::open("tests/data/hdf5_ref/multi_filter_orders.h5").unwrap();
-    let vals: Vec<i32> = f.dataset("nbit_deflate").unwrap().read::<i32>().unwrap();
-    assert_eq!(vals, (0..64).collect::<Vec<_>>());
+    assert_dataset_values::<i32>(
+        &f.dataset("nbit_deflate").unwrap(),
+        &(0..64).collect::<Vec<_>>(),
+    )
+    .unwrap();
 }
 
 #[test]
 fn test_fletcher32_corruption_fails_for_uncompressed_chunk() {
     let f = File::open("tests/data/hdf5_ref/fletcher32_corrupt.h5").unwrap();
-    let err = f
-        .dataset("fletcher32_corrupt")
-        .unwrap()
-        .read::<i32>()
-        .expect_err("bad Fletcher32 checksum should fail");
+    let ds = f.dataset("fletcher32_corrupt").unwrap();
+    let mut values = vec![0i32; dataset_len(&ds).unwrap()];
+    let err = read_dataset_into(&ds, &mut values).expect_err("bad Fletcher32 checksum should fail");
 
     assert!(
         err.to_string().contains("fletcher32 checksum mismatch"),
@@ -303,10 +335,9 @@ fn test_fletcher32_corruption_fails_for_uncompressed_chunk() {
 #[test]
 fn test_fletcher32_corruption_fails_for_deflate_chunk() {
     let f = File::open("tests/data/hdf5_ref/fletcher32_corrupt.h5").unwrap();
-    let err = f
-        .dataset("deflate_fletcher32_corrupt")
-        .unwrap()
-        .read::<i32>()
+    let ds = f.dataset("deflate_fletcher32_corrupt").unwrap();
+    let mut values = vec![0i32; dataset_len(&ds).unwrap()];
+    let err = read_dataset_into(&ds, &mut values)
         .expect_err("bad Fletcher32 checksum should fail before deflate");
 
     assert!(
@@ -318,22 +349,22 @@ fn test_fletcher32_corruption_fails_for_deflate_chunk() {
 #[test]
 fn test_v4_extensible_array_chunks_read() {
     let f = File::open("tests/data/hdf5_ref/v4_extensible_array_chunks.h5").unwrap();
-    let vals: Vec<f64> = f
-        .dataset("extensible_array")
-        .unwrap()
-        .read::<f64>()
-        .unwrap();
-    assert_eq!(vals, (0..80).map(|v| v as f64).collect::<Vec<_>>());
+    assert_dataset_values::<f64>(
+        &f.dataset("extensible_array").unwrap(),
+        &(0..80).map(|v| v as f64).collect::<Vec<_>>(),
+    )
+    .unwrap();
 }
 
 #[test]
 fn test_v4_extensible_array_2d_unlimited_edge_chunks_read() {
     let f = File::open("tests/data/hdf5_ref/v4_extensible_array_2d_unlimited_edges.h5").unwrap();
     let ds = f.dataset("extensible_array_2d_unlimited_edges").unwrap();
-    assert_eq!(ds.shape().unwrap(), vec![5, 7]);
+    assert_shape(&ds, &[5, 7]);
     assert!(ds.space().unwrap().is_resizable());
 
-    let vals: Vec<i32> = ds.read::<i32>().unwrap();
+    let mut vals = vec![0i32; dataset_len(&ds).unwrap()];
+    read_dataset_into(&ds, &mut vals).unwrap();
     assert_eq!(vals.len(), 5 * 7);
     assert_eq!(vals[0], 0);
     assert_eq!(vals[6], 6);
@@ -347,11 +378,10 @@ fn test_v4_extensible_array_header_checksum_corruption_fails() {
     let (_dir, path) =
         corrupt_metadata_checksum("tests/data/hdf5_ref/v4_extensible_array_chunks.h5", b"EAHD");
     let f = File::open(&path).unwrap();
-    let err = f
-        .dataset("extensible_array")
-        .unwrap()
-        .read::<f64>()
-        .expect_err("corrupt chunk index checksum should fail");
+    let ds = f.dataset("extensible_array").unwrap();
+    let mut values = vec![0.0f64; dataset_len(&ds).unwrap()];
+    let err =
+        read_dataset_into(&ds, &mut values).expect_err("corrupt chunk index checksum should fail");
     assert!(
         err.to_string()
             .contains("extensible array header checksum mismatch"),
@@ -362,11 +392,9 @@ fn test_v4_extensible_array_header_checksum_corruption_fails() {
 #[test]
 fn test_v4_extensible_array_spillover_chunks_read() {
     let f = File::open("tests/data/hdf5_ref/v4_extensible_array_spillover.h5").unwrap();
-    let vals: Vec<f64> = f
-        .dataset("extensible_array_spillover")
-        .unwrap()
-        .read::<f64>()
-        .unwrap();
+    let ds = f.dataset("extensible_array_spillover").unwrap();
+    let mut vals = vec![0.0f64; dataset_len(&ds).unwrap()];
+    read_dataset_into(&ds, &mut vals).unwrap();
     assert_eq!(vals.len(), 4096);
     assert_eq!(vals[0], 0.0);
     assert_eq!(vals[8], 8.0);
@@ -376,11 +404,9 @@ fn test_v4_extensible_array_spillover_chunks_read() {
 #[test]
 fn test_v4_extensible_array_sparse_transition_chunks_read() {
     let f = File::open("tests/data/hdf5_ref/v4_extensible_array_sparse_transitions.h5").unwrap();
-    let vals: Vec<i32> = f
-        .dataset("extensible_array_sparse_transitions")
-        .unwrap()
-        .read::<i32>()
-        .unwrap();
+    let ds = f.dataset("extensible_array_sparse_transitions").unwrap();
+    let mut vals = vec![0i32; dataset_len(&ds).unwrap()];
+    read_dataset_into(&ds, &mut vals).unwrap();
 
     assert_eq!(vals.len(), 4096);
     for idx in [
@@ -397,8 +423,11 @@ fn test_v4_extensible_array_sparse_transition_chunks_read() {
 #[test]
 fn test_v4_btree2_chunks_read() {
     let f = File::open("tests/data/hdf5_ref/v4_btree2_chunks.h5").unwrap();
-    let vals: Vec<i32> = f.dataset("btree_v2").unwrap().read::<i32>().unwrap();
-    assert_eq!(vals, (0..64).collect::<Vec<_>>());
+    assert_dataset_values::<i32>(
+        &f.dataset("btree_v2").unwrap(),
+        &(0..64).collect::<Vec<_>>(),
+    )
+    .unwrap();
 }
 
 #[test]
@@ -411,11 +440,9 @@ fn test_v4_btree2_header_checksum_corruption_fails() {
 #[test]
 fn test_v4_btree2_internal_chunks_read() {
     let f = File::open("tests/data/hdf5_ref/v4_btree2_internal_chunks.h5").unwrap();
-    let vals: Vec<i32> = f
-        .dataset("btree_v2_internal")
-        .unwrap()
-        .read::<i32>()
-        .unwrap();
+    let ds = f.dataset("btree_v2_internal").unwrap();
+    let mut vals = vec![0i32; dataset_len(&ds).unwrap()];
+    read_dataset_into(&ds, &mut vals).unwrap();
     assert_eq!(vals.len(), 80 * 80);
     assert_eq!(vals[0], 0);
     assert_eq!(vals[79], 79);
@@ -426,11 +453,9 @@ fn test_v4_btree2_internal_chunks_read() {
 #[test]
 fn test_v4_btree2_deep_internal_chunks_read() {
     let f = File::open("tests/data/hdf5_ref/v4_btree2_deep_internal_chunks.h5").unwrap();
-    let vals: Vec<i32> = f
-        .dataset("btree_v2_deep_internal")
-        .unwrap()
-        .read::<i32>()
-        .unwrap();
+    let ds = f.dataset("btree_v2_deep_internal").unwrap();
+    let mut vals = vec![0i32; dataset_len(&ds).unwrap()];
+    read_dataset_into(&ds, &mut vals).unwrap();
     assert_eq!(vals.len(), 160 * 160);
     assert_eq!(vals[0], 0);
     assert_eq!(vals[159], 159);
@@ -441,11 +466,9 @@ fn test_v4_btree2_deep_internal_chunks_read() {
 #[test]
 fn test_v4_btree2_filtered_chunk_mask_read() {
     let f = File::open("tests/data/hdf5_ref/v4_btree2_filtered_mask.h5").unwrap();
-    let vals: Vec<i32> = f
-        .dataset("btree_v2_filtered_mask")
-        .unwrap()
-        .read::<i32>()
-        .unwrap();
+    let ds = f.dataset("btree_v2_filtered_mask").unwrap();
+    let mut vals = vec![0i32; dataset_len(&ds).unwrap()];
+    read_dataset_into(&ds, &mut vals).unwrap();
 
     assert_eq!(
         vals,
@@ -461,32 +484,42 @@ fn test_v4_btree2_filtered_chunk_mask_read() {
 #[test]
 fn test_nbit_filter_i32_read() {
     let f = File::open("tests/data/hdf5_ref/nbit_filter_i32.h5").unwrap();
-    let vals: Vec<i32> = f.dataset("nbit_i32").unwrap().read::<i32>().unwrap();
-    assert_eq!(vals, (0..100).collect::<Vec<_>>());
+    assert_dataset_values::<i32>(
+        &f.dataset("nbit_i32").unwrap(),
+        &(0..100).collect::<Vec<_>>(),
+    )
+    .unwrap();
 }
 
 #[test]
 fn test_nbit_filter_big_endian_i32_read() {
     let f = File::open("tests/data/hdf5_ref/nbit_filter_be_i32.h5").unwrap();
-    let vals: Vec<i32> = f.dataset("nbit_be_i32").unwrap().read::<i32>().unwrap();
-    assert_eq!(vals, (0..100).collect::<Vec<_>>());
+    assert_dataset_values::<i32>(
+        &f.dataset("nbit_be_i32").unwrap(),
+        &(0..100).collect::<Vec<_>>(),
+    )
+    .unwrap();
 }
 
 #[test]
 fn test_nbit_filter_signed_unsigned_and_float_parity_vectors() {
     let f = File::open("tests/data/hdf5_ref/nbit_parity_vectors.h5").unwrap();
 
-    let signed: Vec<i16> = f.dataset("nbit_i16_signed").unwrap().read::<i16>().unwrap();
-    assert_eq!(signed, vec![-32768, -257, -1, 0, 1, 255, 1024, 32767]);
+    assert_dataset_values::<i16>(
+        &f.dataset("nbit_i16_signed").unwrap(),
+        &[-32768, -257, -1, 0, 1, 255, 1024, 32767],
+    )
+    .unwrap();
 
-    let unsigned: Vec<u16> = f
-        .dataset("nbit_u16_unsigned")
-        .unwrap()
-        .read::<u16>()
-        .unwrap();
-    assert_eq!(unsigned, vec![0, 1, 255, 256, 1024, 32768, 65535]);
+    assert_dataset_values::<u16>(
+        &f.dataset("nbit_u16_unsigned").unwrap(),
+        &[0, 1, 255, 256, 1024, 32768, 65535],
+    )
+    .unwrap();
 
-    let floats: Vec<f32> = f.dataset("nbit_f32").unwrap().read::<f32>().unwrap();
+    let ds = f.dataset("nbit_f32").unwrap();
+    let mut floats = vec![0.0f32; dataset_len(&ds).unwrap()];
+    read_dataset_into(&ds, &mut floats).unwrap();
     let expected = [-0.0f32, 1.5, -2.25, 123.5, f32::INFINITY, f32::NEG_INFINITY];
     assert_eq!(
         floats
@@ -505,13 +538,16 @@ fn test_nbit_filter_compound_member_parity_vectors() {
     let f = File::open("tests/data/hdf5_ref/nbit_parity_vectors.h5").unwrap();
     let ds = f.dataset("nbit_compound_members").unwrap();
 
-    let codes: Vec<i16> = ds.read_field::<i16>("code").unwrap();
+    let mut codes = vec![0i16; dataset_len(&ds).unwrap()];
+    read_dataset_field_into(&ds, "code", &mut codes).unwrap();
     assert_eq!(codes, vec![-7, 12, -1024]);
 
-    let counts: Vec<u16> = ds.read_field::<u16>("count").unwrap();
+    let mut counts = vec![0u16; dataset_len(&ds).unwrap()];
+    read_dataset_field_into(&ds, "count", &mut counts).unwrap();
     assert_eq!(counts, vec![3, 65530, 42]);
 
-    let scores: Vec<f32> = ds.read_field::<f32>("score").unwrap();
+    let mut scores = vec![0.0f32; dataset_len(&ds).unwrap()];
+    read_dataset_field_into(&ds, "score", &mut scores).unwrap();
     assert_eq!(
         scores
             .iter()
@@ -527,25 +563,29 @@ fn test_nbit_filter_compound_member_parity_vectors() {
 #[test]
 fn test_scaleoffset_filter_i32_read() {
     let f = File::open("tests/data/hdf5_ref/scaleoffset_filter_i32.h5").unwrap();
-    let vals: Vec<i32> = f.dataset("scaleoffset_i32").unwrap().read::<i32>().unwrap();
-    assert_eq!(vals, (0..100).collect::<Vec<_>>());
+    assert_dataset_values::<i32>(
+        &f.dataset("scaleoffset_i32").unwrap(),
+        &(0..100).collect::<Vec<_>>(),
+    )
+    .unwrap();
 }
 
 #[test]
 fn test_scaleoffset_filter_big_endian_i32_read() {
     let f = File::open("tests/data/hdf5_ref/scaleoffset_filter_be_i32.h5").unwrap();
-    let vals: Vec<i32> = f
-        .dataset("scaleoffset_be_i32")
-        .unwrap()
-        .read::<i32>()
-        .unwrap();
-    assert_eq!(vals, (0..100).collect::<Vec<_>>());
+    assert_dataset_values::<i32>(
+        &f.dataset("scaleoffset_be_i32").unwrap(),
+        &(0..100).collect::<Vec<_>>(),
+    )
+    .unwrap();
 }
 
 #[test]
 fn test_scaleoffset_filter_f32_read() {
     let f = File::open("tests/data/hdf5_ref/scaleoffset_filter_i32.h5").unwrap();
-    let vals: Vec<f32> = f.dataset("scaleoffset_f32").unwrap().read::<f32>().unwrap();
+    let ds = f.dataset("scaleoffset_f32").unwrap();
+    let mut vals = vec![0.0f32; dataset_len(&ds).unwrap()];
+    read_dataset_into(&ds, &mut vals).unwrap();
     let expected: Vec<f32> = (0..40).map(|v| v as f32 / 10.0 + 1.25).collect();
     for (actual, expected) in vals.iter().zip(expected) {
         assert!((*actual - expected).abs() < 0.011);
@@ -556,46 +596,39 @@ fn test_scaleoffset_filter_f32_read() {
 fn test_scaleoffset_integer_parity_vectors() {
     let f = File::open("tests/data/hdf5_ref/scaleoffset_parity_vectors.h5").unwrap();
 
-    let signed: Vec<i16> = f
-        .dataset("scaleoffset_i16_signed")
-        .unwrap()
-        .read::<i16>()
-        .unwrap();
-    assert_eq!(signed, vec![-120, -17, -1, 0, 5, 63, 127]);
+    assert_dataset_values::<i16>(
+        &f.dataset("scaleoffset_i16_signed").unwrap(),
+        &[-120, -17, -1, 0, 5, 63, 127],
+    )
+    .unwrap();
 
-    let unsigned: Vec<u16> = f
-        .dataset("scaleoffset_u16_minbits")
-        .unwrap()
-        .read::<u16>()
-        .unwrap();
-    assert_eq!(unsigned, vec![1000, 1001, 1003, 1007, 1015, 1023]);
+    assert_dataset_values::<u16>(
+        &f.dataset("scaleoffset_u16_minbits").unwrap(),
+        &[1000, 1001, 1003, 1007, 1015, 1023],
+    )
+    .unwrap();
 
-    let zero_minbits: Vec<i32> = f
-        .dataset("scaleoffset_i32_zero_minbits")
-        .unwrap()
-        .read::<i32>()
-        .unwrap();
-    assert_eq!(zero_minbits, vec![-42; 8]);
+    assert_dataset_values::<i32>(
+        &f.dataset("scaleoffset_i32_zero_minbits").unwrap(),
+        &[-42; 8],
+    )
+    .unwrap();
 }
 
 #[test]
 fn test_scaleoffset_float_parity_vectors() {
     let f = File::open("tests/data/hdf5_ref/scaleoffset_parity_vectors.h5").unwrap();
 
-    let f32_vals: Vec<f32> = f
-        .dataset("scaleoffset_f32_dscale")
-        .unwrap()
-        .read::<f32>()
-        .unwrap();
+    let ds = f.dataset("scaleoffset_f32_dscale").unwrap();
+    let mut f32_vals = vec![0.0f32; dataset_len(&ds).unwrap()];
+    read_dataset_into(&ds, &mut f32_vals).unwrap();
     for (actual, expected) in f32_vals.iter().zip([-1.25, -0.5, 0.0, 1.25, 3.5]) {
         assert!((*actual - expected).abs() < 0.011);
     }
 
-    let f64_vals: Vec<f64> = f
-        .dataset("scaleoffset_f64_dscale")
-        .unwrap()
-        .read::<f64>()
-        .unwrap();
+    let ds = f.dataset("scaleoffset_f64_dscale").unwrap();
+    let mut f64_vals = vec![0.0f64; dataset_len(&ds).unwrap()];
+    read_dataset_into(&ds, &mut f64_vals).unwrap();
     for (actual, expected) in f64_vals.iter().zip([-100.125, -1.5, 0.25, 12.75, 2048.5]) {
         assert!((*actual - expected).abs() < 0.0011);
     }

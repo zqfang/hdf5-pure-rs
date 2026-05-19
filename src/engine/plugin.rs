@@ -50,10 +50,31 @@ pub fn H5PL__expand_cache(cache: &mut PluginCache, additional: usize) {
 }
 
 #[allow(non_snake_case)]
-pub fn H5PL__add_plugin(cache: &mut PluginCache, name: impl Into<String>) {
-    let name = name.into();
+pub fn H5PL__add_plugin_ref(cache: &mut PluginCache, name: &str) {
+    if !cache.plugins.iter().any(|plugin| plugin == name) {
+        cache.plugins.push(name.to_owned());
+    }
+}
+
+#[allow(non_snake_case)]
+pub fn H5PL__add_plugin_owned(cache: &mut PluginCache, name: String) {
     if !cache.plugins.contains(&name) {
         cache.plugins.push(name);
+    }
+}
+
+#[allow(non_snake_case)]
+pub fn H5PL__plugin_cache_iter(cache: &PluginCache) -> impl Iterator<Item = &str> {
+    cache.plugins.iter().map(String::as_str)
+}
+
+#[allow(non_snake_case)]
+pub fn H5PL__plugin_cache_iterate_with<F>(cache: &PluginCache, mut callback: F)
+where
+    F: FnMut(&str),
+{
+    for plugin in H5PL__plugin_cache_iter(cache) {
+        callback(plugin);
     }
 }
 
@@ -85,9 +106,28 @@ pub fn H5PL_load(registry: &mut PluginRegistry, name: &str) -> Result<()> {
         return Err(Error::Unsupported("plugin loading is disabled".into()));
     }
     if registry.cache.plugins.iter().any(|plugin| plugin == name) {
+        if let Some(count) = registry.open_plugins.get_mut(name) {
+            *count += 1;
+        } else {
+            registry.open_plugins.insert(name.to_owned(), 1);
+        }
+        Ok(())
+    } else {
+        Err(Error::Unsupported(format!(
+            "dynamic plugin loading is not supported for '{name}'"
+        )))
+    }
+}
+
+#[allow(non_snake_case)]
+pub fn H5PL_load_owned(registry: &mut PluginRegistry, name: String) -> Result<()> {
+    if !registry.loading_enabled {
+        return Err(Error::Unsupported("plugin loading is disabled".into()));
+    }
+    if registry.cache.plugins.iter().any(|plugin| plugin == &name) {
         registry
             .open_plugins
-            .entry(name.to_string())
+            .entry(name)
             .and_modify(|count| *count += 1)
             .or_insert(1);
         Ok(())
@@ -116,8 +156,22 @@ pub fn H5PL__close(registry: &mut PluginRegistry, name: &str) -> Result<()> {
 }
 
 #[allow(non_snake_case)]
-pub fn H5PL_iterate(registry: &PluginRegistry) -> Vec<String> {
-    registry.cache.plugins.clone()
+pub fn H5PL_iterate_into(registry: &PluginRegistry, plugins: &mut Vec<String>) {
+    plugins.clear();
+    plugins.extend(H5PL_iter_plugins(registry).map(str::to_owned));
+}
+
+#[allow(non_snake_case)]
+pub fn H5PL_iter_plugins(registry: &PluginRegistry) -> impl Iterator<Item = &str> {
+    H5PL__plugin_cache_iter(&registry.cache)
+}
+
+#[allow(non_snake_case)]
+pub fn H5PL_iterate_with<F>(registry: &PluginRegistry, callback: F)
+where
+    F: FnMut(&str),
+{
+    H5PL__plugin_cache_iterate_with(&registry.cache, callback);
 }
 
 #[allow(non_snake_case)]
@@ -218,13 +272,18 @@ pub fn H5PL__insert_path(
 }
 
 #[allow(non_snake_case)]
-pub fn H5PL__remove_path(table: &mut PluginPathTable, index: usize) -> Result<PathBuf> {
+pub fn H5PL__remove_path_into(
+    table: &mut PluginPathTable,
+    index: usize,
+    removed: &mut PathBuf,
+) -> Result<()> {
     if index >= table.paths.len() {
         return Err(Error::InvalidFormat(format!(
             "plugin path index {index} out of range"
         )));
     }
-    Ok(table.paths.remove(index))
+    *removed = table.paths.remove(index);
+    Ok(())
 }
 
 #[allow(non_snake_case)]
@@ -237,28 +296,41 @@ pub fn H5PL__get_path(table: &PluginPathTable, index: usize) -> Result<&Path> {
 }
 
 #[allow(non_snake_case)]
-pub fn H5PL__path_table_iterate(table: &PluginPathTable) -> Vec<PathBuf> {
-    table.paths.clone()
+pub fn H5PL__path_table_paths(table: &PluginPathTable) -> impl Iterator<Item = &Path> {
+    table.paths.iter().map(PathBuf::as_path)
 }
 
 #[allow(non_snake_case)]
-pub fn H5PL__path_table_iterate_process_path(path: &Path) -> PathBuf {
-    path.to_path_buf()
+pub fn H5PL__path_table_iterate_with<F>(table: &PluginPathTable, mut callback: F)
+where
+    F: FnMut(&Path),
+{
+    for path in H5PL__path_table_paths(table) {
+        callback(path);
+    }
 }
 
 #[allow(non_snake_case)]
-pub fn H5PL__find_plugin_in_path_table(table: &PluginPathTable, name: &str) -> Option<PathBuf> {
-    table
-        .paths
-        .iter()
-        .map(|path| path.join(name))
-        .find(|candidate| candidate.exists())
+pub fn H5PL__path_table_iterate_into(table: &PluginPathTable, paths: &mut Vec<PathBuf>) {
+    paths.clear();
+    paths.extend(H5PL__path_table_paths(table).map(Path::to_path_buf));
 }
 
 #[allow(non_snake_case)]
-pub fn H5PL__find_plugin_in_path(path: &Path, name: &str) -> Option<PathBuf> {
-    let candidate = path.join(name);
-    candidate.exists().then_some(candidate)
+pub fn H5PL__find_plugin_in_path_table_into(
+    table: &PluginPathTable,
+    name: &str,
+    candidate: &mut PathBuf,
+) -> bool {
+    H5PL__path_table_paths(table).any(|path| H5PL__find_plugin_in_path_into(path, name, candidate))
+}
+
+#[allow(non_snake_case)]
+pub fn H5PL__find_plugin_in_path_into(path: &Path, name: &str, candidate: &mut PathBuf) -> bool {
+    candidate.clear();
+    candidate.push(path);
+    candidate.push(name);
+    candidate.exists()
 }
 
 #[allow(non_snake_case)]
@@ -295,8 +367,20 @@ pub fn H5PLinsert(
 }
 
 #[allow(non_snake_case)]
+#[deprecated(note = "use H5PLremove_into with caller-provided PathBuf storage")]
 pub fn H5PLremove(registry: &mut PluginRegistry, index: usize) -> Result<PathBuf> {
-    H5PL__remove_path(&mut registry.paths, index)
+    let mut removed = PathBuf::new();
+    H5PLremove_into(registry, index, &mut removed)?;
+    Ok(removed)
+}
+
+#[allow(non_snake_case)]
+pub fn H5PLremove_into(
+    registry: &mut PluginRegistry,
+    index: usize,
+    removed: &mut PathBuf,
+) -> Result<()> {
+    H5PL__remove_path_into(&mut registry.paths, index, removed)
 }
 
 #[allow(non_snake_case)]
@@ -321,15 +405,79 @@ mod tests {
         H5PLinsert(&mut registry, 1, "/mid").unwrap();
         assert_eq!(H5PLsize(&registry), 3);
         assert_eq!(H5PLget(&registry, 1).unwrap(), Path::new("/mid"));
-        assert_eq!(H5PLremove(&mut registry, 1).unwrap(), PathBuf::from("/mid"));
+        assert_eq!(
+            H5PL__path_table_paths(&registry.paths).collect::<Vec<_>>(),
+            vec![Path::new("/a"), Path::new("/mid"), Path::new("/b")]
+        );
+        let mut removed = PathBuf::new();
+        H5PLremove_into(&mut registry, 1, &mut removed).unwrap();
+        assert_eq!(removed, PathBuf::from("/mid"));
     }
 
     #[test]
     fn plugin_load_is_explicitly_unsupported_without_cached_plugin() {
         let mut registry = H5PL__init_package();
         assert!(H5PL_load(&mut registry, "missing").is_err());
-        H5PL__add_plugin(&mut registry.cache, "known");
+        H5PL__add_plugin_ref(&mut registry.cache, "known");
         H5PL_load(&mut registry, "known").unwrap();
+        H5PL_load_owned(&mut registry, "known".to_owned()).unwrap();
+        assert_eq!(registry.open_plugins.get("known"), Some(&2));
         H5PL__close(&mut registry, "known").unwrap();
+        H5PL__close(&mut registry, "known").unwrap();
+    }
+
+    #[test]
+    fn plugin_iterators_and_path_search_use_borrowed_or_caller_storage() {
+        let mut registry = H5PL__init_package();
+        H5PL__add_plugin_ref(&mut registry.cache, "known");
+        H5PL__add_plugin_owned(&mut registry.cache, "owned".to_owned());
+        assert_eq!(
+            H5PL_iter_plugins(&registry).collect::<Vec<_>>(),
+            vec!["known", "owned"]
+        );
+
+        let mut plugin_names = vec!["stale".to_string()];
+        H5PL_iterate_into(&registry, &mut plugin_names);
+        assert_eq!(plugin_names, vec!["known", "owned"]);
+
+        let mut visited = Vec::new();
+        H5PL_iterate_with(&registry, |plugin| visited.push(plugin.to_owned()));
+        assert_eq!(visited, vec!["known", "owned"]);
+
+        H5PLappend(&mut registry, "/tmp");
+        let mut path_count = 0;
+        H5PL__path_table_iterate_with(&registry.paths, |path| {
+            assert_eq!(path, Path::new("/tmp"));
+            path_count += 1;
+        });
+        assert_eq!(path_count, 1);
+
+        let mut paths = vec![PathBuf::from("stale")];
+        H5PL__path_table_iterate_into(&registry.paths, &mut paths);
+        assert_eq!(paths, vec![PathBuf::from("/tmp")]);
+
+        let mut candidate = PathBuf::from("stale");
+        assert!(!H5PL__find_plugin_in_path_table_into(
+            &registry.paths,
+            "definitely-missing-hdf5-plugin",
+            &mut candidate
+        ));
+        assert_eq!(
+            candidate,
+            PathBuf::from("/tmp/definitely-missing-hdf5-plugin")
+        );
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn allocating_public_plugin_remove_wrapper_remains_callable() {
+        let mut registry = H5PL__init_package();
+        H5PL__add_plugin_ref(&mut registry.cache, "known");
+        let mut names = Vec::new();
+        H5PL_iterate_into(&registry, &mut names);
+        assert_eq!(names, vec!["known"]);
+
+        H5PLappend(&mut registry, "/tmp");
+        assert_eq!(H5PLremove(&mut registry, 0).unwrap(), PathBuf::from("/tmp"));
     }
 }

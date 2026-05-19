@@ -1,3 +1,6 @@
+use std::borrow::Cow;
+use std::cmp::Ordering;
+use std::fmt;
 use std::fs;
 use std::io::BufReader;
 use std::sync::Arc;
@@ -6,7 +9,8 @@ use parking_lot::Mutex;
 
 use crate::error::{Error, Result};
 use crate::format::btree_v2;
-use crate::format::fractal_heap::FractalHeapHeader;
+use crate::format::checksum::checksum_lookup3;
+use crate::format::fractal_heap::{FractalHeapHeader, FractalHeapManagedObjectCache};
 use crate::format::messages::attribute::AttributeMessage;
 use crate::format::messages::attribute_info::AttributeInfoMessage;
 use crate::format::messages::dataspace::{DataspaceMessage, DataspaceType};
@@ -80,6 +84,18 @@ impl AttributeTable {
             .filter_map(|entry| entry.creation_order)
             .max()
             .map_or(0, |value| value.saturating_add(1))
+    }
+
+    /// Iterate over table entries without cloning the attribute messages.
+    pub fn iter(&self) -> Result<impl Iterator<Item = &AttributeTableEntry> + '_> {
+        self.ensure_open()?;
+        Ok(self.attrs.iter())
+    }
+
+    /// Iterate over table entry names as borrowed strings.
+    pub fn names(&self) -> Result<impl Iterator<Item = &str> + '_> {
+        self.ensure_open()?;
+        Ok(self.attrs.iter().map(|entry| entry.attr.name.as_str()))
     }
 }
 
@@ -191,82 +207,61 @@ pub fn H5A__create_by_name_api_common(
     H5A__create_by_name(table, name, data)
 }
 
-/// Deprecated 1.6-era public attribute-create entry point. Mirrors
-/// `H5Acreate1`; superseded by `H5Acreate2`.
+/// Look up an attribute by name and borrow its table entry.
 #[allow(non_snake_case)]
-pub fn H5Acreate1(table: &mut AttributeTable, name: &str, data: Vec<u8>) -> Result<()> {
-    H5A__create_api_common(table, name, data)
-}
-
-/// Look up an attribute by name and return a clone of its table entry.
-/// Mirrors libhdf5's `H5A__open_common`.
-#[allow(non_snake_case)]
-pub fn H5A__open_common(table: &AttributeTable, name: &str) -> Result<AttributeTableEntry> {
+pub fn H5A__open_common_ref<'a>(
+    table: &'a AttributeTable,
+    name: &str,
+) -> Result<&'a AttributeTableEntry> {
     table.ensure_open()?;
     table
         .attrs
         .iter()
         .find(|entry| entry.attr.name == name)
-        .cloned()
         .ok_or_else(|| Error::InvalidFormat(format!("attribute '{name}' not found")))
 }
 
-/// Open an attribute by name. Mirrors `H5A__open`.
+/// Open an attribute by name, borrowing the table entry.
 #[allow(non_snake_case)]
-pub fn H5A__open(table: &AttributeTable, name: &str) -> Result<AttributeTableEntry> {
-    H5A__open_common(table, name)
+pub fn H5A__open_ref<'a>(table: &'a AttributeTable, name: &str) -> Result<&'a AttributeTableEntry> {
+    H5A__open_common_ref(table, name)
 }
 
-/// Common API entry point for opening an attribute by name. Mirrors
-/// `H5A__open_api_common`.
+/// Common API entry point for borrowing an attribute by name.
 #[allow(non_snake_case)]
-pub fn H5A__open_api_common(table: &AttributeTable, name: &str) -> Result<AttributeTableEntry> {
-    H5A__open_common(table, name)
-}
-
-/// Common API entry point for opening an attribute on a named object.
-/// Mirrors `H5A__open_by_name_api_common`.
-#[allow(non_snake_case)]
-pub fn H5A__open_by_name_api_common(
-    table: &AttributeTable,
+pub fn H5A__open_api_common_ref<'a>(
+    table: &'a AttributeTable,
     name: &str,
-) -> Result<AttributeTableEntry> {
-    H5A__open_common(table, name)
+) -> Result<&'a AttributeTableEntry> {
+    H5A__open_common_ref(table, name)
 }
 
-/// Deprecated 1.6-era public open-by-name entry point. Mirrors
-/// `H5Aopen_name`; superseded by `H5Aopen`.
+/// Common API entry point for borrowing an attribute on a named object.
 #[allow(non_snake_case)]
-pub fn H5Aopen_name(table: &AttributeTable, name: &str) -> Result<AttributeTableEntry> {
-    H5A__open_common(table, name)
+pub fn H5A__open_by_name_api_common_ref<'a>(
+    table: &'a AttributeTable,
+    name: &str,
+) -> Result<&'a AttributeTableEntry> {
+    H5A__open_common_ref(table, name)
 }
 
-/// Open an attribute by its index in the table. Mirrors `H5A__open_by_idx`.
+/// Open an attribute by its index, borrowing the table entry.
 #[allow(non_snake_case)]
-pub fn H5A__open_by_idx(table: &AttributeTable, index: usize) -> Result<AttributeTableEntry> {
+pub fn H5A__open_by_idx_ref(table: &AttributeTable, index: usize) -> Result<&AttributeTableEntry> {
     table.ensure_open()?;
     table
         .attrs
         .get(index)
-        .cloned()
         .ok_or_else(|| Error::InvalidFormat(format!("attribute index {index} out of range")))
 }
 
-/// Common API entry point for opening an attribute by index. Mirrors
-/// `H5A__open_by_idx_api_common`.
+/// Common API entry point for borrowing an attribute by index.
 #[allow(non_snake_case)]
-pub fn H5A__open_by_idx_api_common(
+pub fn H5A__open_by_idx_api_common_ref(
     table: &AttributeTable,
     index: usize,
-) -> Result<AttributeTableEntry> {
-    H5A__open_by_idx(table, index)
-}
-
-/// Deprecated 1.6-era open-by-index entry point. Mirrors `H5Aopen_idx`;
-/// superseded by `H5Aopen_by_idx`.
-#[allow(non_snake_case)]
-pub fn H5Aopen_idx(table: &AttributeTable, index: usize) -> Result<AttributeTableEntry> {
-    H5A__open_by_idx(table, index)
+) -> Result<&AttributeTableEntry> {
+    H5A__open_by_idx_ref(table, index)
 }
 
 /// Return the attribute's name. Mirrors `H5A__get_name`.
@@ -281,22 +276,22 @@ pub fn H5Aget_name(entry: &AttributeTableEntry) -> &str {
     H5A__get_name(entry)
 }
 
-/// Return a copy of the dataspace of an attribute. Mirrors `H5A_get_space`.
+/// Borrow the dataspace message of an attribute.
 #[allow(non_snake_case)]
-pub fn H5A_get_space(entry: &AttributeTableEntry) -> DataspaceMessage {
-    entry.attr.dataspace.clone()
+pub fn H5A_get_space_ref(entry: &AttributeTableEntry) -> &DataspaceMessage {
+    &entry.attr.dataspace
 }
 
-/// Return a copy of the datatype of an attribute. Mirrors `H5A__get_type`.
+/// Borrow the datatype message of an attribute.
 #[allow(non_snake_case)]
-pub fn H5A__get_type(entry: &AttributeTableEntry) -> DatatypeMessage {
-    entry.attr.datatype.clone()
+pub fn H5A__get_type_ref(entry: &AttributeTableEntry) -> &DatatypeMessage {
+    &entry.attr.datatype
 }
 
-/// Get a copy of the datatype for an attribute. Mirrors `H5Aget_type`.
+/// Borrow the datatype for an attribute.
 #[allow(non_snake_case)]
-pub fn H5Aget_type(entry: &AttributeTableEntry) -> DatatypeMessage {
-    H5A__get_type(entry)
+pub fn H5Aget_type_ref(entry: &AttributeTableEntry) -> &DatatypeMessage {
+    H5A__get_type_ref(entry)
 }
 
 /// Return a copy of the attribute's creation property list. Mirrors
@@ -339,14 +334,28 @@ pub fn H5A__get_info(entry: &AttributeTableEntry) -> AttributeInfo {
 /// `H5Aget_info_by_name`.
 #[allow(non_snake_case)]
 pub fn H5Aget_info_by_name(table: &AttributeTable, name: &str) -> Result<AttributeInfo> {
-    H5A__open_common(table, name).map(|entry| H5A__get_info(&entry))
+    H5A__open_common_ref(table, name).map(H5A__get_info)
 }
 
-/// Return a copy of the attribute's raw bytes. Mirrors `H5A__read` /
-/// `H5Aread`.
+/// Borrow the attribute's raw value bytes without copying.
 #[allow(non_snake_case)]
-pub fn H5A__read(entry: &AttributeTableEntry) -> Vec<u8> {
-    entry.attr.data.clone()
+pub fn H5A__read_bytes(entry: &AttributeTableEntry) -> &[u8] {
+    &entry.attr.data
+}
+
+/// Copy the attribute's raw bytes into caller-provided storage. Mirrors the
+/// caller-buffer shape of `H5Aread`.
+#[allow(non_snake_case)]
+pub fn H5A__read_into(entry: &AttributeTableEntry, out: &mut [u8]) -> Result<()> {
+    if out.len() != entry.attr.data.len() {
+        return Err(Error::InvalidFormat(format!(
+            "attribute output buffer has {} bytes, expected {}",
+            out.len(),
+            entry.attr.data.len()
+        )));
+    }
+    out.copy_from_slice(&entry.attr.data);
+    Ok(())
 }
 
 /// Replace an attribute's data bytes with `data`. Mirrors `H5A__write` /
@@ -357,10 +366,16 @@ pub fn H5A__write(entry: &mut AttributeTableEntry, data: &[u8]) {
     entry.attr.data.extend_from_slice(data);
 }
 
-/// Return a deep copy of an attribute table entry. Mirrors `H5A__copy`.
+/// Borrow an attribute table entry where ownership is not required.
 #[allow(non_snake_case)]
-pub fn H5A__copy(entry: &AttributeTableEntry) -> AttributeTableEntry {
-    entry.clone()
+pub fn H5A__copy_ref(entry: &AttributeTableEntry) -> &AttributeTableEntry {
+    entry
+}
+
+/// Copy an attribute table entry into caller-provided storage.
+#[allow(non_snake_case)]
+pub fn H5A__copy_into(entry: &AttributeTableEntry, out: &mut AttributeTableEntry) {
+    out.clone_from(entry);
 }
 
 /// Release the shared part of an attribute, dropping its reference count to
@@ -419,33 +434,38 @@ pub fn H5A__exists_by_name_api_common(table: &AttributeTable, name: &str) -> Res
     H5A__exists_by_name(table, name)
 }
 
-/// Build a sorted table of attributes from compact (object-header) storage.
-/// Mirrors `H5A__compact_build_table`.
+/// Visit compact-storage attributes without materializing a cloned table.
 #[allow(non_snake_case)]
-pub fn H5A__compact_build_table(table: &AttributeTable) -> Result<Vec<AttributeTableEntry>> {
+pub fn H5A__compact_visit_table<F>(table: &AttributeTable, mut visitor: F) -> Result<()>
+where
+    F: FnMut(&AttributeTableEntry) -> Result<()>,
+{
     table.ensure_open()?;
-    Ok(table.attrs.clone())
+    for entry in &table.attrs {
+        visitor(entry)?;
+    }
+    Ok(())
 }
 
-/// Object-header iterator callback that copies a single attribute into the
-/// compact build table. Mirrors `H5A__compact_build_table_cb`.
+/// Object-header iterator callback that borrows a compact attribute entry.
 #[allow(non_snake_case)]
-pub fn H5A__compact_build_table_cb(entry: &AttributeTableEntry) -> AttributeTableEntry {
-    entry.clone()
+pub fn H5A__compact_build_table_cb_ref(entry: &AttributeTableEntry) -> &AttributeTableEntry {
+    entry
 }
 
-/// Build a sorted table of attributes from dense (fractal-heap + B-tree)
-/// storage. Mirrors `H5A__dense_build_table`.
+/// Visit dense-storage attributes without materializing a cloned table.
 #[allow(non_snake_case)]
-pub fn H5A__dense_build_table(table: &AttributeTable) -> Result<Vec<AttributeTableEntry>> {
-    H5A__compact_build_table(table)
+pub fn H5A__dense_visit_table<F>(table: &AttributeTable, visitor: F) -> Result<()>
+where
+    F: FnMut(&AttributeTableEntry) -> Result<()>,
+{
+    H5A__compact_visit_table(table, visitor)
 }
 
-/// Callback used while building a table of attributes from dense storage.
-/// Mirrors `H5A__dense_build_table_cb`.
+/// Callback used while visiting dense storage without cloning the entry.
 #[allow(non_snake_case)]
-pub fn H5A__dense_build_table_cb(entry: &AttributeTableEntry) -> AttributeTableEntry {
-    entry.clone()
+pub fn H5A__dense_build_table_cb_ref(entry: &AttributeTableEntry) -> &AttributeTableEntry {
+    entry
 }
 
 /// Comparator that orders attributes by name in decreasing alphabetic order.
@@ -477,18 +497,10 @@ pub fn H5A__get_ainfo(table: &AttributeTable) -> Result<usize> {
     Ok(table.attrs.len())
 }
 
-/// Return the number of attributes attached to the object. Mirrors the
-/// deprecated `H5Aget_num_attrs`.
+/// Retrieve the borrowed name of the attribute at `index` in iteration order.
 #[allow(non_snake_case)]
-pub fn H5Aget_num_attrs(table: &AttributeTable) -> Result<usize> {
-    H5A__get_ainfo(table)
-}
-
-/// Retrieve the name of the attribute at `index` in iteration order.
-/// Mirrors `H5Aget_name_by_idx`.
-#[allow(non_snake_case)]
-pub fn H5Aget_name_by_idx(table: &AttributeTable, index: usize) -> Result<String> {
-    Ok(H5A__open_by_idx(table, index)?.attr.name)
+pub fn H5Aget_name_by_idx_ref(table: &AttributeTable, index: usize) -> Result<&str> {
+    Ok(H5A__open_by_idx_ref(table, index)?.attr.name.as_str())
 }
 
 /// Asynchronous variant of `H5Aexists`. Mirrors `H5Aexists_async`; this
@@ -512,11 +524,16 @@ pub fn H5A__set_version(table: &mut AttributeTable, version: u8) {
     table.version = version;
 }
 
-/// Copy an attribute when copying its parent object between files. Mirrors
-/// the first phase of libhdf5's `H5A__attr_copy_file`.
+/// Borrow an attribute during parent-object copy planning.
 #[allow(non_snake_case)]
-pub fn H5A__attr_copy_file(entry: &AttributeTableEntry) -> AttributeTableEntry {
-    entry.clone()
+pub fn H5A__attr_copy_file_ref(entry: &AttributeTableEntry) -> &AttributeTableEntry {
+    entry
+}
+
+/// Copy an attribute into caller-provided storage during parent-object copy.
+#[allow(non_snake_case)]
+pub fn H5A__attr_copy_file_into(entry: &AttributeTableEntry, out: &mut AttributeTableEntry) {
+    out.clone_from(entry);
 }
 
 /// Finish copying an attribute between files (bumps shared refcount).
@@ -542,42 +559,41 @@ pub fn H5A__dense_post_copy_file_all(table: &mut AttributeTable) {
     }
 }
 
-/// Collect the names of all attributes in the table, in stored order.
-/// Mirrors `H5A__iterate_common`.
+/// Iterate over borrowed attribute names in stored order.
 #[allow(non_snake_case)]
-pub fn H5A__iterate_common(table: &AttributeTable) -> Result<Vec<String>> {
+pub fn H5A__iter_names(table: &AttributeTable) -> Result<impl Iterator<Item = &str> + '_> {
+    table.names()
+}
+
+/// Invoke `visitor` for each borrowed attribute name in stored order.
+#[allow(non_snake_case)]
+pub fn H5A__iterate_common_cb<F>(table: &AttributeTable, mut visitor: F) -> Result<()>
+where
+    F: FnMut(&str) -> Result<()>,
+{
     table.ensure_open()?;
-    Ok(table
-        .attrs
-        .iter()
-        .map(|entry| entry.attr.name.clone())
-        .collect())
+    for entry in &table.attrs {
+        visitor(&entry.attr.name)?;
+    }
+    Ok(())
 }
 
-/// Iterate over the attribute names of an object. Mirrors `H5A__iterate`.
+/// Iterate over borrowed attribute names of an object.
 #[allow(non_snake_case)]
-pub fn H5A__iterate(table: &AttributeTable) -> Result<Vec<String>> {
-    H5A__iterate_common(table)
+pub fn H5A__iterate_cb<F>(table: &AttributeTable, visitor: F) -> Result<()>
+where
+    F: FnMut(&str) -> Result<()>,
+{
+    H5A__iterate_common_cb(table, visitor)
 }
 
-/// Deprecated iteration entry point. Mirrors `H5A__iterate_old` (the
-/// internal backing for `H5Aiterate1`).
+/// Iterate over borrowed attribute names of an object identified by name.
 #[allow(non_snake_case)]
-pub fn H5A__iterate_old(table: &AttributeTable) -> Result<Vec<String>> {
-    H5A__iterate_common(table)
-}
-
-/// Deprecated 1.6-era attribute iteration entry point. Mirrors `H5Aiterate1`.
-#[allow(non_snake_case)]
-pub fn H5Aiterate1(table: &AttributeTable) -> Result<Vec<String>> {
-    H5A__iterate_common(table)
-}
-
-/// Iterate over the attributes of an object identified by name. Mirrors
-/// `H5Aiterate_by_name`.
-#[allow(non_snake_case)]
-pub fn H5Aiterate_by_name(table: &AttributeTable) -> Result<Vec<String>> {
-    H5A__iterate_common(table)
+pub fn H5Aiterate_by_name_cb<F>(table: &AttributeTable, visitor: F) -> Result<()>
+where
+    F: FnMut(&str) -> Result<()>,
+{
+    H5A__iterate_common_cb(table, visitor)
 }
 
 /// Remove the attribute at the given index from the table and return it.
@@ -674,26 +690,24 @@ pub fn H5A__rename_by_name(
     H5A__rename_common(table, old_name, new_name)
 }
 
-/// Callback invoked when an attribute is located in a dense index. Mirrors
-/// `H5A__dense_fnd_cb`.
+/// Callback invoked when an attribute is located in a dense index, borrowing
+/// the matching entry.
 #[allow(non_snake_case)]
-pub fn H5A__dense_fnd_cb(
-    table: &AttributeTable,
+pub fn H5A__dense_fnd_cb_ref<'a>(
+    table: &'a AttributeTable,
     name: &str,
-) -> Result<Option<AttributeTableEntry>> {
+) -> Result<Option<&'a AttributeTableEntry>> {
     table.ensure_open()?;
-    Ok(table
-        .attrs
-        .iter()
-        .find(|entry| entry.attr.name == name)
-        .cloned())
+    Ok(table.attrs.iter().find(|entry| entry.attr.name == name))
 }
 
-/// Open an attribute stored in dense storage by name. Mirrors
-/// `H5A__dense_open`.
+/// Open an attribute stored in dense storage by name, borrowing the entry.
 #[allow(non_snake_case)]
-pub fn H5A__dense_open(table: &AttributeTable, name: &str) -> Result<AttributeTableEntry> {
-    H5A__open_common(table, name)
+pub fn H5A__dense_open_ref<'a>(
+    table: &'a AttributeTable,
+    name: &str,
+) -> Result<&'a AttributeTableEntry> {
+    H5A__open_common_ref(table, name)
 }
 
 /// Insert a new attribute into dense storage. Mirrors `H5A__dense_insert`.
@@ -702,11 +716,10 @@ pub fn H5A__dense_insert(table: &mut AttributeTable, attr: AttributeMessage) -> 
     H5A__create(table, attr)
 }
 
-/// v2 B-tree 'modify' callback used when updating dense-storage attribute
-/// data via the name index. Mirrors `H5A__dense_write_bt2_cb`.
+/// v2 B-tree modify callback that borrows the encoded name bytes.
 #[allow(non_snake_case)]
-pub fn H5A__dense_write_bt2_cb(entry: &AttributeTableEntry) -> Vec<u8> {
-    H5A__dense_btree2_name_encode(entry)
+pub fn H5A__dense_write_bt2_cb_bytes(entry: &AttributeTableEntry) -> &[u8] {
+    H5A__dense_btree2_name_encode_bytes(entry)
 }
 
 /// Modify an existing attribute stored in dense form. Mirrors
@@ -716,25 +729,25 @@ pub fn H5A__dense_write(table: &mut AttributeTable, attr: AttributeMessage) -> R
     H5A__dense_insert(table, attr)
 }
 
-/// Fractal-heap callback that hands back a cloned attribute to the caller.
-/// Mirrors `H5A__dense_copy_fh_cb`.
+/// Fractal-heap callback that borrows the attribute entry.
 #[allow(non_snake_case)]
-pub fn H5A__dense_copy_fh_cb(entry: &AttributeTableEntry) -> AttributeTableEntry {
-    entry.clone()
+pub fn H5A__dense_copy_fh_cb_ref(entry: &AttributeTableEntry) -> &AttributeTableEntry {
+    entry
 }
 
-/// Iterate over attributes stored in dense form. Mirrors
-/// `H5A__dense_iterate`.
+/// Iterate over dense-storage attributes with borrowed names.
 #[allow(non_snake_case)]
-pub fn H5A__dense_iterate(table: &AttributeTable) -> Result<Vec<String>> {
-    H5A__iterate_common(table)
+pub fn H5A__dense_iterate_cb<F>(table: &AttributeTable, visitor: F) -> Result<()>
+where
+    F: FnMut(&str) -> Result<()>,
+{
+    H5A__iterate_common_cb(table, visitor)
 }
 
-/// v2 B-tree callback used to iterate the dense storage name index.
-/// Mirrors `H5A__dense_iterate_bt2_cb`.
+/// v2 B-tree callback that borrows the dense storage name-index key.
 #[allow(non_snake_case)]
-pub fn H5A__dense_iterate_bt2_cb(entry: &AttributeTableEntry) -> String {
-    entry.attr.name.clone()
+pub fn H5A__dense_iterate_bt2_cb_ref(entry: &AttributeTableEntry) -> &str {
+    entry.attr.name.as_str()
 }
 
 /// Check whether an attribute exists in dense storage. Mirrors
@@ -812,11 +825,10 @@ pub fn H5A__dense_fh_name_cmp(
     left.attr.name.cmp(&right.attr.name)
 }
 
-/// Store user information into a native record for the dense-storage name
-/// v2 B-tree. Mirrors `H5A__dense_btree2_name_store`.
+/// Borrow user information for the dense-storage name v2 B-tree.
 #[allow(non_snake_case)]
-pub fn H5A__dense_btree2_name_store(entry: &AttributeTableEntry) -> Vec<u8> {
-    H5A__dense_btree2_name_encode(entry)
+pub fn H5A__dense_btree2_name_store_bytes(entry: &AttributeTableEntry) -> &[u8] {
+    H5A__dense_btree2_name_encode_bytes(entry)
 }
 
 /// Compare two name-index v2 B-tree records by attribute name. Mirrors
@@ -829,18 +841,19 @@ pub fn H5A__dense_btree2_name_compare(
     left.attr.name.cmp(&right.attr.name)
 }
 
-/// Encode the native form of a name-index v2 B-tree record into its raw
-/// disk bytes. Mirrors `H5A__dense_btree2_name_encode`.
+/// Borrow the native name-index v2 B-tree record bytes.
 #[allow(non_snake_case)]
-pub fn H5A__dense_btree2_name_encode(entry: &AttributeTableEntry) -> Vec<u8> {
-    entry.attr.name.as_bytes().to_vec()
+pub fn H5A__dense_btree2_name_encode_bytes(entry: &AttributeTableEntry) -> &[u8] {
+    entry.attr.name.as_bytes()
 }
 
-/// Store user information into a native record for the dense-storage
-/// creation-order v2 B-tree. Mirrors `H5A__dense_btree2_corder_store`.
+/// Store creation-order B-tree record bytes into caller-provided storage.
 #[allow(non_snake_case)]
-pub fn H5A__dense_btree2_corder_store(entry: &AttributeTableEntry) -> Vec<u8> {
-    H5A__dense_btree2_corder_encode(entry)
+pub fn H5A__dense_btree2_corder_store_into(
+    entry: &AttributeTableEntry,
+    out: &mut [u8],
+) -> Result<()> {
+    H5A__dense_btree2_corder_encode_into(entry, out)
 }
 
 /// Compare two creation-order v2 B-tree records. Mirrors
@@ -853,18 +866,33 @@ pub fn H5A__dense_btree2_corder_compare(
     left.creation_order.cmp(&right.creation_order)
 }
 
-/// Encode the native form of a creation-order v2 B-tree record into its
-/// raw disk bytes. Mirrors `H5A__dense_btree2_corder_encode`.
+/// Encode the creation-order v2 B-tree record into caller-provided storage.
 #[allow(non_snake_case)]
-pub fn H5A__dense_btree2_corder_encode(entry: &AttributeTableEntry) -> Vec<u8> {
-    entry.creation_order.unwrap_or(0).to_le_bytes().to_vec()
+pub fn H5A__dense_btree2_corder_encode_into(
+    entry: &AttributeTableEntry,
+    out: &mut [u8],
+) -> Result<()> {
+    let bytes = entry.creation_order.unwrap_or(0).to_le_bytes();
+    if out.len() != bytes.len() {
+        return Err(Error::InvalidFormat(format!(
+            "creation-order output buffer has {} bytes, expected {}",
+            out.len(),
+            bytes.len()
+        )));
+    }
+    out.copy_from_slice(&bytes);
+    Ok(())
 }
 
-/// Format a creation-order v2 B-tree record for debug output. Mirrors
-/// `H5A__dense_btree2_corder_debug`.
+/// Write a creation-order v2 B-tree record debug representation into
+/// caller-provided formatting storage.
 #[allow(non_snake_case)]
-pub fn H5A__dense_btree2_corder_debug(entry: &AttributeTableEntry) -> String {
-    format!(
+pub fn H5A__dense_btree2_corder_fmt(
+    entry: &AttributeTableEntry,
+    out: &mut impl fmt::Write,
+) -> fmt::Result {
+    write!(
+        out,
         "AttributeCOrder(name={}, corder={})",
         entry.attr.name,
         entry.creation_order.unwrap_or(0)
@@ -955,6 +983,19 @@ impl Attribute {
         &self.msg.data
     }
 
+    /// Copy the raw data bytes of the attribute value into caller-provided storage.
+    pub fn read_raw_into(&self, out: &mut [u8]) -> Result<()> {
+        if out.len() != self.msg.data.len() {
+            return Err(Error::InvalidFormat(format!(
+                "attribute raw output buffer has {} bytes, expected {}",
+                out.len(),
+                self.msg.data.len()
+            )));
+        }
+        out.copy_from_slice(&self.msg.data);
+        Ok(())
+    }
+
     /// Get the datatype size in bytes.
     pub fn element_size(&self) -> usize {
         match usize::try_from(self.msg.datatype.size) {
@@ -983,9 +1024,19 @@ impl Attribute {
         self.msg.datatype.clone()
     }
 
+    /// Borrow the parsed low-level datatype message for this attribute.
+    pub fn raw_datatype_message_ref(&self) -> &DatatypeMessage {
+        &self.msg.datatype
+    }
+
     /// Return the parsed low-level dataspace message for this attribute.
     pub fn raw_dataspace_message(&self) -> DataspaceMessage {
         self.msg.dataspace.clone()
+    }
+
+    /// Borrow the parsed low-level dataspace message for this attribute.
+    pub fn raw_dataspace_message_ref(&self) -> &DataspaceMessage {
+        &self.msg.dataspace
     }
 
     /// Try to read the attribute as a single f64 scalar.
@@ -1007,41 +1058,182 @@ impl Attribute {
 
     /// Read the attribute value as a typed Vec.
     pub fn read<T: crate::hl::types::H5Type>(&self) -> crate::Result<Vec<T>> {
+        self.read_vec()
+    }
+
+    fn read_vec<T: crate::hl::types::H5Type>(&self) -> crate::Result<Vec<T>> {
         let conversion =
             crate::hl::conversion::ReadConversion::for_dataset::<T>(&self.msg.datatype)?;
-        conversion.bytes_to_vec(self.msg.data.clone())
+        let elem_size = self.element_size();
+        let count = if elem_size == 0 {
+            return Err(Error::InvalidFormat(format!(
+                "attribute '{}' has zero-sized datatype",
+                self.msg.name
+            )));
+        } else {
+            self.msg.data.len() / elem_size
+        };
+        if self.msg.data.len() % elem_size != 0 {
+            return Err(Error::InvalidFormat(format!(
+                "attribute '{}' data length {} is not a multiple of element size {}",
+                self.msg.name,
+                self.msg.data.len(),
+                elem_size
+            )));
+        }
+
+        if conversion.is_same_size_bytes() {
+            let mut values = Vec::<T>::with_capacity(count);
+            let raw_out = unsafe {
+                std::slice::from_raw_parts_mut(values.as_mut_ptr() as *mut u8, self.msg.data.len())
+            };
+            raw_out.copy_from_slice(&self.msg.data);
+            conversion.convert_bytes_in_place(raw_out);
+            unsafe {
+                values.set_len(count);
+            }
+            return Ok(values);
+        }
+
+        let mut values = Vec::with_capacity(count);
+        for chunk in self.msg.data.chunks_exact(elem_size) {
+            values.push(conversion.bytes_to_scalar_from_slice(chunk)?);
+        }
+        Ok(values)
+    }
+
+    /// Read the attribute value into caller-provided typed storage.
+    pub fn read_into<T: crate::hl::types::H5Type>(&self, out: &mut [T]) -> crate::Result<()> {
+        let conversion =
+            crate::hl::conversion::ReadConversion::for_dataset::<T>(&self.msg.datatype)?;
+        let elem_size = self.element_size();
+        let count = if elem_size == 0 {
+            return Err(Error::InvalidFormat(format!(
+                "attribute '{}' has zero-sized datatype",
+                self.msg.name
+            )));
+        } else {
+            self.msg.data.len() / elem_size
+        };
+        if self.msg.data.len() % elem_size != 0 {
+            return Err(Error::InvalidFormat(format!(
+                "attribute '{}' data length {} is not a multiple of element size {}",
+                self.msg.name,
+                self.msg.data.len(),
+                elem_size
+            )));
+        }
+        if out.len() != count {
+            return Err(Error::InvalidFormat(format!(
+                "attribute typed output buffer has {} elements, expected {count}",
+                out.len()
+            )));
+        }
+
+        if conversion.is_same_size_bytes() {
+            let raw_out = crate::hl::types::slice_as_bytes_mut(out);
+            raw_out.copy_from_slice(&self.msg.data);
+            conversion.convert_bytes_in_place(raw_out);
+            return Ok(());
+        }
+
+        conversion.bytes_into_slice(&self.msg.data, out)
     }
 
     /// Read the attribute as a typed scalar.
     pub fn read_scalar<T: crate::hl::types::H5Type>(&self) -> crate::Result<T> {
         let conversion =
             crate::hl::conversion::ReadConversion::for_dataset::<T>(&self.msg.datatype)?;
-        conversion.bytes_to_scalar(self.msg.data.clone())
+        if conversion.is_same_size_bytes() && self.msg.data.len() == T::type_size() {
+            let mut value = std::mem::MaybeUninit::<T>::uninit();
+            let raw_out = unsafe {
+                std::slice::from_raw_parts_mut(value.as_mut_ptr() as *mut u8, T::type_size())
+            };
+            raw_out.copy_from_slice(&self.msg.data);
+            conversion.convert_bytes_in_place(raw_out);
+            return Ok(unsafe { value.assume_init() });
+        }
+        conversion.bytes_to_scalar_from_slice(&self.msg.data)
     }
 
     /// Read the attribute as a string (for fixed-length string attributes).
     pub fn read_string(&self) -> String {
+        self.read_string_cow()
+            .map(Cow::into_owned)
+            .unwrap_or_default()
+    }
+
+    /// Read the first string element, borrowing fixed-length string data when
+    /// possible and allocating only for variable-length strings.
+    pub fn read_string_cow(&self) -> Result<Cow<'_, str>> {
         if self.msg.datatype.is_variable_string() {
-            return self
-                .read_strings()
-                .ok()
-                .and_then(|mut strings| {
-                    if strings.is_empty() {
-                        None
-                    } else {
-                        Some(strings.remove(0))
-                    }
-                })
-                .unwrap_or_default();
+            let mut out = String::new();
+            self.read_string_into(&mut out)?;
+            return Ok(Cow::Owned(out));
         }
+
+        if self.msg.datatype.class != DatatypeClass::String {
+            return Err(Error::Unsupported(format!(
+                "attribute '{}' is not a string attribute",
+                self.msg.name
+            )));
+        }
+
+        let elem_size = self.element_size();
+        if elem_size == 0 {
+            return Err(Error::InvalidFormat(format!(
+                "attribute '{}' has zero-sized string datatype",
+                self.msg.name
+            )));
+        }
+        if self.msg.data.len() % elem_size != 0 {
+            return Err(Error::InvalidFormat(format!(
+                "attribute '{}' string data length {} is not a multiple of element size {}",
+                self.msg.name,
+                self.msg.data.len(),
+                elem_size
+            )));
+        }
+
+        let Some(chunk) = self.msg.data.chunks_exact(elem_size).next() else {
+            return Ok(Cow::Borrowed(""));
+        };
         let padding = self.msg.datatype.string_padding().unwrap_or(1);
-        decode_fixed_string_with_padding(&self.msg.data, padding).unwrap_or_default()
+        Ok(Cow::Borrowed(decode_fixed_string_slice_with_padding(
+            chunk, padding,
+        )?))
+    }
+
+    /// Read the first string element into caller-provided storage.
+    pub fn read_string_into(&self, out: &mut String) -> Result<()> {
+        out.clear();
+        let mut seen = false;
+        self.visit_strings(|value| {
+            if !seen {
+                out.push_str(value);
+                seen = true;
+            }
+            Ok(())
+        })
     }
 
     /// Read the attribute as string elements.
     pub fn read_strings(&self) -> Result<Vec<String>> {
+        let mut strings = Vec::new();
+        self.visit_strings(|value| {
+            strings.push(value.to_string());
+            Ok(())
+        })?;
+        Ok(strings)
+    }
+
+    /// Visit each string element without collecting the result into a Vec.
+    pub fn visit_strings<F>(&self, mut visitor: F) -> Result<()>
+    where
+        F: FnMut(&str) -> Result<()>,
+    {
         if self.msg.datatype.is_variable_string() {
-            return self.read_vlen_strings();
+            return self.visit_vlen_strings(visitor);
         }
 
         if self.msg.datatype.class != DatatypeClass::String {
@@ -1068,16 +1260,18 @@ impl Attribute {
         }
 
         let padding = self.msg.datatype.string_padding().unwrap_or(1);
-        self.msg
-            .data
-            .chunks_exact(elem_size)
-            .map(|chunk| decode_fixed_string_with_padding(chunk, padding))
-            .collect()
+        for chunk in self.msg.data.chunks_exact(elem_size) {
+            visitor(decode_fixed_string_slice_with_padding(chunk, padding)?)?;
+        }
+        Ok(())
     }
 
-    /// Materialize a variable-length string attribute by walking its
-    /// per-element global-heap references and decoding each payload as UTF-8.
-    fn read_vlen_strings(&self) -> Result<Vec<String>> {
+    /// Visit variable-length string elements by walking their global-heap
+    /// references and decoding each payload as UTF-8.
+    fn visit_vlen_strings<F>(&self, mut visitor: F) -> Result<()>
+    where
+        F: FnMut(&str) -> Result<()>,
+    {
         let inner = self.inner.as_ref().ok_or_else(|| {
             Error::Unsupported(format!(
                 "attribute '{}' has no file context for variable-length string read",
@@ -1105,33 +1299,56 @@ impl Attribute {
             )));
         }
 
-        let mut strings = Vec::with_capacity(self.msg.data.len() / ref_size);
+        enum VLenStringSlot {
+            Empty,
+            Heap {
+                seq_len: usize,
+                gh_ref: crate::format::global_heap::GlobalHeapRef,
+            },
+        }
+
+        let mut slots = Vec::with_capacity(self.msg.data.len() / ref_size);
         for chunk in self.msg.data.chunks_exact(ref_size) {
             let (seq_len, addr, index) = decode_vlen_string_ref(chunk, sizeof_addr)?;
 
             if addr == 0 || crate::io::reader::is_undef_addr(addr) {
-                strings.push(String::new());
+                slots.push(VLenStringSlot::Empty);
                 continue;
             }
 
-            let gh_ref = crate::format::global_heap::GlobalHeapRef {
-                collection_addr: addr,
-                object_index: index,
-            };
-            let data =
-                crate::format::global_heap::read_global_heap_object(&mut guard.reader, &gh_ref)?;
-            if seq_len > data.len() {
-                return Err(Error::InvalidFormat(format!(
-                    "attribute '{}' vlen string payload too short: expected {} bytes, got {}",
-                    self.msg.name,
-                    seq_len,
-                    data.len()
-                )));
-            }
-            let bytes = &data[..seq_len];
-            strings.push(decode_utf8_string(bytes, "attribute vlen string payload")?);
+            slots.push(VLenStringSlot::Heap {
+                seq_len,
+                gh_ref: crate::format::global_heap::GlobalHeapRef {
+                    collection_addr: addr,
+                    object_index: index,
+                },
+            });
         }
-        Ok(strings)
+
+        let mut heap_cache = crate::format::global_heap::GlobalHeapObjectCache::new();
+        for slot in slots {
+            match slot {
+                VLenStringSlot::Empty => visitor("")?,
+                VLenStringSlot::Heap { seq_len, gh_ref } => {
+                    heap_cache.visit_object(&mut guard.reader, &gh_ref, |data| {
+                    if seq_len > data.len() {
+                        return Err(Error::InvalidFormat(format!(
+                            "attribute '{}' vlen string payload too short: expected {} bytes, got {}",
+                            self.msg.name,
+                            seq_len,
+                            data.len()
+                        )));
+                    }
+                    let bytes = &data[..seq_len];
+                    visitor(decode_utf8_string_slice(
+                        bytes,
+                        "attribute vlen string payload",
+                    )?)
+                    })?;
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1185,27 +1402,116 @@ fn read_u32_le_at(data: &[u8], pos: usize, context: &str) -> Result<u32> {
     Ok(u32::from_le_bytes(bytes))
 }
 
+/// Read a little-endian u16 at `data[pos..pos+2]` with a contextual error.
+fn read_u16_le_at(data: &[u8], pos: usize, context: &str) -> Result<u16> {
+    let bytes = checked_window(data, pos, 2, context)?;
+    let bytes: [u8; 2] = bytes
+        .try_into()
+        .map_err(|_| Error::InvalidFormat(format!("{context} is truncated")))?;
+    Ok(u16::from_le_bytes(bytes))
+}
+
 /// Decode a fixed-length string element, stopping at the first NUL byte
 /// and (for `padding == 2`, i.e. space-padded) trimming trailing whitespace.
+#[cfg(test)]
 fn decode_fixed_string_with_padding(bytes: &[u8], padding: u8) -> Result<String> {
+    Ok(decode_fixed_string_slice_with_padding(bytes, padding)?.to_string())
+}
+
+/// Decode a fixed-length string element as a borrowed `str`.
+fn decode_fixed_string_slice_with_padding(bytes: &[u8], padding: u8) -> Result<&str> {
     let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
     let bytes = &bytes[..end];
     let s = std::str::from_utf8(bytes)
         .map_err(|_| Error::InvalidFormat("attribute fixed string payload is not UTF-8".into()))?;
-    Ok(if padding == 2 {
-        s.trim_end().to_string()
-    } else {
-        s.to_string()
-    })
+    Ok(if padding == 2 { s.trim_end() } else { s })
 }
 
-/// Decode `bytes` as UTF-8 and trim trailing NUL bytes (used for vlen
-/// string payloads pulled out of the global heap).
-fn decode_utf8_string(bytes: &[u8], context: &str) -> Result<String> {
+/// Decode `bytes` as borrowed UTF-8 and trim trailing NUL bytes.
+fn decode_utf8_string_slice<'a>(bytes: &'a [u8], context: &str) -> Result<&'a str> {
     Ok(std::str::from_utf8(bytes)
         .map_err(|_| Error::InvalidFormat(format!("{context} is not UTF-8")))?
-        .trim_end_matches('\0')
-        .to_string())
+        .trim_end_matches('\0'))
+}
+
+/// Borrow just the name field from an encoded attribute message.
+fn attribute_message_name(raw: &[u8]) -> Result<&str> {
+    if raw.len() < 6 {
+        return Err(Error::InvalidFormat("attribute message too short".into()));
+    }
+
+    let version = raw[0];
+    let (name_size, pos) = match version {
+        1 => {
+            checked_window(raw, 0, 8, "attribute v1 header")?;
+            let name_size = usize::from(read_u16_le_at(raw, 2, "attribute v1 name size")?);
+            let name_padded = align8(name_size, "attribute v1 name")?;
+            checked_window(raw, 8, name_padded, "attribute v1 padded name")?;
+            (name_size, 8)
+        }
+        2 => {
+            checked_window(raw, 0, 8, "attribute v2 header")?;
+            if raw[1] & !0x03 != 0 {
+                return Err(Error::InvalidFormat(format!(
+                    "attribute message flags {:#x} are invalid",
+                    raw[1]
+                )));
+            }
+            (
+                usize::from(read_u16_le_at(raw, 2, "attribute v2 name size")?),
+                8,
+            )
+        }
+        3 => {
+            checked_window(raw, 0, 9, "attribute v3 header")?;
+            if raw[1] & !0x03 != 0 {
+                return Err(Error::InvalidFormat(format!(
+                    "attribute message flags {:#x} are invalid",
+                    raw[1]
+                )));
+            }
+            if raw[8] > 1 {
+                return Err(Error::InvalidFormat(format!(
+                    "invalid attribute character encoding {}",
+                    raw[8]
+                )));
+            }
+            (
+                usize::from(read_u16_le_at(raw, 2, "attribute v3 name size")?),
+                9,
+            )
+        }
+        _ => {
+            return Err(Error::InvalidFormat(format!(
+                "attribute message version {version}"
+            )));
+        }
+    };
+
+    decode_attribute_name_slice(raw, pos, name_size)
+}
+
+fn decode_attribute_name_slice(raw: &[u8], pos: usize, name_size: usize) -> Result<&str> {
+    if name_size <= 1 {
+        return Err(Error::InvalidFormat(
+            "attribute message name length is invalid".into(),
+        ));
+    }
+    let name_bytes = checked_window(raw, pos, name_size, "attribute name")?;
+    let name_text = &name_bytes[..name_size - 1];
+    if name_text.contains(&0) || name_bytes[name_size - 1] != 0 {
+        return Err(Error::InvalidFormat(
+            "attribute name has different length than stored length".into(),
+        ));
+    }
+    std::str::from_utf8(name_text)
+        .map_err(|_| Error::InvalidFormat("attribute name is not UTF-8".into()))
+}
+
+fn align8(len: usize, context: &str) -> Result<usize> {
+    len.checked_add(7)
+        .map(|value| value & !7)
+        .ok_or_else(|| Error::InvalidFormat(format!("{context} padded size overflow")))
 }
 
 /// Collect all attributes from an object header at the given address.
@@ -1213,16 +1519,296 @@ pub(crate) fn collect_attributes(
     inner: &Arc<Mutex<FileInner<BufReader<fs::File>>>>,
     addr: u64,
 ) -> Result<Vec<Attribute>> {
-    let mut guard = inner.lock();
-    let oh = ObjectHeader::read_at(&mut guard.reader, addr)?;
-
     let mut attrs = Vec::new();
+    collect_attributes_into(inner, addr, &mut attrs)?;
+    Ok(attrs)
+}
+
+/// Append all attributes from an object header at the given address.
+pub(crate) fn collect_attributes_into(
+    inner: &Arc<Mutex<FileInner<BufReader<fs::File>>>>,
+    addr: u64,
+    out: &mut Vec<Attribute>,
+) -> Result<()> {
+    let start = out.len();
+    let result = collect_attributes_into_impl(inner, addr, out);
+    if result.is_err() {
+        out.truncate(start);
+    }
+    result
+}
+
+fn collect_attributes_into_impl(
+    inner: &Arc<Mutex<FileInner<BufReader<fs::File>>>>,
+    addr: u64,
+    out: &mut Vec<Attribute>,
+) -> Result<()> {
+    let (oh, sizeof_addr) = {
+        let mut guard = inner.lock();
+        let oh = ObjectHeader::read_at(&mut guard.reader, addr)?;
+        (oh, guard.superblock.sizeof_addr)
+    };
+
     for msg in &oh.messages {
         if msg.msg_type == object_header::MSG_ATTRIBUTE {
             match AttributeMessage::decode(&msg.data) {
-                Ok(attr_msg) => attrs.push((attr_msg, msg.creation_index.map(u64::from))),
+                Ok(attr_msg) => out.push(Attribute::from_message(
+                    attr_msg,
+                    msg.creation_index.map(u64::from),
+                    inner,
+                )),
                 Err(e) => {
                     // Skip malformed attributes
+                    eprintln!("Warning: failed to decode attribute: {e}");
+                }
+            }
+        }
+    }
+
+    for msg in &oh.messages {
+        if msg.msg_type == object_header::MSG_ATTR_INFO {
+            let attr_info = AttributeInfoMessage::decode(&msg.data, sizeof_addr)?;
+            if attr_info.has_dense_storage() {
+                let (heap, heap_refs) = {
+                    let mut guard = inner.lock();
+                    let heap =
+                        FractalHeapHeader::read_at(&mut guard.reader, attr_info.fractal_heap_addr)?;
+                    let heap_id_len = usize::from(heap.heap_id_len);
+                    let mut heap_refs = Vec::new();
+                    collect_dense_attribute_heap_refs(
+                        &mut guard.reader,
+                        attr_info.name_btree_addr,
+                        heap_id_len,
+                        &mut heap_refs,
+                    )?;
+                    (heap, heap_refs)
+                };
+                let mut cache = FractalHeapManagedObjectCache::new();
+
+                for heap_ref in heap_refs {
+                    let attr_data = {
+                        let mut guard = inner.lock();
+                        heap.read_managed_object_cached(
+                            &mut guard.reader,
+                            &heap_ref.heap_id,
+                            &mut cache,
+                        )
+                    };
+                    if let Ok(attr_data) = attr_data {
+                        match AttributeMessage::decode(&attr_data) {
+                            Ok(attr_msg) => out.push(Attribute::from_message(
+                                attr_msg,
+                                heap_ref.creation_order,
+                                inner,
+                            )),
+                            Err(e) => {
+                                eprintln!("Warning: failed to decode dense attribute: {e}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Extract the 4-byte creation-order index that follows the heap ID and
+/// flags byte in a dense-attribute name-index v2 B-tree record.
+fn dense_attribute_record_creation_order(record: &[u8], heap_id_len: usize) -> Option<u64> {
+    let start = heap_id_len.checked_add(1)?;
+    let bytes = checked_window(record, start, 4, "dense attribute creation order").ok()?;
+    Some(u64::from(u32::from_le_bytes(bytes.try_into().ok()?)))
+}
+
+fn dense_attribute_record_name_hash(record: &[u8], heap_id_len: usize) -> Option<u32> {
+    let start = heap_id_len.checked_add(1)?.checked_add(4)?;
+    let bytes = checked_window(record, start, 4, "dense attribute name hash").ok()?;
+    Some(u32::from_le_bytes(bytes.try_into().ok()?))
+}
+
+struct DenseAttributeHeapRef {
+    heap_id: Vec<u8>,
+    creation_order: Option<u64>,
+}
+
+fn collect_dense_attribute_heap_refs<R>(
+    reader: &mut crate::io::reader::HdfReader<R>,
+    btree_addr: u64,
+    heap_id_len: usize,
+    out: &mut Vec<DenseAttributeHeapRef>,
+) -> Result<()>
+where
+    R: std::io::Read + std::io::Seek,
+{
+    out.clear();
+    btree_v2::visit_all_records(reader, btree_addr, |record| {
+        if record.len() >= heap_id_len {
+            out.push(DenseAttributeHeapRef {
+                heap_id: record[..heap_id_len].to_vec(),
+                creation_order: dense_attribute_record_creation_order(record, heap_id_len),
+            });
+        }
+        Ok(())
+    })
+}
+
+fn collect_matching_dense_attribute_heap_refs<R>(
+    reader: &mut crate::io::reader::HdfReader<R>,
+    btree_addr: u64,
+    heap_id_len: usize,
+    target_hash: u32,
+    out: &mut Vec<DenseAttributeHeapRef>,
+) -> Result<()>
+where
+    R: std::io::Read + std::io::Seek,
+{
+    out.clear();
+    btree_v2::visit_matching_records(
+        reader,
+        btree_addr,
+        |record| match dense_attribute_record_name_hash(record, heap_id_len) {
+            Some(hash) => hash.cmp(&target_hash),
+            None => Ordering::Less,
+        },
+        |record| {
+            if record.len() >= heap_id_len {
+                out.push(DenseAttributeHeapRef {
+                    heap_id: record[..heap_id_len].to_vec(),
+                    creation_order: dense_attribute_record_creation_order(record, heap_id_len),
+                });
+            }
+            Ok(())
+        },
+    )
+}
+
+fn find_dense_attribute_by_name<R>(
+    reader: &mut crate::io::reader::HdfReader<R>,
+    attr_info: &AttributeInfoMessage,
+    name: &str,
+) -> Result<Option<(AttributeMessage, Option<u64>)>>
+where
+    R: std::io::Read + std::io::Seek,
+{
+    let heap = FractalHeapHeader::read_at(reader, attr_info.fractal_heap_addr)?;
+    let heap_id_len = usize::from(heap.heap_id_len);
+    let target_hash = checksum_lookup3(name.as_bytes(), 0);
+    let mut heap_refs = Vec::new();
+    collect_matching_dense_attribute_heap_refs(
+        reader,
+        attr_info.name_btree_addr,
+        heap_id_len,
+        target_hash,
+        &mut heap_refs,
+    )?;
+
+    let mut cache = FractalHeapManagedObjectCache::new();
+    for heap_ref in heap_refs {
+        let attr_data = heap.read_managed_object_cached(reader, &heap_ref.heap_id, &mut cache);
+        if let Ok(attr_data) = attr_data {
+            match attribute_message_name(&attr_data) {
+                Ok(attr_name) if attr_name == name => {
+                    return AttributeMessage::decode(&attr_data)
+                        .map(|attr_msg| Some((attr_msg, heap_ref.creation_order)));
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    eprintln!("Warning: failed to decode dense attribute: {e}");
+                }
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+fn dense_attribute_exists_by_name<R>(
+    reader: &mut crate::io::reader::HdfReader<R>,
+    attr_info: &AttributeInfoMessage,
+    name: &str,
+) -> Result<bool>
+where
+    R: std::io::Read + std::io::Seek,
+{
+    let heap = FractalHeapHeader::read_at(reader, attr_info.fractal_heap_addr)?;
+    let heap_id_len = usize::from(heap.heap_id_len);
+    let target_hash = checksum_lookup3(name.as_bytes(), 0);
+    let mut heap_refs = Vec::new();
+    collect_matching_dense_attribute_heap_refs(
+        reader,
+        attr_info.name_btree_addr,
+        heap_id_len,
+        target_hash,
+        &mut heap_refs,
+    )?;
+
+    let mut cache = FractalHeapManagedObjectCache::new();
+    for heap_ref in heap_refs {
+        let attr_data = heap.read_managed_object_cached(reader, &heap_ref.heap_id, &mut cache);
+        if let Ok(attr_data) = attr_data {
+            match attribute_message_name(&attr_data) {
+                Ok(attr_name) if attr_name == name => return Ok(true),
+                Ok(_) => {}
+                Err(e) => {
+                    eprintln!("Warning: failed to decode dense attribute: {e}");
+                }
+            }
+        }
+    }
+
+    Ok(false)
+}
+
+/// Collect attributes sorted by tracked creation order.
+pub(crate) fn collect_attributes_by_creation_order(
+    inner: &Arc<Mutex<FileInner<BufReader<fs::File>>>>,
+    addr: u64,
+) -> Result<Vec<Attribute>> {
+    let mut attrs = Vec::new();
+    collect_attributes_by_creation_order_into(inner, addr, &mut attrs)?;
+    Ok(attrs)
+}
+
+/// Append attributes sorted by tracked creation order.
+pub(crate) fn collect_attributes_by_creation_order_into(
+    inner: &Arc<Mutex<FileInner<BufReader<fs::File>>>>,
+    addr: u64,
+    out: &mut Vec<Attribute>,
+) -> Result<()> {
+    let start = out.len();
+    collect_attributes_into(inner, addr, out)?;
+    if out[start..]
+        .iter()
+        .any(|attr| attr.creation_order.is_none())
+    {
+        out.truncate(start);
+        return Err(Error::Unsupported(
+            "object does not track attribute creation order".into(),
+        ));
+    }
+    out[start..].sort_by_key(|attr| attr.creation_order.unwrap_or(u64::MAX));
+    Ok(())
+}
+
+/// Visit attribute names from an object header without collecting them first.
+pub(crate) fn visit_attribute_names<F>(
+    inner: &Arc<Mutex<FileInner<BufReader<fs::File>>>>,
+    addr: u64,
+    mut visitor: F,
+) -> Result<()>
+where
+    F: FnMut(&str) -> Result<()>,
+{
+    let mut guard = inner.lock();
+    let oh = ObjectHeader::read_at(&mut guard.reader, addr)?;
+
+    for msg in &oh.messages {
+        if msg.msg_type == object_header::MSG_ATTRIBUTE {
+            match attribute_message_name(&msg.data) {
+                Ok(name) => visitor(name)?,
+                Err(e) => {
                     eprintln!("Warning: failed to decode attribute: {e}");
                 }
             }
@@ -1235,19 +1821,25 @@ pub(crate) fn collect_attributes(
             if attr_info.has_dense_storage() {
                 let heap =
                     FractalHeapHeader::read_at(&mut guard.reader, attr_info.fractal_heap_addr)?;
-                let records =
-                    btree_v2::collect_all_records(&mut guard.reader, attr_info.name_btree_addr)?;
                 let heap_id_len = usize::from(heap.heap_id_len);
+                let mut heap_refs = Vec::new();
+                collect_dense_attribute_heap_refs(
+                    &mut guard.reader,
+                    attr_info.name_btree_addr,
+                    heap_id_len,
+                    &mut heap_refs,
+                )?;
 
-                for record in &records {
-                    if record.len() < heap_id_len {
-                        continue;
-                    }
-                    let heap_id = &record[..heap_id_len];
-                    let creation_order = dense_attribute_record_creation_order(record, heap_id_len);
-                    if let Ok(attr_data) = heap.read_managed_object(&mut guard.reader, heap_id) {
-                        match AttributeMessage::decode(&attr_data) {
-                            Ok(attr_msg) => attrs.push((attr_msg, creation_order)),
+                let mut cache = FractalHeapManagedObjectCache::new();
+                for heap_ref in heap_refs {
+                    let attr_data = heap.read_managed_object_cached(
+                        &mut guard.reader,
+                        &heap_ref.heap_id,
+                        &mut cache,
+                    );
+                    if let Ok(attr_data) = attr_data {
+                        match attribute_message_name(&attr_data) {
+                            Ok(name) => visitor(name)?,
                             Err(e) => {
                                 eprintln!("Warning: failed to decode dense attribute: {e}");
                             }
@@ -1258,34 +1850,7 @@ pub(crate) fn collect_attributes(
         }
     }
 
-    drop(guard);
-    Ok(attrs
-        .into_iter()
-        .map(|(attr_msg, creation_order)| Attribute::from_message(attr_msg, creation_order, inner))
-        .collect())
-}
-
-/// Extract the 4-byte creation-order index that follows the heap ID and
-/// flags byte in a dense-attribute name-index v2 B-tree record.
-fn dense_attribute_record_creation_order(record: &[u8], heap_id_len: usize) -> Option<u64> {
-    let start = heap_id_len.checked_add(1)?;
-    let bytes = checked_window(record, start, 4, "dense attribute creation order").ok()?;
-    Some(u64::from(u32::from_le_bytes(bytes.try_into().ok()?)))
-}
-
-/// Collect attributes sorted by tracked creation order.
-pub(crate) fn collect_attributes_by_creation_order(
-    inner: &Arc<Mutex<FileInner<BufReader<fs::File>>>>,
-    addr: u64,
-) -> Result<Vec<Attribute>> {
-    let mut attrs = collect_attributes(inner, addr)?;
-    if attrs.iter().any(|attr| attr.creation_order.is_none()) {
-        return Err(Error::Unsupported(
-            "object does not track attribute creation order".into(),
-        ));
-    }
-    attrs.sort_by_key(|attr| attr.creation_order.unwrap_or(u64::MAX));
-    Ok(attrs)
+    Ok(())
 }
 
 /// Get attribute names from an object header.
@@ -1293,8 +1858,12 @@ pub(crate) fn attr_names(
     inner: &Arc<Mutex<FileInner<BufReader<fs::File>>>>,
     addr: u64,
 ) -> Result<Vec<String>> {
-    let attrs = collect_attributes(inner, addr)?;
-    Ok(attrs.iter().map(|a| a.msg.name.clone()).collect())
+    let mut names = Vec::new();
+    visit_attribute_names(inner, addr, |name| {
+        names.push(name.to_string());
+        Ok(())
+    })?;
+    Ok(names)
 }
 
 /// Check whether a specific attribute exists on an object.
@@ -1303,8 +1872,34 @@ pub(crate) fn attr_exists(
     addr: u64,
     name: &str,
 ) -> Result<bool> {
-    let names = attr_names(inner, addr)?;
-    Ok(names.iter().any(|attr_name| attr_name == name))
+    let mut guard = inner.lock();
+    let sizeof_addr = guard.superblock.sizeof_addr;
+    let oh = ObjectHeader::read_at(&mut guard.reader, addr)?;
+
+    for msg in &oh.messages {
+        if msg.msg_type == object_header::MSG_ATTRIBUTE {
+            match attribute_message_name(&msg.data) {
+                Ok(attr_name) if attr_name == name => return Ok(true),
+                Ok(_) => {}
+                Err(e) => {
+                    eprintln!("Warning: failed to decode attribute: {e}");
+                }
+            }
+        }
+    }
+
+    for msg in &oh.messages {
+        if msg.msg_type == object_header::MSG_ATTR_INFO {
+            let attr_info = AttributeInfoMessage::decode(&msg.data, sizeof_addr)?;
+            if attr_info.has_dense_storage()
+                && dense_attribute_exists_by_name(&mut guard.reader, &attr_info, name)?
+            {
+                return Ok(true);
+            }
+        }
+    }
+
+    Ok(false)
 }
 
 /// Get a specific attribute by name.
@@ -1313,19 +1908,59 @@ pub(crate) fn get_attr(
     addr: u64,
     name: &str,
 ) -> Result<Attribute> {
-    let attrs = collect_attributes(inner, addr)?;
-    attrs
-        .into_iter()
-        .find(|a| a.msg.name == name)
-        .ok_or_else(|| Error::InvalidFormat(format!("attribute '{name}' not found")))
+    let mut guard = inner.lock();
+    let sizeof_addr = guard.superblock.sizeof_addr;
+    let oh = ObjectHeader::read_at(&mut guard.reader, addr)?;
+
+    for msg in &oh.messages {
+        if msg.msg_type == object_header::MSG_ATTRIBUTE {
+            match attribute_message_name(&msg.data) {
+                Ok(attr_name) if attr_name == name => {
+                    let attr_msg = AttributeMessage::decode(&msg.data)?;
+                    let creation_order = msg.creation_index.map(u64::from);
+                    drop(guard);
+                    return Ok(Attribute::from_message(attr_msg, creation_order, inner));
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    eprintln!("Warning: failed to decode attribute: {e}");
+                }
+            }
+        }
+    }
+
+    for msg in &oh.messages {
+        if msg.msg_type == object_header::MSG_ATTR_INFO {
+            let attr_info = AttributeInfoMessage::decode(&msg.data, sizeof_addr)?;
+            if !attr_info.has_dense_storage() {
+                continue;
+            }
+            if let Some((attr_msg, creation_order)) =
+                find_dense_attribute_by_name(&mut guard.reader, &attr_info, name)?
+            {
+                drop(guard);
+                return Ok(Attribute::from_message(attr_msg, creation_order, inner));
+            }
+        }
+    }
+
+    Err(Error::InvalidFormat(format!(
+        "attribute '{name}' not found"
+    )))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         checked_window, decode_fixed_string_with_padding, decode_vlen_string_ref,
-        default_attribute_message,
+        default_attribute_message, Attribute, AttributeTable, H5A__compact_visit_table,
+        H5A__copy_into, H5A__create_by_name, H5A__dense_btree2_corder_fmt, H5A__get_type_ref,
+        H5A__iter_names, H5A__open_by_idx_ref, H5A__open_common_ref, H5A__read_bytes,
+        H5A__read_into, H5A_get_space_ref, H5Aget_name_by_idx_ref,
     };
+    use crate::format::messages::dataspace::{DataspaceMessage, DataspaceType};
+    use crate::format::messages::datatype::{DatatypeClass, DatatypeMessage};
+    use std::borrow::Cow;
 
     #[test]
     fn decode_vlen_string_ref_rejects_truncated_descriptor() {
@@ -1380,5 +2015,102 @@ mod tests {
             "alpha"
         );
         assert!(decode_fixed_string_with_padding(&[0xff, 0], 1).is_err());
+    }
+
+    #[test]
+    fn borrowed_table_helpers_avoid_cloning_names_and_data() {
+        let mut table = AttributeTable::new();
+        H5A__create_by_name(&mut table, "alpha", vec![1, 2, 3]).unwrap();
+        H5A__create_by_name(&mut table, "beta", vec![4]).unwrap();
+
+        assert_eq!(
+            H5A__open_common_ref(&table, "alpha").unwrap().attr.data,
+            [1, 2, 3]
+        );
+        assert_eq!(H5A__open_by_idx_ref(&table, 1).unwrap().attr.name, "beta");
+        assert_eq!(H5Aget_name_by_idx_ref(&table, 0).unwrap(), "alpha");
+
+        let names = H5A__iter_names(&table).unwrap().collect::<Vec<_>>();
+        assert_eq!(names, vec!["alpha", "beta"]);
+
+        let mut visited = Vec::new();
+        H5A__compact_visit_table(&table, |entry| {
+            visited.push(entry.attr.name.clone());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(visited, vec!["alpha", "beta"]);
+
+        let entry = H5A__open_common_ref(&table, "alpha").unwrap();
+        assert_eq!(H5A__read_bytes(entry), &[1, 2, 3]);
+        let mut out = [0; 3];
+        H5A__read_into(entry, &mut out).unwrap();
+        assert_eq!(out, [1, 2, 3]);
+
+        assert_eq!(H5A__get_type_ref(entry).size, 3);
+        assert_eq!(H5A_get_space_ref(entry).dims.as_slice(), &[3]);
+
+        let mut copied = H5A__open_common_ref(&table, "beta").unwrap().clone();
+        H5A__copy_into(entry, &mut copied);
+        assert_eq!(copied.attr.name, "alpha");
+    }
+
+    #[test]
+    fn attribute_string_visit_and_read_into_use_caller_storage() {
+        let attr = Attribute {
+            msg: crate::format::messages::attribute::AttributeMessage {
+                version: 3,
+                name: "labels".to_string(),
+                char_encoding: 0,
+                datatype: DatatypeMessage {
+                    version: 1,
+                    class: DatatypeClass::String,
+                    class_bits: [0, 0, 0],
+                    size: 4,
+                    properties: vec![1, 0, 0, 0],
+                },
+                dataspace: DataspaceMessage {
+                    version: 2,
+                    space_type: DataspaceType::Simple,
+                    ndims: 1,
+                    dims: vec![2],
+                    max_dims: None,
+                },
+                data: b"hi\0\0rust".to_vec(),
+            },
+            creation_order: None,
+            inner: None,
+            object_id: None,
+        };
+
+        let mut strings = Vec::new();
+        attr.visit_strings(|value| {
+            strings.push(value.to_string());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(strings, vec!["hi", "rust"]);
+
+        let mut first = String::from("previous");
+        attr.read_string_into(&mut first).unwrap();
+        assert_eq!(first, "hi");
+
+        assert!(matches!(
+            attr.read_string_cow().unwrap(),
+            Cow::Borrowed("hi")
+        ));
+        assert_eq!(attr.raw_datatype_message_ref().class, DatatypeClass::String);
+        assert_eq!(attr.raw_dataspace_message_ref().dims, &[2]);
+    }
+
+    #[test]
+    fn dense_corder_debug_writes_to_caller_storage() {
+        let mut table = AttributeTable::new();
+        H5A__create_by_name(&mut table, "alpha", vec![1]).unwrap();
+        let entry = H5A__open_common_ref(&table, "alpha").unwrap();
+
+        let mut out = String::from("prefix:");
+        H5A__dense_btree2_corder_fmt(entry, &mut out).unwrap();
+        assert_eq!(out, "prefix:AttributeCOrder(name=alpha, corder=0)");
     }
 }

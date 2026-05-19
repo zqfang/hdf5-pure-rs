@@ -24,15 +24,46 @@ pub unsafe trait H5Type: Copy + 'static {
     /// Size of one element in bytes.
     fn type_size() -> usize;
 
-    /// For compound types, return the field descriptors.
-    /// Returns None for primitive types.
-    fn compound_fields() -> Option<Vec<FieldDescriptor>> {
+    /// Visit compound field descriptors without returning a fresh Vec.
+    fn visit_compound_fields<F>(_visitor: F) -> Option<()>
+    where
+        F: FnMut(FieldDescriptor),
+    {
         None
     }
 
-    /// For enum types, return the (name, value) mapping.
-    fn enum_members() -> Option<Vec<(String, i64)>> {
+    /// Store compound field descriptors in caller-provided storage.
+    fn compound_fields_into(out: &mut Vec<FieldDescriptor>) -> Option<()> {
+        out.clear();
+        Self::visit_compound_fields(|field| out.push(field))
+    }
+
+    /// Return compound field descriptors in a fresh vector.
+    fn compound_fields() -> Option<Vec<FieldDescriptor>> {
+        let mut fields = Vec::new();
+        Self::compound_fields_into(&mut fields)?;
+        Some(fields)
+    }
+
+    /// Visit enum members without returning a fresh Vec.
+    fn visit_enum_members<F>(_visitor: F) -> Option<()>
+    where
+        F: FnMut(&str, i64),
+    {
         None
+    }
+
+    /// Store enum members in caller-provided storage.
+    fn enum_members_into(out: &mut Vec<(String, i64)>) -> Option<()> {
+        out.clear();
+        Self::visit_enum_members(|name, value| out.push((name.to_string(), value)))
+    }
+
+    /// Return enum members in a fresh vector.
+    fn enum_members() -> Option<Vec<(String, i64)>> {
+        let mut members = Vec::new();
+        Self::enum_members_into(&mut members)?;
+        Some(members)
     }
 }
 
@@ -75,6 +106,30 @@ pub fn bytes_to_slice<T: H5Type>(bytes: &[u8]) -> crate::Result<&[T]> {
     let ptr = bytes.as_ptr() as *const T;
     // SAFETY: We verified alignment and size.
     Ok(unsafe { std::slice::from_raw_parts(ptr, count) })
+}
+
+/// View a mutable typed slice as raw bytes for caller-buffer I/O.
+pub fn slice_as_bytes_mut<T: H5Type>(values: &mut [T]) -> &mut [u8] {
+    let len = values
+        .len()
+        .checked_mul(T::type_size())
+        .expect("typed slice byte length overflow");
+    let ptr = values.as_mut_ptr() as *mut u8;
+    // SAFETY: `values` is a live mutable slice and `T: H5Type` promises a plain
+    // byte-addressable representation with exactly `type_size()` bytes.
+    unsafe { std::slice::from_raw_parts_mut(ptr, len) }
+}
+
+/// View a typed slice as raw bytes without allocating.
+pub fn slice_as_bytes<T: H5Type>(values: &[T]) -> &[u8] {
+    let len = values
+        .len()
+        .checked_mul(T::type_size())
+        .expect("typed slice byte length overflow");
+    let ptr = values.as_ptr() as *const u8;
+    // SAFETY: `values` is a live slice and `T: H5Type` promises a plain
+    // byte-addressable representation with exactly `type_size()` bytes.
+    unsafe { std::slice::from_raw_parts(ptr, len) }
 }
 
 /// Reinterpret a byte vec as a vec of `T`.

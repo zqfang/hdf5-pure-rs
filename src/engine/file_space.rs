@@ -1,3 +1,5 @@
+use std::fmt::{self, Write};
+
 use crate::engine::allocator::FileAllocator;
 use crate::engine::free_space::{
     FreeSpaceClass, FreeSpaceManager, FreeSpaceSection, FreeSpaceStats,
@@ -235,10 +237,18 @@ impl FileSpaceManager {
         }
     }
 
-    pub fn open_fstype(sections: Vec<FreeSpaceSection>, eoa: u64) -> Result<Self> {
+    pub fn open_fstype_from_iter<I>(sections: I, eoa: u64) -> Result<Self>
+    where
+        I: IntoIterator<Item = FreeSpaceSection>,
+    {
         let mut manager = Self::new(eoa);
-        manager.free_space = FreeSpaceManager::open(sections)?;
+        manager.free_space = FreeSpaceManager::open_from_iter(sections)?;
         Ok(manager)
+    }
+
+    #[deprecated(note = "use open_fstype_from_iter to avoid requiring Vec storage")]
+    pub fn open_fstype(sections: Vec<FreeSpaceSection>, eoa: u64) -> Result<Self> {
+        Self::open_fstype_from_iter(sections, eoa)
     }
 
     pub fn create_fstype(eoa: u64) -> Self {
@@ -356,19 +366,22 @@ impl FileSpaceManager {
         self.free_space.stat_info()
     }
 
+    #[deprecated(note = "use free_sections or sects_cb to borrow sections without cloning")]
     pub fn get_free_sections(&self) -> Vec<FreeSpaceSection> {
-        let mut sections = Vec::new();
-        self.free_space
-            .iterate_sect_cb(|section| sections.push(section.clone()));
-        sections
+        self.free_sections().cloned().collect()
+    }
+
+    pub fn free_sections(&self) -> impl Iterator<Item = &FreeSpaceSection> {
+        self.free_space.sections()
     }
 
     pub fn sects_cb<F: FnMut(&FreeSpaceSection)>(&self, f: F) {
         self.free_space.iterate_sect_cb(f);
     }
 
+    #[deprecated(note = "use free_sections or sects_cb to borrow sections without cloning")]
     pub fn get_free_sects(&self) -> Vec<FreeSpaceSection> {
-        self.get_free_sections()
+        self.free_sections().cloned().collect()
     }
 
     pub fn settle_raw_data_fsm(&mut self) -> Result<()> {
@@ -401,16 +414,16 @@ impl FileSpaceManager {
                 || !self.meta_aggr.is_empty())
     }
 
-    pub fn sects_debug_cb(section: &FreeSpaceSection) -> String {
-        FreeSpaceManager::sect_debug(section)
+    pub fn write_sects_debug_cb<W: Write>(section: &FreeSpaceSection, out: &mut W) -> fmt::Result {
+        FreeSpaceManager::write_sect_debug(section, out)
     }
 
-    pub fn sects_debug(&self) -> Vec<String> {
-        self.free_space.sects_debug()
+    pub fn write_sects_debug<W: Write>(&self, out: &mut W) -> fmt::Result {
+        self.free_space.write_sects_debug(out)
     }
 
-    pub fn sects_dump(&self) -> String {
-        self.sects_debug().join("\n")
+    pub fn write_sects_dump<W: Write>(&self, out: &mut W) -> fmt::Result {
+        self.write_sects_debug(out)
     }
 
     fn alloc_from_vfd(&mut self, size: u64, align: u64) -> Result<u64> {
@@ -434,20 +447,7 @@ impl FileSpaceManager {
         size: u64,
     ) -> Result<Option<FreeSpaceSection>> {
         let class = Self::class_for_type(ty);
-        let Some(mut section) = self
-            .get_free_sections()
-            .into_iter()
-            .find(|section| section.class == class && section.size >= size)
-        else {
-            return Ok(None);
-        };
-        self.free_space.sect_remove(section.addr)?;
-        if section.size == size {
-            return Ok(Some(section));
-        }
-        let allocated = section.split(size)?;
-        self.free_space.sect_add(section)?;
-        Ok(Some(allocated))
+        self.free_space.sect_find_by_class(class, size)
     }
 }
 
@@ -475,5 +475,22 @@ mod tests {
         manager.settle_raw_data_fsm().unwrap();
         assert!(manager.raw_aggr.is_empty());
         assert_eq!(manager.get_freespace().total_space, 24);
+    }
+
+    #[test]
+    fn open_fstype_accepts_section_iterators_and_visits_sections() {
+        let sections = [
+            FreeSpaceSection::new(8, 4, FreeSpaceClass::Simple).unwrap(),
+            FreeSpaceSection::new(32, 16, FreeSpaceClass::Large).unwrap(),
+        ];
+        let manager =
+            FileSpaceManager::open_fstype_from_iter(sections.iter().cloned(), 128).unwrap();
+
+        assert_eq!(manager.get_freespace().section_count, 2);
+        assert_eq!(manager.free_sections().count(), 2);
+
+        let mut total = 0;
+        manager.sects_cb(|section| total += section.size);
+        assert_eq!(total, 20);
     }
 }

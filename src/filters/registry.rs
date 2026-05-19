@@ -152,15 +152,23 @@ impl FilterRegistry {
         &self,
         pipeline: &FilterPipelineMessage,
     ) -> Vec<FilterInfo> {
-        pipeline
-            .filters
-            .iter()
-            .map(|filter| FilterInfo {
-                id: filter.id,
-                flags: filter.flags,
-                client_data_count: filter.client_data.len(),
-            })
-            .collect()
+        let mut infos = Vec::new();
+        self.prepare_prelude_callback_dcpl_into(pipeline, &mut infos);
+        infos
+    }
+
+    pub fn prepare_prelude_callback_dcpl_into(
+        &self,
+        pipeline: &FilterPipelineMessage,
+        out: &mut Vec<FilterInfo>,
+    ) {
+        out.clear();
+        out.reserve(pipeline.filters.len());
+        out.extend(pipeline.filters.iter().map(|filter| FilterInfo {
+            id: filter.id,
+            flags: filter.flags,
+            client_data_count: filter.client_data.len(),
+        }));
     }
 
     pub fn set_local_direct(
@@ -544,6 +552,27 @@ mod tests {
         assert!(registry.filter_avail(FILTER_DEFLATE));
         assert!(registry.filter_avail(FILTER_SHUFFLE));
         assert!(!registry.filter_avail(32_099));
+    }
+
+    #[test]
+    fn registry_prelude_callback_reuses_caller_buffer() {
+        let registry = FilterRegistry::init_package();
+        let pipeline = pipeline();
+        let mut infos = vec![FilterInfo {
+            id: 0,
+            flags: 0,
+            client_data_count: 0,
+        }];
+        registry.prepare_prelude_callback_dcpl_into(&pipeline, &mut infos);
+        assert_eq!(
+            infos,
+            vec![FilterInfo {
+                id: FILTER_DEFLATE,
+                flags: 0,
+                client_data_count: 1,
+            }]
+        );
+        assert_eq!(registry.prepare_prelude_callback_dcpl(&pipeline), infos);
     }
 
     #[test]

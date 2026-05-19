@@ -3,7 +3,10 @@
 
 #![allow(dead_code)]
 
-use std::io::{Read, Seek};
+use std::{
+    fmt,
+    io::{Read, Seek},
+};
 
 use crate::error::{Error, Result};
 use crate::format::checksum::checksum_metadata;
@@ -21,8 +24,9 @@ pub(super) struct FixedArrayHeader {
 }
 
 /// Format a fixed array header for debug printing.
-pub(super) fn hdr_debug(header: &FixedArrayHeader) -> String {
-    format!(
+pub(super) fn write_hdr_debug(header: &FixedArrayHeader, out: &mut impl fmt::Write) -> fmt::Result {
+    write!(
+        out,
         "FixedArrayHeader(class_id={}, raw_element_size={}, max_page_elements_bits={}, elements={}, data_block_addr={:#x})",
         header.class_id,
         header.raw_element_size,
@@ -52,12 +56,14 @@ pub(super) fn cache_hdr_image_len(addr_size: usize, length_size: usize) -> Resul
 }
 
 /// Serialize a dirty fixed array header to its on-disk image.
-pub(super) fn cache_hdr_serialize(
+pub(super) fn cache_hdr_serialize_into(
     header: &FixedArrayHeader,
     addr_size: usize,
     length_size: usize,
-) -> Result<Vec<u8>> {
-    let mut out = Vec::with_capacity(cache_hdr_image_len(addr_size, length_size)?);
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    out.clear();
+    out.reserve(cache_hdr_image_len(addr_size, length_size)?);
     out.extend_from_slice(b"FAHD");
     out.push(0);
     out.push(header.class_id);
@@ -65,11 +71,11 @@ pub(super) fn cache_hdr_serialize(
         Error::InvalidFormat("fixed array raw element size does not fit in u8".into())
     })?);
     out.push(header.max_page_elements_bits);
-    encode_var(&mut out, header.elements, length_size)?;
-    encode_addr(&mut out, header.data_block_addr, addr_size)?;
+    encode_var(out, header.elements, length_size)?;
+    encode_addr(out, header.data_block_addr, addr_size)?;
     let checksum = checksum_metadata(&out);
     out.extend_from_slice(&checksum.to_le_bytes());
-    Ok(out)
+    Ok(())
 }
 
 /// Handle metadata-cache action notifications for the header.
@@ -173,8 +179,9 @@ pub(super) fn read_header<R: Read + Seek>(
     addr: u64,
 ) -> Result<FixedArrayHeader> {
     reader.seek(addr)?;
-    let magic = reader.read_bytes(4)?;
-    if magic != b"FAHD" {
+    let mut magic = [0u8; 4];
+    reader.read_bytes_into(&mut magic)?;
+    if magic != *b"FAHD" {
         return Err(Error::InvalidFormat(
             "invalid fixed array header magic".into(),
         ));
@@ -257,7 +264,8 @@ pub(super) fn verify_checksum<R: Read + Seek>(
     let check_len = usize::try_from(checksum_pos - start)
         .map_err(|_| Error::InvalidFormat(format!("{context} checksum span is too large")))?;
     reader.seek(start)?;
-    let check_data = reader.read_bytes(check_len)?;
+    let mut check_data = vec![0; check_len];
+    reader.read_bytes_into(&mut check_data)?;
     let computed = checksum_metadata(&check_data);
     if stored_checksum != computed {
         return Err(Error::InvalidFormat(format!(
@@ -277,7 +285,8 @@ mod tests {
     use crate::io::HdfReader;
 
     use super::{
-        cache_hdr_serialize, hdr_fuse_incr_checked, hdr_incr_checked, read_header, FixedArrayHeader,
+        cache_hdr_serialize_into, hdr_fuse_incr_checked, hdr_incr_checked, read_header,
+        FixedArrayHeader,
     };
 
     #[test]
@@ -308,20 +317,21 @@ mod tests {
             elements: 7,
             data_block_addr: crate::io::reader::UNDEF_ADDR,
         };
-        let image = cache_hdr_serialize(&header, 4, 4).unwrap();
+        let mut image = Vec::new();
+        cache_hdr_serialize_into(&header, 4, 4, &mut image).unwrap();
         assert_eq!(&image[12..16], &[0xff; 4]);
 
         let too_large_elements = FixedArrayHeader {
             elements: u64::from(u32::MAX) + 1,
             ..header.clone()
         };
-        assert!(cache_hdr_serialize(&too_large_elements, 4, 4).is_err());
+        assert!(cache_hdr_serialize_into(&too_large_elements, 4, 4, &mut Vec::new()).is_err());
 
         let too_large_addr = FixedArrayHeader {
             data_block_addr: u64::from(u32::MAX) + 1,
             ..header
         };
-        assert!(cache_hdr_serialize(&too_large_addr, 4, 4).is_err());
+        assert!(cache_hdr_serialize_into(&too_large_addr, 4, 4, &mut Vec::new()).is_err());
     }
 
     #[test]

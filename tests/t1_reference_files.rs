@@ -6,13 +6,26 @@ use hdf5_pure_rust::File;
 
 const REF_DIR: &str = "tests/data/hdf5_ref";
 
-/// Helper: try to open a file, parse superblock, list root members.
-/// Returns Ok(member_names) or Err(error_message).
-fn try_open_and_list(filename: &str) -> Result<Vec<String>, String> {
+/// Helper: try to open a file, parse superblock, visit root members.
+fn try_open_and_visit_members<F>(filename: &str, mut visitor: F) -> Result<(), String>
+where
+    F: FnMut(&str),
+{
     let path = format!("{REF_DIR}/{filename}");
     let f = File::open(&path).map_err(|e| format!("{e}"))?;
-    let names = f.member_names().map_err(|e| format!("{e}"))?;
-    Ok(names)
+    f.visit_member_names(|name| {
+        visitor(name);
+        Ok(())
+    })
+    .map_err(|e| format!("{e}"))?;
+    Ok(())
+}
+
+/// Helper: try to open a file, parse superblock, count root members.
+fn try_open_and_count_members(filename: &str) -> Result<usize, String> {
+    let mut count = 0;
+    try_open_and_visit_members(filename, |_| count += 1)?;
+    Ok(count)
 }
 
 /// Helper: just try to open (parse superblock).
@@ -72,11 +85,9 @@ fn t1a_tarrold() {
 
 #[test]
 fn t1b_group_old() {
-    let names = try_open_and_list("group_old.h5");
-    assert!(names.is_ok(), "group_old.h5: {}", names.unwrap_err());
-    let names = names.unwrap();
-    println!("group_old members: {names:?}");
-    assert!(!names.is_empty());
+    let count = try_open_and_count_members("group_old.h5");
+    assert!(count.is_ok(), "group_old.h5: {}", count.unwrap_err());
+    assert!(count.unwrap() > 0);
 }
 
 #[test]
@@ -110,8 +121,8 @@ fn t1b_mergemsg() {
 
 #[test]
 fn t1c_charsets() {
-    let names = try_open_and_list("charsets.h5");
-    assert!(names.is_ok(), "charsets.h5: {}", names.unwrap_err());
+    let result = try_open_and_visit_members("charsets.h5", |_| {});
+    assert!(result.is_ok(), "charsets.h5: {}", result.unwrap_err());
 }
 
 #[test]
@@ -144,8 +155,8 @@ fn t1d_tlayouto() {
 
 #[test]
 fn t1e_deflate() {
-    let names = try_open_and_list("deflate.h5");
-    assert!(names.is_ok(), "deflate.h5: {}", names.unwrap_err());
+    let result = try_open_and_visit_members("deflate.h5", |_| {});
+    assert!(result.is_ok(), "deflate.h5: {}", result.unwrap_err());
 }
 
 #[test]
@@ -188,13 +199,13 @@ fn t1f_btree_idx_1_8() {
 
 #[test]
 fn t1g_be_data() {
-    let r = try_open_and_list("be_data.h5");
+    let r = try_open_and_visit_members("be_data.h5", |_| {});
     assert!(r.is_ok(), "be_data.h5: {}", r.unwrap_err());
 }
 
 #[test]
 fn t1g_le_data() {
-    let r = try_open_and_list("le_data.h5");
+    let r = try_open_and_visit_members("le_data.h5", |_| {});
     assert!(r.is_ok(), "le_data.h5: {}", r.unwrap_err());
 }
 

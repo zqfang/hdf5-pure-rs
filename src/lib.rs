@@ -15,11 +15,12 @@ pub use hl::dataset::{
     ChunkInfo, Dataset, DatasetAccess, DatasetSpaceStatus, VdsMissingSourcePolicy, VdsView,
 };
 pub use hl::dataset_builder::DatasetBuilder;
-pub use hl::dataspace::Dataspace;
-pub use hl::datatype::Datatype;
+pub use hl::dataspace::{Dataspace, Extents};
+pub use hl::datatype::{Datatype, TypeDescriptor};
 pub use hl::file::{
-    File, FileInfo, FileIntent, FreeSpaceInfo, MetadataCacheImageInfo, MetadataCacheSize,
-    PageBufferingStats, SharedMessageInfo, SuperblockInfo,
+    File, FileBuilder, FileCreateBuilder, FileInfo, FileIntent, FreeSpaceInfo,
+    MetadataCacheImageInfo, MetadataCacheSize, OpenMode, PageBufferingStats, SharedMessageInfo,
+    SuperblockInfo,
 };
 pub use hl::group::{Group, GroupInfo, LinkInfo, LinkValue, ObjectInfo};
 pub use hl::location::Location;
@@ -37,7 +38,7 @@ pub use hl::plist::link_access::LinkAccess;
 pub use hl::plist::object_copy::ObjectCopy;
 pub use hl::plist::object_create::ObjectCreate;
 pub use hl::selection::{
-    HyperslabDim, IntoSelection, IntoSliceDim, Selection, SelectionType, SliceInfo,
+    HyperslabDim, IntoSelection, IntoSliceDim, RawSelection, Selection, SelectionType, SliceInfo,
 };
 pub use hl::types::H5Type;
 pub use hl::value::H5Value;

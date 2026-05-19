@@ -1,4 +1,6 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
+use std::fmt;
 
 use crate::error::{Error, Result};
 use crate::hl::selection::{Selection, SelectionType};
@@ -273,20 +275,51 @@ pub fn H5D_virtual_free_parsed_name(_parsed_name: Option<VirtualParsedName>) {}
 
 /// Dataset operation: virtual build source name.
 #[allow(non_snake_case)]
-pub fn H5D__virtual_build_source_name(
-    source_name: &str,
-    parsed_name: Option<&VirtualParsedName>,
+pub fn H5D__virtual_build_source_name_cow<'a>(
+    source_name: &'a str,
+    parsed_name: Option<&'a VirtualParsedName>,
     blockno: u64,
-) -> Result<String> {
+) -> Result<Cow<'a, str>> {
     let Some(parsed_name) = parsed_name else {
-        return Ok(source_name.to_string());
+        return Ok(Cow::Borrowed(source_name));
     };
     if parsed_name.substitutions == 0 {
         return Ok(parsed_name
             .segments
             .first()
-            .cloned()
-            .unwrap_or_else(|| source_name.to_string()));
+            .map(String::as_str)
+            .map(Cow::Borrowed)
+            .unwrap_or(Cow::Borrowed(source_name)));
+    }
+
+    let mut out = String::new();
+    H5D__virtual_build_source_name_into(source_name, Some(parsed_name), blockno, &mut out)?;
+    Ok(Cow::Owned(out))
+}
+
+/// Dataset operation: virtual build source name into caller-provided storage.
+#[allow(non_snake_case)]
+pub fn H5D__virtual_build_source_name_into(
+    source_name: &str,
+    parsed_name: Option<&VirtualParsedName>,
+    blockno: u64,
+    out: &mut String,
+) -> Result<()> {
+    let Some(parsed_name) = parsed_name else {
+        out.clear();
+        out.push_str(source_name);
+        return Ok(());
+    };
+    if parsed_name.substitutions == 0 {
+        out.clear();
+        out.push_str(
+            parsed_name
+                .segments
+                .first()
+                .map(String::as_str)
+                .unwrap_or(source_name),
+        );
+        return Ok(());
     }
     if parsed_name.segments.len() != parsed_name.substitutions + 1 {
         return Err(Error::InvalidFormat(
@@ -302,14 +335,28 @@ pub fn H5D__virtual_build_source_name(
         .static_strlen
         .checked_add(substitution_bytes)
         .ok_or_else(|| Error::InvalidFormat("VDS built source-name size overflow".into()))?;
-    let mut out = String::with_capacity(capacity);
+    out.clear();
+    out.reserve(capacity.saturating_sub(out.capacity()));
     for (idx, segment) in parsed_name.segments.iter().enumerate() {
         out.push_str(segment);
         if idx < parsed_name.substitutions {
             out.push_str(&block);
         }
     }
-    Ok(out)
+    Ok(())
+}
+
+/// Dataset operation: virtual build source name.
+#[allow(non_snake_case)]
+#[deprecated(
+    note = "use H5D__virtual_build_source_name_cow or H5D__virtual_build_source_name_into"
+)]
+pub fn H5D__virtual_build_source_name(
+    source_name: &str,
+    parsed_name: Option<&VirtualParsedName>,
+    blockno: u64,
+) -> Result<String> {
+    H5D__virtual_build_source_name_cow(source_name, parsed_name, blockno).map(Cow::into_owned)
 }
 
 /// Dataset operation: virtual store layout.
@@ -320,8 +367,15 @@ pub fn H5D__virtual_store_layout(dataset: &mut DatasetApi, layout: VirtualLayout
 
 /// Dataset operation: virtual load layout.
 #[allow(non_snake_case)]
+pub fn H5D__virtual_load_layout_ref(dataset: &DatasetApi) -> Option<&VirtualLayout> {
+    dataset.virtual_layout.as_ref()
+}
+
+/// Dataset operation: virtual load layout.
+#[allow(non_snake_case)]
+#[deprecated(note = "use H5D__virtual_load_layout_ref to borrow the stored layout")]
 pub fn H5D__virtual_load_layout(dataset: &DatasetApi) -> Option<VirtualLayout> {
-    dataset.virtual_layout.clone()
+    H5D__virtual_load_layout_ref(dataset).cloned()
 }
 
 /// Return a deep copy of a dataset.
@@ -402,8 +456,17 @@ pub fn H5D__virtual_release_source_dset_files(layout: &mut VirtualLayout) {
 
 /// Dataset operation: mappings to leaves.
 #[allow(non_snake_case)]
+pub fn H5D__mappings_to_leaves_iter(
+    layout: &VirtualLayout,
+) -> impl Iterator<Item = &VirtualMapping> + '_ {
+    layout.mappings.iter()
+}
+
+/// Dataset operation: mappings to leaves.
+#[allow(non_snake_case)]
+#[deprecated(note = "use H5D__mappings_to_leaves_iter to avoid cloning mappings")]
 pub fn H5D__mappings_to_leaves(layout: &VirtualLayout) -> Vec<VirtualMapping> {
-    layout.mappings.clone()
+    H5D__mappings_to_leaves_iter(layout).cloned().collect()
 }
 
 /// Dataset operation: virtual not in tree grow.
@@ -497,8 +560,15 @@ pub fn H5D__single_idx_delete(index: &mut SingleChunkIndex) {
 
 /// Return a deep copy of a dataset.
 #[allow(non_snake_case)]
+#[deprecated(note = "use H5D__single_idx_copy_setup_into to reuse caller-provided storage")]
 pub fn H5D__single_idx_copy_setup(index: &SingleChunkIndex) -> SingleChunkIndex {
     index.clone()
+}
+
+/// Copy a single-chunk index into caller-provided storage.
+#[allow(non_snake_case)]
+pub fn H5D__single_idx_copy_setup_into(index: &SingleChunkIndex, out: &mut SingleChunkIndex) {
+    out.clone_from(index);
 }
 
 /// Reset a dataset to its default state.
@@ -507,13 +577,26 @@ pub fn H5D__single_idx_reset(index: &mut SingleChunkIndex) {
     H5D__single_idx_delete(index);
 }
 
-/// Render a dataset for debug output.
+/// Render a single-chunk index for debug output into a formatter.
 #[allow(non_snake_case)]
-pub fn H5D__single_idx_dump(index: &SingleChunkIndex) -> String {
-    format!(
+pub fn H5D__single_idx_dump_to<W: fmt::Write>(
+    index: &SingleChunkIndex,
+    out: &mut W,
+) -> fmt::Result {
+    write!(
+        out,
         "single_idx(open={}, allocated={}, addr={:?})",
         index.open, index.space_allocated, index.chunk_addr
     )
+}
+
+/// Render a dataset for debug output.
+#[allow(non_snake_case)]
+#[deprecated(note = "use H5D__single_idx_dump_to to write into caller-provided output")]
+pub fn H5D__single_idx_dump(index: &SingleChunkIndex) -> String {
+    let mut out = String::new();
+    let _ = H5D__single_idx_dump_to(index, &mut out);
+    out
 }
 
 /// Create a new dataset.
@@ -551,8 +634,33 @@ pub fn H5D__get_space_api_common(dataset: &DatasetApi) -> &[u64] {
 
 /// Read from a dataset.
 #[allow(non_snake_case)]
+#[deprecated(note = "use H5Dread_multi_with or H5Dread_multi_into to avoid cloning raw buffers")]
 pub fn H5Dread_multi(datasets: &[DatasetApi]) -> Vec<Vec<u8>> {
-    datasets.iter().map(|dataset| dataset.raw.clone()).collect()
+    let mut out = Vec::new();
+    H5Dread_multi_into(datasets, &mut out);
+    out
+}
+
+/// Visit each dataset raw buffer without cloning it.
+#[allow(non_snake_case)]
+pub fn H5Dread_multi_with<F>(datasets: &[DatasetApi], mut visitor: F)
+where
+    F: FnMut(&[u8]),
+{
+    for dataset in datasets {
+        visitor(dataset.raw.as_slice());
+    }
+}
+
+/// Copy dataset raw buffers into caller-provided storage.
+#[allow(non_snake_case)]
+pub fn H5Dread_multi_into(datasets: &[DatasetApi], out: &mut Vec<Vec<u8>>) {
+    out.truncate(datasets.len());
+    out.resize_with(datasets.len(), Vec::new);
+    for (dst, dataset) in out.iter_mut().zip(datasets) {
+        dst.clear();
+        dst.extend_from_slice(&dataset.raw);
+    }
 }
 
 /// Read from a dataset.
@@ -565,15 +673,28 @@ pub fn H5Dread_multi_async(_datasets: &[DatasetApi]) -> Result<()> {
 
 /// Read from a dataset.
 #[allow(non_snake_case)]
+#[deprecated(note = "use H5Dread_chunk2_slice or H5Dread_chunk2_into to avoid allocating")]
 pub fn H5Dread_chunk2(dataset: &DatasetApi, offset: usize, len: usize) -> Result<Vec<u8>> {
+    Ok(H5Dread_chunk2_slice(dataset, offset, len)?.to_vec())
+}
+
+/// Borrow a raw chunk byte range from a dataset.
+#[allow(non_snake_case)]
+pub fn H5Dread_chunk2_slice(dataset: &DatasetApi, offset: usize, len: usize) -> Result<&[u8]> {
     let end = offset
         .checked_add(len)
         .ok_or_else(|| Error::InvalidFormat("dataset chunk read overflow".into()))?;
-    Ok(dataset
+    dataset
         .raw
         .get(offset..end)
-        .ok_or_else(|| Error::InvalidFormat("dataset chunk read out of bounds".into()))?
-        .to_vec())
+        .ok_or_else(|| Error::InvalidFormat("dataset chunk read out of bounds".into()))
+}
+
+/// Copy a raw chunk byte range into caller-provided storage.
+#[allow(non_snake_case)]
+pub fn H5Dread_chunk2_into(dataset: &DatasetApi, offset: usize, out: &mut [u8]) -> Result<()> {
+    out.copy_from_slice(H5Dread_chunk2_slice(dataset, offset, out.len())?);
+    Ok(())
 }
 
 /// Write to a dataset.
@@ -586,6 +707,15 @@ pub fn H5D__write_api_common(dataset: &mut DatasetApi, data: &[u8]) {
 /// Write to a dataset.
 #[allow(non_snake_case)]
 pub fn H5Dwrite_multi(datasets: &mut [DatasetApi], payloads: &[Vec<u8>]) {
+    H5Dwrite_multi_slices(datasets, payloads.iter().map(Vec::as_slice));
+}
+
+/// Write borrowed payloads to multiple datasets.
+#[allow(non_snake_case)]
+pub fn H5Dwrite_multi_slices<'a, I>(datasets: &mut [DatasetApi], payloads: I)
+where
+    I: IntoIterator<Item = &'a [u8]>,
+{
     for (dataset, payload) in datasets.iter_mut().zip(payloads) {
         H5D__write_api_common(dataset, payload);
     }
@@ -649,15 +779,36 @@ pub fn H5D__compact_iovv_memmanage_cb(storage: &CompactStorage) -> usize {
 
 /// Dataset operation: compact readvv.
 #[allow(non_snake_case)]
+#[deprecated(note = "use H5D__compact_readvv_slice or H5D__compact_readvv_into")]
 pub fn H5D__compact_readvv(storage: &CompactStorage, offset: usize, len: usize) -> Result<Vec<u8>> {
+    Ok(H5D__compact_readvv_slice(storage, offset, len)?.to_vec())
+}
+
+/// Dataset operation: compact readvv borrowed slice.
+#[allow(non_snake_case)]
+pub fn H5D__compact_readvv_slice(
+    storage: &CompactStorage,
+    offset: usize,
+    len: usize,
+) -> Result<&[u8]> {
     let end = offset
         .checked_add(len)
         .ok_or_else(|| Error::InvalidFormat("compact read overflow".into()))?;
-    Ok(storage
+    storage
         .data
         .get(offset..end)
-        .ok_or_else(|| Error::InvalidFormat("compact read out of bounds".into()))?
-        .to_vec())
+        .ok_or_else(|| Error::InvalidFormat("compact read out of bounds".into()))
+}
+
+/// Dataset operation: compact readvv into caller storage.
+#[allow(non_snake_case)]
+pub fn H5D__compact_readvv_into(
+    storage: &CompactStorage,
+    offset: usize,
+    out: &mut [u8],
+) -> Result<()> {
+    out.copy_from_slice(H5D__compact_readvv_slice(storage, offset, out.len())?);
+    Ok(())
 }
 
 /// Dataset operation: compact writevv.
@@ -695,8 +846,15 @@ pub fn H5D__compact_dest(storage: &mut CompactStorage) {
 
 /// Return a deep copy of a dataset.
 #[allow(non_snake_case)]
+#[deprecated(note = "use H5D__compact_copy_into to reuse caller-provided storage")]
 pub fn H5D__compact_copy(storage: &CompactStorage) -> CompactStorage {
     storage.clone()
+}
+
+/// Copy compact storage into caller-provided storage.
+#[allow(non_snake_case)]
+pub fn H5D__compact_copy_into(storage: &CompactStorage, out: &mut CompactStorage) {
+    out.clone_from(storage);
 }
 
 /// Dataset operation: get chunk storage size.
@@ -761,8 +919,19 @@ pub fn H5D__chunk_io_init(_table: &mut ChunkTable) {}
 
 /// Initialize the dataset subsystem.
 #[allow(non_snake_case)]
+pub fn H5D__chunk_io_init_selections_iter(
+    coords: &[Vec<u64>],
+) -> impl Iterator<Item = &[u64]> + '_ {
+    coords.iter().map(Vec::as_slice)
+}
+
+/// Initialize the dataset subsystem.
+#[allow(non_snake_case)]
+#[deprecated(note = "use H5D__chunk_io_init_selections_iter to borrow coordinates")]
 pub fn H5D__chunk_io_init_selections(coords: &[Vec<u64>]) -> Vec<Vec<u64>> {
-    coords.to_vec()
+    H5D__chunk_io_init_selections_iter(coords)
+        .map(<[u64]>::to_vec)
+        .collect()
 }
 
 /// Allocate storage for a dataset.
@@ -792,46 +961,122 @@ pub fn H5D__create_piece_map_single(coord: Vec<u64>, data: Vec<u8>) -> HashMap<V
 
 /// Create a new dataset.
 #[allow(non_snake_case)]
-pub fn H5D__create_piece_file_map_all(table: &ChunkTable) -> HashMap<Vec<u64>, u64> {
-    table
-        .chunks
-        .iter()
-        .map(|(coord, info)| (coord.clone(), info.addr))
-        .collect()
+pub fn H5D__create_piece_file_map_all_with<F>(table: &ChunkTable, mut visitor: F)
+where
+    F: FnMut(&[u64], u64),
+{
+    for (coord, info) in &table.chunks {
+        visitor(coord, info.addr);
+    }
 }
 
 /// Create a new dataset.
 #[allow(non_snake_case)]
+#[deprecated(note = "use H5D__create_piece_file_map_all_with to avoid cloning coordinates")]
+pub fn H5D__create_piece_file_map_all(table: &ChunkTable) -> HashMap<Vec<u64>, u64> {
+    let mut out = HashMap::with_capacity(table.chunks.len());
+    H5D__create_piece_file_map_all_with(table, |coord, addr| {
+        out.insert(coord.to_vec(), addr);
+    });
+    out
+}
+
+/// Create a new dataset.
+#[allow(non_snake_case)]
+pub fn H5D__create_piece_file_map_hyper_with<F>(
+    table: &ChunkTable,
+    coords: &[Vec<u64>],
+    mut visitor: F,
+) where
+    F: FnMut(&[u64], u64),
+{
+    H5D__create_piece_file_map_hyper_slices_with(
+        table,
+        coords.iter().map(Vec::as_slice),
+        |coord, addr| {
+            visitor(coord, addr);
+        },
+    );
+}
+
+/// Create a new dataset from borrowed chunk coordinate slices.
+#[allow(non_snake_case)]
+pub fn H5D__create_piece_file_map_hyper_slices_with<'a, I, F>(
+    table: &ChunkTable,
+    coords: I,
+    mut visitor: F,
+) where
+    I: IntoIterator<Item = &'a [u64]>,
+    F: FnMut(&[u64], u64),
+{
+    for coord in coords {
+        if let Some(info) = table.chunks.get(coord) {
+            visitor(coord, info.addr);
+        }
+    }
+}
+
+/// Create a new dataset.
+#[allow(non_snake_case)]
+#[deprecated(note = "use H5D__create_piece_file_map_hyper_with to avoid cloning coordinates")]
 pub fn H5D__create_piece_file_map_hyper(
     table: &ChunkTable,
     coords: &[Vec<u64>],
 ) -> HashMap<Vec<u64>, u64> {
-    coords
-        .iter()
-        .filter_map(|coord| {
-            table
-                .chunks
-                .get(coord)
-                .map(|info| (coord.clone(), info.addr))
-        })
-        .collect()
+    let mut out = HashMap::with_capacity(coords.len());
+    H5D__create_piece_file_map_hyper_with(table, coords, |coord, addr| {
+        out.insert(coord.to_vec(), addr);
+    });
+    out
 }
 
 /// Create a new dataset.
 #[allow(non_snake_case)]
+pub fn H5D__create_piece_mem_map_hyper_with<F>(
+    table: &ChunkTable,
+    coords: &[Vec<u64>],
+    mut visitor: F,
+) where
+    F: FnMut(&[u64], &[u8]),
+{
+    H5D__create_piece_mem_map_hyper_slices_with(
+        table,
+        coords.iter().map(Vec::as_slice),
+        |coord, data| {
+            visitor(coord, data);
+        },
+    );
+}
+
+/// Create a new dataset from borrowed chunk coordinate slices.
+#[allow(non_snake_case)]
+pub fn H5D__create_piece_mem_map_hyper_slices_with<'a, I, F>(
+    table: &ChunkTable,
+    coords: I,
+    mut visitor: F,
+) where
+    I: IntoIterator<Item = &'a [u64]>,
+    F: FnMut(&[u64], &[u8]),
+{
+    for coord in coords {
+        if let Some(data) = table.data.get(coord) {
+            visitor(coord, data);
+        }
+    }
+}
+
+/// Create a new dataset.
+#[allow(non_snake_case)]
+#[deprecated(note = "use H5D__create_piece_mem_map_hyper_with to avoid cloning chunks")]
 pub fn H5D__create_piece_mem_map_hyper(
     table: &ChunkTable,
     coords: &[Vec<u64>],
 ) -> HashMap<Vec<u64>, Vec<u8>> {
-    coords
-        .iter()
-        .filter_map(|coord| {
-            table
-                .data
-                .get(coord)
-                .map(|data| (coord.clone(), data.clone()))
-        })
-        .collect()
+    let mut out = HashMap::with_capacity(coords.len());
+    H5D__create_piece_mem_map_hyper_with(table, coords, |coord, data| {
+        out.insert(coord.to_vec(), data.to_vec());
+    });
+    out
 }
 
 /// Dataset operation: piece file cb.
@@ -858,13 +1103,33 @@ pub fn H5D__chunk_may_use_select_io(coords: &[Vec<u64>]) -> bool {
 
 /// Read from a dataset.
 #[allow(non_snake_case)]
-pub fn H5D__chunk_read(table: &mut ChunkTable, coord: &[u64]) -> Result<Vec<u8>> {
+pub fn H5D__chunk_read_slice<'a>(table: &'a mut ChunkTable, coord: &[u64]) -> Result<&'a [u8]> {
     if let Some(data) = table.data.get(coord) {
         table.cache_hits += 1;
-        return Ok(data.clone());
+        return Ok(data);
     }
     table.cache_misses += 1;
     Err(Error::InvalidFormat("chunk not found".into()))
+}
+
+/// Read from a dataset.
+#[allow(non_snake_case)]
+pub fn H5D__chunk_read_into(table: &mut ChunkTable, coord: &[u64], out: &mut [u8]) -> Result<()> {
+    let data = H5D__chunk_read_slice(table, coord)?;
+    if out.len() != data.len() {
+        return Err(Error::InvalidFormat(
+            "chunk read output size mismatch".into(),
+        ));
+    }
+    out.copy_from_slice(data);
+    Ok(())
+}
+
+/// Read from a dataset.
+#[allow(non_snake_case)]
+#[deprecated(note = "use H5D__chunk_read_slice or H5D__chunk_read_into to avoid cloning chunks")]
+pub fn H5D__chunk_read(table: &mut ChunkTable, coord: &[u64]) -> Result<Vec<u8>> {
+    Ok(H5D__chunk_read_slice(table, coord)?.to_vec())
 }
 
 /// Write to a dataset.
@@ -972,11 +1237,16 @@ pub fn H5D__chunk_cache_evict(table: &mut ChunkTable, coord: &[u64]) -> Option<V
 /// Dataset operation: chunk cache prune.
 #[allow(non_snake_case)]
 pub fn H5D__chunk_cache_prune(table: &mut ChunkTable, max_chunks: usize) {
-    while table.data.len() > max_chunks {
-        if let Some(coord) = table.data.keys().next().cloned() {
-            table.data.remove(&coord);
-        }
+    if table.data.len() <= max_chunks {
+        return;
     }
+
+    let mut keep = max_chunks;
+    table.data.retain(|_, _| {
+        let retain = keep > 0;
+        keep = keep.saturating_sub(1);
+        retain
+    });
 }
 
 /// Lock a dataset against further modification.
@@ -1046,14 +1316,35 @@ pub fn H5D__chunk_prune_by_extent(table: &mut ChunkTable, extent: &[u64]) {
 
 /// Dataset operation: chunk addrmap cb.
 #[allow(non_snake_case)]
+pub fn H5D__chunk_addrmap_cb_ref(info: &ChunkInfo) -> (&[u64], u64) {
+    (&info.coord, info.addr)
+}
+
+/// Dataset operation: chunk addrmap cb.
+#[allow(non_snake_case)]
+#[deprecated(note = "use H5D__chunk_addrmap_cb_ref to borrow the coordinate")]
 pub fn H5D__chunk_addrmap_cb(info: &ChunkInfo) -> (Vec<u64>, u64) {
     (info.coord.clone(), info.addr)
 }
 
 /// Dataset operation: chunk addrmap.
 #[allow(non_snake_case)]
+pub fn H5D__chunk_addrmap_with<F>(table: &ChunkTable, visitor: F)
+where
+    F: FnMut(&[u64], u64),
+{
+    H5D__create_piece_file_map_all_with(table, visitor);
+}
+
+/// Dataset operation: chunk addrmap.
+#[allow(non_snake_case)]
+#[deprecated(note = "use H5D__chunk_addrmap_with to avoid cloning coordinates")]
 pub fn H5D__chunk_addrmap(table: &ChunkTable) -> HashMap<Vec<u64>, u64> {
-    H5D__create_piece_file_map_all(table)
+    let mut out = HashMap::with_capacity(table.chunks.len());
+    H5D__chunk_addrmap_with(table, |coord, addr| {
+        out.insert(coord.to_vec(), addr);
+    });
+    out
 }
 
 /// Delete a dataset.
@@ -1071,14 +1362,28 @@ pub fn H5D__chunk_update_cache(table: &mut ChunkTable, coord: Vec<u64>, data: Ve
 
 /// Return a deep copy of a dataset.
 #[allow(non_snake_case)]
+#[deprecated(note = "use H5D__chunk_copy_cb_ref to borrow the chunk info")]
 pub fn H5D__chunk_copy_cb(info: &ChunkInfo) -> ChunkInfo {
     info.clone()
 }
 
+/// Borrow chunk information during copy callbacks.
+#[allow(non_snake_case)]
+pub fn H5D__chunk_copy_cb_ref(info: &ChunkInfo) -> &ChunkInfo {
+    info
+}
+
 /// Return a deep copy of a dataset.
 #[allow(non_snake_case)]
+#[deprecated(note = "use H5D__chunk_copy_into to reuse caller-provided storage")]
 pub fn H5D__chunk_copy(table: &ChunkTable) -> ChunkTable {
     table.clone()
+}
+
+/// Copy chunk table metadata into caller-provided storage.
+#[allow(non_snake_case)]
+pub fn H5D__chunk_copy_into(table: &ChunkTable, out: &mut ChunkTable) {
+    out.clone_from(table);
 }
 
 /// Dataset operation: chunk stats.
@@ -1087,16 +1392,30 @@ pub fn H5D__chunk_stats(table: &ChunkTable) -> (usize, u64, u64) {
     (table.chunks.len(), table.cache_hits, table.cache_misses)
 }
 
+/// Fill caller-provided storage for a nonexistent chunk read callback.
+#[allow(non_snake_case)]
+pub fn H5D__nonexistent_readvv_cb_into(out: &mut [u8]) {
+    out.fill(0);
+}
+
 /// Dataset operation: nonexistent readvv cb.
 #[allow(non_snake_case)]
+#[deprecated(note = "use H5D__nonexistent_readvv_cb_into to fill caller-provided buffers")]
 pub fn H5D__nonexistent_readvv_cb(len: usize) -> Vec<u8> {
     vec![0; len]
 }
 
+/// Fill caller-provided storage for a nonexistent chunk read.
+#[allow(non_snake_case)]
+pub fn H5D__nonexistent_readvv_into(out: &mut [u8]) {
+    H5D__nonexistent_readvv_cb_into(out);
+}
+
 /// Dataset operation: nonexistent readvv.
 #[allow(non_snake_case)]
+#[deprecated(note = "use H5D__nonexistent_readvv_into to fill caller-provided buffers")]
 pub fn H5D__nonexistent_readvv(len: usize) -> Vec<u8> {
-    H5D__nonexistent_readvv_cb(len)
+    vec![0; len]
 }
 
 /// Allocate storage for a dataset.
@@ -1126,8 +1445,15 @@ pub fn H5D__chunk_file_alloc_checked(
 
 /// Convert a dataset.
 #[allow(non_snake_case)]
+pub fn H5D__chunk_format_convert_cb_slice(data: &[u8]) -> &[u8] {
+    data
+}
+
+/// Convert a dataset.
+#[allow(non_snake_case)]
+#[deprecated(note = "use H5D__chunk_format_convert_cb_slice to borrow converted data")]
 pub fn H5D__chunk_format_convert_cb(data: &[u8]) -> Vec<u8> {
-    data.to_vec()
+    H5D__chunk_format_convert_cb_slice(data).to_vec()
 }
 
 /// Convert a dataset.
@@ -1179,8 +1505,15 @@ pub fn H5D__get_chunk_info_by_coord<'a>(
 
 /// Return the offset of a dataset.
 #[allow(non_snake_case)]
+pub fn H5D__chunk_get_offset_copy_slice(coord: &[u64]) -> &[u64] {
+    coord
+}
+
+/// Return the offset of a dataset.
+#[allow(non_snake_case)]
+#[deprecated(note = "use H5D__chunk_get_offset_copy_slice to borrow the coordinate")]
 pub fn H5D__chunk_get_offset_copy(coord: &[u64]) -> Vec<u64> {
-    coord.to_vec()
+    H5D__chunk_get_offset_copy_slice(coord).to_vec()
 }
 
 /// Read from a dataset.
@@ -1235,8 +1568,13 @@ fn chunk_index_remove(index: &mut ChunkIndexState, coord: &[u64]) -> Option<Chun
 }
 
 /// Internal helper `chunk_index_dump`.
-fn chunk_index_dump(kind: &str, index: &ChunkIndexState) -> String {
-    format!(
+fn chunk_index_dump_to<W: fmt::Write>(
+    kind: &str,
+    index: &ChunkIndexState,
+    out: &mut W,
+) -> fmt::Result {
+    write!(
+        out,
         "{kind}(open={}, allocated={}, entries={}, declared={})",
         index.open,
         index.space_allocated,
@@ -1245,12 +1583,50 @@ fn chunk_index_dump(kind: &str, index: &ChunkIndexState) -> String {
     )
 }
 
+/// Iterate over a chunk index without cloning entries.
+#[allow(non_snake_case)]
+pub fn H5D__chunk_index_iterate(index: &ChunkIndexState) -> impl Iterator<Item = &ChunkInfo> + '_ {
+    index.entries.values()
+}
+
+/// Render a chunk index debug string into caller-provided output.
+#[allow(non_snake_case)]
+pub fn H5D__chunk_index_dump_to<W: fmt::Write>(
+    kind: &str,
+    index: &ChunkIndexState,
+    out: &mut W,
+) -> fmt::Result {
+    chunk_index_dump_to(kind, index, out)
+}
+
+/// Copy a chunk index into caller-provided storage.
+#[allow(non_snake_case)]
+pub fn H5D__chunk_index_copy_setup_into(index: &ChunkIndexState, out: &mut ChunkIndexState) {
+    out.clone_from(index);
+}
+
 /// Internal helper `chunk_index_encode_count`.
-fn chunk_index_encode_count(index: &ChunkIndexState) -> Result<Vec<u8>> {
+fn chunk_index_encode_count_array(index: &ChunkIndexState) -> Result<[u8; 8]> {
     let count = u64::try_from(index.entries.len()).map_err(|_| {
         Error::InvalidFormat("chunk-index entry count cannot be represented as u64".into())
     })?;
-    Ok(count.to_le_bytes().to_vec())
+    Ok(count.to_le_bytes())
+}
+
+/// Encode a chunk-index count into caller-provided storage.
+#[allow(non_snake_case)]
+pub fn H5D__chunk_index_encode_count_into(
+    index: &ChunkIndexState,
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    out.clear();
+    out.extend_from_slice(&chunk_index_encode_count_array(index)?);
+    Ok(())
+}
+
+/// Internal helper `chunk_index_encode_count`.
+fn chunk_index_encode_count(index: &ChunkIndexState) -> Result<Vec<u8>> {
+    Ok(chunk_index_encode_count_array(index)?.into())
 }
 
 /// Internal helper `chunk_index_decode_count_image`.
@@ -1418,8 +1794,11 @@ macro_rules! chunk_index_family {
         }
 
         #[allow(non_snake_case)]
+        #[deprecated(note = "use H5D__chunk_index_dump_to to write into caller-provided output")]
         pub fn $debug(index: &ChunkIndexState) -> String {
-            chunk_index_dump($kind, index)
+            let mut out = String::new();
+            let _ = H5D__chunk_index_dump_to($kind, index, &mut out);
+            out
         }
 
         #[allow(non_snake_case)]
@@ -1473,13 +1852,15 @@ macro_rules! chunk_index_family {
         }
 
         #[allow(non_snake_case)]
+        #[deprecated(note = "use H5D__chunk_index_iterate to borrow chunk info entries")]
         pub fn $idx_iterate_cb(info: &ChunkInfo) -> ChunkInfo {
             info.clone()
         }
 
         #[allow(non_snake_case)]
+        #[deprecated(note = "use H5D__chunk_index_iterate to avoid cloning chunk info entries")]
         pub fn $idx_iterate(index: &ChunkIndexState) -> Vec<ChunkInfo> {
-            index.entries.values().cloned().collect()
+            H5D__chunk_index_iterate(index).cloned().collect()
         }
 
         #[allow(non_snake_case)]
@@ -1488,6 +1869,7 @@ macro_rules! chunk_index_family {
         }
 
         #[allow(non_snake_case)]
+        #[deprecated(note = "use H5D__chunk_index_iterate to borrow chunk info entries")]
         pub fn $idx_delete_cb(info: &ChunkInfo) -> ChunkInfo {
             info.clone()
         }
@@ -1499,6 +1881,9 @@ macro_rules! chunk_index_family {
         }
 
         #[allow(non_snake_case)]
+        #[deprecated(
+            note = "use H5D__chunk_index_copy_setup_into to reuse caller-provided storage"
+        )]
         pub fn $idx_copy_setup(index: &ChunkIndexState) -> ChunkIndexState {
             index.clone()
         }
@@ -1514,8 +1899,11 @@ macro_rules! chunk_index_family {
         }
 
         #[allow(non_snake_case)]
+        #[deprecated(note = "use H5D__chunk_index_dump_to to write into caller-provided output")]
         pub fn $idx_dump(index: &ChunkIndexState) -> String {
-            chunk_index_dump($kind, index)
+            let mut out = String::new();
+            let _ = H5D__chunk_index_dump_to($kind, index, &mut out);
+            out
         }
 
         #[allow(non_snake_case)]
@@ -1571,8 +1959,11 @@ pub fn H5D__earray_filt_encode(index: &ChunkIndexState) -> Result<Vec<u8>> {
 
 /// Return a debug-friendly representation of a dataset.
 #[allow(non_snake_case)]
+#[deprecated(note = "use H5D__chunk_index_dump_to to write into caller-provided output")]
 pub fn H5D__earray_filt_debug(index: &ChunkIndexState) -> String {
-    H5D__earray_debug(index)
+    let mut out = String::new();
+    let _ = H5D__chunk_index_dump_to("earray", index, &mut out);
+    out
 }
 
 /// Dataset operation: earray crt dbg context.
@@ -1655,8 +2046,11 @@ pub fn H5D__farray_filt_decode(bytes: &[u8]) -> Result<ChunkIndexState> {
 
 /// Return a debug-friendly representation of a dataset.
 #[allow(non_snake_case)]
+#[deprecated(note = "use H5D__chunk_index_dump_to to write into caller-provided output")]
 pub fn H5D__farray_filt_debug(index: &ChunkIndexState) -> String {
-    H5D__farray_debug(index)
+    let mut out = String::new();
+    let _ = H5D__chunk_index_dump_to("farray", index, &mut out);
+    out
 }
 
 /// Dataset operation: farray filt crt dbg context.
@@ -1715,8 +2109,11 @@ pub fn H5D__bt2_filt_decode(bytes: &[u8]) -> Result<ChunkIndexState> {
 
 /// Return a debug-friendly representation of a dataset.
 #[allow(non_snake_case)]
+#[deprecated(note = "use H5D__chunk_index_dump_to to write into caller-provided output")]
 pub fn H5D__bt2_filt_debug(index: &ChunkIndexState) -> String {
-    H5D__bt2_unfilt_debug(index)
+    let mut out = String::new();
+    let _ = H5D__chunk_index_dump_to("bt2", index, &mut out);
+    out
 }
 
 /// Dataset operation: bt2 mod cb.
@@ -1727,8 +2124,15 @@ pub fn H5D__bt2_mod_cb(info: &mut ChunkInfo, addr: u64, size: usize) {
 
 /// Dataset operation: bt2 found cb.
 #[allow(non_snake_case)]
+#[deprecated(note = "use H5D__bt2_found_cb_ref to borrow the chunk info")]
 pub fn H5D__bt2_found_cb(info: &ChunkInfo) -> ChunkInfo {
     info.clone()
+}
+
+/// Dataset operation: bt2 found cb.
+#[allow(non_snake_case)]
+pub fn H5D__bt2_found_cb_ref(info: &ChunkInfo) -> &ChunkInfo {
+    info
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1778,11 +2182,13 @@ pub fn H5D__ioinfo_init(element_size: usize) -> DatasetIoInfo {
 /// Initialize the dataset subsystem.
 #[allow(non_snake_case)]
 pub fn H5D__dset_ioinfo_init(dataset: &DatasetApi, element_size: usize) -> DatasetIoInfo {
-    DatasetIoInfo {
+    let mut info = DatasetIoInfo {
         element_size,
-        file_selection: dataset.extent.clone(),
-        memory_selection: dataset.extent.clone(),
-    }
+        file_selection: Vec::new(),
+        memory_selection: Vec::new(),
+    };
+    H5D__ioinfo_adjust(&mut info, H5D__get_space(dataset));
+    info
 }
 
 /// Initialize the dataset subsystem.
@@ -1804,8 +2210,10 @@ pub fn H5D__typeinfo_init_phase2(info: &mut DatasetTypeInfo) {
 /// Dataset operation: ioinfo adjust.
 #[allow(non_snake_case)]
 pub fn H5D__ioinfo_adjust(info: &mut DatasetIoInfo, extent: &[u64]) {
-    info.file_selection = extent.to_vec();
-    info.memory_selection = extent.to_vec();
+    info.file_selection.clear();
+    info.file_selection.extend_from_slice(extent);
+    info.memory_selection.clear();
+    info.memory_selection.extend_from_slice(extent);
 }
 
 /// Initialize the dataset subsystem.
@@ -1834,13 +2242,23 @@ pub fn H5D__layout_contig_size_test(size: u64) -> bool {
 
 /// Return a debug-friendly representation of a dataset.
 #[allow(non_snake_case)]
-pub fn H5Ddebug(dataset: &DatasetApi) -> String {
-    format!(
+pub fn H5Ddebug_to<W: fmt::Write>(dataset: &DatasetApi, out: &mut W) -> fmt::Result {
+    write!(
+        out,
         "dataset(name={:?}, extent={:?}, bytes={})",
         dataset.name,
         dataset.extent,
         dataset.raw.len()
     )
+}
+
+/// Return a debug-friendly representation of a dataset.
+#[allow(non_snake_case)]
+#[deprecated(note = "use H5Ddebug_to to write into caller-provided output")]
+pub fn H5Ddebug(dataset: &DatasetApi) -> String {
+    let mut out = String::new();
+    let _ = H5Ddebug_to(dataset, &mut out);
+    out
 }
 
 /// Return a debug-friendly representation of a dataset.
@@ -2055,67 +2473,297 @@ pub fn H5D__mpio_get_chunk_insert_info_types() -> Result<()> {
 
 /// Render a dataset for debug output.
 #[allow(non_snake_case)]
+#[deprecated(
+    note = "use H5D__mpio_dump_collective_filtered_chunk_list_to to write into caller-provided output"
+)]
 pub fn H5D__mpio_dump_collective_filtered_chunk_list(chunks: &[ChunkInfo]) -> String {
-    format!("{} collective chunks", chunks.len())
+    let mut out = String::new();
+    let _ = H5D__mpio_dump_collective_filtered_chunk_list_to(chunks, &mut out);
+    out
+}
+
+/// Render a dataset for debug output into caller-provided output.
+#[allow(non_snake_case)]
+pub fn H5D__mpio_dump_collective_filtered_chunk_list_to<W: fmt::Write>(
+    chunks: &[ChunkInfo],
+    out: &mut W,
+) -> fmt::Result {
+    write!(out, "{} collective chunks", chunks.len())
 }
 
 /// Dataset operation: scatter file.
 #[allow(non_snake_case)]
+#[deprecated(
+    since = "0.4.0",
+    note = "use H5D__scatter_file_into to fill caller-provided buffers"
+)]
 pub fn H5D__scatter_file(src: &[u8], spans: &[(usize, usize)]) -> Result<Vec<Vec<u8>>> {
-    H5D__scatter_file_checked(src, spans)
+    let mut out: Vec<Vec<u8>> = spans.iter().map(|&(_, len)| vec![0; len]).collect();
+    H5D__scatter_file_into(src, spans, &mut out)?;
+    Ok(out)
+}
+
+fn validate_scatter_output_shapes<'a, I>(spans: &[(usize, usize)], out: I) -> Result<()>
+where
+    I: IntoIterator<Item = &'a [u8]>,
+{
+    let mut out = out.into_iter();
+    for &(_, len) in spans {
+        let Some(dst) = out.next() else {
+            return Err(Error::InvalidFormat(
+                "dataset scatter output span count mismatch".into(),
+            ));
+        };
+        if dst.len() != len {
+            return Err(Error::InvalidFormat(
+                "dataset scatter output span size mismatch".into(),
+            ));
+        }
+    }
+    if out.next().is_some() {
+        return Err(Error::InvalidFormat(
+            "dataset scatter output span count mismatch".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_scatter_output_shapes_mut(spans: &[(usize, usize)], out: &[&mut [u8]]) -> Result<()> {
+    if out.len() != spans.len() {
+        return Err(Error::InvalidFormat(
+            "dataset scatter output span count mismatch".into(),
+        ));
+    }
+
+    spans.iter().zip(out).try_for_each(|(&(_, len), dst)| {
+        if dst.len() != len {
+            return Err(Error::InvalidFormat(
+                "dataset scatter output span size mismatch".into(),
+            ));
+        }
+        Ok(())
+    })
+}
+
+/// Dataset operation: scatter file borrowed visitor.
+#[allow(non_snake_case)]
+pub fn H5D__scatter_file_with<F>(src: &[u8], spans: &[(usize, usize)], mut visitor: F) -> Result<()>
+where
+    F: FnMut(&[u8]),
+{
+    for &(offset, len) in spans {
+        let end = offset
+            .checked_add(len)
+            .ok_or_else(|| Error::InvalidFormat("dataset scatter span overflow".into()))?;
+        let span = src
+            .get(offset..end)
+            .ok_or_else(|| Error::InvalidFormat("dataset scatter span out of bounds".into()))?;
+        visitor(span);
+    }
+    Ok(())
+}
+
+/// Dataset operation: scatter file into caller-provided buffers.
+#[allow(non_snake_case)]
+pub fn H5D__scatter_file_into(
+    src: &[u8],
+    spans: &[(usize, usize)],
+    out: &mut [Vec<u8>],
+) -> Result<()> {
+    validate_scatter_output_shapes(spans, out.iter().map(Vec::as_slice))?;
+
+    let mut out = out.iter_mut();
+    H5D__scatter_file_with(src, spans, |span| {
+        if let Some(dst) = out.next() {
+            dst.copy_from_slice(span);
+        }
+    })?;
+
+    Ok(())
+}
+
+/// Dataset operation: scatter file into caller-provided borrowed buffers.
+#[allow(non_snake_case)]
+pub fn H5D__scatter_file_into_slices(
+    src: &[u8],
+    spans: &[(usize, usize)],
+    out: &mut [&mut [u8]],
+) -> Result<()> {
+    validate_scatter_output_shapes_mut(spans, out)?;
+
+    let mut out = out.iter_mut();
+    H5D__scatter_file_with(src, spans, |span| {
+        if let Some(dst) = out.next() {
+            dst.copy_from_slice(span);
+        }
+    })?;
+
+    Ok(())
 }
 
 /// Dataset operation: scatter file checked.
 #[allow(non_snake_case)]
+#[deprecated(
+    since = "0.4.0",
+    note = "use H5D__scatter_file_into to fill caller-provided buffers"
+)]
 pub fn H5D__scatter_file_checked(src: &[u8], spans: &[(usize, usize)]) -> Result<Vec<Vec<u8>>> {
-    spans
-        .iter()
-        .map(|&(offset, len)| {
-            let end = offset
-                .checked_add(len)
-                .ok_or_else(|| Error::InvalidFormat("dataset scatter span overflow".into()))?;
-            Ok(src
-                .get(offset..end)
-                .ok_or_else(|| Error::InvalidFormat("dataset scatter span out of bounds".into()))?
-                .to_vec())
-        })
-        .collect()
+    let mut out: Vec<Vec<u8>> = spans.iter().map(|&(_, len)| vec![0; len]).collect();
+    H5D__scatter_file_into(src, spans, &mut out)?;
+    Ok(out)
 }
 
 /// Dataset operation: gather file.
 #[allow(non_snake_case)]
+pub fn H5D__gather_file_into<'a, I>(parts: I, out: &mut Vec<u8>)
+where
+    I: IntoIterator<Item = &'a [u8]>,
+{
+    out.clear();
+    for part in parts {
+        out.extend_from_slice(part);
+    }
+}
+
+/// Dataset operation: gather file.
+#[allow(non_snake_case)]
+#[deprecated(note = "use H5D__gather_file_into to reuse caller-provided storage")]
 pub fn H5D__gather_file(parts: &[Vec<u8>]) -> Vec<u8> {
-    parts.concat()
+    let mut out = Vec::new();
+    H5D__gather_file_into(parts.iter().map(Vec::as_slice), &mut out);
+    out
 }
 
 /// Dataset operation: scatter mem.
 #[allow(non_snake_case)]
+#[deprecated(
+    since = "0.4.0",
+    note = "use H5D__scatter_mem_into to fill caller-provided buffers"
+)]
 pub fn H5D__scatter_mem(src: &[u8], spans: &[(usize, usize)]) -> Result<Vec<Vec<u8>>> {
-    H5D__scatter_file(src, spans)
+    let mut out: Vec<Vec<u8>> = spans.iter().map(|&(_, len)| vec![0; len]).collect();
+    H5D__scatter_mem_into(src, spans, &mut out)?;
+    Ok(out)
+}
+
+/// Dataset operation: scatter mem into caller-provided buffers.
+#[allow(non_snake_case)]
+pub fn H5D__scatter_mem_into(
+    src: &[u8],
+    spans: &[(usize, usize)],
+    out: &mut [Vec<u8>],
+) -> Result<()> {
+    H5D__scatter_file_into(src, spans, out)
+}
+
+/// Dataset operation: scatter mem into caller-provided borrowed buffers.
+#[allow(non_snake_case)]
+pub fn H5D__scatter_mem_into_slices(
+    src: &[u8],
+    spans: &[(usize, usize)],
+    out: &mut [&mut [u8]],
+) -> Result<()> {
+    H5D__scatter_file_into_slices(src, spans, out)
+}
+
+/// Dataset operation: scatter mem borrowed visitor.
+#[allow(non_snake_case)]
+pub fn H5D__scatter_mem_with<F>(src: &[u8], spans: &[(usize, usize)], visitor: F) -> Result<()>
+where
+    F: FnMut(&[u8]),
+{
+    H5D__scatter_file_with(src, spans, visitor)
 }
 
 /// Dataset operation: gather mem.
 #[allow(non_snake_case)]
+pub fn H5D__gather_mem_into<'a, I>(parts: I, out: &mut Vec<u8>)
+where
+    I: IntoIterator<Item = &'a [u8]>,
+{
+    H5D__gather_file_into(parts, out);
+}
+
+/// Dataset operation: gather mem.
+#[allow(non_snake_case)]
+#[deprecated(note = "use H5D__gather_mem_into to reuse caller-provided storage")]
 pub fn H5D__gather_mem(parts: &[Vec<u8>]) -> Vec<u8> {
-    H5D__gather_file(parts)
+    let mut out = Vec::new();
+    H5D__gather_mem_into(parts.iter().map(Vec::as_slice), &mut out);
+    out
 }
 
 /// Read from a dataset.
 #[allow(non_snake_case)]
+pub fn H5D__scatgath_read_select_into(
+    src: &[u8],
+    spans: &[(usize, usize)],
+    out: &mut [Vec<u8>],
+) -> Result<()> {
+    H5D__scatter_file_into(src, spans, out)
+}
+
+/// Read from a dataset into caller-provided borrowed buffers.
+#[allow(non_snake_case)]
+pub fn H5D__scatgath_read_select_into_slices(
+    src: &[u8],
+    spans: &[(usize, usize)],
+    out: &mut [&mut [u8]],
+) -> Result<()> {
+    H5D__scatter_file_into_slices(src, spans, out)
+}
+
+/// Read selected spans through a borrowed visitor.
+#[allow(non_snake_case)]
+pub fn H5D__scatgath_read_select_with<F>(
+    src: &[u8],
+    spans: &[(usize, usize)],
+    visitor: F,
+) -> Result<()>
+where
+    F: FnMut(&[u8]),
+{
+    H5D__scatter_file_with(src, spans, visitor)
+}
+
+/// Read from a dataset.
+#[allow(non_snake_case)]
+#[deprecated(note = "use H5D__scatgath_read_select_into to fill caller-provided buffers")]
 pub fn H5D__scatgath_read_select(src: &[u8], spans: &[(usize, usize)]) -> Result<Vec<Vec<u8>>> {
-    H5D__scatter_file(src, spans)
+    let mut out: Vec<Vec<u8>> = spans.iter().map(|&(_, len)| vec![0; len]).collect();
+    H5D__scatgath_read_select_into(src, spans, &mut out)?;
+    Ok(out)
 }
 
 /// Write to a dataset.
 #[allow(non_snake_case)]
+pub fn H5D__scatgath_write_select_into<'a, I>(parts: I, out: &mut Vec<u8>)
+where
+    I: IntoIterator<Item = &'a [u8]>,
+{
+    H5D__gather_file_into(parts, out);
+}
+
+/// Write to a dataset.
+#[allow(non_snake_case)]
+#[deprecated(note = "use H5D__scatgath_write_select_into to reuse caller-provided storage")]
 pub fn H5D__scatgath_write_select(parts: &[Vec<u8>]) -> Vec<u8> {
-    H5D__gather_file(parts)
+    let mut out = Vec::new();
+    H5D__scatgath_write_select_into(parts.iter().map(Vec::as_slice), &mut out);
+    out
 }
 
 /// Read from a dataset.
 #[allow(non_snake_case)]
+pub fn H5D__compound_opt_read_slice(src: &[u8]) -> &[u8] {
+    src
+}
+
+/// Read from a dataset.
+#[allow(non_snake_case)]
+#[deprecated(note = "use H5D__compound_opt_read_slice to borrow optimized compound bytes")]
 pub fn H5D__compound_opt_read(src: &[u8]) -> Vec<u8> {
-    src.to_vec()
+    H5D__compound_opt_read_slice(src).to_vec()
 }
 
 /// Dataset operation: efl construct.
@@ -2161,15 +2809,31 @@ pub fn H5D__efl_write(_efl: &ExternalFileList, _offset: u64, _data: &[u8]) -> Re
 
 /// Dataset operation: efl readvv cb.
 #[allow(non_snake_case)]
+pub fn H5D__efl_readvv_cb_into(out: &mut [u8]) {
+    out.fill(0);
+}
+
+/// Dataset operation: efl readvv cb.
+#[allow(non_snake_case)]
+#[deprecated(note = "use H5D__efl_readvv_cb_into to fill caller-provided buffers")]
 pub fn H5D__efl_readvv_cb(len: usize) -> Vec<u8> {
-    vec![0; len]
+    let mut out = vec![0; len];
+    H5D__efl_readvv_cb_into(&mut out);
+    out
 }
 
 /// Dataset operation: efl readvv.
 #[allow(non_snake_case)]
+pub fn H5D__efl_readvv_into(efl: &ExternalFileList, offset: u64, out: &mut [u8]) -> Result<()> {
+    H5D__efl_read(efl, offset, out)
+}
+
+/// Dataset operation: efl readvv.
+#[allow(non_snake_case)]
+#[deprecated(note = "use H5D__efl_readvv_into to fill caller-provided buffers")]
 pub fn H5D__efl_readvv(efl: &ExternalFileList, offset: u64, len: usize) -> Result<Vec<u8>> {
     let mut buf = vec![0; len];
-    H5D__efl_read(efl, offset, &mut buf)?;
+    H5D__efl_readvv_into(efl, offset, &mut buf)?;
     Ok(buf)
 }
 
@@ -2213,18 +2877,38 @@ pub fn H5D__layout_meta_size_checked(dataset: &DatasetApi) -> Result<usize> {
 
 /// Create a new dataset.
 #[allow(non_snake_case)]
+pub fn H5D__layout_oh_create_into(dataset: &DatasetApi, out: &mut Vec<u8>) -> Result<()> {
+    let size = H5D__layout_meta_size_checked(dataset)?;
+    out.clear();
+    out.reserve(size);
+    for dim in &dataset.extent {
+        out.extend_from_slice(&dim.to_le_bytes());
+    }
+    Ok(())
+}
+
+/// Create a new dataset.
+#[allow(non_snake_case)]
+#[deprecated(note = "use H5D__layout_oh_create_into to reuse caller-provided storage")]
 pub fn H5D__layout_oh_create(dataset: &DatasetApi) -> Vec<u8> {
-    dataset
-        .extent
-        .iter()
-        .flat_map(|dim| dim.to_le_bytes())
-        .collect()
+    let mut out = Vec::new();
+    let _ = H5D__layout_oh_create_into(dataset, &mut out);
+    out
 }
 
 /// Write to a dataset.
 #[allow(non_snake_case)]
+pub fn H5D__layout_oh_write_into(dataset: &DatasetApi, out: &mut Vec<u8>) -> Result<()> {
+    H5D__layout_oh_create_into(dataset, out)
+}
+
+/// Write to a dataset.
+#[allow(non_snake_case)]
+#[deprecated(note = "use H5D__layout_oh_write_into to reuse caller-provided storage")]
 pub fn H5D__layout_oh_write(dataset: &DatasetApi) -> Vec<u8> {
-    H5D__layout_oh_create(dataset)
+    let mut out = Vec::new();
+    let _ = H5D__layout_oh_write_into(dataset, &mut out);
+    out
 }
 
 /// Create a new dataset.
@@ -2322,28 +3006,55 @@ pub fn H5D__none_idx_load_metadata(_index: &mut ChunkIndexState) {}
 
 /// Iterate over the entries of a dataset.
 #[allow(non_snake_case)]
-pub fn H5D__none_idx_iterate(index: &ChunkIndexState) -> Result<Vec<ChunkInfo>> {
-    H5D__none_idx_iterate_checked(index)
+pub fn H5D__none_idx_iterate_with<F>(index: &ChunkIndexState, mut visitor: F) -> Result<()>
+where
+    F: FnMut(&[u64], u64, usize),
+{
+    let total = none_total_chunks(&index.none_chunks_per_dim)?;
+    let mut coord = vec![0u64; index.none_chunks_per_dim.len()];
+    for _ in 0..total {
+        let addr = H5D__none_idx_get_addr_checked(index, &coord)?;
+        visitor(&coord, addr, index.none_chunk_size);
+        none_increment_scaled_coord(&mut coord, &index.none_chunks_per_dim);
+    }
+    Ok(())
 }
 
 /// Iterate over the entries of a dataset.
 #[allow(non_snake_case)]
+#[deprecated(note = "use H5D__none_idx_iterate_with to visit implicit chunks without collecting")]
+pub fn H5D__none_idx_iterate(index: &ChunkIndexState) -> Result<Vec<ChunkInfo>> {
+    let total = none_total_chunks(&index.none_chunks_per_dim)?;
+    let total_usize = usize::try_from(total)
+        .map_err(|_| Error::InvalidFormat("none chunk count exceeds usize".into()))?;
+    let mut out = Vec::with_capacity(total_usize);
+    H5D__none_idx_iterate_with(index, |coord, addr, size| {
+        out.push(ChunkInfo {
+            coord: coord.to_vec(),
+            addr,
+            size,
+            filter_mask: 0,
+        });
+    })?;
+    Ok(out)
+}
+
+/// Iterate over the entries of a dataset.
+#[allow(non_snake_case)]
+#[deprecated(note = "use H5D__none_idx_iterate_with to visit implicit chunks without collecting")]
 pub fn H5D__none_idx_iterate_checked(index: &ChunkIndexState) -> Result<Vec<ChunkInfo>> {
     let total = none_total_chunks(&index.none_chunks_per_dim)?;
     let total_usize = usize::try_from(total)
         .map_err(|_| Error::InvalidFormat("none chunk count exceeds usize".into()))?;
     let mut out = Vec::with_capacity(total_usize);
-    let mut coord = vec![0u64; index.none_chunks_per_dim.len()];
-    for _ in 0..total {
-        let addr = H5D__none_idx_get_addr_checked(index, &coord)?;
+    H5D__none_idx_iterate_with(index, |coord, addr, size| {
         out.push(ChunkInfo {
-            coord: coord.clone(),
+            coord: coord.to_vec(),
             addr,
-            size: index.none_chunk_size,
+            size,
             filter_mask: 0,
         });
-        none_increment_scaled_coord(&mut coord, &index.none_chunks_per_dim);
-    }
+    })?;
     Ok(out)
 }
 
@@ -2359,6 +3070,7 @@ pub fn H5D__none_idx_delete(_index: &mut ChunkIndexState) {}
 
 /// Return a deep copy of a dataset.
 #[allow(non_snake_case)]
+#[deprecated(note = "use H5D__chunk_index_copy_setup_into to reuse caller-provided storage")]
 pub fn H5D__none_idx_copy_setup(index: &ChunkIndexState) -> ChunkIndexState {
     index.clone()
 }
@@ -2371,8 +3083,9 @@ pub fn H5D__none_idx_reset(index: &mut ChunkIndexState) {
 
 /// Render a dataset for debug output.
 #[allow(non_snake_case)]
-pub fn H5D__none_idx_dump(index: &ChunkIndexState) -> String {
-    format!(
+pub fn H5D__none_idx_dump_to<W: fmt::Write>(index: &ChunkIndexState, out: &mut W) -> fmt::Result {
+    write!(
+        out,
         "none_idx(open={}, allocated={}, base={:?}, chunk_size={}, chunks_per_dim={:?})",
         index.open,
         H5D__none_idx_is_space_alloc(index),
@@ -2380,6 +3093,15 @@ pub fn H5D__none_idx_dump(index: &ChunkIndexState) -> String {
         index.none_chunk_size,
         index.none_chunks_per_dim
     )
+}
+
+/// Render a dataset for debug output.
+#[allow(non_snake_case)]
+#[deprecated(note = "use H5D__none_idx_dump_to to write into caller-provided output")]
+pub fn H5D__none_idx_dump(index: &ChunkIndexState) -> String {
+    let mut out = String::new();
+    let _ = H5D__none_idx_dump_to(index, &mut out);
+    out
 }
 
 /// Initialize the dataset subsystem.
@@ -2426,8 +3148,15 @@ pub fn H5D__init_type(element_size: usize) -> DatasetTypeInfo {
 
 /// Dataset operation: cache dataspace info.
 #[allow(non_snake_case)]
+pub fn H5D__cache_dataspace_info_slice(dataset: &DatasetApi) -> &[u64] {
+    &dataset.extent
+}
+
+/// Dataset operation: cache dataspace info.
+#[allow(non_snake_case)]
+#[deprecated(note = "use H5D__cache_dataspace_info_slice to borrow the dataspace extent")]
 pub fn H5D__cache_dataspace_info(dataset: &DatasetApi) -> Vec<u64> {
-    dataset.extent.clone()
+    H5D__cache_dataspace_info_slice(dataset).to_vec()
 }
 
 /// Initialize the dataset subsystem.
@@ -2456,8 +3185,17 @@ pub fn H5D__calculate_minimum_header_size_checked(dataset: &DatasetApi) -> Resul
 
 /// Dataset operation: prepare minimized oh.
 #[allow(non_snake_case)]
+pub fn H5D__prepare_minimized_oh_into(dataset: &DatasetApi, out: &mut Vec<u8>) -> Result<()> {
+    H5D__layout_oh_create_into(dataset, out)
+}
+
+/// Dataset operation: prepare minimized oh.
+#[allow(non_snake_case)]
+#[deprecated(note = "use H5D__prepare_minimized_oh_into to reuse caller-provided storage")]
 pub fn H5D__prepare_minimized_oh(dataset: &DatasetApi) -> Vec<u8> {
-    H5D__layout_oh_create(dataset)
+    let mut out = Vec::new();
+    let _ = H5D__prepare_minimized_oh_into(dataset, &mut out);
+    out
 }
 
 /// Update a dataset.
@@ -2468,9 +3206,15 @@ pub fn H5D__update_oh_info(dataset: &mut DatasetApi, extent: Vec<u64>) {
 
 /// Dataset operation: build file prefix.
 #[allow(non_snake_case)]
+pub fn H5D__build_file_prefix_slice(path: &str) -> &str {
+    path.rsplit_once('/').map_or("", |(prefix, _)| prefix)
+}
+
+/// Dataset operation: build file prefix.
+#[allow(non_snake_case)]
+#[deprecated(note = "use H5D__build_file_prefix_slice to borrow the prefix")]
 pub fn H5D__build_file_prefix(path: &str) -> String {
-    path.rsplit_once('/')
-        .map_or(String::new(), |(prefix, _)| prefix.to_string())
+    H5D__build_file_prefix_slice(path).to_owned()
 }
 
 /// Create a new dataset.
@@ -2507,8 +3251,18 @@ pub fn H5D_mult_refresh_close(_datasets: &mut [DatasetApi]) {}
 
 /// Refresh the dataset from storage.
 #[allow(non_snake_case)]
+pub fn H5D_mult_refresh_reopen_into(datasets: &[DatasetApi], out: &mut Vec<DatasetApi>) {
+    out.clear();
+    out.extend_from_slice(datasets);
+}
+
+/// Refresh the dataset from storage.
+#[allow(non_snake_case)]
+#[deprecated(note = "use H5D_mult_refresh_reopen_into to reuse caller-provided storage")]
 pub fn H5D_mult_refresh_reopen(datasets: &[DatasetApi]) -> Vec<DatasetApi> {
-    datasets.to_vec()
+    let mut out = Vec::new();
+    H5D_mult_refresh_reopen_into(datasets, &mut out);
+    out
 }
 
 /// Dataset operation: oloc.
@@ -2562,13 +3316,31 @@ pub fn H5D__vlen_get_buf_size_cb(value: &[u8]) -> usize {
 /// Dataset operation: vlen get buf size.
 #[allow(non_snake_case)]
 pub fn H5D__vlen_get_buf_size(values: &[Vec<u8>]) -> usize {
-    H5D__vlen_get_buf_size_checked(values).unwrap_or(usize::MAX)
+    H5D__vlen_get_buf_size_slices(values.iter().map(Vec::as_slice))
 }
 
 /// Dataset operation: vlen get buf size checked.
 #[allow(non_snake_case)]
 pub fn H5D__vlen_get_buf_size_checked(values: &[Vec<u8>]) -> Result<usize> {
-    values.iter().try_fold(0usize, |acc, value| {
+    H5D__vlen_get_buf_size_slices_checked(values.iter().map(Vec::as_slice))
+}
+
+/// Dataset operation: vlen get buf size for borrowed values.
+#[allow(non_snake_case)]
+pub fn H5D__vlen_get_buf_size_slices<'a, I>(values: I) -> usize
+where
+    I: IntoIterator<Item = &'a [u8]>,
+{
+    H5D__vlen_get_buf_size_slices_checked(values).unwrap_or(usize::MAX)
+}
+
+/// Dataset operation: vlen get buf size checked for borrowed values.
+#[allow(non_snake_case)]
+pub fn H5D__vlen_get_buf_size_slices_checked<'a, I>(values: I) -> Result<usize>
+where
+    I: IntoIterator<Item = &'a [u8]>,
+{
+    values.into_iter().try_fold(0usize, |acc, value| {
         acc.checked_add(value.len()).ok_or_else(|| {
             Error::InvalidFormat("variable-length dataset buffer size overflow".into())
         })
@@ -2584,13 +3356,13 @@ pub fn H5D__vlen_get_buf_size_gen_cb(value: &[u8]) -> usize {
 /// Dataset operation: vlen get buf size gen.
 #[allow(non_snake_case)]
 pub fn H5D__vlen_get_buf_size_gen(values: &[Vec<u8>]) -> usize {
-    H5D__vlen_get_buf_size(values)
+    H5D__vlen_get_buf_size_slices(values.iter().map(Vec::as_slice))
 }
 
 /// Dataset operation: vlen get buf size gen checked.
 #[allow(non_snake_case)]
 pub fn H5D__vlen_get_buf_size_gen_checked(values: &[Vec<u8>]) -> Result<usize> {
-    H5D__vlen_get_buf_size_checked(values)
+    H5D__vlen_get_buf_size_slices_checked(values.iter().map(Vec::as_slice))
 }
 
 /// Flush the dataset to storage.
@@ -2731,28 +3503,78 @@ pub fn H5D__contig_write_one(
     offset: usize,
     data: &[u8],
 ) -> Result<()> {
-    H5D__contig_writevv(storage, &[(offset, data.to_vec())])
+    H5D__contig_writevv_slices(storage, &[(offset, data)])
 }
 
 /// Dataset operation: contig readvv sieve cb.
 #[allow(non_snake_case)]
+pub fn H5D__contig_readvv_sieve_cb_slice(data: &[u8]) -> &[u8] {
+    data
+}
+
+/// Dataset operation: contig readvv sieve cb.
+#[allow(non_snake_case)]
+#[deprecated(note = "use H5D__contig_readvv_sieve_cb_slice to borrow contiguous data")]
 pub fn H5D__contig_readvv_sieve_cb(data: &[u8]) -> Vec<u8> {
-    data.to_vec()
+    H5D__contig_readvv_sieve_cb_slice(data).to_vec()
 }
 
 /// Dataset operation: contig readvv cb.
 #[allow(non_snake_case)]
+pub fn H5D__contig_readvv_cb_slice(data: &[u8]) -> &[u8] {
+    data
+}
+
+/// Dataset operation: contig readvv cb.
+#[allow(non_snake_case)]
+#[deprecated(note = "use H5D__contig_readvv_cb_slice to borrow contiguous data")]
 pub fn H5D__contig_readvv_cb(data: &[u8]) -> Vec<u8> {
-    data.to_vec()
+    H5D__contig_readvv_cb_slice(data).to_vec()
 }
 
 /// Dataset operation: contig readvv.
 #[allow(non_snake_case)]
+#[deprecated(note = "use H5D__contig_readvv_into to fill caller-provided buffers")]
 pub fn H5D__contig_readvv(
     storage: &ContiguousStorage,
     spans: &[(usize, usize)],
 ) -> Result<Vec<Vec<u8>>> {
-    H5D__scatter_file_checked(&storage.data, spans)
+    let mut out: Vec<Vec<u8>> = spans.iter().map(|&(_, len)| vec![0; len]).collect();
+    H5D__contig_readvv_into(storage, spans, &mut out)?;
+    Ok(out)
+}
+
+/// Dataset operation: contig readvv into caller-provided buffers.
+#[allow(non_snake_case)]
+pub fn H5D__contig_readvv_into(
+    storage: &ContiguousStorage,
+    spans: &[(usize, usize)],
+    out: &mut [Vec<u8>],
+) -> Result<()> {
+    H5D__scatter_file_into(&storage.data, spans, out)
+}
+
+/// Dataset operation: contig readvv into caller-provided borrowed buffers.
+#[allow(non_snake_case)]
+pub fn H5D__contig_readvv_into_slices(
+    storage: &ContiguousStorage,
+    spans: &[(usize, usize)],
+    out: &mut [&mut [u8]],
+) -> Result<()> {
+    H5D__scatter_file_into_slices(&storage.data, spans, out)
+}
+
+/// Dataset operation: contig readvv borrowed visitor.
+#[allow(non_snake_case)]
+pub fn H5D__contig_readvv_with<F>(
+    storage: &ContiguousStorage,
+    spans: &[(usize, usize)],
+    visitor: F,
+) -> Result<()>
+where
+    F: FnMut(&[u8]),
+{
+    H5D__scatter_file_with(&storage.data, spans, visitor)
 }
 
 /// Dataset operation: contig writevv sieve cb.
@@ -2769,9 +3591,29 @@ pub fn H5D__contig_writevv_cb(data: &[u8]) -> usize {
 
 /// Dataset operation: contig writevv.
 #[allow(non_snake_case)]
+#[deprecated(note = "use H5D__contig_writevv_slices to write borrowed spans")]
 pub fn H5D__contig_writevv(
     storage: &mut ContiguousStorage,
     spans: &[(usize, Vec<u8>)],
+) -> Result<()> {
+    for (offset, data) in spans {
+        let end = offset
+            .checked_add(data.len())
+            .ok_or_else(|| Error::InvalidFormat("contiguous write overflow".into()))?;
+        if storage.data.len() < end {
+            storage.data.resize(end, 0);
+        }
+        storage.data[*offset..end].copy_from_slice(data);
+    }
+    storage.allocated = true;
+    Ok(())
+}
+
+/// Dataset operation: contig writevv from borrowed spans.
+#[allow(non_snake_case)]
+pub fn H5D__contig_writevv_slices(
+    storage: &mut ContiguousStorage,
+    spans: &[(usize, &[u8])],
 ) -> Result<()> {
     for (offset, data) in spans {
         let end = offset
@@ -2798,8 +3640,15 @@ pub fn H5D__contig_io_term(storage: &mut ContiguousStorage) {
 
 /// Return a deep copy of a dataset.
 #[allow(non_snake_case)]
+#[deprecated(note = "use H5D__contig_copy_into to reuse caller-provided storage")]
 pub fn H5D__contig_copy(storage: &ContiguousStorage) -> ContiguousStorage {
     storage.clone()
+}
+
+/// Copy contiguous storage into caller-provided storage.
+#[allow(non_snake_case)]
+pub fn H5D__contig_copy_into(storage: &ContiguousStorage, out: &mut ContiguousStorage) {
+    out.clone_from(storage);
 }
 
 /// Dataset operation: create1.
@@ -2828,8 +3677,9 @@ pub fn H5Dvlen_reclaim(values: &mut Vec<Vec<u8>>) {
 
 /// Read from a dataset.
 #[allow(non_snake_case)]
+#[deprecated(note = "use H5Dread_chunk2_slice or H5Dread_chunk2_into to avoid allocating")]
 pub fn H5Dread_chunk1(dataset: &DatasetApi, offset: usize, len: usize) -> Result<Vec<u8>> {
-    H5Dread_chunk2(dataset, offset, len)
+    Ok(H5Dread_chunk2_slice(dataset, offset, len)?.to_vec())
 }
 
 /// Dataset operation: fill.
@@ -2902,8 +3752,11 @@ pub mod explicit_index_wrappers {
 
     /// Return a debug-friendly representation of a dataset.
     #[allow(non_snake_case)]
+    #[deprecated(note = "use H5D__chunk_index_dump_to to write into caller-provided output")]
     pub fn H5D__earray_debug(index: &ChunkIndexState) -> String {
-        chunk_index_dump("earray", index)
+        let mut out = String::new();
+        let _ = H5D__chunk_index_dump_to("earray", index, &mut out);
+        out
     }
 
     /// Decode a dataset from its on-disk representation.
@@ -2985,14 +3838,16 @@ pub mod explicit_index_wrappers {
 
     /// Iterate over the entries of a dataset.
     #[allow(non_snake_case)]
+    #[deprecated(note = "use H5D__chunk_index_iterate to borrow chunk info entries")]
     pub fn H5D__earray_idx_iterate_cb(info: &ChunkInfo) -> ChunkInfo {
         info.clone()
     }
 
     /// Iterate over the entries of a dataset.
     #[allow(non_snake_case)]
+    #[deprecated(note = "use H5D__chunk_index_iterate to avoid cloning chunk info entries")]
     pub fn H5D__earray_idx_iterate(index: &ChunkIndexState) -> Vec<ChunkInfo> {
-        index.entries.values().cloned().collect()
+        H5D__chunk_index_iterate(index).cloned().collect()
     }
 
     /// Remove an entry from a dataset.
@@ -3003,6 +3858,7 @@ pub mod explicit_index_wrappers {
 
     /// Delete a dataset.
     #[allow(non_snake_case)]
+    #[deprecated(note = "use H5D__chunk_index_iterate to borrow chunk info entries")]
     pub fn H5D__earray_idx_delete_cb(info: &ChunkInfo) -> ChunkInfo {
         info.clone()
     }
@@ -3016,6 +3872,7 @@ pub mod explicit_index_wrappers {
 
     /// Return a deep copy of a dataset.
     #[allow(non_snake_case)]
+    #[deprecated(note = "use H5D__chunk_index_copy_setup_into to reuse caller-provided storage")]
     pub fn H5D__earray_idx_copy_setup(index: &ChunkIndexState) -> ChunkIndexState {
         index.clone()
     }
@@ -3026,16 +3883,28 @@ pub mod explicit_index_wrappers {
         *index = ChunkIndexState::default();
     }
 
-    /// Render a dataset for debug output.
+    /// Render a dataset for debug output into caller-provided output.
     #[allow(non_snake_case)]
-    pub fn H5D__earray_idx_dump(index: &ChunkIndexState) -> String {
+    pub fn H5D__earray_idx_dump_to<W: fmt::Write>(
+        index: &ChunkIndexState,
+        out: &mut W,
+    ) -> fmt::Result {
         let addr = index
             .none_base_addr
             .or_else(|| index.entries.values().map(|chunk| chunk.addr).min());
         match addr {
-            Some(addr) => format!("    Address: {addr}\n"),
-            None => "    Address: undefined\n".to_string(),
+            Some(addr) => writeln!(out, "    Address: {addr}"),
+            None => writeln!(out, "    Address: undefined"),
         }
+    }
+
+    /// Render a dataset for debug output.
+    #[allow(non_snake_case)]
+    #[deprecated(note = "use H5D__earray_idx_dump_to to write into caller-provided output")]
+    pub fn H5D__earray_idx_dump(index: &ChunkIndexState) -> String {
+        let mut out = String::new();
+        let _ = H5D__earray_idx_dump_to(index, &mut out);
+        out
     }
 
     /// Dataset operation: earray idx dest.
@@ -3077,8 +3946,11 @@ pub mod explicit_index_wrappers {
 
     /// Return a debug-friendly representation of a dataset.
     #[allow(non_snake_case)]
+    #[deprecated(note = "use H5D__chunk_index_dump_to to write into caller-provided output")]
     pub fn H5D__bt2_unfilt_debug(index: &ChunkIndexState) -> String {
-        chunk_index_dump("bt2", index)
+        let mut out = String::new();
+        let _ = H5D__chunk_index_dump_to("bt2", index, &mut out);
+        out
     }
 
     /// Initialize the dataset subsystem.
@@ -3148,18 +4020,21 @@ pub mod explicit_index_wrappers {
 
     /// Iterate over the entries of a dataset.
     #[allow(non_snake_case)]
+    #[deprecated(note = "use H5D__chunk_index_iterate to borrow chunk info entries")]
     pub fn H5D__bt2_idx_iterate_cb(info: &ChunkInfo) -> ChunkInfo {
         info.clone()
     }
 
     /// Iterate over the entries of a dataset.
     #[allow(non_snake_case)]
+    #[deprecated(note = "use H5D__chunk_index_iterate to avoid cloning chunk info entries")]
     pub fn H5D__bt2_idx_iterate(index: &ChunkIndexState) -> Vec<ChunkInfo> {
-        index.entries.values().cloned().collect()
+        H5D__chunk_index_iterate(index).cloned().collect()
     }
 
     /// Remove an entry from a dataset.
     #[allow(non_snake_case)]
+    #[deprecated(note = "use H5D__chunk_index_iterate to borrow chunk info entries")]
     pub fn H5D__bt2_remove_cb(info: &ChunkInfo) -> ChunkInfo {
         info.clone()
     }
@@ -3179,6 +4054,7 @@ pub mod explicit_index_wrappers {
 
     /// Return a deep copy of a dataset.
     #[allow(non_snake_case)]
+    #[deprecated(note = "use H5D__chunk_index_copy_setup_into to reuse caller-provided storage")]
     pub fn H5D__bt2_idx_copy_setup(index: &ChunkIndexState) -> ChunkIndexState {
         index.clone()
     }
@@ -3197,8 +4073,11 @@ pub mod explicit_index_wrappers {
 
     /// Render a dataset for debug output.
     #[allow(non_snake_case)]
+    #[deprecated(note = "use H5D__chunk_index_dump_to to write into caller-provided output")]
     pub fn H5D__bt2_idx_dump(index: &ChunkIndexState) -> String {
-        chunk_index_dump("bt2", index)
+        let mut out = String::new();
+        let _ = H5D__chunk_index_dump_to("bt2", index, &mut out);
+        out
     }
 
     /// Dataset operation: bt2 idx dest.
@@ -3240,8 +4119,11 @@ pub mod explicit_index_wrappers {
 
     /// Return a debug-friendly representation of a dataset.
     #[allow(non_snake_case)]
+    #[deprecated(note = "use H5D__chunk_index_dump_to to write into caller-provided output")]
     pub fn H5D__farray_debug(index: &ChunkIndexState) -> String {
-        chunk_index_dump("farray", index)
+        let mut out = String::new();
+        let _ = H5D__chunk_index_dump_to("farray", index, &mut out);
+        out
     }
 
     /// Dataset operation: farray idx depend.
@@ -3311,14 +4193,16 @@ pub mod explicit_index_wrappers {
 
     /// Iterate over the entries of a dataset.
     #[allow(non_snake_case)]
+    #[deprecated(note = "use H5D__chunk_index_iterate to borrow chunk info entries")]
     pub fn H5D__farray_idx_iterate_cb(info: &ChunkInfo) -> ChunkInfo {
         info.clone()
     }
 
     /// Iterate over the entries of a dataset.
     #[allow(non_snake_case)]
+    #[deprecated(note = "use H5D__chunk_index_iterate to avoid cloning chunk info entries")]
     pub fn H5D__farray_idx_iterate(index: &ChunkIndexState) -> Vec<ChunkInfo> {
-        index.entries.values().cloned().collect()
+        H5D__chunk_index_iterate(index).cloned().collect()
     }
 
     /// Remove an entry from a dataset.
@@ -3329,6 +4213,7 @@ pub mod explicit_index_wrappers {
 
     /// Delete a dataset.
     #[allow(non_snake_case)]
+    #[deprecated(note = "use H5D__chunk_index_iterate to borrow chunk info entries")]
     pub fn H5D__farray_idx_delete_cb(info: &ChunkInfo) -> ChunkInfo {
         info.clone()
     }
@@ -3342,6 +4227,7 @@ pub mod explicit_index_wrappers {
 
     /// Return a deep copy of a dataset.
     #[allow(non_snake_case)]
+    #[deprecated(note = "use H5D__chunk_index_copy_setup_into to reuse caller-provided storage")]
     pub fn H5D__farray_idx_copy_setup(index: &ChunkIndexState) -> ChunkIndexState {
         index.clone()
     }
@@ -3360,8 +4246,11 @@ pub mod explicit_index_wrappers {
 
     /// Render a dataset for debug output.
     #[allow(non_snake_case)]
+    #[deprecated(note = "use H5D__chunk_index_dump_to to write into caller-provided output")]
     pub fn H5D__farray_idx_dump(index: &ChunkIndexState) -> String {
-        chunk_index_dump("farray", index)
+        let mut out = String::new();
+        let _ = H5D__chunk_index_dump_to("farray", index, &mut out);
+        out
     }
 
     /// Dataset operation: farray idx dest.
@@ -3409,8 +4298,11 @@ pub mod explicit_index_wrappers {
 
     /// Return a debug-friendly representation of a dataset.
     #[allow(non_snake_case)]
+    #[deprecated(note = "use H5D__chunk_index_dump_to to write into caller-provided output")]
     pub fn H5D__btree_debug_key(index: &ChunkIndexState) -> String {
-        chunk_index_dump("btree", index)
+        let mut out = String::new();
+        let _ = H5D__chunk_index_dump_to("btree", index, &mut out);
+        out
     }
 
     /// Free a dataset's in-memory resources.
@@ -3463,14 +4355,16 @@ pub mod explicit_index_wrappers {
 
     /// Iterate over the entries of a dataset.
     #[allow(non_snake_case)]
+    #[deprecated(note = "use H5D__chunk_index_iterate to borrow chunk info entries")]
     pub fn H5D__btree_idx_iterate_cb(info: &ChunkInfo) -> ChunkInfo {
         info.clone()
     }
 
     /// Iterate over the entries of a dataset.
     #[allow(non_snake_case)]
+    #[deprecated(note = "use H5D__chunk_index_iterate to avoid cloning chunk info entries")]
     pub fn H5D__btree_idx_iterate(index: &ChunkIndexState) -> Vec<ChunkInfo> {
-        index.entries.values().cloned().collect()
+        H5D__chunk_index_iterate(index).cloned().collect()
     }
 
     /// Remove an entry from a dataset.
@@ -3488,6 +4382,7 @@ pub mod explicit_index_wrappers {
 
     /// Return a deep copy of a dataset.
     #[allow(non_snake_case)]
+    #[deprecated(note = "use H5D__chunk_index_copy_setup_into to reuse caller-provided storage")]
     pub fn H5D__btree_idx_copy_setup(index: &ChunkIndexState) -> ChunkIndexState {
         index.clone()
     }
@@ -3512,8 +4407,11 @@ pub mod explicit_index_wrappers {
 
     /// Render a dataset for debug output.
     #[allow(non_snake_case)]
+    #[deprecated(note = "use H5D__chunk_index_dump_to to write into caller-provided output")]
     pub fn H5D__btree_idx_dump(index: &ChunkIndexState) -> String {
-        chunk_index_dump("btree", index)
+        let mut out = String::new();
+        let _ = H5D__chunk_index_dump_to("btree", index, &mut out);
+        out
     }
 
     /// Dataset operation: btree idx dest.
@@ -3532,20 +4430,97 @@ pub fn H5D__chunk_disjoint(left: &ChunkInfo, right: &ChunkInfo) -> bool {
 
 /// Return a debug-friendly representation of a dataset.
 #[allow(non_snake_case)]
+#[deprecated(note = "use H5D__chunk_index_dump_to to write into caller-provided output")]
 pub fn H5D_btree_debug(index: &ChunkIndexState) -> String {
-    chunk_index_dump("btree", index)
+    let mut out = String::new();
+    let _ = H5D__chunk_index_dump_to("btree", index, &mut out);
+    out
 }
 
 /// Dataset operation: select io.
 #[allow(non_snake_case)]
+#[deprecated(
+    since = "0.4.0",
+    note = "use H5D__select_io_into to fill caller-provided buffers"
+)]
 pub fn H5D__select_io(dataset: &DatasetApi, spans: &[(usize, usize)]) -> Result<Vec<Vec<u8>>> {
-    H5D__scatter_file(&dataset.raw, spans)
+    let mut out: Vec<Vec<u8>> = spans.iter().map(|&(_, len)| vec![0; len]).collect();
+    H5D__select_io_into(dataset, spans, &mut out)?;
+    Ok(out)
+}
+
+/// Dataset operation: select io into caller-provided buffers.
+#[allow(non_snake_case)]
+pub fn H5D__select_io_into(
+    dataset: &DatasetApi,
+    spans: &[(usize, usize)],
+    out: &mut [Vec<u8>],
+) -> Result<()> {
+    H5D__scatter_file_into(&dataset.raw, spans, out)
+}
+
+/// Dataset operation: select io into caller-provided borrowed buffers.
+#[allow(non_snake_case)]
+pub fn H5D__select_io_into_slices(
+    dataset: &DatasetApi,
+    spans: &[(usize, usize)],
+    out: &mut [&mut [u8]],
+) -> Result<()> {
+    H5D__scatter_file_into_slices(&dataset.raw, spans, out)
+}
+
+/// Dataset operation: select io borrowed visitor.
+#[allow(non_snake_case)]
+pub fn H5D__select_io_with<F>(
+    dataset: &DatasetApi,
+    spans: &[(usize, usize)],
+    visitor: F,
+) -> Result<()>
+where
+    F: FnMut(&[u8]),
+{
+    H5D__scatter_file_with(&dataset.raw, spans, visitor)
 }
 
 /// Dataset operation: select io mem.
 #[allow(non_snake_case)]
+#[deprecated(
+    since = "0.4.0",
+    note = "use H5D_select_io_mem_into to fill caller-provided buffers"
+)]
 pub fn H5D_select_io_mem(src: &[u8], spans: &[(usize, usize)]) -> Result<Vec<Vec<u8>>> {
-    H5D__scatter_mem(src, spans)
+    let mut out: Vec<Vec<u8>> = spans.iter().map(|&(_, len)| vec![0; len]).collect();
+    H5D_select_io_mem_into(src, spans, &mut out)?;
+    Ok(out)
+}
+
+/// Dataset operation: select io mem into caller-provided buffers.
+#[allow(non_snake_case)]
+pub fn H5D_select_io_mem_into(
+    src: &[u8],
+    spans: &[(usize, usize)],
+    out: &mut [Vec<u8>],
+) -> Result<()> {
+    H5D__scatter_mem_into(src, spans, out)
+}
+
+/// Dataset operation: select io mem into caller-provided borrowed buffers.
+#[allow(non_snake_case)]
+pub fn H5D_select_io_mem_into_slices(
+    src: &[u8],
+    spans: &[(usize, usize)],
+    out: &mut [&mut [u8]],
+) -> Result<()> {
+    H5D__scatter_mem_into_slices(src, spans, out)
+}
+
+/// Dataset operation: select io mem borrowed visitor.
+#[allow(non_snake_case)]
+pub fn H5D_select_io_mem_with<F>(src: &[u8], spans: &[(usize, usize)], visitor: F) -> Result<()>
+where
+    F: FnMut(&[u8]),
+{
+    H5D__scatter_mem_with(src, spans, visitor)
 }
 
 #[cfg(test)]
@@ -3556,7 +4531,9 @@ mod tests {
     fn compact_storage_reads_and_writes() {
         let mut storage = H5D__compact_construct(b"abcd".to_vec());
         H5D__compact_writevv(&mut storage, 2, b"XY").unwrap();
-        assert_eq!(H5D__compact_readvv(&storage, 0, 4).unwrap(), b"abXY");
+        let mut data = [0; 4];
+        H5D__compact_readvv_into(&storage, 0, &mut data).unwrap();
+        assert_eq!(&data, b"abXY");
         assert!(storage.dirty);
         H5D__compact_flush(&mut storage);
         assert!(!storage.dirty);
@@ -3582,7 +4559,16 @@ mod tests {
             1048
         );
 
-        let chunks = H5D__none_idx_iterate(&index).unwrap();
+        let mut chunks = Vec::new();
+        H5D__none_idx_iterate_with(&index, |coord, addr, size| {
+            chunks.push(ChunkInfo {
+                coord: coord.to_vec(),
+                addr,
+                size,
+                filter_mask: 0,
+            });
+        })
+        .unwrap();
         assert_eq!(chunks.len(), 6);
         assert_eq!(chunks[0].coord, vec![0, 0]);
         assert_eq!(chunks[0].addr, 1000);
@@ -3609,7 +4595,8 @@ mod tests {
         H5D__farray_idx_insert(&mut index, vec![0], 64, 8);
         H5D__farray_idx_insert(&mut index, vec![1], 72, 8);
 
-        let farray_image = H5D__farray_encode(&index).unwrap();
+        let mut farray_image = Vec::with_capacity(8);
+        H5D__chunk_index_encode_count_into(&index, &mut farray_image).unwrap();
         let farray = H5D__farray_decode(&farray_image).unwrap();
         assert!(farray.metadata_loaded);
         assert!(farray.space_allocated);
@@ -3624,10 +4611,9 @@ mod tests {
 
         let earray = H5D__earray_filt_decode(&H5D__earray_encode(&index).unwrap()).unwrap();
         assert_eq!(earray.declared_entry_count, 2);
-        assert_eq!(
-            explicit_index_wrappers::H5D__earray_idx_dump(&index),
-            "    Address: 64\n"
-        );
+        let mut earray_dump = String::new();
+        explicit_index_wrappers::H5D__earray_idx_dump_to(&index, &mut earray_dump).unwrap();
+        assert_eq!(earray_dump, "    Address: 64\n");
 
         let bt2 = H5D__bt2_filt_decode(&H5D__bt2_filt_encode(&index).unwrap()).unwrap();
         assert_eq!(bt2.declared_entry_count, 2);
@@ -3761,18 +4747,25 @@ mod tests {
         assert_eq!(parsed.substitutions, 2);
         assert_eq!(parsed.static_strlen, "run_/part_%_.h5".len());
         assert_eq!(
-            H5D__virtual_build_source_name("ignored", Some(&parsed), 42).unwrap(),
+            H5D__virtual_build_source_name_cow("ignored", Some(&parsed), 42).unwrap(),
             "run_42/part_%_42.h5"
         );
+        let mut built = String::new();
+        H5D__virtual_build_source_name_into("ignored", Some(&parsed), 42, &mut built).unwrap();
+        assert_eq!(built, "run_42/part_%_42.h5");
 
         let escaped = H5D_virtual_parse_source_name("literal_%%.h5")
             .unwrap()
             .expect("escaped percent should allocate parsed name");
         assert_eq!(escaped.substitutions, 0);
         assert_eq!(
-            H5D__virtual_build_source_name("literal_%%.h5", Some(&escaped), 7).unwrap(),
+            H5D__virtual_build_source_name_cow("literal_%%.h5", Some(&escaped), 7).unwrap(),
             "literal_%.h5"
         );
+        assert!(matches!(
+            H5D__virtual_build_source_name_cow("plain.h5", None, 7).unwrap(),
+            Cow::Borrowed("plain.h5")
+        ));
         H5D_virtual_free_parsed_name(Some(escaped));
     }
 
@@ -3793,25 +4786,23 @@ mod tests {
             substitutions: 1,
         };
         assert!(matches!(
-            H5D__virtual_build_source_name("ignored", Some(&malformed), 0),
+            H5D__virtual_build_source_name_cow("ignored", Some(&malformed), 0),
             Err(Error::InvalidFormat(_))
         ));
     }
 
     #[test]
     fn scatter_and_contiguous_reads_reject_bad_spans() {
-        assert_eq!(
-            H5D__scatter_file_checked(b"abcdef", &[(1, 2), (4, 2)]).unwrap(),
-            vec![b"bc".to_vec(), b"ef".to_vec()]
-        );
-        assert_eq!(
-            H5D__scatter_file(b"abcdef", &[(1, 2), (4, 2)]).unwrap(),
-            vec![b"bc".to_vec(), b"ef".to_vec()]
-        );
-        assert!(H5D__scatter_file_checked(b"abc", &[(usize::MAX, 1)]).is_err());
-        assert!(H5D__scatter_file_checked(b"abc", &[(2, 2)]).is_err());
-        assert!(H5D__scatter_file(b"abc", &[(usize::MAX, 1)]).is_err());
-        assert!(H5D__scatgath_read_select(b"abc", &[(2, 2)]).is_err());
+        let mut out = vec![vec![0; 2], vec![0; 2]];
+        H5D__scatter_file_into(b"abcdef", &[(1, 2), (4, 2)], &mut out).unwrap();
+        assert_eq!(out, vec![b"bc".to_vec(), b"ef".to_vec()]);
+
+        let mut out = vec![vec![0; 1]];
+        assert!(H5D__scatter_file_into(b"abc", &[(usize::MAX, 1)], &mut out).is_err());
+        let mut out = vec![vec![0; 2]];
+        assert!(H5D__scatter_file_into(b"abc", &[(2, 2)], &mut out).is_err());
+        let mut out = vec![vec![0; 2]];
+        assert!(H5D__scatgath_read_select_into(b"abc", &[(2, 2)], &mut out).is_err());
 
         let storage = ContiguousStorage {
             addr: Some(0),
@@ -3819,11 +4810,89 @@ mod tests {
             cached: false,
             allocated: true,
         };
-        assert_eq!(
-            H5D__contig_readvv(&storage, &[(0, 3)]).unwrap(),
-            vec![b"abc".to_vec()]
-        );
-        assert!(H5D__contig_readvv(&storage, &[(5, 2)]).is_err());
+        let mut out = vec![vec![0; 3]];
+        H5D__contig_readvv_into(&storage, &[(0, 3)], &mut out).unwrap();
+        assert_eq!(out, vec![b"abc".to_vec()]);
+        let mut out = vec![vec![0; 2]];
+        assert!(H5D__contig_readvv_into(&storage, &[(5, 2)], &mut out).is_err());
+    }
+
+    #[test]
+    fn scatter_into_fills_original_shaped_output() {
+        let mut out = vec![vec![0; 2], vec![0; 2]];
+        H5D__scatter_file_into(b"abcdef", &[(1, 2), (4, 2)], &mut out).unwrap();
+        assert_eq!(out, vec![b"bc".to_vec(), b"ef".to_vec()]);
+
+        let mut mem_out = vec![vec![0; 3]];
+        H5D__scatter_mem_into(b"abcdef", &[(2, 3)], &mut mem_out).unwrap();
+        assert_eq!(mem_out, vec![b"cde".to_vec()]);
+    }
+
+    #[test]
+    fn select_io_into_fills_original_shaped_output() {
+        let dataset = DatasetApi {
+            name: Some("d".into()),
+            extent: vec![6],
+            raw: b"abcdef".to_vec(),
+            virtual_layout: None,
+        };
+        let mut out = vec![vec![0; 1], vec![0; 3]];
+        H5D__select_io_into(&dataset, &[(0, 1), (3, 3)], &mut out).unwrap();
+        assert_eq!(out, vec![b"a".to_vec(), b"def".to_vec()]);
+
+        let mut mem_out = vec![vec![0; 2]];
+        H5D_select_io_mem_into(b"abcdef", &[(4, 2)], &mut mem_out).unwrap();
+        assert_eq!(mem_out, vec![b"ef".to_vec()]);
+    }
+
+    #[test]
+    fn scatter_into_rejects_output_size_mismatch() {
+        let mut missing = vec![vec![0; 2]];
+        assert!(matches!(
+            H5D__scatter_file_into(b"abcdef", &[(1, 2), (4, 2)], &mut missing),
+            Err(Error::InvalidFormat(_))
+        ));
+        assert_eq!(missing, vec![vec![0; 2]]);
+
+        let mut wrong_span_len = vec![vec![0; 3]];
+        assert!(matches!(
+            H5D__scatter_mem_into(b"abcdef", &[(1, 2)], &mut wrong_span_len),
+            Err(Error::InvalidFormat(_))
+        ));
+        assert_eq!(wrong_span_len, vec![vec![0; 3]]);
+    }
+
+    #[test]
+    fn select_io_into_rejects_output_size_mismatch() {
+        let dataset = DatasetApi {
+            name: None,
+            extent: vec![3],
+            raw: b"abc".to_vec(),
+            virtual_layout: None,
+        };
+        let mut out = vec![vec![0; 2]];
+        assert!(matches!(
+            H5D__select_io_into(&dataset, &[(0, 1)], &mut out),
+            Err(Error::InvalidFormat(_))
+        ));
+        assert_eq!(out, vec![vec![0; 2]]);
+    }
+
+    #[test]
+    fn scatter_into_rejects_span_bounds_errors() {
+        let mut out = vec![vec![0; 1]];
+        assert!(matches!(
+            H5D__scatter_file_into(b"abc", &[(usize::MAX, 1)], &mut out),
+            Err(Error::InvalidFormat(_))
+        ));
+        assert_eq!(out, vec![vec![0; 1]]);
+
+        let mut out = vec![vec![0; 2]];
+        assert!(matches!(
+            H5D_select_io_mem_into(b"abc", &[(2, 2)], &mut out),
+            Err(Error::InvalidFormat(_))
+        ));
+        assert_eq!(out, vec![vec![0; 2]]);
     }
 
     #[test]
@@ -3843,6 +4912,10 @@ mod tests {
         assert_eq!(H5D__vlen_get_buf_size_checked(&values).unwrap(), 5);
         assert_eq!(H5D__vlen_get_buf_size(&values), 5);
         assert_eq!(H5D__vlen_get_buf_size_gen_checked(&values).unwrap(), 5);
+        assert_eq!(
+            H5D__vlen_get_buf_size_slices_checked([b"aa".as_slice(), b"bbb".as_slice()]).unwrap(),
+            5
+        );
     }
 
     #[test]
@@ -3857,5 +4930,219 @@ mod tests {
         let addr = H5D__chunk_file_alloc_checked(&mut table, vec![2, 0], 8).unwrap();
         assert_eq!(addr, 2);
         assert_eq!(H5D__chunk_file_alloc(&mut table, vec![3, 0], 8), 3);
+    }
+
+    #[test]
+    fn allocation_aware_views_borrow_layout_and_chunk_data() {
+        let mut dataset = H5D__create_api_common(Some("vds".into()), vec![4]);
+        let layout = VirtualLayout {
+            mappings: vec![VirtualMapping {
+                source_file: "src.h5".into(),
+                source_dataset: "/d".into(),
+                min_dims: vec![4],
+                max_dims: vec![Some(4)],
+                open: true,
+            }],
+            unlimited: false,
+        };
+        H5D__virtual_store_layout(&mut dataset, layout);
+
+        let borrowed = H5D__virtual_load_layout_ref(&dataset).unwrap();
+        assert_eq!(borrowed.mappings.len(), 1);
+        assert_eq!(
+            H5D__mappings_to_leaves_iter(borrowed)
+                .next()
+                .unwrap()
+                .source_dataset,
+            "/d"
+        );
+        assert_eq!(H5D__cache_dataspace_info_slice(&dataset), &[4]);
+
+        let mut image = Vec::with_capacity(64);
+        H5D__layout_oh_create_into(&dataset, &mut image).unwrap();
+        assert_eq!(image, 4u64.to_le_bytes());
+        H5D__prepare_minimized_oh_into(&dataset, &mut image).unwrap();
+        assert_eq!(image, 4u64.to_le_bytes());
+    }
+
+    #[test]
+    fn allocation_aware_chunk_table_helpers_visit_and_copy_into() {
+        let mut table = H5D__chunk_construct(vec![2]);
+        H5D__chunk_write_checked(&mut table, vec![1], b"xy".to_vec()).unwrap();
+
+        assert_eq!(H5D__chunk_read_slice(&mut table, &[1]).unwrap(), b"xy");
+        assert_eq!(table.cache_hits, 1);
+
+        let mut buf = [0; 2];
+        H5D__chunk_read_into(&mut table, &[1], &mut buf).unwrap();
+        assert_eq!(&buf, b"xy");
+        assert_eq!(table.cache_hits, 2);
+
+        let mut addrmap = Vec::new();
+        H5D__chunk_addrmap_with(&table, |coord, addr| addrmap.push((coord.to_vec(), addr)));
+        assert_eq!(addrmap, vec![(vec![1], 0)]);
+
+        let coords = vec![vec![1], vec![2]];
+        let borrowed_coords: Vec<&[u64]> = H5D__chunk_io_init_selections_iter(&coords).collect();
+        assert_eq!(borrowed_coords, vec![&[1][..], &[2][..]]);
+
+        let mut chunks = Vec::new();
+        H5D__create_piece_mem_map_hyper_with(&table, &coords, |coord, data| {
+            chunks.push((coord.to_vec(), data.to_vec()));
+        });
+        assert_eq!(chunks, vec![(vec![1], b"xy".to_vec())]);
+
+        let borrowed_coords = [&[1][..], &[2][..]];
+        let mut borrowed_file_map = Vec::new();
+        H5D__create_piece_file_map_hyper_slices_with(&table, borrowed_coords, |coord, addr| {
+            borrowed_file_map.push((coord.to_vec(), addr))
+        });
+        assert_eq!(borrowed_file_map, vec![(vec![1], 0)]);
+
+        let mut borrowed_mem_map = Vec::new();
+        H5D__create_piece_mem_map_hyper_slices_with(&table, borrowed_coords, |coord, data| {
+            borrowed_mem_map.push((coord.to_vec(), data.to_vec()))
+        });
+        assert_eq!(borrowed_mem_map, vec![(vec![1], b"xy".to_vec())]);
+    }
+
+    #[test]
+    fn allocation_aware_contiguous_and_select_reads_fill_existing_buffers() {
+        let storage = ContiguousStorage {
+            addr: Some(0),
+            data: b"abcdef".to_vec(),
+            cached: false,
+            allocated: true,
+        };
+        let mut out = vec![vec![0; 2], vec![0; 3]];
+        H5D__contig_readvv_into(&storage, &[(1, 2), (3, 3)], &mut out).unwrap();
+        assert_eq!(out, vec![b"bc".to_vec(), b"def".to_vec()]);
+
+        let mut scat = vec![vec![0; 2]];
+        H5D__scatgath_read_select_into(b"abcdef", &[(2, 2)], &mut scat).unwrap();
+        assert_eq!(scat, vec![b"cd".to_vec()]);
+        assert_eq!(H5D__compound_opt_read_slice(b"abc"), b"abc");
+        assert_eq!(H5D__contig_readvv_cb_slice(b"abc"), b"abc");
+        assert_eq!(H5D__contig_readvv_sieve_cb_slice(b"abc"), b"abc");
+
+        let mut visited = Vec::new();
+        H5D__contig_readvv_with(&storage, &[(0, 2), (4, 2)], |span| {
+            visited.push(span.to_vec());
+        })
+        .unwrap();
+        assert_eq!(visited, vec![b"ab".to_vec(), b"ef".to_vec()]);
+
+        let dataset = DatasetApi {
+            name: None,
+            extent: vec![6],
+            raw: b"abcdef".to_vec(),
+            virtual_layout: None,
+        };
+        let mut selected_len = 0usize;
+        H5D__select_io_with(&dataset, &[(1, 3)], |span| {
+            selected_len += span.len();
+            assert_eq!(span, b"bcd");
+        })
+        .unwrap();
+        assert_eq!(selected_len, 3);
+    }
+
+    #[test]
+    fn allocation_aware_scatter_gather_dump_and_copy_helpers_reuse_storage() {
+        let mut first = [0; 2];
+        let mut second = [0; 3];
+        let mut borrowed_out: [&mut [u8]; 2] = [&mut first, &mut second];
+        H5D__scatter_file_into_slices(b"abcdef", &[(1, 2), (3, 3)], &mut borrowed_out).unwrap();
+        assert_eq!(&first, b"bc");
+        assert_eq!(&second, b"def");
+
+        let parts = [b"ab".as_slice(), b"cde".as_slice()];
+        let mut gathered = Vec::with_capacity(16);
+        H5D__gather_file_into(parts, &mut gathered);
+        assert_eq!(gathered, b"abcde");
+        H5D__scatgath_write_select_into([b"x".as_slice(), b"yz".as_slice()], &mut gathered);
+        assert_eq!(gathered, b"xyz");
+
+        let mut index = ChunkIndexState::default();
+        H5D__bt2_idx_insert(&mut index, vec![1], 42, 3);
+        assert_eq!(H5D__chunk_index_iterate(&index).next().unwrap().addr, 42);
+
+        let mut index_copy = ChunkIndexState::default();
+        H5D__chunk_index_copy_setup_into(&index, &mut index_copy);
+        assert_eq!(index_copy, index);
+
+        let mut dump = String::new();
+        H5D__chunk_index_dump_to("bt2", &index, &mut dump).unwrap();
+        assert_eq!(
+            dump,
+            "bt2(open=true, allocated=true, entries=1, declared=0)"
+        );
+
+        let single = SingleChunkIndex {
+            open: true,
+            space_allocated: true,
+            chunk_addr: Some(7),
+            metadata_loaded: false,
+        };
+        let mut single_copy = SingleChunkIndex::default();
+        H5D__single_idx_copy_setup_into(&single, &mut single_copy);
+        assert_eq!(single_copy, single);
+
+        let mut single_dump = String::new();
+        H5D__single_idx_dump_to(&single, &mut single_dump).unwrap();
+        assert_eq!(
+            single_dump,
+            "single_idx(open=true, allocated=true, addr=Some(7))"
+        );
+
+        let mut zeros = [1, 2, 3];
+        H5D__nonexistent_readvv_into(&mut zeros);
+        assert_eq!(zeros, [0, 0, 0]);
+    }
+
+    #[test]
+    fn allocation_aware_misc_helpers_borrow_or_reuse_storage() {
+        assert_eq!(
+            H5D__build_file_prefix_slice("/tmp/data/file.h5"),
+            "/tmp/data"
+        );
+        assert_eq!(H5D__build_file_prefix_slice("file.h5"), "");
+
+        let datasets = vec![H5D__create_api_common(Some("d".into()), vec![1])];
+        let mut reopened = Vec::with_capacity(4);
+        H5D_mult_refresh_reopen_into(&datasets, &mut reopened);
+        assert_eq!(reopened, datasets);
+
+        let mut efl_buf = [9; 4];
+        H5D__efl_readvv_cb_into(&mut efl_buf);
+        assert_eq!(efl_buf, [0; 4]);
+
+        let mut storage = H5D__contig_construct(Vec::new());
+        H5D__contig_writevv_slices(&mut storage, &[(1, b"ab".as_slice())]).unwrap();
+        assert_eq!(storage.data, vec![0, b'a', b'b']);
+
+        let mut datasets = vec![
+            H5D__create_api_common(None, vec![1]),
+            H5Dcreate_anon(vec![2]),
+        ];
+        H5Dwrite_multi_slices(
+            &mut datasets,
+            [b"x".as_slice(), b"yz".as_slice()].into_iter(),
+        );
+        assert_eq!(datasets[0].raw, b"x");
+        assert_eq!(datasets[1].raw, b"yz");
+
+        let before_capacity = datasets[1].raw.capacity();
+        let mut read_multi_out = vec![Vec::new(), Vec::with_capacity(before_capacity)];
+        H5Dread_multi_into(&datasets, &mut read_multi_out);
+        assert_eq!(read_multi_out, vec![b"x".to_vec(), b"yz".to_vec()]);
+        assert_eq!(read_multi_out[1].capacity(), before_capacity);
+
+        let mut visited = Vec::new();
+        H5D__scatter_file_with(b"abcdef", &[(0, 1), (3, 2)], |span| {
+            visited.push(span.to_vec());
+        })
+        .unwrap();
+        assert_eq!(visited, vec![b"a".to_vec(), b"de".to_vec()]);
     }
 }

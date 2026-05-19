@@ -1,8 +1,11 @@
+use std::borrow::Cow;
 use std::collections::BTreeMap;
+use std::fmt;
 
 use crate::error::{Error, Result};
 use crate::format::messages::datatype::{
-    ByteOrder, CompoundField, DatatypeClass, DatatypeMessage, FloatFields,
+    ArrayDims, ByteOrder, CompoundField, CompoundFieldView, CompoundFields, DatatypeClass,
+    DatatypeMessage, EnumMembers, FloatFields,
 };
 use crate::hl::plist::datatype_create::DatatypeCreate;
 
@@ -62,6 +65,28 @@ fn default_message(class: DatatypeClass, size: u32) -> DatatypeMessage {
         size: size.max(1),
         properties: vec![0; props_len],
     }
+}
+
+fn compound_field_from_view(field: CompoundFieldView<'_>) -> CompoundField {
+    CompoundField {
+        name: field.name.into_owned(),
+        byte_offset: field.byte_offset,
+        size: field.size,
+        class: field.class,
+        byte_order: field.byte_order,
+        datatype: Box::new(field.datatype),
+    }
+}
+
+fn collect_compound_fields(message: &DatatypeMessage) -> Result<Vec<CompoundField>> {
+    message
+        .compound_fields_iter()?
+        .map(|field| field.map(compound_field_from_view))
+        .collect()
+}
+
+fn enum_has_members(message: &DatatypeMessage) -> Result<bool> {
+    Ok(message.enum_members_iter()?.next().transpose()?.is_some())
 }
 
 impl RuntimeDatatype {
@@ -175,8 +200,15 @@ pub fn H5Tunregister(registry: &mut DatatypeRegistry, name: &str) -> Option<Runt
 
 /// Find an entry in a datatype.
 #[allow(non_snake_case)]
+pub fn H5Tfind_ref<'a>(registry: &'a DatatypeRegistry, name: &str) -> Option<&'a RuntimeDatatype> {
+    registry.named.get(name)
+}
+
+/// Find an entry in a datatype.
+#[deprecated(note = "use H5Tfind_ref() to borrow the registered datatype")]
+#[allow(non_snake_case)]
 pub fn H5Tfind(registry: &DatatypeRegistry, name: &str) -> Option<RuntimeDatatype> {
-    registry.named.get(name).cloned()
+    H5Tfind_ref(registry, name).cloned()
 }
 
 /// Datatype operation: compiler conv.
@@ -223,12 +255,22 @@ pub fn H5T_reclaim_cb(dtype: &RuntimeDatatype, data: &mut Vec<u8>) {
 
 /// Encode a datatype to its on-disk representation.
 #[allow(non_snake_case)]
-pub fn H5Tencode(dtype: &RuntimeDatatype) -> Result<Vec<u8>> {
-    let mut out = vec![((dtype.message.version & 0x0f) << 4) | (dtype.message.class as u8)];
+pub fn H5Tencode_into(dtype: &RuntimeDatatype, out: &mut Vec<u8>) -> Result<()> {
+    out.clear();
+    out.push(((dtype.message.version & 0x0f) << 4) | (dtype.message.class as u8));
     out.extend_from_slice(&dtype.message.class_bits);
     out.extend_from_slice(&dtype.message.size.to_le_bytes());
     out.extend_from_slice(&dtype.message.properties);
     DatatypeMessage::decode(&out)?;
+    Ok(())
+}
+
+/// Encode a datatype to its on-disk representation.
+#[deprecated(note = "use H5Tencode_into() to reuse caller-provided output storage")]
+#[allow(non_snake_case)]
+pub fn H5Tencode(dtype: &RuntimeDatatype) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(8 + dtype.message.properties.len());
+    H5Tencode_into(dtype, &mut out)?;
     Ok(out)
 }
 
@@ -336,7 +378,8 @@ pub fn H5T__set_size(dtype: &mut RuntimeDatatype, size: u32) -> Result<()> {
         }
         DatatypeClass::Compound => {
             if size < dtype.message.size {
-                for field in H5Tget_member_info(dtype)? {
+                for field in dtype.message.compound_fields_iter()? {
+                    let field = field?;
                     let member_end = u32::try_from(field.byte_offset)
                         .map_err(|_| {
                             Error::InvalidFormat("compound member offset exceeds u32".into())
@@ -355,7 +398,7 @@ pub fn H5T__set_size(dtype: &mut RuntimeDatatype, size: u32) -> Result<()> {
         }
         DatatypeClass::String => {}
         DatatypeClass::Enum => {
-            if !dtype.message.enum_members()?.is_empty() {
+            if enum_has_members(&dtype.message)? {
                 return Err(Error::InvalidFormat(
                     "enum datatype size cannot change after members are defined".into(),
                 ));
@@ -436,21 +479,6 @@ pub fn H5T__set_size(dtype: &mut RuntimeDatatype, size: u32) -> Result<()> {
             u16::try_from(precision)
                 .map_err(|_| Error::InvalidFormat("datatype precision exceeds u16".into()))?,
         );
-    } else if dtype.message.class == DatatypeClass::String {
-        if dtype.message.properties.len() < 4 {
-            dtype.message.properties.resize(4, 0);
-        }
-        let precision = size.checked_mul(8).ok_or_else(|| {
-            Error::InvalidFormat("string datatype precision overflows u32".into())
-        })?;
-        write_le_u16_at(&mut dtype.message.properties, 0, 0);
-        write_le_u16_at(
-            &mut dtype.message.properties,
-            2,
-            u16::try_from(precision).map_err(|_| {
-                Error::InvalidFormat("string datatype precision exceeds u16".into())
-            })?,
-        );
     }
 
     dtype.message.size = size;
@@ -474,26 +502,41 @@ pub fn H5T__init_path_table(registry: &mut DatatypeRegistry) {
 
 /// Datatype operation: path table search.
 #[allow(non_snake_case)]
+pub fn H5T__path_table_search_ref(
+    registry: &DatatypeRegistry,
+    src: DatatypeClass,
+    dst: DatatypeClass,
+) -> Option<&str> {
+    registry
+        .paths
+        .get(&(src as u8, dst as u8))
+        .map(String::as_str)
+}
+
+/// Datatype operation: path table search.
+#[deprecated(note = "use H5T__path_table_search_ref() to borrow the path name")]
+#[allow(non_snake_case)]
 pub fn H5T__path_table_search(
     registry: &DatatypeRegistry,
     src: DatatypeClass,
     dst: DatatypeClass,
 ) -> Option<String> {
-    registry.paths.get(&(src as u8, dst as u8)).cloned()
+    H5T__path_table_search_ref(registry, src, dst).map(str::to_string)
 }
 
 /// Find an entry in a datatype.
 #[allow(non_snake_case)]
-pub fn H5T__path_find_real(
-    registry: &DatatypeRegistry,
+pub fn H5T__path_find_real<'a>(
+    registry: &'a DatatypeRegistry,
     src: &RuntimeDatatype,
     dst: &RuntimeDatatype,
-) -> Option<String> {
+) -> Option<Cow<'a, str>> {
     if H5T_path_noop(src, dst) {
-        Some("noop".to_string())
+        Some(Cow::Borrowed("noop"))
     } else {
-        H5T__path_table_search(registry, src.message.class, dst.message.class)
-            .or_else(|| H5Tcompiler_conv(src, dst).then(|| "compiler".to_string()))
+        H5T__path_table_search_ref(registry, src.message.class, dst.message.class)
+            .map(Cow::Borrowed)
+            .or_else(|| H5Tcompiler_conv(src, dst).then_some(Cow::Borrowed("compiler")))
     }
 }
 
@@ -572,9 +615,16 @@ pub fn H5T_path_bkg(_src: &RuntimeDatatype, _dst: &RuntimeDatatype) -> bool {
 
 /// Convert a datatype.
 #[allow(non_snake_case)]
-pub fn H5T_convert(src: &RuntimeDatatype, dst: &RuntimeDatatype, data: &[u8]) -> Result<Vec<u8>> {
+pub fn H5T_convert_into(
+    src: &RuntimeDatatype,
+    dst: &RuntimeDatatype,
+    data: &[u8],
+    out: &mut Vec<u8>,
+) -> Result<()> {
     if H5T_path_match(src, dst) || H5Tcompiler_conv(src, dst) {
-        Ok(data.to_vec())
+        out.clear();
+        out.extend_from_slice(data);
+        Ok(())
     } else {
         Err(Error::Unsupported(format!(
             "datatype conversion {:?} -> {:?} is not supported",
@@ -584,13 +634,25 @@ pub fn H5T_convert(src: &RuntimeDatatype, dst: &RuntimeDatatype, data: &[u8]) ->
 }
 
 /// Convert a datatype.
+#[deprecated(note = "use H5T_convert_into() to reuse caller-provided output storage")]
+#[allow(non_snake_case)]
+pub fn H5T_convert(src: &RuntimeDatatype, dst: &RuntimeDatatype, data: &[u8]) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(data.len());
+    H5T_convert_into(src, dst, data, &mut out)?;
+    Ok(out)
+}
+
+/// Convert a datatype.
+#[deprecated(note = "use H5T_convert_into() to reuse caller-provided output storage")]
 #[allow(non_snake_case)]
 pub fn H5T_convert_committed_datatype(
     src: &RuntimeDatatype,
     dst: &RuntimeDatatype,
     data: &[u8],
 ) -> Result<Vec<u8>> {
-    H5T_convert(src, dst, data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T_convert_into(src, dst, data, &mut out)?;
+    Ok(out)
 }
 
 /// Datatype operation: nameof.
@@ -665,14 +727,16 @@ pub fn H5T_is_vl_storage(dtype: &RuntimeDatatype) -> bool {
             DatatypeClass::VarLen => return true,
             DatatypeClass::Reference => return true,
             DatatypeClass::Compound => {
-                if let Ok(fields) = message.compound_fields() {
+                if let Ok(fields) = message.compound_fields_iter() {
                     for field in fields {
-                        stack.push(*field.datatype);
+                        if let Ok(field) = field {
+                            stack.push(field.datatype);
+                        }
                     }
                 }
             }
             DatatypeClass::Array => {
-                if let Ok((_, base)) = message.array_dims_base() {
+                if let Ok(base) = message.array_base() {
                     stack.push(base);
                 }
             }
@@ -700,14 +764,20 @@ pub fn H5T__detect_vlen_ref(dtype: &RuntimeDatatype) -> bool {
         DatatypeClass::VarLen | DatatypeClass::Reference
     ) || dtype
         .message
-        .compound_fields()
+        .compound_fields_iter()
         .map(|fields| {
-            fields.into_iter().any(|field| {
-                matches!(
+            for field in fields {
+                let Ok(field) = field else {
+                    return false;
+                };
+                if matches!(
                     field.datatype.class,
                     DatatypeClass::VarLen | DatatypeClass::Reference
-                )
-            })
+                ) {
+                    return true;
+                }
+            }
+            false
         })
         .unwrap_or(false)
 }
@@ -777,21 +847,28 @@ pub fn H5T_is_numeric_with_unusual_unused_bits(dtype: &RuntimeDatatype) -> bool 
 
 /// Datatype operation: enum nameof.
 #[allow(non_snake_case)]
-pub fn H5T__enum_nameof(dtype: &RuntimeDatatype, value: u64) -> Result<Option<String>> {
+pub fn H5T__enum_nameof_ref(dtype: &RuntimeDatatype, value: u64) -> Result<Option<&str>> {
     if dtype.message.class != DatatypeClass::Enum {
         return Err(Error::InvalidFormat("not an enum datatype".into()));
     }
 
-    let mut members = dtype.message.enum_members()?;
-    if members.is_empty() {
+    if !enum_has_members(&dtype.message)? {
         return Err(Error::InvalidFormat("datatype has no members".into()));
     }
-    members.sort_by_key(|(_, member_value)| *member_value);
-
-    match members.binary_search_by_key(&value, |(_, member_value)| *member_value) {
-        Ok(index) => Ok(Some(members[index].0.clone())),
-        Err(_) => Ok(None),
+    for member in dtype.message.enum_members_iter()? {
+        let member = member?;
+        if member.value == value {
+            return Ok(Some(member.name));
+        }
     }
+    Ok(None)
+}
+
+/// Datatype operation: enum nameof.
+#[deprecated(note = "use H5T__enum_nameof_ref() to borrow the enum member name")]
+#[allow(non_snake_case)]
+pub fn H5T__enum_nameof(dtype: &RuntimeDatatype, value: u64) -> Result<Option<String>> {
+    H5T__enum_nameof_ref(dtype, value).map(|name| name.map(str::to_string))
 }
 
 /// Datatype operation: enum valueof.
@@ -804,16 +881,10 @@ pub fn H5T__enum_valueof(dtype: &RuntimeDatatype, name: &str) -> Result<Option<u
         return Err(Error::InvalidFormat("enum member name is empty".into()));
     }
 
-    let mut members = dtype.message.enum_members()?;
-    if members.is_empty() {
+    if !enum_has_members(&dtype.message)? {
         return Err(Error::InvalidFormat("datatype has no members".into()));
     }
-    members.sort_by(|(left, _), (right, _)| left.cmp(right));
-
-    match members.binary_search_by(|(member_name, _)| member_name.as_str().cmp(name)) {
-        Ok(index) => Ok(Some(members[index].1)),
-        Err(_) => Ok(None),
-    }
+    dtype.message.enum_valueof(name)
 }
 
 /// Create a new datatype.
@@ -849,7 +920,10 @@ pub fn H5T__enum_insert(dtype: &mut RuntimeDatatype, name: &str, value: u64) -> 
             "enum datatype member name must not be empty".into(),
         ));
     }
-    for (member_name, member_value) in dtype.message.enum_members()? {
+    for member in dtype.message.enum_members_iter()? {
+        let member = member?;
+        let member_name = member.name;
+        let member_value = member.value;
         if member_name == name {
             return Err(Error::InvalidFormat("name redefinition".into()));
         }
@@ -867,15 +941,22 @@ pub fn H5Tenum_insert(dtype: &mut RuntimeDatatype, name: &str, value: u64) -> Re
 }
 
 /// Datatype operation: enum nameof.
+#[deprecated(note = "use H5T__enum_nameof_ref() to borrow the enum member name")]
 #[allow(non_snake_case)]
 pub fn H5Tenum_nameof(dtype: &RuntimeDatatype, value: u64) -> Result<Option<String>> {
-    H5T__enum_nameof(dtype, value)
+    H5T__enum_nameof_ref(dtype, value).map(|name| name.map(str::to_string))
 }
 
 /// Datatype operation: enum valueof.
 #[allow(non_snake_case)]
 pub fn H5Tenum_valueof(dtype: &RuntimeDatatype, name: &str) -> Result<Option<u64>> {
     H5T__enum_valueof(dtype, name)
+}
+
+/// Iterate enum members without allocating member names.
+#[allow(non_snake_case)]
+pub fn H5Tenum_members_iter(dtype: &RuntimeDatatype) -> Result<EnumMembers<'_>> {
+    dtype.message.enum_members_iter()
 }
 
 /// Commit a datatype to the file as a named object.
@@ -930,44 +1011,105 @@ pub fn H5T_link(dtype: &mut RuntimeDatatype, name: &str) {
 
 /// Open a datatype.
 #[allow(non_snake_case)]
+pub fn H5T__open_api_common_ref<'a>(
+    registry: &'a DatatypeRegistry,
+    name: &str,
+) -> Option<&'a RuntimeDatatype> {
+    H5Tfind_ref(registry, name)
+}
+
+/// Open a datatype.
+#[deprecated(note = "use H5T__open_api_common_ref() to borrow the registered datatype")]
+#[allow(non_snake_case)]
 pub fn H5T__open_api_common(registry: &DatatypeRegistry, name: &str) -> Option<RuntimeDatatype> {
-    H5Tfind(registry, name)
+    H5T__open_api_common_ref(registry, name).cloned()
+}
+
+/// Datatype operation: open2.
+#[deprecated(note = "use H5Topen2_ref() to borrow the registered datatype")]
+#[allow(non_snake_case)]
+pub fn H5Topen2(registry: &DatatypeRegistry, name: &str) -> Option<RuntimeDatatype> {
+    H5Tfind_ref(registry, name).cloned()
 }
 
 /// Datatype operation: open2.
 #[allow(non_snake_case)]
-pub fn H5Topen2(registry: &DatatypeRegistry, name: &str) -> Option<RuntimeDatatype> {
-    H5Tfind(registry, name)
+pub fn H5Topen2_ref<'a>(registry: &'a DatatypeRegistry, name: &str) -> Option<&'a RuntimeDatatype> {
+    H5Tfind_ref(registry, name)
+}
+
+/// Open a datatype.
+#[deprecated(note = "use H5Topen_async_ref() to borrow the registered datatype")]
+#[allow(non_snake_case)]
+pub fn H5Topen_async(registry: &DatatypeRegistry, name: &str) -> Option<RuntimeDatatype> {
+    H5Tfind_ref(registry, name).cloned()
 }
 
 /// Open a datatype.
 #[allow(non_snake_case)]
-pub fn H5Topen_async(registry: &DatatypeRegistry, name: &str) -> Option<RuntimeDatatype> {
-    H5Tfind(registry, name)
+pub fn H5Topen_async_ref<'a>(
+    registry: &'a DatatypeRegistry,
+    name: &str,
+) -> Option<&'a RuntimeDatatype> {
+    H5Tfind_ref(registry, name)
+}
+
+/// Open a datatype by name.
+#[deprecated(note = "use H5T__open_name_ref() to borrow the registered datatype")]
+#[allow(non_snake_case)]
+pub fn H5T__open_name(registry: &DatatypeRegistry, name: &str) -> Option<RuntimeDatatype> {
+    H5Tfind_ref(registry, name).cloned()
 }
 
 /// Open a datatype by name.
 #[allow(non_snake_case)]
-pub fn H5T__open_name(registry: &DatatypeRegistry, name: &str) -> Option<RuntimeDatatype> {
-    H5Tfind(registry, name)
+pub fn H5T__open_name_ref<'a>(
+    registry: &'a DatatypeRegistry,
+    name: &str,
+) -> Option<&'a RuntimeDatatype> {
+    H5Tfind_ref(registry, name)
+}
+
+/// Open a datatype.
+#[deprecated(note = "use H5T_open_ref() to borrow the registered datatype")]
+#[allow(non_snake_case)]
+pub fn H5T_open(registry: &DatatypeRegistry, name: &str) -> Option<RuntimeDatatype> {
+    H5Tfind_ref(registry, name).cloned()
 }
 
 /// Open a datatype.
 #[allow(non_snake_case)]
-pub fn H5T_open(registry: &DatatypeRegistry, name: &str) -> Option<RuntimeDatatype> {
-    H5Tfind(registry, name)
+pub fn H5T_open_ref<'a>(registry: &'a DatatypeRegistry, name: &str) -> Option<&'a RuntimeDatatype> {
+    H5Tfind_ref(registry, name)
+}
+
+/// Datatype operation: open1.
+#[deprecated(note = "use H5Topen1_ref() to borrow the registered datatype")]
+#[allow(non_snake_case)]
+pub fn H5Topen1(registry: &DatatypeRegistry, name: &str) -> Option<RuntimeDatatype> {
+    H5Tfind_ref(registry, name).cloned()
 }
 
 /// Datatype operation: open1.
 #[allow(non_snake_case)]
-pub fn H5Topen1(registry: &DatatypeRegistry, name: &str) -> Option<RuntimeDatatype> {
-    H5Tfind(registry, name)
+pub fn H5Topen1_ref<'a>(registry: &'a DatatypeRegistry, name: &str) -> Option<&'a RuntimeDatatype> {
+    H5Tfind_ref(registry, name)
+}
+
+/// Open a datatype.
+#[deprecated(note = "use H5T__open_oid_ref() to borrow the registered datatype")]
+#[allow(non_snake_case)]
+pub fn H5T__open_oid(registry: &DatatypeRegistry, name: &str) -> Option<RuntimeDatatype> {
+    H5Tfind_ref(registry, name).cloned()
 }
 
 /// Open a datatype.
 #[allow(non_snake_case)]
-pub fn H5T__open_oid(registry: &DatatypeRegistry, name: &str) -> Option<RuntimeDatatype> {
-    H5Tfind(registry, name)
+pub fn H5T__open_oid_ref<'a>(
+    registry: &'a DatatypeRegistry,
+    name: &str,
+) -> Option<&'a RuntimeDatatype> {
+    H5Tfind_ref(registry, name)
 }
 
 /// Update a datatype.
@@ -1004,8 +1146,15 @@ pub fn H5T_already_vol_managed(_dtype: &RuntimeDatatype) -> bool {
 
 /// Datatype operation: get named type.
 #[allow(non_snake_case)]
+pub fn H5T_get_named_type_ref(dtype: &RuntimeDatatype) -> Option<&str> {
+    dtype.name.as_deref()
+}
+
+/// Datatype operation: get named type.
+#[deprecated(note = "use H5T_get_named_type_ref() to borrow the datatype name")]
+#[allow(non_snake_case)]
 pub fn H5T_get_named_type(dtype: &RuntimeDatatype) -> Option<String> {
-    dtype.name.clone()
+    H5T_get_named_type_ref(dtype).map(str::to_string)
 }
 
 /// Datatype operation: get actual type.
@@ -1165,16 +1314,24 @@ pub fn H5Tget_member_index(dtype: &RuntimeDatatype, name: &str) -> Option<usize>
     }
 
     match dtype.message.class {
-        DatatypeClass::Compound => H5Tget_member_info(dtype)
-            .ok()?
-            .iter()
-            .position(|field| field.name == name),
-        DatatypeClass::Enum => dtype
-            .message
-            .enum_members()
-            .ok()?
-            .iter()
-            .position(|(member_name, _)| member_name == name),
+        DatatypeClass::Compound => {
+            for (index, field) in dtype.message.compound_fields_iter().ok()?.enumerate() {
+                let field = field.ok()?;
+                if field.name == name {
+                    return Some(index);
+                }
+            }
+            None
+        }
+        DatatypeClass::Enum => {
+            for (index, member) in dtype.message.enum_members_iter().ok()?.enumerate() {
+                let member = member.ok()?;
+                if member.name == name {
+                    return Some(index);
+                }
+            }
+            None
+        }
         _ => None,
     }
 }
@@ -1182,9 +1339,12 @@ pub fn H5Tget_member_index(dtype: &RuntimeDatatype, name: &str) -> Option<usize>
 /// Return the class of a compound member.
 #[allow(non_snake_case)]
 pub fn H5Tget_member_class(dtype: &RuntimeDatatype, index: usize) -> Option<DatatypeClass> {
-    H5Tget_member_info(dtype)
+    dtype
+        .message
+        .compound_fields_iter()
         .ok()?
-        .get(index)
+        .nth(index)?
+        .ok()
         .map(|field| field.class)
 }
 
@@ -1229,21 +1389,35 @@ pub fn H5Tget_strpad(dtype: &RuntimeDatatype) -> Option<u8> {
 
 /// Return the tag string of a datatype.
 #[allow(non_snake_case)]
-pub fn H5Tget_tag(dtype: &RuntimeDatatype) -> Option<String> {
+pub fn H5Tget_tag_ref(dtype: &RuntimeDatatype) -> Option<&str> {
     if let Some(tag) = &dtype.tag {
-        return Some(tag.clone());
+        return Some(tag);
     }
     if dtype.message.class == DatatypeClass::Opaque {
-        dtype.message.opaque_tag()
+        dtype.message.opaque_tag_str()
     } else {
         None
     }
 }
 
+/// Return the tag string of a datatype.
+#[deprecated(note = "use H5Tget_tag_ref() to borrow the tag")]
+#[allow(non_snake_case)]
+pub fn H5Tget_tag(dtype: &RuntimeDatatype) -> Option<String> {
+    H5Tget_tag_ref(dtype).map(str::to_string)
+}
+
+/// Return info about compound members without collecting all fields.
+#[allow(non_snake_case)]
+pub fn H5Tget_member_info_iter(dtype: &RuntimeDatatype) -> Result<CompoundFields<'_>> {
+    dtype.message.compound_fields_iter()
+}
+
 /// Return info about a compound or enum member.
+#[deprecated(note = "use H5Tget_member_info_iter() to avoid collecting all fields")]
 #[allow(non_snake_case)]
 pub fn H5Tget_member_info(dtype: &RuntimeDatatype) -> Result<Vec<CompoundField>> {
-    dtype.message.compound_fields()
+    collect_compound_fields(&dtype.message)
 }
 
 /// Return the value of an enum member.
@@ -1252,11 +1426,12 @@ pub fn H5Tget_member_value(dtype: &RuntimeDatatype, index: usize) -> Result<Opti
     if dtype.message.class != DatatypeClass::Enum {
         return Err(Error::InvalidFormat("not an enum datatype".into()));
     }
-    let members = dtype.message.enum_members()?;
-    if index >= members.len() {
-        return Ok(None);
-    }
-    Ok(Some(members[index].1))
+    Ok(dtype
+        .message
+        .enum_members_iter()?
+        .nth(index)
+        .transpose()?
+        .map(|member| member.value))
 }
 
 /// Return the base type of a derived datatype.
@@ -1265,7 +1440,7 @@ pub fn H5Tget_super(dtype: &RuntimeDatatype) -> Result<Option<RuntimeDatatype>> 
     let message = match dtype.message.class {
         DatatypeClass::Enum => Some(dtype.message.enum_base()?),
         DatatypeClass::VarLen => dtype.message.vlen_base()?,
-        DatatypeClass::Array => Some(dtype.message.array_dims_base()?.1),
+        DatatypeClass::Array => Some(dtype.message.array_base()?),
         _ => None,
     };
     Ok(message.map(H5T_construct_datatype))
@@ -1273,12 +1448,21 @@ pub fn H5Tget_super(dtype: &RuntimeDatatype) -> Result<Option<RuntimeDatatype>> 
 
 /// Return the dimensions of an array datatype.
 #[allow(non_snake_case)]
-pub fn H5Tget_array_dims(dtype: &RuntimeDatatype) -> Result<Option<Vec<u64>>> {
+pub fn H5Tget_array_dims_iter(dtype: &RuntimeDatatype) -> Result<Option<ArrayDims<'_>>> {
     if dtype.message.class == DatatypeClass::Array {
-        dtype.message.array_dims_base().map(|(dims, _)| Some(dims))
+        dtype.message.array_dims_iter().map(Some)
     } else {
         Ok(None)
     }
+}
+
+/// Return the dimensions of an array datatype.
+#[deprecated(note = "use H5Tget_array_dims_iter() to avoid allocating dimensions")]
+#[allow(non_snake_case)]
+pub fn H5Tget_array_dims(dtype: &RuntimeDatatype) -> Result<Option<Vec<u64>>> {
+    H5Tget_array_dims_iter(dtype)?
+        .map(|dims| dims.collect::<Result<Vec<_>>>())
+        .transpose()
 }
 
 /// Set the precision of a datatype.
@@ -1304,8 +1488,7 @@ pub fn H5T__set_precision(dtype: &mut RuntimeDatatype, precision: u16) -> Result
     match dtype.message.class {
         DatatypeClass::FixedPoint | DatatypeClass::BitField | DatatypeClass::FloatingPoint => {}
         DatatypeClass::Enum => {
-            let members = dtype.message.enum_members()?;
-            if members.is_empty() {
+            if !enum_has_members(&dtype.message)? {
                 return Err(Error::InvalidFormat(
                     "enum datatype with no members has no precision to set".into(),
                 ));
@@ -1457,9 +1640,10 @@ pub fn H5Tset_tag(dtype: &mut RuntimeDatatype, tag: impl Into<String>) -> Result
 pub fn H5Tget_member_offset(dtype: &RuntimeDatatype, index: usize) -> Option<usize> {
     dtype
         .message
-        .compound_fields()
+        .compound_fields_iter()
         .ok()?
-        .get(index)
+        .nth(index)?
+        .ok()
         .map(|field| field.byte_offset)
 }
 
@@ -1474,16 +1658,23 @@ pub fn H5T_get_member_offset(dtype: &RuntimeDatatype, index: usize) -> Option<us
 pub fn H5T__get_member_size(dtype: &RuntimeDatatype, index: usize) -> Option<usize> {
     dtype
         .message
-        .compound_fields()
+        .compound_fields_iter()
         .ok()?
-        .get(index)
+        .nth(index)?
+        .ok()
         .map(|field| field.size)
 }
 
 /// Datatype operation: reopen member type.
 #[allow(non_snake_case)]
 pub fn H5T__reopen_member_type(dtype: &RuntimeDatatype, index: usize) -> Option<RuntimeDatatype> {
-    let msg = (*dtype.message.compound_fields().ok()?.get(index)?.datatype).clone();
+    let msg = dtype
+        .message
+        .compound_fields_iter()
+        .ok()?
+        .nth(index)?
+        .ok()?
+        .datatype;
     Some(RuntimeDatatype {
         name: None,
         message: msg,
@@ -1534,7 +1725,8 @@ pub fn H5Tinsert(
         ));
     }
     if old_nmembers > 0 {
-        for field in H5Tget_member_info(dtype)? {
+        for field in dtype.message.compound_fields_iter()? {
+            let field = field?;
             if field.name == name {
                 return Err(Error::InvalidFormat("member name is not unique".into()));
             }
@@ -1601,16 +1793,17 @@ pub fn H5Tinsert(
                 .push(((offset >> (8 * shift)) & 0xff) as u8);
         }
     }
-    dtype
-        .message
-        .properties
-        .extend_from_slice(&H5Tencode(&member)?);
+    let mut encoded_member = Vec::new();
+    H5Tencode_into(&member, &mut encoded_member)?;
+    dtype.message.properties.extend_from_slice(&encoded_member);
 
     let new_nmembers = old_nmembers + 1;
     dtype.message.class_bits[0] = (new_nmembers & 0xff) as u8;
     dtype.message.class_bits[1] = (new_nmembers >> 8) as u8;
     dtype.force_conv |= member.force_conv;
-    DatatypeMessage::decode(&H5Tencode(dtype)?)?;
+    let mut encoded_dtype = Vec::new();
+    H5Tencode_into(dtype, &mut encoded_dtype)?;
+    DatatypeMessage::decode(&encoded_dtype)?;
     Ok(())
 }
 
@@ -1658,8 +1851,7 @@ pub fn H5T__set_offset(dtype: &mut RuntimeDatatype, offset: u16) -> Result<()> {
             ));
         }
         DatatypeClass::Enum => {
-            let members = dtype.message.enum_members()?;
-            if !members.is_empty() {
+            if enum_has_members(&dtype.message)? {
                 return Err(Error::InvalidFormat(
                     "enum datatype offset cannot change after members are defined".into(),
                 ));
@@ -1728,118 +1920,349 @@ pub fn H5T_get_force_conv(dtype: &RuntimeDatatype) -> bool {
 
 /// Visit the entries of a datatype.
 #[allow(non_snake_case)]
+pub fn H5T__visit_cb(
+    dtype: &RuntimeDatatype,
+    mut visitor: impl FnMut(DatatypeClass) -> Result<()>,
+) -> Result<()> {
+    visitor(dtype.message.class)
+}
+
+/// Visit the entries of a datatype.
+#[deprecated(note = "use H5T__visit_cb() to avoid allocating a class list")]
+#[allow(non_snake_case)]
 pub fn H5T__visit(dtype: &RuntimeDatatype) -> Vec<DatatypeClass> {
-    vec![dtype.message.class]
+    let mut classes = Vec::with_capacity(1);
+    let _ = H5T__visit_cb(dtype, |class| {
+        classes.push(class);
+        Ok(())
+    });
+    classes
 }
 
 /// Datatype operation: print path stats.
 #[allow(non_snake_case)]
+pub fn H5T__print_path_stats_fmt(
+    registry: &DatatypeRegistry,
+    out: &mut impl fmt::Write,
+) -> fmt::Result {
+    write!(out, "DatatypePaths({})", registry.paths.len())
+}
+
+/// Datatype operation: print path stats.
+#[allow(non_snake_case)]
+pub fn H5T__print_path_stats_into(registry: &DatatypeRegistry, out: &mut String) {
+    let _ = H5T__print_path_stats_fmt(registry, out);
+}
+
+/// Datatype operation: print path stats.
+#[deprecated(note = "use H5T__print_path_stats_into() to reuse caller-provided String storage")]
+#[allow(non_snake_case)]
 pub fn H5T__print_path_stats(registry: &DatatypeRegistry) -> String {
-    format!("DatatypePaths({})", registry.paths.len())
+    let mut out = String::new();
+    H5T__print_path_stats_into(registry, &mut out);
+    out
 }
 
 /// Return a debug-friendly representation of a datatype.
 #[allow(non_snake_case)]
-pub fn H5T_debug(dtype: &RuntimeDatatype) -> String {
-    format!(
+pub fn H5T_debug_fmt(dtype: &RuntimeDatatype, out: &mut impl fmt::Write) -> fmt::Result {
+    write!(
+        out,
         "RuntimeDatatype(class={:?}, size={})",
         dtype.message.class, dtype.message.size
     )
 }
 
+/// Return a debug-friendly representation of a datatype.
+#[allow(non_snake_case)]
+pub fn H5T_debug_into(dtype: &RuntimeDatatype, out: &mut String) {
+    let _ = H5T_debug_fmt(dtype, out);
+}
+
+/// Return a debug-friendly representation of a datatype.
+#[deprecated(note = "use H5T_debug_into() to reuse caller-provided String storage")]
+#[allow(non_snake_case)]
+pub fn H5T_debug(dtype: &RuntimeDatatype) -> String {
+    let mut out = String::new();
+    H5T_debug_into(dtype, &mut out);
+    out
+}
+
 /// Internal helper `conv_copy`.
 fn conv_copy(data: &[u8]) -> Vec<u8> {
-    data.to_vec()
+    let mut out = Vec::with_capacity(data.len());
+    conv_copy_into(data, &mut out);
+    out
+}
+
+/// Internal helper `conv_copy_into`.
+fn conv_copy_into(data: &[u8], out: &mut Vec<u8>) {
+    out.clear();
+    out.extend_from_slice(data);
 }
 
 /// Initialize the datatype subsystem.
 #[allow(non_snake_case)]
+pub fn H5T__conv_enum_init_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Initialize the datatype subsystem.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_enum_init(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_enum_init_into(data, &mut out);
+    out
 }
 /// Datatype operation: conv enum.
 #[allow(non_snake_case)]
+pub fn H5T__conv_enum_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv enum.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_enum(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_enum_into(data, &mut out);
+    out
 }
 /// Datatype operation: conv enum numeric.
 #[allow(non_snake_case)]
+pub fn H5T__conv_enum_numeric_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv enum numeric.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_enum_numeric(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_enum_numeric_into(data, &mut out);
+    out
 }
 /// Datatype operation: conv struct subset.
 #[allow(non_snake_case)]
+pub fn H5T__conv_struct_subset_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv struct subset.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_struct_subset(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_struct_subset_into(data, &mut out);
+    out
 }
 /// Initialize the datatype subsystem.
 #[allow(non_snake_case)]
+pub fn H5T__conv_struct_init_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Initialize the datatype subsystem.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_struct_init(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_struct_init_into(data, &mut out);
+    out
 }
 /// Free a datatype's in-memory resources.
 #[allow(non_snake_case)]
+pub fn H5T__conv_struct_free_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Free a datatype's in-memory resources.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_struct_free(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_struct_free_into(data, &mut out);
+    out
 }
 /// Datatype operation: conv struct.
 #[allow(non_snake_case)]
+pub fn H5T__conv_struct_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv struct.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_struct(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_struct_into(data, &mut out);
+    out
 }
 /// Datatype operation: conv struct opt.
 #[allow(non_snake_case)]
+pub fn H5T__conv_struct_opt_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv struct opt.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_struct_opt(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_struct_opt_into(data, &mut out);
+    out
 }
 /// Datatype operation: conv complex.
 #[allow(non_snake_case)]
+pub fn H5T__conv_complex_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv complex.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_complex(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_complex_into(data, &mut out);
+    out
 }
 /// Datatype operation: conv complex loop.
 #[allow(non_snake_case)]
+pub fn H5T__conv_complex_loop_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv complex loop.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_complex_loop(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_complex_loop_into(data, &mut out);
+    out
 }
 /// Datatype operation: conv complex part.
 #[allow(non_snake_case)]
+pub fn H5T__conv_complex_part_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv complex part.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_complex_part(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_complex_part_into(data, &mut out);
+    out
 }
 /// Datatype operation: conv complex i.
 #[allow(non_snake_case)]
+pub fn H5T__conv_complex_i_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv complex i.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_complex_i(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_complex_i_into(data, &mut out);
+    out
 }
 /// Datatype operation: conv complex f.
 #[allow(non_snake_case)]
+pub fn H5T__conv_complex_f_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv complex f.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_complex_f(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_complex_f_into(data, &mut out);
+    out
 }
 /// Datatype operation: conv complex f matched.
 #[allow(non_snake_case)]
+pub fn H5T__conv_complex_f_matched_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv complex f matched.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_complex_f_matched(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_complex_f_matched_into(data, &mut out);
+    out
 }
 /// Datatype operation: conv complex compat.
 #[allow(non_snake_case)]
+pub fn H5T__conv_complex_compat_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv complex compat.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_complex_compat(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_complex_compat_into(data, &mut out);
+    out
 }
 /// Datatype operation: conv ref.
 #[allow(non_snake_case)]
+pub fn H5T__conv_ref_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv ref.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_ref(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_ref_into(data, &mut out);
+    out
 }
 /// Datatype operation: sort value.
 #[allow(non_snake_case)]
 pub fn H5T__sort_value(dtype: &mut RuntimeDatatype, map: Option<&mut [usize]>) -> Result<()> {
     match dtype.message.class {
         DatatypeClass::Compound => {
-            let mut members = dtype
-                .message
-                .compound_fields()?
+            let mut members = collect_compound_fields(&dtype.message)?
                 .into_iter()
                 .enumerate()
                 .collect::<Vec<_>>();
@@ -1874,7 +2297,9 @@ pub fn H5T__sort_value(dtype: &mut RuntimeDatatype, map: Option<&mut [usize]>) -
             let base = dtype.message.enum_base()?;
             let mut members = dtype
                 .message
-                .enum_members()?
+                .enum_members_iter()?
+                .map(|member| member.map(|member| (member.name.to_string(), member.value)))
+                .collect::<Result<Vec<_>>>()?
                 .into_iter()
                 .enumerate()
                 .collect::<Vec<_>>();
@@ -1916,9 +2341,7 @@ pub fn H5T__sort_value(dtype: &mut RuntimeDatatype, map: Option<&mut [usize]>) -
 pub fn H5T__sort_name(dtype: &mut RuntimeDatatype, map: Option<&mut [usize]>) -> Result<()> {
     match dtype.message.class {
         DatatypeClass::Compound => {
-            let mut members = dtype
-                .message
-                .compound_fields()?
+            let mut members = collect_compound_fields(&dtype.message)?
                 .into_iter()
                 .enumerate()
                 .collect::<Vec<_>>();
@@ -1953,7 +2376,9 @@ pub fn H5T__sort_name(dtype: &mut RuntimeDatatype, map: Option<&mut [usize]>) ->
             let base = dtype.message.enum_base()?;
             let mut members = dtype
                 .message
-                .enum_members()?
+                .enum_members_iter()?
+                .map(|member| member.map(|member| (member.name.to_string(), member.value)))
+                .collect::<Result<Vec<_>>>()?
                 .into_iter()
                 .enumerate()
                 .collect::<Vec<_>>();
@@ -1992,67 +2417,92 @@ pub fn H5T__sort_name(dtype: &mut RuntimeDatatype, map: Option<&mut [usize]>) ->
 }
 /// Datatype operation: reverse order.
 #[allow(non_snake_case)]
+pub fn H5T__reverse_order_into(
+    data: &[u8],
+    order: H5TDetectedOrder,
+    is_complex: bool,
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    let size = data.len();
+    if order == H5TDetectedOrder::Vax && size % 2 != 0 {
+        return Err(Error::InvalidFormat(
+            "VAX byte order requires an even byte count".into(),
+        ));
+    }
+    if order == H5TDetectedOrder::BigEndian && is_complex && size % 2 != 0 {
+        return Err(Error::InvalidFormat(
+            "complex byte order requires an even byte count".into(),
+        ));
+    }
+
+    out.clear();
+    out.resize(size, 0);
+    match order {
+        H5TDetectedOrder::Vax => {
+            for i in (0..size).step_by(2) {
+                out[i] = data[(size - 2) - i];
+                out[i + 1] = data[(size - 1) - i];
+            }
+        }
+        H5TDetectedOrder::BigEndian => {
+            if is_complex {
+                let part_size = size / 2;
+                for i in 0..part_size {
+                    out[part_size - (i + 1)] = data[i];
+                }
+                for i in 0..part_size {
+                    out[part_size + part_size - (i + 1)] = data[part_size + i];
+                }
+            } else {
+                for i in 0..size {
+                    out[size - (i + 1)] = data[i];
+                }
+            }
+        }
+        H5TDetectedOrder::LittleEndian => {
+            out.copy_from_slice(data);
+        }
+    }
+    Ok(())
+}
+
+/// Datatype operation: reverse order.
+#[deprecated(note = "use H5T__reverse_order_into() to reuse caller-provided output storage")]
+#[allow(non_snake_case)]
 pub fn H5T__reverse_order(
     data: &[u8],
     order: H5TDetectedOrder,
     is_complex: bool,
 ) -> Result<Vec<u8>> {
-    let size = data.len();
-    let mut rev = vec![0u8; size];
-
-    match order {
-        H5TDetectedOrder::Vax => {
-            if size % 2 != 0 {
-                return Err(Error::InvalidFormat(
-                    "VAX byte order requires an even byte count".into(),
-                ));
-            }
-            for i in (0..size).step_by(2) {
-                rev[i] = data[(size - 2) - i];
-                rev[i + 1] = data[(size - 1) - i];
-            }
-        }
-        H5TDetectedOrder::BigEndian => {
-            if is_complex {
-                if size % 2 != 0 {
-                    return Err(Error::InvalidFormat(
-                        "complex byte order requires an even byte count".into(),
-                    ));
-                }
-                let part_size = size / 2;
-                for i in 0..part_size {
-                    rev[part_size - (i + 1)] = data[i];
-                }
-                for i in 0..part_size {
-                    rev[part_size + part_size - (i + 1)] = data[part_size + i];
-                }
-            } else {
-                for i in 0..size {
-                    rev[size - (i + 1)] = data[i];
-                }
-            }
-        }
-        H5TDetectedOrder::LittleEndian => {
-            for i in 0..size {
-                rev[i] = data[i];
-            }
-        }
-    }
-    Ok(rev)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__reverse_order_into(data, order, is_complex, &mut out)?;
+    Ok(out)
 }
 /// Datatype operation: conv noop.
 #[allow(non_snake_case)]
+pub fn H5T__conv_noop_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv noop.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_noop(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_noop_into(data, &mut out);
+    out
 }
 /// Datatype operation: conv order opt.
 #[allow(non_snake_case)]
-pub fn H5T__conv_order_opt(
+pub fn H5T__conv_order_opt_into(
     data: &[u8],
     element_size: usize,
     order: H5TDetectedOrder,
     is_complex: bool,
-) -> Result<Vec<u8>> {
+    out: &mut Vec<u8>,
+) -> Result<()> {
     if element_size == 0 || !matches!(element_size, 1 | 2 | 4 | 8 | 16) {
         return Err(Error::Unsupported(
             "byte-order optimized conversion only supports 1, 2, 4, 8, or 16 byte elements".into(),
@@ -2063,27 +2513,86 @@ pub fn H5T__conv_order_opt(
             "byte-order conversion buffer is not element aligned".into(),
         ));
     }
-
-    let mut converted = Vec::with_capacity(data.len());
-    for element in data.chunks_exact(element_size) {
-        converted.extend_from_slice(&H5T__reverse_order(element, order, is_complex)?);
+    if order == H5TDetectedOrder::Vax && element_size % 2 != 0 {
+        return Err(Error::InvalidFormat(
+            "VAX byte order requires an even byte count".into(),
+        ));
     }
-    Ok(converted)
+    if order == H5TDetectedOrder::BigEndian && is_complex && element_size % 2 != 0 {
+        return Err(Error::InvalidFormat(
+            "complex byte order requires an even byte count".into(),
+        ));
+    }
+
+    out.clear();
+    let mut reversed = Vec::with_capacity(element_size);
+    for element in data.chunks_exact(element_size) {
+        H5T__reverse_order_into(element, order, is_complex, &mut reversed)?;
+        out.extend_from_slice(&reversed);
+    }
+    Ok(())
+}
+
+/// Datatype operation: conv order opt.
+#[deprecated(note = "use H5T__conv_order_opt_into() to reuse caller-provided output storage")]
+#[allow(non_snake_case)]
+pub fn H5T__conv_order_opt(
+    data: &[u8],
+    element_size: usize,
+    order: H5TDetectedOrder,
+    is_complex: bool,
+) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_order_opt_into(data, element_size, order, is_complex, &mut out)?;
+    Ok(out)
 }
 /// Datatype operation: conv i f loop.
 #[allow(non_snake_case)]
+pub fn H5T__conv_i_f_loop_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv i f loop.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_i_f_loop(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_i_f_loop_into(data, &mut out);
+    out
 }
 /// Datatype operation: conv i complex.
 #[allow(non_snake_case)]
+pub fn H5T__conv_i_complex_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv i complex.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_i_complex(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_i_complex_into(data, &mut out);
+    out
 }
 /// Datatype operation: conv f f loop.
 #[allow(non_snake_case)]
+pub fn H5T__conv_f_f_loop_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv f f loop.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_f_f_loop(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_f_f_loop_into(data, &mut out);
+    out
 }
 /// Find an entry in a datatype.
 #[allow(non_snake_case)]
@@ -2168,43 +2677,127 @@ pub fn H5T__conv_float_find_special(
 }
 /// Datatype operation: conv f i loop.
 #[allow(non_snake_case)]
+pub fn H5T__conv_f_i_loop_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv f i loop.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_f_i_loop(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_f_i_loop_into(data, &mut out);
+    out
 }
 /// Datatype operation: conv f complex.
 #[allow(non_snake_case)]
+pub fn H5T__conv_f_complex_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv f complex.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_f_complex(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_f_complex_into(data, &mut out);
+    out
 }
 /// Free a datatype's in-memory resources.
 #[allow(non_snake_case)]
+pub fn H5T__conv_vlen_nested_free_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Free a datatype's in-memory resources.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_vlen_nested_free(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_vlen_nested_free_into(data, &mut out);
+    out
 }
 /// Datatype operation: conv vlen.
 #[allow(non_snake_case)]
+pub fn H5T__conv_vlen_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv vlen.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_vlen(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_vlen_into(data, &mut out);
+    out
 }
 /// Read from a datatype.
+#[allow(non_snake_case)]
+pub fn H5T__vlen_mem_seq_read_ref(data: &[u8]) -> &[u8] {
+    data
+}
+
+/// Read from a datatype.
+#[deprecated(note = "use H5T__vlen_mem_seq_read_ref() to borrow the vlen sequence bytes")]
 #[allow(non_snake_case)]
 pub fn H5T__vlen_mem_seq_read(data: &[u8]) -> Vec<u8> {
     conv_copy(data)
 }
 /// Datatype operation: conv b b.
 #[allow(non_snake_case)]
+pub fn H5T__conv_b_b_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv b b.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_b_b(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_b_b_into(data, &mut out);
+    out
 }
 /// Datatype operation: conv s s.
 #[allow(non_snake_case)]
+pub fn H5T__conv_s_s_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv s s.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_s_s(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_s_s_into(data, &mut out);
+    out
 }
 /// Datatype operation: conv array.
 #[allow(non_snake_case)]
+pub fn H5T__conv_array_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv array.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_array(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_array_into(data, &mut out);
+    out
 }
 
 /// Set the floating-point field layout of a datatype.
@@ -2370,7 +2963,7 @@ pub fn H5Tset_sign(dtype: &mut RuntimeDatatype, sign: u8) -> Result<()> {
             Ok(())
         }
         DatatypeClass::Enum => {
-            if !dtype.message.enum_members()?.is_empty() {
+            if enum_has_members(&dtype.message)? {
                 return Err(Error::InvalidFormat(
                     "operation not allowed after members are defined".into(),
                 ));
@@ -2407,7 +3000,7 @@ pub fn H5Tset_pad(dtype: &mut RuntimeDatatype, low: u8, high: u8) -> Result<()> 
             Ok(())
         }
         DatatypeClass::Enum => {
-            if !dtype.message.enum_members()?.is_empty() {
+            if enum_has_members(&dtype.message)? {
                 return Err(Error::InvalidFormat(
                     "operation not allowed after members are defined".into(),
                 ));
@@ -2745,243 +3338,771 @@ pub fn H5T__imp_bit(data: &[u8]) -> bool {
 
 /// Datatype operation: conv fcomplex schar.
 #[allow(non_snake_case)]
+pub fn H5T__conv_fcomplex_schar_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv fcomplex schar.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_fcomplex_schar(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_fcomplex_schar_into(data, &mut out);
+    out
 }
 /// Datatype operation: conv fcomplex uchar.
 #[allow(non_snake_case)]
+pub fn H5T__conv_fcomplex_uchar_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv fcomplex uchar.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_fcomplex_uchar(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_fcomplex_uchar_into(data, &mut out);
+    out
 }
 /// Datatype operation: conv fcomplex short.
 #[allow(non_snake_case)]
+pub fn H5T__conv_fcomplex_short_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv fcomplex short.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_fcomplex_short(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_fcomplex_short_into(data, &mut out);
+    out
 }
 /// Datatype operation: conv fcomplex ushort.
 #[allow(non_snake_case)]
+pub fn H5T__conv_fcomplex_ushort_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv fcomplex ushort.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_fcomplex_ushort(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_fcomplex_ushort_into(data, &mut out);
+    out
 }
 /// Datatype operation: conv fcomplex int.
 #[allow(non_snake_case)]
+pub fn H5T__conv_fcomplex_int_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv fcomplex int.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_fcomplex_int(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_fcomplex_int_into(data, &mut out);
+    out
 }
 /// Datatype operation: conv fcomplex uint.
 #[allow(non_snake_case)]
+pub fn H5T__conv_fcomplex_uint_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv fcomplex uint.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_fcomplex_uint(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_fcomplex_uint_into(data, &mut out);
+    out
 }
 /// Datatype operation: conv fcomplex long.
 #[allow(non_snake_case)]
+pub fn H5T__conv_fcomplex_long_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv fcomplex long.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_fcomplex_long(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_fcomplex_long_into(data, &mut out);
+    out
 }
 /// Datatype operation: conv fcomplex ulong.
 #[allow(non_snake_case)]
+pub fn H5T__conv_fcomplex_ulong_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv fcomplex ulong.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_fcomplex_ulong(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_fcomplex_ulong_into(data, &mut out);
+    out
 }
 /// Datatype operation: conv fcomplex llong.
 #[allow(non_snake_case)]
+pub fn H5T__conv_fcomplex_llong_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv fcomplex llong.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_fcomplex_llong(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_fcomplex_llong_into(data, &mut out);
+    out
 }
 /// Datatype operation: conv fcomplex ullong.
 #[allow(non_snake_case)]
+pub fn H5T__conv_fcomplex_ullong_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv fcomplex ullong.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_fcomplex_ullong(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_fcomplex_ullong_into(data, &mut out);
+    out
 }
 /// Datatype operation: conv fcomplex  Float16.
 #[allow(non_snake_case)]
+pub fn H5T__conv_fcomplex__Float16_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv fcomplex  Float16.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_fcomplex__Float16(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_fcomplex__Float16_into(data, &mut out);
+    out
 }
 /// Datatype operation: conv fcomplex float.
 #[allow(non_snake_case)]
+pub fn H5T__conv_fcomplex_float_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv fcomplex float.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_fcomplex_float(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_fcomplex_float_into(data, &mut out);
+    out
 }
 /// Datatype operation: conv fcomplex double.
 #[allow(non_snake_case)]
+pub fn H5T__conv_fcomplex_double_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv fcomplex double.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_fcomplex_double(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_fcomplex_double_into(data, &mut out);
+    out
 }
 /// Datatype operation: conv fcomplex ldouble.
 #[allow(non_snake_case)]
+pub fn H5T__conv_fcomplex_ldouble_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv fcomplex ldouble.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_fcomplex_ldouble(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_fcomplex_ldouble_into(data, &mut out);
+    out
 }
 /// Datatype operation: conv fcomplex dcomplex.
 #[allow(non_snake_case)]
+pub fn H5T__conv_fcomplex_dcomplex_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv fcomplex dcomplex.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_fcomplex_dcomplex(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_fcomplex_dcomplex_into(data, &mut out);
+    out
 }
 /// Datatype operation: conv fcomplex lcomplex.
 #[allow(non_snake_case)]
+pub fn H5T__conv_fcomplex_lcomplex_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv fcomplex lcomplex.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_fcomplex_lcomplex(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_fcomplex_lcomplex_into(data, &mut out);
+    out
 }
 /// Datatype operation: conv dcomplex schar.
 #[allow(non_snake_case)]
+pub fn H5T__conv_dcomplex_schar_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv dcomplex schar.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_dcomplex_schar(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_dcomplex_schar_into(data, &mut out);
+    out
 }
 /// Datatype operation: conv dcomplex uchar.
 #[allow(non_snake_case)]
+pub fn H5T__conv_dcomplex_uchar_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv dcomplex uchar.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_dcomplex_uchar(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_dcomplex_uchar_into(data, &mut out);
+    out
 }
 /// Datatype operation: conv dcomplex short.
 #[allow(non_snake_case)]
+pub fn H5T__conv_dcomplex_short_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv dcomplex short.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_dcomplex_short(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_dcomplex_short_into(data, &mut out);
+    out
 }
 /// Datatype operation: conv dcomplex ushort.
 #[allow(non_snake_case)]
+pub fn H5T__conv_dcomplex_ushort_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv dcomplex ushort.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_dcomplex_ushort(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_dcomplex_ushort_into(data, &mut out);
+    out
 }
 /// Datatype operation: conv dcomplex int.
 #[allow(non_snake_case)]
+pub fn H5T__conv_dcomplex_int_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv dcomplex int.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_dcomplex_int(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_dcomplex_int_into(data, &mut out);
+    out
 }
 /// Datatype operation: conv dcomplex uint.
 #[allow(non_snake_case)]
+pub fn H5T__conv_dcomplex_uint_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv dcomplex uint.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_dcomplex_uint(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_dcomplex_uint_into(data, &mut out);
+    out
 }
 /// Datatype operation: conv dcomplex long.
 #[allow(non_snake_case)]
+pub fn H5T__conv_dcomplex_long_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv dcomplex long.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_dcomplex_long(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_dcomplex_long_into(data, &mut out);
+    out
 }
 /// Datatype operation: conv dcomplex ulong.
 #[allow(non_snake_case)]
+pub fn H5T__conv_dcomplex_ulong_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv dcomplex ulong.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_dcomplex_ulong(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_dcomplex_ulong_into(data, &mut out);
+    out
 }
 /// Datatype operation: conv dcomplex llong.
 #[allow(non_snake_case)]
+pub fn H5T__conv_dcomplex_llong_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv dcomplex llong.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_dcomplex_llong(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_dcomplex_llong_into(data, &mut out);
+    out
 }
 /// Datatype operation: conv dcomplex ullong.
 #[allow(non_snake_case)]
+pub fn H5T__conv_dcomplex_ullong_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv dcomplex ullong.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_dcomplex_ullong(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_dcomplex_ullong_into(data, &mut out);
+    out
 }
 /// Datatype operation: conv dcomplex  Float16.
 #[allow(non_snake_case)]
+pub fn H5T__conv_dcomplex__Float16_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv dcomplex  Float16.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_dcomplex__Float16(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_dcomplex__Float16_into(data, &mut out);
+    out
 }
 /// Datatype operation: conv dcomplex float.
 #[allow(non_snake_case)]
+pub fn H5T__conv_dcomplex_float_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv dcomplex float.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_dcomplex_float(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_dcomplex_float_into(data, &mut out);
+    out
 }
 /// Datatype operation: conv dcomplex double.
 #[allow(non_snake_case)]
+pub fn H5T__conv_dcomplex_double_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv dcomplex double.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_dcomplex_double(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_dcomplex_double_into(data, &mut out);
+    out
 }
 /// Datatype operation: conv dcomplex ldouble.
 #[allow(non_snake_case)]
+pub fn H5T__conv_dcomplex_ldouble_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv dcomplex ldouble.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_dcomplex_ldouble(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_dcomplex_ldouble_into(data, &mut out);
+    out
 }
 /// Datatype operation: conv dcomplex fcomplex.
 #[allow(non_snake_case)]
+pub fn H5T__conv_dcomplex_fcomplex_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv dcomplex fcomplex.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_dcomplex_fcomplex(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_dcomplex_fcomplex_into(data, &mut out);
+    out
 }
 /// Datatype operation: conv dcomplex lcomplex.
 #[allow(non_snake_case)]
+pub fn H5T__conv_dcomplex_lcomplex_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv dcomplex lcomplex.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_dcomplex_lcomplex(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_dcomplex_lcomplex_into(data, &mut out);
+    out
 }
 /// Datatype operation: conv lcomplex schar.
 #[allow(non_snake_case)]
+pub fn H5T__conv_lcomplex_schar_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv lcomplex schar.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_lcomplex_schar(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_lcomplex_schar_into(data, &mut out);
+    out
 }
 /// Datatype operation: conv lcomplex uchar.
 #[allow(non_snake_case)]
+pub fn H5T__conv_lcomplex_uchar_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv lcomplex uchar.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_lcomplex_uchar(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_lcomplex_uchar_into(data, &mut out);
+    out
 }
 /// Datatype operation: conv lcomplex short.
 #[allow(non_snake_case)]
+pub fn H5T__conv_lcomplex_short_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv lcomplex short.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_lcomplex_short(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_lcomplex_short_into(data, &mut out);
+    out
 }
 /// Datatype operation: conv lcomplex ushort.
 #[allow(non_snake_case)]
+pub fn H5T__conv_lcomplex_ushort_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv lcomplex ushort.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_lcomplex_ushort(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_lcomplex_ushort_into(data, &mut out);
+    out
 }
 /// Datatype operation: conv lcomplex int.
 #[allow(non_snake_case)]
+pub fn H5T__conv_lcomplex_int_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv lcomplex int.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_lcomplex_int(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_lcomplex_int_into(data, &mut out);
+    out
 }
 /// Datatype operation: conv lcomplex uint.
 #[allow(non_snake_case)]
+pub fn H5T__conv_lcomplex_uint_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv lcomplex uint.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_lcomplex_uint(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_lcomplex_uint_into(data, &mut out);
+    out
 }
 /// Datatype operation: conv lcomplex long.
 #[allow(non_snake_case)]
+pub fn H5T__conv_lcomplex_long_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv lcomplex long.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_lcomplex_long(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_lcomplex_long_into(data, &mut out);
+    out
 }
 /// Datatype operation: conv lcomplex ulong.
 #[allow(non_snake_case)]
+pub fn H5T__conv_lcomplex_ulong_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv lcomplex ulong.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_lcomplex_ulong(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_lcomplex_ulong_into(data, &mut out);
+    out
 }
 /// Datatype operation: conv lcomplex llong.
 #[allow(non_snake_case)]
+pub fn H5T__conv_lcomplex_llong_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv lcomplex llong.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_lcomplex_llong(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_lcomplex_llong_into(data, &mut out);
+    out
 }
 /// Datatype operation: conv lcomplex ullong.
 #[allow(non_snake_case)]
+pub fn H5T__conv_lcomplex_ullong_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv lcomplex ullong.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_lcomplex_ullong(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_lcomplex_ullong_into(data, &mut out);
+    out
 }
 /// Datatype operation: conv lcomplex  Float16.
 #[allow(non_snake_case)]
+pub fn H5T__conv_lcomplex__Float16_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv lcomplex  Float16.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_lcomplex__Float16(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_lcomplex__Float16_into(data, &mut out);
+    out
 }
 /// Datatype operation: conv lcomplex float.
 #[allow(non_snake_case)]
+pub fn H5T__conv_lcomplex_float_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv lcomplex float.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_lcomplex_float(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_lcomplex_float_into(data, &mut out);
+    out
 }
 /// Datatype operation: conv lcomplex double.
 #[allow(non_snake_case)]
+pub fn H5T__conv_lcomplex_double_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv lcomplex double.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_lcomplex_double(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_lcomplex_double_into(data, &mut out);
+    out
 }
 /// Datatype operation: conv lcomplex ldouble.
 #[allow(non_snake_case)]
+pub fn H5T__conv_lcomplex_ldouble_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv lcomplex ldouble.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_lcomplex_ldouble(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_lcomplex_ldouble_into(data, &mut out);
+    out
 }
 /// Datatype operation: conv lcomplex fcomplex.
 #[allow(non_snake_case)]
+pub fn H5T__conv_lcomplex_fcomplex_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv lcomplex fcomplex.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_lcomplex_fcomplex(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_lcomplex_fcomplex_into(data, &mut out);
+    out
 }
 /// Datatype operation: conv lcomplex dcomplex.
 #[allow(non_snake_case)]
+pub fn H5T__conv_lcomplex_dcomplex_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv lcomplex dcomplex.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_lcomplex_dcomplex(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_lcomplex_dcomplex_into(data, &mut out);
+    out
 }
 
 /// Initialize the datatype subsystem.
@@ -3033,6 +4154,13 @@ pub fn H5T__ref_mem_getsize(buf: &[u8]) -> usize {
 }
 
 /// Read from a datatype.
+#[allow(non_snake_case)]
+pub fn H5T__ref_mem_read_ref(buf: &[u8]) -> &[u8] {
+    buf
+}
+
+/// Read from a datatype.
+#[deprecated(note = "use H5T__ref_mem_read_ref() to borrow the reference bytes")]
 #[allow(non_snake_case)]
 pub fn H5T__ref_mem_read(buf: &[u8]) -> Vec<u8> {
     buf.to_vec()
@@ -3129,7 +4257,7 @@ pub fn H5T__ref_disk_getsize(buf: &[u8]) -> Result<(usize, bool)> {
 
 /// Read from a datatype.
 #[allow(non_snake_case)]
-pub fn H5T__ref_disk_read(buf: &[u8]) -> Result<Vec<u8>> {
+pub fn H5T__ref_disk_read_into(buf: &[u8], dst: &mut Vec<u8>) -> Result<()> {
     let blob_offset = H5R_ENCODE_HEADER_SIZE + std::mem::size_of::<u32>();
     if buf.len() < blob_offset {
         return Err(Error::InvalidFormat(
@@ -3151,9 +4279,18 @@ pub fn H5T__ref_disk_read(buf: &[u8]) -> Result<Vec<u8>> {
         ));
     }
 
-    let mut dst = Vec::with_capacity(H5R_ENCODE_HEADER_SIZE + payload_size);
+    dst.clear();
     dst.extend_from_slice(&buf[..H5R_ENCODE_HEADER_SIZE]);
     dst.extend_from_slice(&buf[blob_offset..end]);
+    Ok(())
+}
+
+/// Read from a datatype.
+#[deprecated(note = "use H5T__ref_disk_read_into() to reuse caller-provided output storage")]
+#[allow(non_snake_case)]
+pub fn H5T__ref_disk_read(buf: &[u8]) -> Result<Vec<u8>> {
+    let mut dst = Vec::new();
+    H5T__ref_disk_read_into(buf, &mut dst)?;
     Ok(dst)
 }
 
@@ -3211,15 +4348,28 @@ pub fn H5T__ref_obj_disk_getsize(buf: &[u8], address_size: usize) -> Result<usiz
 
 /// Read from a datatype.
 #[allow(non_snake_case)]
-pub fn H5T__ref_obj_disk_read(buf: &[u8], address_size: usize) -> Result<Vec<u8>> {
+pub fn H5T__ref_obj_disk_read_into(
+    buf: &[u8],
+    address_size: usize,
+    dst: &mut Vec<u8>,
+) -> Result<()> {
     if address_size == 0 || buf.len() < address_size {
         return Err(Error::InvalidFormat(
             "object reference disk buffer is truncated".into(),
         ));
     }
-    let mut token = vec![0u8; address_size];
-    token.copy_from_slice(&buf[..address_size]);
-    Ok(token)
+    dst.clear();
+    dst.extend_from_slice(&buf[..address_size]);
+    Ok(())
+}
+
+/// Read from a datatype.
+#[deprecated(note = "use H5T__ref_obj_disk_read_into() to reuse caller-provided output storage")]
+#[allow(non_snake_case)]
+pub fn H5T__ref_obj_disk_read(buf: &[u8], address_size: usize) -> Result<Vec<u8>> {
+    let mut dst = Vec::with_capacity(address_size);
+    H5T__ref_obj_disk_read_into(buf, address_size, &mut dst)?;
+    Ok(dst)
 }
 
 /// Datatype operation: ref dsetreg disk isnull.
@@ -3246,15 +4396,33 @@ pub fn H5T__ref_dsetreg_disk_getsize(buf: &[u8], address_size: usize) -> Result<
 
 /// Read from a datatype.
 #[allow(non_snake_case)]
-pub fn H5T__ref_dsetreg_disk_read(buf: &[u8], address_size: usize) -> Result<(Vec<u8>, Vec<u8>)> {
+pub fn H5T__ref_dsetreg_disk_read_into(
+    buf: &[u8],
+    address_size: usize,
+    token: &mut Vec<u8>,
+    encoded_space: &mut Vec<u8>,
+) -> Result<()> {
     if address_size == 0 || buf.len() < address_size {
         return Err(Error::InvalidFormat(
             "dataset-region reference disk buffer is truncated".into(),
         ));
     }
-    let mut token = vec![0u8; address_size];
-    token.copy_from_slice(&buf[..address_size]);
-    let encoded_space = buf[address_size..].to_vec();
+    token.clear();
+    token.extend_from_slice(&buf[..address_size]);
+    encoded_space.clear();
+    encoded_space.extend_from_slice(&buf[address_size..]);
+    Ok(())
+}
+
+/// Read from a datatype.
+#[deprecated(
+    note = "use H5T__ref_dsetreg_disk_read_into() to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
+pub fn H5T__ref_dsetreg_disk_read(buf: &[u8], address_size: usize) -> Result<(Vec<u8>, Vec<u8>)> {
+    let mut token = Vec::with_capacity(address_size);
+    let mut encoded_space = Vec::new();
+    H5T__ref_dsetreg_disk_read_into(buf, address_size, &mut token, &mut encoded_space)?;
     Ok((token, encoded_space))
 }
 
@@ -3321,6 +4489,13 @@ pub fn H5T__vlen_mem_str_setnull(value: &mut String) {
 
 /// Read from a datatype.
 #[allow(non_snake_case)]
+pub fn H5T__vlen_mem_str_read_ref(value: &str) -> &[u8] {
+    value.as_bytes()
+}
+
+/// Read from a datatype.
+#[deprecated(note = "use H5T__vlen_mem_str_read_ref() to borrow the string bytes")]
+#[allow(non_snake_case)]
 pub fn H5T__vlen_mem_str_read(value: &str) -> Vec<u8> {
     value.as_bytes().to_vec()
 }
@@ -3372,7 +4547,7 @@ pub fn H5T__vlen_disk_setnull(buf: &mut Vec<u8>, background: Option<&mut Vec<u8>
 
 /// Read from a datatype.
 #[allow(non_snake_case)]
-pub fn H5T__vlen_disk_read(buf: &[u8], len: usize) -> Result<Vec<u8>> {
+pub fn H5T__vlen_disk_read_ref(buf: &[u8], len: usize) -> Result<&[u8]> {
     let blob_offset = std::mem::size_of::<u32>();
     let end = blob_offset
         .checked_add(len)
@@ -3380,7 +4555,14 @@ pub fn H5T__vlen_disk_read(buf: &[u8], len: usize) -> Result<Vec<u8>> {
     if end > buf.len() {
         return Err(Error::InvalidFormat("vlen disk blob is truncated".into()));
     }
-    Ok(buf[blob_offset..end].to_vec())
+    Ok(&buf[blob_offset..end])
+}
+
+/// Read from a datatype.
+#[deprecated(note = "use H5T__vlen_disk_read_ref() to borrow the vlen blob bytes")]
+#[allow(non_snake_case)]
+pub fn H5T__vlen_disk_read(buf: &[u8], len: usize) -> Result<Vec<u8>> {
+    H5T__vlen_disk_read_ref(buf, len).map(<[u8]>::to_vec)
 }
 
 /// Write to a datatype.
@@ -3434,1346 +4616,3810 @@ pub fn H5T_vlen_reclaim_elmt(buf: &mut Vec<u8>) {
 
 /// Datatype operation: conv schar uchar.
 #[allow(non_snake_case)]
+pub fn H5T__conv_schar_uchar_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv schar uchar.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_schar_uchar(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_schar_uchar_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv schar short.
 #[allow(non_snake_case)]
+pub fn H5T__conv_schar_short_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv schar short.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_schar_short(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_schar_short_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv schar ushort.
 #[allow(non_snake_case)]
+pub fn H5T__conv_schar_ushort_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv schar ushort.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_schar_ushort(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_schar_ushort_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv schar int.
 #[allow(non_snake_case)]
+pub fn H5T__conv_schar_int_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv schar int.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_schar_int(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_schar_int_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv schar uint.
 #[allow(non_snake_case)]
+pub fn H5T__conv_schar_uint_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv schar uint.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_schar_uint(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_schar_uint_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv schar long.
 #[allow(non_snake_case)]
+pub fn H5T__conv_schar_long_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv schar long.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_schar_long(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_schar_long_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv schar ulong.
 #[allow(non_snake_case)]
+pub fn H5T__conv_schar_ulong_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv schar ulong.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_schar_ulong(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_schar_ulong_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv schar llong.
 #[allow(non_snake_case)]
+pub fn H5T__conv_schar_llong_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv schar llong.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_schar_llong(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_schar_llong_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv schar ullong.
 #[allow(non_snake_case)]
+pub fn H5T__conv_schar_ullong_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv schar ullong.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_schar_ullong(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_schar_ullong_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv schar  Float16.
 #[allow(non_snake_case)]
+pub fn H5T__conv_schar__Float16_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv schar  Float16.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_schar__Float16(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_schar__Float16_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv schar float.
 #[allow(non_snake_case)]
+pub fn H5T__conv_schar_float_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv schar float.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_schar_float(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_schar_float_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv schar double.
 #[allow(non_snake_case)]
+pub fn H5T__conv_schar_double_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv schar double.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_schar_double(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_schar_double_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv schar ldouble.
 #[allow(non_snake_case)]
+pub fn H5T__conv_schar_ldouble_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv schar ldouble.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_schar_ldouble(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_schar_ldouble_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv schar fcomplex.
 #[allow(non_snake_case)]
+pub fn H5T__conv_schar_fcomplex_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv schar fcomplex.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_schar_fcomplex(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_schar_fcomplex_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv schar dcomplex.
 #[allow(non_snake_case)]
+pub fn H5T__conv_schar_dcomplex_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv schar dcomplex.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_schar_dcomplex(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_schar_dcomplex_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv schar lcomplex.
 #[allow(non_snake_case)]
+pub fn H5T__conv_schar_lcomplex_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv schar lcomplex.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_schar_lcomplex(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_schar_lcomplex_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv uchar schar.
 #[allow(non_snake_case)]
+pub fn H5T__conv_uchar_schar_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv uchar schar.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_uchar_schar(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_uchar_schar_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv uchar short.
 #[allow(non_snake_case)]
+pub fn H5T__conv_uchar_short_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv uchar short.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_uchar_short(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_uchar_short_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv uchar ushort.
 #[allow(non_snake_case)]
+pub fn H5T__conv_uchar_ushort_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv uchar ushort.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_uchar_ushort(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_uchar_ushort_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv uchar int.
 #[allow(non_snake_case)]
+pub fn H5T__conv_uchar_int_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv uchar int.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_uchar_int(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_uchar_int_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv uchar uint.
 #[allow(non_snake_case)]
+pub fn H5T__conv_uchar_uint_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv uchar uint.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_uchar_uint(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_uchar_uint_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv uchar long.
 #[allow(non_snake_case)]
+pub fn H5T__conv_uchar_long_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv uchar long.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_uchar_long(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_uchar_long_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv uchar ulong.
 #[allow(non_snake_case)]
+pub fn H5T__conv_uchar_ulong_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv uchar ulong.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_uchar_ulong(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_uchar_ulong_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv uchar llong.
 #[allow(non_snake_case)]
+pub fn H5T__conv_uchar_llong_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv uchar llong.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_uchar_llong(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_uchar_llong_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv uchar ullong.
 #[allow(non_snake_case)]
+pub fn H5T__conv_uchar_ullong_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv uchar ullong.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_uchar_ullong(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_uchar_ullong_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv uchar  Float16.
 #[allow(non_snake_case)]
+pub fn H5T__conv_uchar__Float16_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv uchar  Float16.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_uchar__Float16(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_uchar__Float16_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv uchar float.
 #[allow(non_snake_case)]
+pub fn H5T__conv_uchar_float_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv uchar float.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_uchar_float(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_uchar_float_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv uchar double.
 #[allow(non_snake_case)]
+pub fn H5T__conv_uchar_double_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv uchar double.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_uchar_double(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_uchar_double_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv uchar ldouble.
 #[allow(non_snake_case)]
+pub fn H5T__conv_uchar_ldouble_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv uchar ldouble.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_uchar_ldouble(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_uchar_ldouble_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv uchar fcomplex.
 #[allow(non_snake_case)]
+pub fn H5T__conv_uchar_fcomplex_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv uchar fcomplex.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_uchar_fcomplex(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_uchar_fcomplex_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv uchar dcomplex.
 #[allow(non_snake_case)]
+pub fn H5T__conv_uchar_dcomplex_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv uchar dcomplex.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_uchar_dcomplex(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_uchar_dcomplex_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv uchar lcomplex.
 #[allow(non_snake_case)]
+pub fn H5T__conv_uchar_lcomplex_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv uchar lcomplex.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_uchar_lcomplex(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_uchar_lcomplex_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv short schar.
 #[allow(non_snake_case)]
+pub fn H5T__conv_short_schar_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv short schar.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_short_schar(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_short_schar_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv short uchar.
 #[allow(non_snake_case)]
+pub fn H5T__conv_short_uchar_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv short uchar.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_short_uchar(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_short_uchar_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv short ushort.
 #[allow(non_snake_case)]
+pub fn H5T__conv_short_ushort_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv short ushort.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_short_ushort(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_short_ushort_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv short int.
 #[allow(non_snake_case)]
+pub fn H5T__conv_short_int_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv short int.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_short_int(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_short_int_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv short uint.
 #[allow(non_snake_case)]
+pub fn H5T__conv_short_uint_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv short uint.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_short_uint(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_short_uint_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv short long.
 #[allow(non_snake_case)]
+pub fn H5T__conv_short_long_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv short long.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_short_long(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_short_long_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv short ulong.
 #[allow(non_snake_case)]
+pub fn H5T__conv_short_ulong_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv short ulong.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_short_ulong(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_short_ulong_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv short llong.
 #[allow(non_snake_case)]
+pub fn H5T__conv_short_llong_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv short llong.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_short_llong(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_short_llong_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv short ullong.
 #[allow(non_snake_case)]
+pub fn H5T__conv_short_ullong_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv short ullong.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_short_ullong(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_short_ullong_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv short  Float16.
 #[allow(non_snake_case)]
+pub fn H5T__conv_short__Float16_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv short  Float16.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_short__Float16(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_short__Float16_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv short float.
 #[allow(non_snake_case)]
+pub fn H5T__conv_short_float_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv short float.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_short_float(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_short_float_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv short double.
 #[allow(non_snake_case)]
+pub fn H5T__conv_short_double_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv short double.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_short_double(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_short_double_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv short ldouble.
 #[allow(non_snake_case)]
+pub fn H5T__conv_short_ldouble_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv short ldouble.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_short_ldouble(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_short_ldouble_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv short fcomplex.
 #[allow(non_snake_case)]
+pub fn H5T__conv_short_fcomplex_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv short fcomplex.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_short_fcomplex(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_short_fcomplex_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv short dcomplex.
 #[allow(non_snake_case)]
+pub fn H5T__conv_short_dcomplex_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv short dcomplex.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_short_dcomplex(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_short_dcomplex_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv short lcomplex.
 #[allow(non_snake_case)]
+pub fn H5T__conv_short_lcomplex_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv short lcomplex.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_short_lcomplex(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_short_lcomplex_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv ushort schar.
 #[allow(non_snake_case)]
+pub fn H5T__conv_ushort_schar_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv ushort schar.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_ushort_schar(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_ushort_schar_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv ushort uchar.
 #[allow(non_snake_case)]
+pub fn H5T__conv_ushort_uchar_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv ushort uchar.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_ushort_uchar(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_ushort_uchar_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv ushort short.
 #[allow(non_snake_case)]
+pub fn H5T__conv_ushort_short_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv ushort short.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_ushort_short(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_ushort_short_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv ushort int.
 #[allow(non_snake_case)]
+pub fn H5T__conv_ushort_int_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv ushort int.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_ushort_int(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_ushort_int_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv ushort uint.
 #[allow(non_snake_case)]
+pub fn H5T__conv_ushort_uint_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv ushort uint.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_ushort_uint(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_ushort_uint_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv ushort long.
 #[allow(non_snake_case)]
+pub fn H5T__conv_ushort_long_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv ushort long.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_ushort_long(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_ushort_long_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv ushort ulong.
 #[allow(non_snake_case)]
+pub fn H5T__conv_ushort_ulong_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv ushort ulong.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_ushort_ulong(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_ushort_ulong_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv ushort llong.
 #[allow(non_snake_case)]
+pub fn H5T__conv_ushort_llong_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv ushort llong.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_ushort_llong(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_ushort_llong_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv ushort ullong.
 #[allow(non_snake_case)]
+pub fn H5T__conv_ushort_ullong_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv ushort ullong.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_ushort_ullong(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_ushort_ullong_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv ushort  Float16.
 #[allow(non_snake_case)]
+pub fn H5T__conv_ushort__Float16_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv ushort  Float16.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_ushort__Float16(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_ushort__Float16_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv ushort float.
 #[allow(non_snake_case)]
+pub fn H5T__conv_ushort_float_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv ushort float.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_ushort_float(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_ushort_float_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv ushort double.
 #[allow(non_snake_case)]
+pub fn H5T__conv_ushort_double_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv ushort double.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_ushort_double(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_ushort_double_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv ushort ldouble.
 #[allow(non_snake_case)]
+pub fn H5T__conv_ushort_ldouble_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv ushort ldouble.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_ushort_ldouble(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_ushort_ldouble_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv ushort fcomplex.
 #[allow(non_snake_case)]
+pub fn H5T__conv_ushort_fcomplex_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv ushort fcomplex.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_ushort_fcomplex(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_ushort_fcomplex_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv ushort dcomplex.
 #[allow(non_snake_case)]
+pub fn H5T__conv_ushort_dcomplex_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv ushort dcomplex.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_ushort_dcomplex(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_ushort_dcomplex_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv ushort lcomplex.
 #[allow(non_snake_case)]
+pub fn H5T__conv_ushort_lcomplex_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv ushort lcomplex.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_ushort_lcomplex(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_ushort_lcomplex_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv int schar.
 #[allow(non_snake_case)]
+pub fn H5T__conv_int_schar_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv int schar.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_int_schar(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_int_schar_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv int uchar.
 #[allow(non_snake_case)]
+pub fn H5T__conv_int_uchar_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv int uchar.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_int_uchar(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_int_uchar_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv int short.
 #[allow(non_snake_case)]
+pub fn H5T__conv_int_short_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv int short.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_int_short(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_int_short_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv int ushort.
 #[allow(non_snake_case)]
+pub fn H5T__conv_int_ushort_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv int ushort.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_int_ushort(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_int_ushort_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv int uint.
 #[allow(non_snake_case)]
+pub fn H5T__conv_int_uint_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv int uint.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_int_uint(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_int_uint_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv int long.
 #[allow(non_snake_case)]
+pub fn H5T__conv_int_long_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv int long.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_int_long(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_int_long_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv int ulong.
 #[allow(non_snake_case)]
+pub fn H5T__conv_int_ulong_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv int ulong.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_int_ulong(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_int_ulong_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv int llong.
 #[allow(non_snake_case)]
+pub fn H5T__conv_int_llong_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv int llong.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_int_llong(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_int_llong_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv int ullong.
 #[allow(non_snake_case)]
+pub fn H5T__conv_int_ullong_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv int ullong.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_int_ullong(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_int_ullong_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv int  Float16.
 #[allow(non_snake_case)]
+pub fn H5T__conv_int__Float16_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv int  Float16.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_int__Float16(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_int__Float16_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv int float.
 #[allow(non_snake_case)]
+pub fn H5T__conv_int_float_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv int float.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_int_float(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_int_float_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv int double.
 #[allow(non_snake_case)]
+pub fn H5T__conv_int_double_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv int double.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_int_double(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_int_double_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv int ldouble.
 #[allow(non_snake_case)]
+pub fn H5T__conv_int_ldouble_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv int ldouble.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_int_ldouble(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_int_ldouble_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv int fcomplex.
 #[allow(non_snake_case)]
+pub fn H5T__conv_int_fcomplex_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv int fcomplex.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_int_fcomplex(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_int_fcomplex_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv int dcomplex.
 #[allow(non_snake_case)]
+pub fn H5T__conv_int_dcomplex_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv int dcomplex.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_int_dcomplex(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_int_dcomplex_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv int lcomplex.
 #[allow(non_snake_case)]
+pub fn H5T__conv_int_lcomplex_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv int lcomplex.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_int_lcomplex(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_int_lcomplex_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv uint schar.
 #[allow(non_snake_case)]
+pub fn H5T__conv_uint_schar_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv uint schar.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_uint_schar(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_uint_schar_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv uint uchar.
 #[allow(non_snake_case)]
+pub fn H5T__conv_uint_uchar_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv uint uchar.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_uint_uchar(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_uint_uchar_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv uint short.
 #[allow(non_snake_case)]
+pub fn H5T__conv_uint_short_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv uint short.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_uint_short(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_uint_short_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv uint ushort.
 #[allow(non_snake_case)]
+pub fn H5T__conv_uint_ushort_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv uint ushort.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_uint_ushort(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_uint_ushort_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv uint int.
 #[allow(non_snake_case)]
+pub fn H5T__conv_uint_int_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv uint int.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_uint_int(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_uint_int_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv uint long.
 #[allow(non_snake_case)]
+pub fn H5T__conv_uint_long_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv uint long.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_uint_long(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_uint_long_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv uint ulong.
 #[allow(non_snake_case)]
+pub fn H5T__conv_uint_ulong_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv uint ulong.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_uint_ulong(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_uint_ulong_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv uint llong.
 #[allow(non_snake_case)]
+pub fn H5T__conv_uint_llong_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv uint llong.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_uint_llong(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_uint_llong_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv uint ullong.
 #[allow(non_snake_case)]
+pub fn H5T__conv_uint_ullong_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv uint ullong.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_uint_ullong(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_uint_ullong_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv uint  Float16.
 #[allow(non_snake_case)]
+pub fn H5T__conv_uint__Float16_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv uint  Float16.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_uint__Float16(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_uint__Float16_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv uint float.
 #[allow(non_snake_case)]
+pub fn H5T__conv_uint_float_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv uint float.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_uint_float(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_uint_float_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv uint double.
 #[allow(non_snake_case)]
+pub fn H5T__conv_uint_double_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv uint double.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_uint_double(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_uint_double_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv uint ldouble.
 #[allow(non_snake_case)]
+pub fn H5T__conv_uint_ldouble_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv uint ldouble.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_uint_ldouble(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_uint_ldouble_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv uint fcomplex.
 #[allow(non_snake_case)]
+pub fn H5T__conv_uint_fcomplex_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv uint fcomplex.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_uint_fcomplex(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_uint_fcomplex_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv uint dcomplex.
 #[allow(non_snake_case)]
+pub fn H5T__conv_uint_dcomplex_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv uint dcomplex.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_uint_dcomplex(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_uint_dcomplex_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv uint lcomplex.
 #[allow(non_snake_case)]
+pub fn H5T__conv_uint_lcomplex_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv uint lcomplex.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_uint_lcomplex(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_uint_lcomplex_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv long schar.
 #[allow(non_snake_case)]
+pub fn H5T__conv_long_schar_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv long schar.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_long_schar(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_long_schar_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv long uchar.
 #[allow(non_snake_case)]
+pub fn H5T__conv_long_uchar_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv long uchar.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_long_uchar(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_long_uchar_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv long short.
 #[allow(non_snake_case)]
+pub fn H5T__conv_long_short_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv long short.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_long_short(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_long_short_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv long ushort.
 #[allow(non_snake_case)]
+pub fn H5T__conv_long_ushort_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv long ushort.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_long_ushort(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_long_ushort_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv long int.
 #[allow(non_snake_case)]
+pub fn H5T__conv_long_int_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv long int.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_long_int(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_long_int_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv long uint.
 #[allow(non_snake_case)]
+pub fn H5T__conv_long_uint_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv long uint.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_long_uint(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_long_uint_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv long ulong.
 #[allow(non_snake_case)]
+pub fn H5T__conv_long_ulong_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv long ulong.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_long_ulong(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_long_ulong_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv long llong.
 #[allow(non_snake_case)]
+pub fn H5T__conv_long_llong_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv long llong.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_long_llong(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_long_llong_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv long ullong.
 #[allow(non_snake_case)]
+pub fn H5T__conv_long_ullong_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv long ullong.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_long_ullong(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_long_ullong_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv long  Float16.
 #[allow(non_snake_case)]
+pub fn H5T__conv_long__Float16_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv long  Float16.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_long__Float16(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_long__Float16_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv long float.
 #[allow(non_snake_case)]
+pub fn H5T__conv_long_float_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv long float.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_long_float(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_long_float_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv long double.
 #[allow(non_snake_case)]
+pub fn H5T__conv_long_double_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv long double.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_long_double(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_long_double_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv long ldouble.
 #[allow(non_snake_case)]
+pub fn H5T__conv_long_ldouble_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv long ldouble.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_long_ldouble(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_long_ldouble_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv long fcomplex.
 #[allow(non_snake_case)]
+pub fn H5T__conv_long_fcomplex_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv long fcomplex.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_long_fcomplex(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_long_fcomplex_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv long dcomplex.
 #[allow(non_snake_case)]
+pub fn H5T__conv_long_dcomplex_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv long dcomplex.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_long_dcomplex(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_long_dcomplex_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv long lcomplex.
 #[allow(non_snake_case)]
+pub fn H5T__conv_long_lcomplex_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv long lcomplex.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_long_lcomplex(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_long_lcomplex_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv ulong schar.
 #[allow(non_snake_case)]
+pub fn H5T__conv_ulong_schar_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv ulong schar.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_ulong_schar(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_ulong_schar_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv ulong uchar.
 #[allow(non_snake_case)]
+pub fn H5T__conv_ulong_uchar_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv ulong uchar.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_ulong_uchar(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_ulong_uchar_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv ulong short.
 #[allow(non_snake_case)]
+pub fn H5T__conv_ulong_short_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv ulong short.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_ulong_short(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_ulong_short_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv ulong ushort.
 #[allow(non_snake_case)]
+pub fn H5T__conv_ulong_ushort_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv ulong ushort.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_ulong_ushort(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_ulong_ushort_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv ulong int.
 #[allow(non_snake_case)]
+pub fn H5T__conv_ulong_int_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv ulong int.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_ulong_int(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_ulong_int_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv ulong uint.
 #[allow(non_snake_case)]
+pub fn H5T__conv_ulong_uint_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv ulong uint.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_ulong_uint(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_ulong_uint_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv ulong long.
 #[allow(non_snake_case)]
+pub fn H5T__conv_ulong_long_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv ulong long.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_ulong_long(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_ulong_long_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv ulong llong.
 #[allow(non_snake_case)]
+pub fn H5T__conv_ulong_llong_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv ulong llong.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_ulong_llong(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_ulong_llong_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv ulong ullong.
 #[allow(non_snake_case)]
+pub fn H5T__conv_ulong_ullong_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv ulong ullong.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_ulong_ullong(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_ulong_ullong_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv ulong  Float16.
 #[allow(non_snake_case)]
+pub fn H5T__conv_ulong__Float16_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv ulong  Float16.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_ulong__Float16(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_ulong__Float16_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv ulong float.
 #[allow(non_snake_case)]
+pub fn H5T__conv_ulong_float_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv ulong float.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_ulong_float(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_ulong_float_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv ulong double.
 #[allow(non_snake_case)]
+pub fn H5T__conv_ulong_double_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv ulong double.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_ulong_double(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_ulong_double_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv ulong ldouble.
 #[allow(non_snake_case)]
+pub fn H5T__conv_ulong_ldouble_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv ulong ldouble.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_ulong_ldouble(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_ulong_ldouble_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv ulong fcomplex.
 #[allow(non_snake_case)]
+pub fn H5T__conv_ulong_fcomplex_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv ulong fcomplex.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_ulong_fcomplex(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_ulong_fcomplex_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv ulong dcomplex.
 #[allow(non_snake_case)]
+pub fn H5T__conv_ulong_dcomplex_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv ulong dcomplex.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_ulong_dcomplex(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_ulong_dcomplex_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv ulong lcomplex.
 #[allow(non_snake_case)]
+pub fn H5T__conv_ulong_lcomplex_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv ulong lcomplex.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_ulong_lcomplex(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_ulong_lcomplex_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv llong schar.
 #[allow(non_snake_case)]
+pub fn H5T__conv_llong_schar_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv llong schar.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_llong_schar(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_llong_schar_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv llong uchar.
 #[allow(non_snake_case)]
+pub fn H5T__conv_llong_uchar_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv llong uchar.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_llong_uchar(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_llong_uchar_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv llong short.
 #[allow(non_snake_case)]
+pub fn H5T__conv_llong_short_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv llong short.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_llong_short(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_llong_short_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv llong ushort.
 #[allow(non_snake_case)]
+pub fn H5T__conv_llong_ushort_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv llong ushort.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_llong_ushort(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_llong_ushort_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv llong int.
 #[allow(non_snake_case)]
+pub fn H5T__conv_llong_int_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv llong int.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_llong_int(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_llong_int_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv llong uint.
 #[allow(non_snake_case)]
+pub fn H5T__conv_llong_uint_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv llong uint.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_llong_uint(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_llong_uint_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv llong long.
 #[allow(non_snake_case)]
+pub fn H5T__conv_llong_long_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv llong long.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_llong_long(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_llong_long_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv llong ulong.
 #[allow(non_snake_case)]
+pub fn H5T__conv_llong_ulong_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv llong ulong.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_llong_ulong(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_llong_ulong_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv llong ullong.
 #[allow(non_snake_case)]
+pub fn H5T__conv_llong_ullong_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv llong ullong.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_llong_ullong(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_llong_ullong_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv llong  Float16.
 #[allow(non_snake_case)]
+pub fn H5T__conv_llong__Float16_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv llong  Float16.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_llong__Float16(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_llong__Float16_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv llong float.
 #[allow(non_snake_case)]
+pub fn H5T__conv_llong_float_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv llong float.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_llong_float(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_llong_float_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv llong double.
 #[allow(non_snake_case)]
+pub fn H5T__conv_llong_double_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv llong double.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_llong_double(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_llong_double_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv llong ldouble.
 #[allow(non_snake_case)]
+pub fn H5T__conv_llong_ldouble_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv llong ldouble.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_llong_ldouble(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_llong_ldouble_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv llong fcomplex.
 #[allow(non_snake_case)]
+pub fn H5T__conv_llong_fcomplex_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv llong fcomplex.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_llong_fcomplex(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_llong_fcomplex_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv llong dcomplex.
 #[allow(non_snake_case)]
+pub fn H5T__conv_llong_dcomplex_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv llong dcomplex.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_llong_dcomplex(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_llong_dcomplex_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv llong lcomplex.
 #[allow(non_snake_case)]
+pub fn H5T__conv_llong_lcomplex_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv llong lcomplex.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_llong_lcomplex(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_llong_lcomplex_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv ullong schar.
 #[allow(non_snake_case)]
+pub fn H5T__conv_ullong_schar_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv ullong schar.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_ullong_schar(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_ullong_schar_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv ullong uchar.
 #[allow(non_snake_case)]
+pub fn H5T__conv_ullong_uchar_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv ullong uchar.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_ullong_uchar(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_ullong_uchar_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv ullong short.
 #[allow(non_snake_case)]
+pub fn H5T__conv_ullong_short_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv ullong short.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_ullong_short(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_ullong_short_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv ullong ushort.
 #[allow(non_snake_case)]
+pub fn H5T__conv_ullong_ushort_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv ullong ushort.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_ullong_ushort(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_ullong_ushort_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv ullong int.
 #[allow(non_snake_case)]
+pub fn H5T__conv_ullong_int_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv ullong int.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_ullong_int(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_ullong_int_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv ullong uint.
 #[allow(non_snake_case)]
+pub fn H5T__conv_ullong_uint_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv ullong uint.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_ullong_uint(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_ullong_uint_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv ullong long.
 #[allow(non_snake_case)]
+pub fn H5T__conv_ullong_long_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv ullong long.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_ullong_long(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_ullong_long_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv ullong ulong.
 #[allow(non_snake_case)]
+pub fn H5T__conv_ullong_ulong_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv ullong ulong.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_ullong_ulong(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_ullong_ulong_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv ullong llong.
 #[allow(non_snake_case)]
+pub fn H5T__conv_ullong_llong_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv ullong llong.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_ullong_llong(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_ullong_llong_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv ullong  Float16.
 #[allow(non_snake_case)]
+pub fn H5T__conv_ullong__Float16_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv ullong  Float16.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_ullong__Float16(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_ullong__Float16_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv ullong float.
 #[allow(non_snake_case)]
+pub fn H5T__conv_ullong_float_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv ullong float.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_ullong_float(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_ullong_float_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv ullong double.
 #[allow(non_snake_case)]
+pub fn H5T__conv_ullong_double_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv ullong double.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_ullong_double(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_ullong_double_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv ullong ldouble.
 #[allow(non_snake_case)]
+pub fn H5T__conv_ullong_ldouble_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv ullong ldouble.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_ullong_ldouble(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_ullong_ldouble_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv ullong fcomplex.
 #[allow(non_snake_case)]
+pub fn H5T__conv_ullong_fcomplex_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv ullong fcomplex.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_ullong_fcomplex(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_ullong_fcomplex_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv ullong dcomplex.
 #[allow(non_snake_case)]
+pub fn H5T__conv_ullong_dcomplex_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv ullong dcomplex.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_ullong_dcomplex(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_ullong_dcomplex_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv ullong lcomplex.
 #[allow(non_snake_case)]
+pub fn H5T__conv_ullong_lcomplex_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv ullong lcomplex.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_ullong_lcomplex(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_ullong_lcomplex_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv  Float16 schar.
 #[allow(non_snake_case)]
+pub fn H5T__conv__Float16_schar_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv  Float16 schar.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv__Float16_schar(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv__Float16_schar_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv  Float16 uchar.
 #[allow(non_snake_case)]
+pub fn H5T__conv__Float16_uchar_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv  Float16 uchar.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv__Float16_uchar(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv__Float16_uchar_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv  Float16 short.
 #[allow(non_snake_case)]
+pub fn H5T__conv__Float16_short_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv  Float16 short.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv__Float16_short(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv__Float16_short_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv  Float16 ushort.
 #[allow(non_snake_case)]
+pub fn H5T__conv__Float16_ushort_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv  Float16 ushort.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv__Float16_ushort(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv__Float16_ushort_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv  Float16 int.
 #[allow(non_snake_case)]
+pub fn H5T__conv__Float16_int_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv  Float16 int.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv__Float16_int(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv__Float16_int_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv  Float16 uint.
 #[allow(non_snake_case)]
+pub fn H5T__conv__Float16_uint_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv  Float16 uint.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv__Float16_uint(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv__Float16_uint_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv  Float16 long.
 #[allow(non_snake_case)]
+pub fn H5T__conv__Float16_long_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv  Float16 long.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv__Float16_long(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv__Float16_long_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv  Float16 ulong.
 #[allow(non_snake_case)]
+pub fn H5T__conv__Float16_ulong_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv  Float16 ulong.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv__Float16_ulong(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv__Float16_ulong_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv  Float16 llong.
 #[allow(non_snake_case)]
+pub fn H5T__conv__Float16_llong_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv  Float16 llong.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv__Float16_llong(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv__Float16_llong_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv  Float16 ullong.
 #[allow(non_snake_case)]
+pub fn H5T__conv__Float16_ullong_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv  Float16 ullong.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv__Float16_ullong(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv__Float16_ullong_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv  Float16 float.
 #[allow(non_snake_case)]
+pub fn H5T__conv__Float16_float_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv  Float16 float.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv__Float16_float(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv__Float16_float_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv  Float16 double.
 #[allow(non_snake_case)]
+pub fn H5T__conv__Float16_double_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv  Float16 double.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv__Float16_double(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv__Float16_double_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv  Float16 ldouble.
 #[allow(non_snake_case)]
+pub fn H5T__conv__Float16_ldouble_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv  Float16 ldouble.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv__Float16_ldouble(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv__Float16_ldouble_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv  Float16 fcomplex.
 #[allow(non_snake_case)]
+pub fn H5T__conv__Float16_fcomplex_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv  Float16 fcomplex.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv__Float16_fcomplex(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv__Float16_fcomplex_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv  Float16 dcomplex.
 #[allow(non_snake_case)]
+pub fn H5T__conv__Float16_dcomplex_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv  Float16 dcomplex.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv__Float16_dcomplex(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv__Float16_dcomplex_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv  Float16 lcomplex.
 #[allow(non_snake_case)]
+pub fn H5T__conv__Float16_lcomplex_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv  Float16 lcomplex.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv__Float16_lcomplex(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv__Float16_lcomplex_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv float schar.
 #[allow(non_snake_case)]
+pub fn H5T__conv_float_schar_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv float schar.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_float_schar(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_float_schar_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv float uchar.
 #[allow(non_snake_case)]
+pub fn H5T__conv_float_uchar_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv float uchar.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_float_uchar(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_float_uchar_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv float short.
 #[allow(non_snake_case)]
+pub fn H5T__conv_float_short_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv float short.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_float_short(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_float_short_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv float ushort.
 #[allow(non_snake_case)]
+pub fn H5T__conv_float_ushort_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv float ushort.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_float_ushort(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_float_ushort_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv float int.
 #[allow(non_snake_case)]
+pub fn H5T__conv_float_int_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv float int.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_float_int(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_float_int_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv float uint.
 #[allow(non_snake_case)]
+pub fn H5T__conv_float_uint_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv float uint.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_float_uint(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_float_uint_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv float long.
 #[allow(non_snake_case)]
+pub fn H5T__conv_float_long_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv float long.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_float_long(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_float_long_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv float ulong.
 #[allow(non_snake_case)]
+pub fn H5T__conv_float_ulong_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv float ulong.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_float_ulong(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_float_ulong_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv float llong.
 #[allow(non_snake_case)]
+pub fn H5T__conv_float_llong_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv float llong.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_float_llong(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_float_llong_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv float ullong.
 #[allow(non_snake_case)]
+pub fn H5T__conv_float_ullong_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv float ullong.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_float_ullong(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_float_ullong_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv float  Float16.
 #[allow(non_snake_case)]
+pub fn H5T__conv_float__Float16_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv float  Float16.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_float__Float16(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_float__Float16_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv float double.
 #[allow(non_snake_case)]
+pub fn H5T__conv_float_double_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv float double.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_float_double(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_float_double_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv float ldouble.
 #[allow(non_snake_case)]
+pub fn H5T__conv_float_ldouble_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv float ldouble.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_float_ldouble(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_float_ldouble_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv float fcomplex.
 #[allow(non_snake_case)]
+pub fn H5T__conv_float_fcomplex_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv float fcomplex.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_float_fcomplex(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_float_fcomplex_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv float dcomplex.
 #[allow(non_snake_case)]
+pub fn H5T__conv_float_dcomplex_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv float dcomplex.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_float_dcomplex(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_float_dcomplex_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv float lcomplex.
 #[allow(non_snake_case)]
+pub fn H5T__conv_float_lcomplex_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv float lcomplex.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_float_lcomplex(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_float_lcomplex_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv double schar.
 #[allow(non_snake_case)]
+pub fn H5T__conv_double_schar_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv double schar.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_double_schar(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_double_schar_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv double uchar.
 #[allow(non_snake_case)]
+pub fn H5T__conv_double_uchar_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv double uchar.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_double_uchar(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_double_uchar_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv double short.
 #[allow(non_snake_case)]
+pub fn H5T__conv_double_short_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv double short.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_double_short(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_double_short_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv double ushort.
 #[allow(non_snake_case)]
+pub fn H5T__conv_double_ushort_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv double ushort.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_double_ushort(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_double_ushort_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv double int.
 #[allow(non_snake_case)]
+pub fn H5T__conv_double_int_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv double int.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_double_int(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_double_int_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv double uint.
 #[allow(non_snake_case)]
+pub fn H5T__conv_double_uint_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv double uint.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_double_uint(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_double_uint_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv double long.
 #[allow(non_snake_case)]
+pub fn H5T__conv_double_long_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv double long.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_double_long(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_double_long_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv double ulong.
 #[allow(non_snake_case)]
+pub fn H5T__conv_double_ulong_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv double ulong.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_double_ulong(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_double_ulong_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv double llong.
 #[allow(non_snake_case)]
+pub fn H5T__conv_double_llong_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv double llong.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_double_llong(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_double_llong_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv double ullong.
 #[allow(non_snake_case)]
+pub fn H5T__conv_double_ullong_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv double ullong.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_double_ullong(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_double_ullong_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv double  Float16.
 #[allow(non_snake_case)]
+pub fn H5T__conv_double__Float16_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv double  Float16.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_double__Float16(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_double__Float16_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv double float.
 #[allow(non_snake_case)]
+pub fn H5T__conv_double_float_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv double float.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_double_float(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_double_float_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv double ldouble.
 #[allow(non_snake_case)]
+pub fn H5T__conv_double_ldouble_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv double ldouble.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_double_ldouble(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_double_ldouble_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv double fcomplex.
 #[allow(non_snake_case)]
+pub fn H5T__conv_double_fcomplex_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv double fcomplex.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_double_fcomplex(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_double_fcomplex_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv double dcomplex.
 #[allow(non_snake_case)]
+pub fn H5T__conv_double_dcomplex_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv double dcomplex.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_double_dcomplex(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_double_dcomplex_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv double lcomplex.
 #[allow(non_snake_case)]
+pub fn H5T__conv_double_lcomplex_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv double lcomplex.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_double_lcomplex(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_double_lcomplex_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv ldouble schar.
 #[allow(non_snake_case)]
+pub fn H5T__conv_ldouble_schar_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv ldouble schar.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_ldouble_schar(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_ldouble_schar_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv ldouble uchar.
 #[allow(non_snake_case)]
+pub fn H5T__conv_ldouble_uchar_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv ldouble uchar.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_ldouble_uchar(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_ldouble_uchar_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv ldouble short.
 #[allow(non_snake_case)]
+pub fn H5T__conv_ldouble_short_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv ldouble short.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_ldouble_short(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_ldouble_short_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv ldouble ushort.
 #[allow(non_snake_case)]
+pub fn H5T__conv_ldouble_ushort_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv ldouble ushort.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_ldouble_ushort(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_ldouble_ushort_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv ldouble int.
 #[allow(non_snake_case)]
+pub fn H5T__conv_ldouble_int_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv ldouble int.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_ldouble_int(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_ldouble_int_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv ldouble uint.
 #[allow(non_snake_case)]
+pub fn H5T__conv_ldouble_uint_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv ldouble uint.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_ldouble_uint(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_ldouble_uint_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv ldouble long.
 #[allow(non_snake_case)]
+pub fn H5T__conv_ldouble_long_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv ldouble long.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_ldouble_long(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_ldouble_long_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv ldouble ulong.
 #[allow(non_snake_case)]
+pub fn H5T__conv_ldouble_ulong_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv ldouble ulong.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_ldouble_ulong(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_ldouble_ulong_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv ldouble llong.
 #[allow(non_snake_case)]
+pub fn H5T__conv_ldouble_llong_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv ldouble llong.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_ldouble_llong(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_ldouble_llong_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv ldouble ullong.
 #[allow(non_snake_case)]
+pub fn H5T__conv_ldouble_ullong_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv ldouble ullong.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_ldouble_ullong(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_ldouble_ullong_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv ldouble  Float16.
 #[allow(non_snake_case)]
+pub fn H5T__conv_ldouble__Float16_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv ldouble  Float16.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_ldouble__Float16(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_ldouble__Float16_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv ldouble float.
 #[allow(non_snake_case)]
+pub fn H5T__conv_ldouble_float_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv ldouble float.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_ldouble_float(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_ldouble_float_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv ldouble double.
 #[allow(non_snake_case)]
+pub fn H5T__conv_ldouble_double_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv ldouble double.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_ldouble_double(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_ldouble_double_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv ldouble fcomplex.
 #[allow(non_snake_case)]
+pub fn H5T__conv_ldouble_fcomplex_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv ldouble fcomplex.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_ldouble_fcomplex(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_ldouble_fcomplex_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv ldouble dcomplex.
 #[allow(non_snake_case)]
+pub fn H5T__conv_ldouble_dcomplex_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv ldouble dcomplex.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_ldouble_dcomplex(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_ldouble_dcomplex_into(data, &mut out);
+    out
 }
 
 /// Datatype operation: conv ldouble lcomplex.
 #[allow(non_snake_case)]
+pub fn H5T__conv_ldouble_lcomplex_into(data: &[u8], out: &mut Vec<u8>) {
+    conv_copy_into(data, out);
+}
+
+/// Datatype operation: conv ldouble lcomplex.
+#[deprecated(
+    note = "use the corresponding _into() function to reuse caller-provided output storage"
+)]
+#[allow(non_snake_case)]
 pub fn H5T__conv_ldouble_lcomplex(data: &[u8]) -> Vec<u8> {
-    conv_copy(data)
+    let mut out = Vec::with_capacity(data.len());
+    H5T__conv_ldouble_lcomplex_into(data, &mut out);
+    out
 }
 
 #[cfg(test)]
@@ -4785,7 +8431,7 @@ mod tests {
         let mut reg = DatatypeRegistry::default();
         let dtype = H5Tcreate(DatatypeClass::FixedPoint, 4);
         H5T__commit_api_common(&mut reg, "i32", dtype);
-        let opened = H5Topen2(&reg, "i32").unwrap();
+        let opened = H5Topen2_ref(&reg, "i32").unwrap();
         assert!(H5Tcommitted(&opened));
         assert_eq!(H5T_nameof(&opened).unwrap(), "i32");
         assert!(H5T_nameof(&H5Tcreate(DatatypeClass::FixedPoint, 4)).is_err());
@@ -4801,7 +8447,8 @@ mod tests {
     fn datatype_encode_decode_uses_message_validator() {
         let mut dtype = H5Tcreate(DatatypeClass::FixedPoint, 4);
         dtype.message.properties[2..4].copy_from_slice(&32u16.to_le_bytes());
-        let image = H5Tencode(&dtype).unwrap();
+        let mut image = Vec::new();
+        H5Tencode_into(&dtype, &mut image).unwrap();
         let decoded = H5Tdecode(&image).unwrap();
         assert_eq!(decoded.message.version, dtype.message.version);
         assert_eq!(decoded.message.class, dtype.message.class);
@@ -4811,7 +8458,7 @@ mod tests {
 
         let mut malformed = dtype.clone();
         malformed.message.properties.truncate(3);
-        assert!(H5Tencode(&malformed).is_err());
+        assert!(H5Tencode_into(&malformed, &mut image).is_err());
         assert!(H5Tdecode(&image[..7]).is_err());
     }
 
@@ -4883,10 +8530,22 @@ mod tests {
         assert_eq!(string.message.size, 2);
         assert_eq!(H5Tget_precision(&string), None);
 
+        H5Tset_size(&mut string, 8192).unwrap();
+        assert_eq!(string.message.class, DatatypeClass::String);
+        assert_eq!(string.message.size, 8192);
+        assert_eq!(H5Tget_precision(&string), None);
+        assert!(!H5Tis_variable_str(&string));
+        let mut encoded = Vec::new();
+        H5Tencode_into(&string, &mut encoded).unwrap();
+
         H5Tset_size(&mut string, u32::MAX).unwrap();
         assert_eq!(string.message.class, DatatypeClass::VarLen);
         assert!(H5Tis_variable_str(&string));
         assert!(string.force_conv);
+        H5Tset_size(&mut string, 8192).unwrap();
+        assert_eq!(string.message.class, DatatypeClass::VarLen);
+        assert!(H5Tis_variable_str(&string));
+        assert_eq!(string.message.size, 8192);
     }
 
     #[test]
@@ -4925,22 +8584,19 @@ mod tests {
         let mut base = H5Tcreate(DatatypeClass::FixedPoint, 1);
         H5Tset_precision(&mut base, 8).unwrap();
         let mut enum_type = H5Tenum_create(&base).unwrap();
-        assert!(H5T__enum_nameof(&enum_type, 1).is_err());
+        assert!(H5T__enum_nameof_ref(&enum_type, 1).is_err());
         assert!(H5T__enum_valueof(&enum_type, "one").is_err());
 
         H5T__enum_insert(&mut enum_type, "two", 2).unwrap();
         H5T__enum_insert(&mut enum_type, "one", 1).unwrap();
-        assert_eq!(
-            H5T__enum_nameof(&enum_type, 1).unwrap().as_deref(),
-            Some("one")
-        );
-        assert_eq!(H5T__enum_nameof(&enum_type, 3).unwrap(), None);
+        assert_eq!(H5T__enum_nameof_ref(&enum_type, 1).unwrap(), Some("one"));
+        assert_eq!(H5T__enum_nameof_ref(&enum_type, 3).unwrap(), None);
         assert_eq!(H5T__enum_valueof(&enum_type, "two").unwrap(), Some(2));
         assert_eq!(H5T__enum_valueof(&enum_type, "missing").unwrap(), None);
         assert!(H5T__enum_insert(&mut enum_type, "two", 3).is_err());
         assert!(H5T__enum_insert(&mut enum_type, "three", 2).is_err());
         assert!(H5T__enum_valueof(&enum_type, "").is_err());
-        assert!(H5T__enum_nameof(&H5Tcreate(DatatypeClass::FixedPoint, 1), 1).is_err());
+        assert!(H5T__enum_nameof_ref(&H5Tcreate(DatatypeClass::FixedPoint, 1), 1).is_err());
     }
 
     #[test]
@@ -4988,16 +8644,25 @@ mod tests {
 
         let mut map = [10usize, 11, 12];
         H5T__sort_name(&mut enum_type, Some(&mut map)).unwrap();
-        assert_eq!(enum_type.message.enum_members().unwrap()[0].0, "alpha");
+        assert_eq!(
+            enum_type
+                .message
+                .enum_members_iter()
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .name,
+            "alpha"
+        );
         assert_eq!(map, [11, 12, 10]);
 
         H5T__sort_value(&mut enum_type, None).unwrap();
         let values = enum_type
             .message
-            .enum_members()
+            .enum_members_iter()
             .unwrap()
-            .into_iter()
-            .map(|(_, value)| value)
+            .map(|member| member.unwrap().value)
             .collect::<Vec<_>>();
         assert_eq!(values, vec![1, 2, 3]);
 
@@ -5005,10 +8670,27 @@ mod tests {
         H5Tinsert(&mut compound, "b", 4, base.clone()).unwrap();
         H5Tinsert(&mut compound, "a", 0, base).unwrap();
         H5T__sort_name(&mut compound, None).unwrap();
-        assert_eq!(compound.message.compound_fields().unwrap()[0].name, "a");
+        assert_eq!(
+            compound
+                .message
+                .compound_fields_iter()
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .name,
+            "a"
+        );
         H5T__sort_value(&mut compound, None).unwrap();
         assert_eq!(
-            compound.message.compound_fields().unwrap()[0].byte_offset,
+            compound
+                .message
+                .compound_fields_iter()
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .byte_offset,
             0
         );
     }
@@ -5095,7 +8777,7 @@ mod tests {
 
         let mut opaque = H5Tcreate(DatatypeClass::Opaque, 3);
         H5Tset_tag(&mut opaque, "rgb").unwrap();
-        assert_eq!(H5Tget_tag(&opaque).as_deref(), Some("rgb"));
+        assert_eq!(H5Tget_tag_ref(&opaque), Some("rgb"));
         assert!(H5Tset_tag(&mut opaque, "x".repeat(256)).is_err());
         assert!(H5Tset_tag(&mut string, "bad").is_err());
 
@@ -5145,12 +8827,16 @@ mod tests {
 
         H5Tinsert(&mut compound, "a", 0, member.clone()).unwrap();
         H5Tinsert(&mut compound, "b", 4, member.clone()).unwrap();
-        let fields = H5Tget_member_info(&compound).unwrap();
+        let fields = H5Tget_member_info_iter(&compound)
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
         assert_eq!(fields.len(), 2);
         assert_eq!(fields[0].name, "a");
         assert_eq!(fields[1].byte_offset, 4);
         assert_eq!(H5Tget_member_index(&compound, "b"), Some(1));
-        assert!(H5Tencode(&compound).is_ok());
+        let mut image = Vec::new();
+        assert!(H5Tencode_into(&compound, &mut image).is_ok());
 
         assert!(H5Tinsert(&mut compound, "a", 0, member.clone()).is_err());
         assert!(H5Tinsert(&mut compound, "c", 2, member.clone()).is_err());
@@ -5253,35 +8939,56 @@ mod tests {
 
     #[test]
     fn reverse_order_handles_atomic_complex_and_vax_layouts() {
-        assert_eq!(
-            H5T__reverse_order(&[1, 2, 3, 4], H5TDetectedOrder::LittleEndian, false).unwrap(),
-            vec![1, 2, 3, 4]
+        let mut converted = Vec::new();
+        H5T__reverse_order_into(
+            &[1, 2, 3, 4],
+            H5TDetectedOrder::LittleEndian,
+            false,
+            &mut converted,
+        )
+        .unwrap();
+        assert_eq!(converted, vec![1, 2, 3, 4]);
+        H5T__reverse_order_into(
+            &[1, 2, 3, 4],
+            H5TDetectedOrder::BigEndian,
+            false,
+            &mut converted,
+        )
+        .unwrap();
+        assert_eq!(converted, vec![4, 3, 2, 1]);
+        H5T__reverse_order_into(
+            &[1, 2, 3, 4],
+            H5TDetectedOrder::BigEndian,
+            true,
+            &mut converted,
+        )
+        .unwrap();
+        assert_eq!(converted, vec![2, 1, 4, 3]);
+        H5T__reverse_order_into(&[1, 2, 3, 4], H5TDetectedOrder::Vax, false, &mut converted)
+            .unwrap();
+        assert_eq!(converted, vec![3, 4, 1, 2]);
+        assert!(
+            H5T__reverse_order_into(&[1, 2, 3], H5TDetectedOrder::Vax, false, &mut converted)
+                .is_err()
         );
-        assert_eq!(
-            H5T__reverse_order(&[1, 2, 3, 4], H5TDetectedOrder::BigEndian, false).unwrap(),
-            vec![4, 3, 2, 1]
-        );
-        assert_eq!(
-            H5T__reverse_order(&[1, 2, 3, 4], H5TDetectedOrder::BigEndian, true).unwrap(),
-            vec![2, 1, 4, 3]
-        );
-        assert_eq!(
-            H5T__reverse_order(&[1, 2, 3, 4], H5TDetectedOrder::Vax, false).unwrap(),
-            vec![3, 4, 1, 2]
-        );
-        assert!(H5T__reverse_order(&[1, 2, 3], H5TDetectedOrder::Vax, false).is_err());
 
-        assert_eq!(
-            H5T__conv_order_opt(
-                &[1, 2, 3, 4, 5, 6, 7, 8],
-                4,
-                H5TDetectedOrder::BigEndian,
-                false
-            )
-            .unwrap(),
-            vec![4, 3, 2, 1, 8, 7, 6, 5]
-        );
-        assert!(H5T__conv_order_opt(&[1, 2, 3], 3, H5TDetectedOrder::BigEndian, false).is_err());
+        H5T__conv_order_opt_into(
+            &[1, 2, 3, 4, 5, 6, 7, 8],
+            4,
+            H5TDetectedOrder::BigEndian,
+            false,
+            &mut converted,
+        )
+        .unwrap();
+        assert_eq!(converted, vec![4, 3, 2, 1, 8, 7, 6, 5]);
+        assert!(H5T__conv_order_opt_into(
+            &[1, 2, 3],
+            3,
+            H5TDetectedOrder::BigEndian,
+            false,
+            &mut converted,
+        )
+        .is_err());
     }
 
     #[test]
@@ -5353,7 +9060,9 @@ mod tests {
             u32::from_le_bytes(disk[2..6].try_into().unwrap()),
             (src.len() - H5R_ENCODE_HEADER_SIZE) as u32
         );
-        assert_eq!(H5T__ref_disk_read(&disk).unwrap(), src);
+        let mut decoded_ref = Vec::new();
+        H5T__ref_disk_read_into(&disk, &mut decoded_ref).unwrap();
+        assert_eq!(decoded_ref, src);
         assert_eq!(H5T__ref_disk_getsize(&disk).unwrap(), (disk.len(), true));
         assert!(!H5T__ref_disk_isnull(&disk).unwrap());
 
@@ -5367,25 +9076,28 @@ mod tests {
         let mut null_ref = [0xffu8; 8];
         H5T__ref_disk_setnull(&mut null_ref, None).unwrap();
         assert!(H5T__ref_disk_isnull(&null_ref).unwrap());
-        assert!(H5T__ref_disk_read(&disk[..5]).is_err());
+        assert!(H5T__ref_disk_read_into(&disk[..5], &mut decoded_ref).is_err());
         assert!(H5T__ref_disk_getsize(&[]).is_err());
 
         let legacy_object = [0x34u8, 0x12, 0, 0, 0, 0, 0, 0];
         assert!(!H5T__ref_obj_disk_isnull(&legacy_object, 8).unwrap());
         assert_eq!(H5T__ref_obj_disk_getsize(&legacy_object, 8).unwrap(), 8);
-        assert_eq!(
-            H5T__ref_obj_disk_read(&legacy_object, 8).unwrap(),
-            legacy_object
-        );
+        H5T__ref_obj_disk_read_into(&legacy_object, 8, &mut decoded_ref).unwrap();
+        assert_eq!(decoded_ref, legacy_object);
         assert!(H5T__ref_obj_disk_isnull(&[0u8; 8], 8).unwrap());
 
         let legacy_region = [0x34u8, 0x12, 0, 0, 1, 2, 3, 4, 5, 6];
         assert!(!H5T__ref_dsetreg_disk_isnull(&legacy_region, 4).unwrap());
-        let (token, space) = H5T__ref_dsetreg_disk_read(&legacy_region, 4).unwrap();
+        let mut token = Vec::new();
+        let mut space = Vec::new();
+        H5T__ref_dsetreg_disk_read_into(&legacy_region, 4, &mut token, &mut space).unwrap();
         assert_eq!(token, vec![0x34, 0x12, 0, 0]);
         assert_eq!(space, vec![1, 2, 3, 4, 5, 6]);
         assert!(H5T__ref_dsetreg_disk_getsize(&legacy_region, 4).unwrap() >= 4);
-        assert!(H5T__ref_dsetreg_disk_read(&legacy_region[..2], 4).is_err());
+        assert!(
+            H5T__ref_dsetreg_disk_read_into(&legacy_region[..2], 4, &mut token, &mut space)
+                .is_err()
+        );
     }
 
     #[test]
@@ -5394,19 +9106,19 @@ mod tests {
         let mut disk = Vec::new();
         H5T__vlen_disk_write(&mut disk, &src, None, 3, 2).unwrap();
         assert_eq!(H5T__vlen_disk_getlen(&disk).unwrap(), 3);
-        assert_eq!(H5T__vlen_disk_read(&disk, 6).unwrap(), src);
+        assert_eq!(H5T__vlen_disk_read_ref(&disk, 6).unwrap(), src);
         assert!(!H5T__vlen_disk_isnull(&disk).unwrap());
 
         let mut old = vec![9u8; 4];
         H5T__vlen_disk_write(&mut disk, &src, Some(&mut old), 2, 2).unwrap();
         assert!(old.is_empty());
         assert_eq!(H5T__vlen_disk_getlen(&disk).unwrap(), 2);
-        assert_eq!(H5T__vlen_disk_read(&disk, 4).unwrap(), src[..4]);
+        assert_eq!(H5T__vlen_disk_read_ref(&disk, 4).unwrap(), &src[..4]);
 
         H5T__vlen_disk_setnull(&mut disk, None).unwrap();
         assert_eq!(H5T__vlen_disk_getlen(&disk).unwrap(), 0);
         assert!(H5T__vlen_disk_isnull(&disk).unwrap());
-        assert!(H5T__vlen_disk_read(&disk, 1).is_err());
+        assert!(H5T__vlen_disk_read_ref(&disk, 1).is_err());
         assert!(H5T__vlen_disk_write(&mut disk, &src, None, usize::MAX, 2).is_err());
     }
 

@@ -1,7 +1,12 @@
 use std::fs;
 
 use hdf5_pure_rust::engine::writer::{DatasetSpec, DtypeSpec, HdfFileWriter};
-use hdf5_pure_rust::File;
+use hdf5_pure_rust::{Dataset, File};
+
+fn raw_len(ds: &Dataset) -> usize {
+    let nbytes = ds.size().unwrap() as usize * ds.element_size().unwrap() as usize;
+    nbytes
+}
 
 #[test]
 fn test_write_compact_dataset() {
@@ -35,9 +40,10 @@ fn test_write_compact_dataset() {
     {
         let f = File::open(&path).unwrap();
         let ds = f.dataset("small").unwrap();
-        assert_eq!(ds.shape().unwrap(), vec![5]);
-        let raw = ds.read_raw().unwrap();
-        assert_eq!(raw, vec![1, 2, 3, 4, 5]);
+        assert_eq!(ds.space().unwrap().shape(), &[5]);
+        let mut values = [0u8; 5];
+        ds.read_into(&mut values).unwrap();
+        assert_eq!(values, [1, 2, 3, 4, 5]);
     }
 
     // Verify with h5dump
@@ -86,11 +92,14 @@ fn test_compact_zero_sized_dataset_read() {
     let f = File::open("tests/data/hdf5_ref/compact_read_cases.h5").unwrap();
     let ds = f.dataset("compact_zero").unwrap();
 
-    assert_eq!(ds.shape().unwrap(), vec![0]);
+    assert_eq!(ds.space().unwrap().shape(), &[0]);
     assert_eq!(ds.size().unwrap(), 0);
-    assert!(ds.read_raw().unwrap().is_empty());
+    assert_eq!(raw_len(&ds), 0);
+    let mut raw = [];
+    ds.read_raw_into(&mut raw).unwrap();
 
-    let vals: Vec<i32> = ds.read::<i32>().unwrap();
+    let mut vals = Vec::<i32>::new();
+    ds.read_into(&mut vals).unwrap();
     assert!(vals.is_empty());
 }
 
@@ -99,18 +108,26 @@ fn test_compact_scalar_compound_payload_read() {
     let f = File::open("tests/data/hdf5_ref/compact_read_cases.h5").unwrap();
     let ds = f.dataset("compact_compound_scalar").unwrap();
 
-    assert_eq!(ds.shape().unwrap(), Vec::<u64>::new());
+    assert_eq!(ds.space().unwrap().shape(), &[]);
     assert_eq!(ds.size().unwrap(), 1);
-    assert_eq!(ds.read_raw().unwrap().len(), 12);
+    let mut raw = [0u8; 12];
+    ds.read_raw_into(&mut raw).unwrap();
 
-    let fields = ds.compound_fields().unwrap();
+    let dtype = ds.dtype().unwrap();
+    let fields = dtype
+        .compound_fields_iter()
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
     assert_eq!(fields.len(), 2);
     assert_eq!(fields[0].name, "x");
     assert_eq!(fields[1].name, "label");
 
-    let x_vals: Vec<f64> = ds.read_field("x").unwrap();
+    let mut x_vals = vec![0.0; ds.size().unwrap() as usize];
+    ds.read_field_into("x", &mut x_vals).unwrap();
     assert_eq!(x_vals, vec![1.5]);
 
-    let labels: Vec<i32> = ds.read_field("label").unwrap();
+    let mut labels = vec![0; ds.size().unwrap() as usize];
+    ds.read_field_into("label", &mut labels).unwrap();
     assert_eq!(labels, vec![7]);
 }

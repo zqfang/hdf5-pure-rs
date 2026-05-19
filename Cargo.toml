@@ -3,7 +3,7 @@ members = [".", "derive"]
 
 [package]
 name = "hdf5-pure-rust"
-version = "0.4.0"
+version = "0.3.3"
 edition = "2021"
 description = "Pure Rust implementation of the HDF5 file format"
 license = "BSD-3-Clause"
@@ -17,7 +17,7 @@ flate2 = { version = "1.0", default-features = false, features = ["zlib-rs"] }
 crc32fast = "1.4"
 parking_lot = "0.12"
 ndarray = "0.15"
-hdf5-pure-rust-derive = { version = "0.3.2", path = "derive", optional = true }
+hdf5-pure-rust-derive = { version = "0.3.3", path = "derive", optional = true }
 blosc2-pure-rs = { version = "0.2.1", optional = true }
 tracehash = { package = "tracehash-rs", version = "0.1", optional = true }
 

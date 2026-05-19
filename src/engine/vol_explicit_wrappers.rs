@@ -2,14 +2,16 @@
 
 use super::{
     H5VL__conn_free, H5VL__get_connector_by_name, H5VL__get_connector_by_value,
-    H5VL__native_attr_create, H5VL__native_attr_open, H5VL__native_blob_get, H5VL__native_blob_put,
-    H5VL__native_blob_specific, H5VL__register_connector_by_name,
+    H5VL__native_attr_create, H5VL__native_attr_open, H5VL__native_blob_put,
+    H5VL__native_blob_read_into, H5VL__native_blob_specific, H5VL__native_blob_view,
+    H5VL__native_blob_visit_chunks, H5VL__register_connector_by_name,
     H5VL__register_connector_by_value, H5VL__set_def_conn, H5VL__wrap_obj, H5VL_conn_dec_rc,
     H5VL_conn_inc_rc, H5VL_new_vol_obj, H5VL_object_unwrap, H5VL_pass_through_get_wrap_ctx,
     H5VL_restore_lib_state, H5VL_retrieve_lib_state, H5VL_wrap_register, VolConnector, VolLibState,
     VolObject, VolRegistry,
 };
 use crate::error::{Error, Result};
+use std::fmt;
 
 /// Build an [`Error::Unsupported`] for a VOL operation not implemented by the pure-Rust backend.
 fn unsupported_vol(name: &str) -> Error {
@@ -33,6 +35,25 @@ pub fn H5VL_pass_through_attr_write(object: &mut VolObject, data: &[u8]) {
     H5VL__native_blob_put(object, data);
 }
 
+/// Passthrough VOL wrapper: borrow attr bytes.
+pub fn H5VL_pass_through_attr_view(object: &VolObject) -> &[u8] {
+    H5VL__native_blob_view(object)
+}
+
+/// Passthrough VOL wrapper: copy attr bytes into a caller-owned buffer.
+pub fn H5VL_pass_through_attr_read_into(object: &VolObject, dst: &mut [u8]) -> Result<usize> {
+    H5VL__native_blob_read_into(object, dst)
+}
+
+/// Passthrough VOL wrapper: visit attr bytes without allocating.
+pub fn H5VL_pass_through_attr_visit_chunks(
+    object: &VolObject,
+    chunk_size: usize,
+    visit: impl FnMut(&[u8]) -> Result<()>,
+) -> Result<()> {
+    H5VL__native_blob_visit_chunks(object, chunk_size, visit)
+}
+
 /// Passthrough VOL wrapper: invoke a connector-specific op on a attr.
 pub fn H5VL_pass_through_attr_specific() -> Result<()> {
     Err(unsupported_vol("H5VL_pass_through_attr_specific"))
@@ -43,9 +64,23 @@ pub fn H5VL_pass_through_dataset_create(parent: &VolObject, name: &str) -> VolOb
     H5VL_new_vol_obj(parent.connector_id, name)
 }
 
-/// Passthrough VOL wrapper: read from a dataset.
-pub fn H5VL_pass_through_dataset_read(object: &VolObject) -> Vec<u8> {
-    H5VL__native_blob_get(object)
+/// Passthrough VOL wrapper: borrow dataset bytes.
+pub fn H5VL_pass_through_dataset_view(object: &VolObject) -> &[u8] {
+    H5VL__native_blob_view(object)
+}
+
+/// Passthrough VOL wrapper: copy dataset bytes into a caller-owned buffer.
+pub fn H5VL_pass_through_dataset_read_into(object: &VolObject, dst: &mut [u8]) -> Result<usize> {
+    H5VL__native_blob_read_into(object, dst)
+}
+
+/// Passthrough VOL wrapper: visit dataset bytes without allocating.
+pub fn H5VL_pass_through_dataset_visit_chunks(
+    object: &VolObject,
+    chunk_size: usize,
+    visit: impl FnMut(&[u8]) -> Result<()>,
+) -> Result<()> {
+    H5VL__native_blob_visit_chunks(object, chunk_size, visit)
 }
 
 /// Passthrough VOL wrapper: write to a dataset.
@@ -189,8 +224,20 @@ pub fn H5VL_pass_through_object_open(parent: &VolObject, name: &str) -> VolObjec
 }
 
 /// Passthrough VOL wrapper: copy a object.
+pub fn H5VL_pass_through_object_copy_ref(object: &VolObject) -> &VolObject {
+    object
+}
+
+/// Passthrough VOL wrapper: copy a object into caller-owned storage.
+pub fn H5VL_pass_through_object_copy_into(object: &VolObject, dst: &mut VolObject) {
+    dst.clone_from(H5VL_pass_through_object_copy_ref(object));
+}
+
+/// Passthrough VOL wrapper: copy a object.
 pub fn H5VL_pass_through_object_copy(object: &VolObject) -> VolObject {
-    object.clone()
+    let mut copied = VolObject::default();
+    H5VL_pass_through_object_copy_into(object, &mut copied);
+    copied
 }
 
 /// Passthrough VOL wrapper: get information about a object.
@@ -209,8 +256,23 @@ pub fn H5VL_pass_through_object_optional() -> Result<()> {
 }
 
 /// Return the connector class via the passthrough.
+pub fn H5VL_pass_through_introspect_get_conn_cls_ref(connector: &VolConnector) -> &VolConnector {
+    connector
+}
+
+/// Return the connector class via the passthrough into caller-owned storage.
+pub fn H5VL_pass_through_introspect_get_conn_cls_into(
+    connector: &VolConnector,
+    dst: &mut VolConnector,
+) {
+    dst.clone_from(H5VL_pass_through_introspect_get_conn_cls_ref(connector));
+}
+
+/// Return the connector class via the passthrough.
 pub fn H5VL_pass_through_introspect_get_conn_cls(connector: &VolConnector) -> VolConnector {
-    connector.clone()
+    let mut copied = VolConnector::default();
+    H5VL_pass_through_introspect_get_conn_cls_into(connector, &mut copied);
+    copied
 }
 
 /// Return the connector capability flags via the passthrough.
@@ -256,9 +318,23 @@ pub fn H5VL_pass_through_blob_put(object: &mut VolObject, data: &[u8]) {
     H5VL__native_blob_put(object, data);
 }
 
-/// Passthrough VOL wrapper: get information about a blob.
-pub fn H5VL_pass_through_blob_get(object: &VolObject) -> Vec<u8> {
-    H5VL__native_blob_get(object)
+/// Passthrough VOL wrapper: borrow blob bytes.
+pub fn H5VL_pass_through_blob_view(object: &VolObject) -> &[u8] {
+    H5VL__native_blob_view(object)
+}
+
+/// Passthrough VOL wrapper: copy blob bytes into a caller-owned buffer.
+pub fn H5VL_pass_through_blob_read_into(object: &VolObject, dst: &mut [u8]) -> Result<usize> {
+    H5VL__native_blob_read_into(object, dst)
+}
+
+/// Passthrough VOL wrapper: visit blob bytes without allocating.
+pub fn H5VL_pass_through_blob_visit_chunks(
+    object: &VolObject,
+    chunk_size: usize,
+    visit: impl FnMut(&[u8]) -> Result<()>,
+) -> Result<()> {
+    H5VL__native_blob_visit_chunks(object, chunk_size, visit)
 }
 
 /// Passthrough VOL wrapper: invoke a connector-specific op on a blob.
@@ -276,9 +352,9 @@ pub fn H5VL_pass_through_token_cmp(left: u64, right: u64) -> std::cmp::Ordering 
     left.cmp(&right)
 }
 
-/// Render a VOL token as a decimal string.
-pub fn H5VL_pass_through_token_to_str(token: u64) -> String {
-    token.to_string()
+/// Render a VOL token into a caller-owned formatter.
+pub fn H5VL_pass_through_token_fmt(token: u64, dst: &mut impl fmt::Write) -> fmt::Result {
+    write!(dst, "{token}")
 }
 
 /// Parse a VOL token from its string representation.
@@ -323,12 +399,32 @@ pub fn H5VLget_connector_id_by_value(registry: &VolRegistry, value: u64) -> Opti
     H5VL__get_connector_by_value(registry, value).map(|connector| connector.id)
 }
 
-/// Look up the name of a connector by id.
-pub fn H5VLget_connector_name(registry: &VolRegistry, id: u64) -> Option<String> {
+/// Borrow the name of a connector by id.
+pub fn H5VLget_connector_name_view(registry: &VolRegistry, id: u64) -> Option<&str> {
     registry
         .connectors
         .get(&id)
-        .map(|connector| connector.name.clone())
+        .map(|connector| connector.name.as_str())
+}
+
+/// Write the name of a connector by id into a caller-owned formatter.
+pub fn H5VLget_connector_name_fmt(
+    registry: &VolRegistry,
+    id: u64,
+    dst: &mut impl fmt::Write,
+) -> Result<bool> {
+    let Some(name) = H5VLget_connector_name_view(registry, id) else {
+        return Ok(false);
+    };
+    dst.write_str(name)
+        .map_err(|_| Error::InvalidFormat("failed to format VOL connector name".into()))?;
+    Ok(true)
+}
+
+/// Look up the name of a connector by id.
+#[deprecated(note = "use H5VLget_connector_name_view or H5VLget_connector_name_fmt")]
+pub fn H5VLget_connector_name(registry: &VolRegistry, id: u64) -> Option<String> {
+    H5VLget_connector_name_view(registry, id).map(str::to_owned)
 }
 
 /// Close (release) a VOL connector by id.
@@ -392,8 +488,20 @@ pub fn H5VL__native_link_specific() -> Result<()> {
 }
 
 /// Return the connector class for the native VOL.
+pub fn H5VL__native_introspect_get_conn_cls_ref(connector: &VolConnector) -> &VolConnector {
+    connector
+}
+
+/// Return the connector class for the native VOL into caller-owned storage.
+pub fn H5VL__native_introspect_get_conn_cls_into(connector: &VolConnector, dst: &mut VolConnector) {
+    dst.clone_from(H5VL__native_introspect_get_conn_cls_ref(connector));
+}
+
+/// Return the connector class for the native VOL.
 pub fn H5VL__native_introspect_get_conn_cls(connector: &VolConnector) -> VolConnector {
-    connector.clone()
+    let mut copied = VolConnector::default();
+    H5VL__native_introspect_get_conn_cls_into(connector, &mut copied);
+    copied
 }
 
 /// Return the capability flags for the native VOL.
@@ -417,8 +525,20 @@ pub fn H5VL__native_object_open(parent: &VolObject, name: &str) -> VolObject {
 }
 
 /// Native VOL wrapper: copy a object.
+pub fn H5VL__native_object_copy_ref(object: &VolObject) -> &VolObject {
+    object
+}
+
+/// Native VOL wrapper: copy a object into caller-owned storage.
+pub fn H5VL__native_object_copy_into(object: &VolObject, dst: &mut VolObject) {
+    dst.clone_from(H5VL__native_object_copy_ref(object));
+}
+
+/// Native VOL wrapper: copy a object.
 pub fn H5VL__native_object_copy(object: &VolObject) -> VolObject {
-    object.clone()
+    let mut copied = VolObject::default();
+    H5VL__native_object_copy_into(object, &mut copied);
+    copied
 }
 
 /// Native VOL wrapper: get information about a object.
@@ -469,9 +589,9 @@ pub fn H5VL__native_token_cmp(left: u64, right: u64) -> std::cmp::Ordering {
     left.cmp(&right)
 }
 
-/// Render a native VOL token as a decimal string.
-pub fn H5VL__native_token_to_str(token: u64) -> String {
-    token.to_string()
+/// Render a native VOL token into a caller-owned formatter.
+pub fn H5VL__native_token_fmt(token: u64, dst: &mut impl fmt::Write) -> fmt::Result {
+    H5VL_pass_through_token_fmt(token, dst)
 }
 
 /// Parse a native VOL token from its string representation.
@@ -507,9 +627,23 @@ pub fn H5VLattr_write(object: &mut VolObject, data: &[u8]) {
     H5VL__native_blob_put(object, data);
 }
 
-/// VOL wrapper: get information about a attr.
-pub fn H5VLattr_get(object: &VolObject) -> Vec<u8> {
-    H5VL__native_blob_get(object)
+/// VOL wrapper: borrow attr bytes.
+pub fn H5VLattr_view(object: &VolObject) -> &[u8] {
+    H5VL__native_blob_view(object)
+}
+
+/// VOL wrapper: copy attr bytes into a caller-owned buffer.
+pub fn H5VLattr_read_into(object: &VolObject, dst: &mut [u8]) -> Result<usize> {
+    H5VL__native_blob_read_into(object, dst)
+}
+
+/// VOL wrapper: visit attr bytes without allocating.
+pub fn H5VLattr_visit_chunks(
+    object: &VolObject,
+    chunk_size: usize,
+    visit: impl FnMut(&[u8]) -> Result<()>,
+) -> Result<()> {
+    H5VL__native_blob_visit_chunks(object, chunk_size, visit)
 }
 
 /// Internal VOL wrapper: invoke a connector-specific op on a attr.
@@ -555,9 +689,23 @@ pub fn H5VLdataset_open(parent: &VolObject, name: &str) -> VolObject {
     H5VL_new_vol_obj(parent.connector_id, name)
 }
 
-/// VOL wrapper: read from a dataset.
-pub fn H5VLdataset_read(object: &VolObject) -> Vec<u8> {
-    H5VL__native_blob_get(object)
+/// VOL wrapper: borrow dataset bytes.
+pub fn H5VLdataset_view(object: &VolObject) -> &[u8] {
+    H5VL__native_blob_view(object)
+}
+
+/// VOL wrapper: copy dataset bytes into a caller-owned buffer.
+pub fn H5VLdataset_read_into(object: &VolObject, dst: &mut [u8]) -> Result<usize> {
+    H5VL__native_blob_read_into(object, dst)
+}
+
+/// VOL wrapper: visit dataset bytes without allocating.
+pub fn H5VLdataset_visit_chunks(
+    object: &VolObject,
+    chunk_size: usize,
+    visit: impl FnMut(&[u8]) -> Result<()>,
+) -> Result<()> {
+    H5VL__native_blob_visit_chunks(object, chunk_size, visit)
 }
 
 /// VOL wrapper: write to a dataset.
@@ -866,8 +1014,20 @@ pub fn H5VLobject_open(parent: &VolObject, name: &str) -> VolObject {
 }
 
 /// VOL wrapper: copy a object.
+pub fn H5VLobject_copy_ref(object: &VolObject) -> &VolObject {
+    object
+}
+
+/// VOL wrapper: copy a object into caller-owned storage.
+pub fn H5VLobject_copy_into(object: &VolObject, dst: &mut VolObject) {
+    dst.clone_from(H5VLobject_copy_ref(object));
+}
+
+/// VOL wrapper: copy a object.
 pub fn H5VLobject_copy(object: &VolObject) -> VolObject {
-    object.clone()
+    let mut copied = VolObject::default();
+    H5VLobject_copy_into(object, &mut copied);
+    copied
 }
 
 /// VOL wrapper: get information about a object.
@@ -963,9 +1123,23 @@ pub fn H5VLblob_put(object: &mut VolObject, data: &[u8]) {
     H5VL__native_blob_put(object, data);
 }
 
-/// VOL wrapper: get information about a blob.
-pub fn H5VLblob_get(object: &VolObject) -> Vec<u8> {
-    H5VL__native_blob_get(object)
+/// VOL wrapper: borrow blob bytes.
+pub fn H5VLblob_view(object: &VolObject) -> &[u8] {
+    H5VL__native_blob_view(object)
+}
+
+/// VOL wrapper: copy blob bytes into a caller-owned buffer.
+pub fn H5VLblob_read_into(object: &VolObject, dst: &mut [u8]) -> Result<usize> {
+    H5VL__native_blob_read_into(object, dst)
+}
+
+/// VOL wrapper: visit blob bytes in chunks without allocating.
+pub fn H5VLblob_visit_chunks(
+    object: &VolObject,
+    chunk_size: usize,
+    visit: impl FnMut(&[u8]) -> Result<()>,
+) -> Result<()> {
+    H5VL__native_blob_visit_chunks(object, chunk_size, visit)
 }
 
 /// Internal VOL wrapper: invoke a connector-specific op on a blob.
@@ -1003,7 +1177,13 @@ pub fn H5VLtoken_cmp(left: u64, right: u64) -> std::cmp::Ordering {
     left.cmp(&right)
 }
 
+/// Public token-to-formatter conversion.
+pub fn H5VLtoken_fmt(token: u64, dst: &mut impl fmt::Write) -> fmt::Result {
+    H5VL_pass_through_token_fmt(token, dst)
+}
+
 /// Public token-to-string conversion.
+#[deprecated(note = "use H5VLtoken_fmt")]
 pub fn H5VLtoken_to_str(token: u64) -> String {
     token.to_string()
 }
@@ -1111,8 +1291,20 @@ pub fn H5VL__native_introspect_opt_query() -> Result<()> {
 }
 
 /// Native VOL: clone a dataset for I/O setup.
+pub fn H5VL__native_dataset_io_setup_ref(object: &VolObject) -> &VolObject {
+    object
+}
+
+/// Native VOL: clone a dataset for I/O setup into caller-owned storage.
+pub fn H5VL__native_dataset_io_setup_into(object: &VolObject, dst: &mut VolObject) {
+    dst.clone_from(H5VL__native_dataset_io_setup_ref(object));
+}
+
+/// Native VOL: clone a dataset for I/O setup.
 pub fn H5VL__native_dataset_io_setup(object: &VolObject) -> VolObject {
-    object.clone()
+    let mut copied = VolObject::default();
+    H5VL__native_dataset_io_setup_into(object, &mut copied);
+    copied
 }
 
 /// Native VOL: cleanup after a dataset I/O.
@@ -1128,9 +1320,23 @@ pub fn H5VL__native_dataset_open(parent: &VolObject, name: &str) -> VolObject {
     H5VL_new_vol_obj(parent.connector_id, name)
 }
 
-/// Native VOL wrapper: read from a dataset.
-pub fn H5VL__native_dataset_read(object: &VolObject) -> Vec<u8> {
-    H5VL__native_blob_get(object)
+/// Native VOL wrapper: borrow dataset bytes.
+pub fn H5VL__native_dataset_view(object: &VolObject) -> &[u8] {
+    H5VL__native_blob_view(object)
+}
+
+/// Native VOL wrapper: copy dataset bytes into a caller-owned buffer.
+pub fn H5VL__native_dataset_read_into(object: &VolObject, dst: &mut [u8]) -> Result<usize> {
+    H5VL__native_blob_read_into(object, dst)
+}
+
+/// Native VOL wrapper: visit dataset bytes without allocating.
+pub fn H5VL__native_dataset_visit_chunks(
+    object: &VolObject,
+    chunk_size: usize,
+    visit: impl FnMut(&[u8]) -> Result<()>,
+) -> Result<()> {
+    H5VL__native_blob_visit_chunks(object, chunk_size, visit)
 }
 
 /// Native VOL wrapper: write to a dataset.
@@ -1165,4 +1371,259 @@ pub fn H5VL_object_wrap_state(object: VolObject) -> (VolObject, bool) {
 /// Unwrap a VOL object, returning its inner representation.
 pub fn H5VL_object_unwrap_public(object: VolObject) -> VolObject {
     H5VL_object_unwrap(object)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fmt::Write as _;
+
+    struct FixedStrBuf<const N: usize> {
+        bytes: [u8; N],
+        len: usize,
+    }
+
+    impl<const N: usize> FixedStrBuf<N> {
+        fn new(prefix: &str) -> Self {
+            let mut buf = Self {
+                bytes: [0; N],
+                len: 0,
+            };
+            buf.write_str(prefix).unwrap();
+            buf
+        }
+
+        fn as_str(&self) -> &str {
+            std::str::from_utf8(&self.bytes[..self.len]).unwrap()
+        }
+    }
+
+    impl<const N: usize> fmt::Write for FixedStrBuf<N> {
+        fn write_str(&mut self, value: &str) -> fmt::Result {
+            let end = self.len.checked_add(value.len()).ok_or(fmt::Error)?;
+            let dst = self.bytes.get_mut(self.len..end).ok_or(fmt::Error)?;
+            dst.copy_from_slice(value.as_bytes());
+            self.len = end;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn vol_wrappers_expose_allocation_aware_byte_access() {
+        let parent = H5VL_new_vol_obj(0, "file");
+
+        let mut attr = H5VLattr_create(&parent, "units");
+        H5VLattr_write(&mut attr, b"meters");
+        assert_eq!(H5VLattr_view(&attr), b"meters");
+        let mut attr_dst = [0; 6];
+        assert_eq!(H5VLattr_read_into(&attr, &mut attr_dst).unwrap(), 6);
+        assert_eq!(&attr_dst, b"meters");
+        let attr_expected: [&[u8]; 2] = [b"mete", b"rs"];
+        let mut attr_chunk_count = 0;
+        H5VLattr_visit_chunks(&attr, 4, |chunk| {
+            assert_eq!(chunk, attr_expected[attr_chunk_count]);
+            attr_chunk_count += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(attr_chunk_count, attr_expected.len());
+
+        let mut dataset = H5VLdataset_create(&parent, "values");
+        H5VLdataset_write(&mut dataset, b"\x01\x02\x03\x04");
+        assert_eq!(H5VLdataset_view(&dataset), b"\x01\x02\x03\x04");
+        let mut dataset_dst = [0; 4];
+        assert_eq!(
+            H5VLdataset_read_into(&dataset, &mut dataset_dst).unwrap(),
+            4
+        );
+        assert_eq!(&dataset_dst, b"\x01\x02\x03\x04");
+        let dataset_expected: [&[u8]; 2] = [b"\x01\x02\x03", b"\x04"];
+        let mut dataset_chunk_count = 0;
+        H5VLdataset_visit_chunks(&dataset, 3, |chunk| {
+            assert_eq!(chunk, dataset_expected[dataset_chunk_count]);
+            dataset_chunk_count += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(dataset_chunk_count, dataset_expected.len());
+
+        let mut blob = H5VL_new_vol_obj(0, "blob");
+        H5VLblob_put(&mut blob, b"abcdef");
+        assert_eq!(H5VLblob_view(&blob), b"abcdef");
+        assert!(H5VLblob_read_into(&blob, &mut [0; 2]).is_err());
+
+        let blob_expected: [&[u8]; 2] = [b"abc", b"def"];
+        let mut blob_chunk_count = 0;
+        H5VLblob_visit_chunks(&blob, 3, |chunk| {
+            assert_eq!(chunk, blob_expected[blob_chunk_count]);
+            blob_chunk_count += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(blob_chunk_count, blob_expected.len());
+    }
+
+    #[test]
+    fn passthrough_wrappers_expose_allocation_aware_byte_access() {
+        let parent = H5VL_new_vol_obj(0, "file");
+
+        let mut attr = H5VL_pass_through_attr_create(&parent, "units");
+        H5VL_pass_through_attr_write(&mut attr, b"kelvin");
+        assert_eq!(H5VL_pass_through_attr_view(&attr), b"kelvin");
+        let mut attr_dst = [0; 6];
+        assert_eq!(
+            H5VL_pass_through_attr_read_into(&attr, &mut attr_dst).unwrap(),
+            6
+        );
+        assert_eq!(&attr_dst, b"kelvin");
+        let attr_expected: [&[u8]; 3] = [b"ke", b"lv", b"in"];
+        let mut attr_chunk_count = 0;
+        H5VL_pass_through_attr_visit_chunks(&attr, 2, |chunk| {
+            assert_eq!(chunk, attr_expected[attr_chunk_count]);
+            attr_chunk_count += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(attr_chunk_count, attr_expected.len());
+
+        let mut dataset = H5VL_pass_through_dataset_create(&parent, "values");
+        H5VL_pass_through_dataset_write(&mut dataset, b"data");
+        assert_eq!(H5VL_pass_through_dataset_view(&dataset), b"data");
+        let mut dataset_dst = [0; 4];
+        assert_eq!(
+            H5VL_pass_through_dataset_read_into(&dataset, &mut dataset_dst).unwrap(),
+            4
+        );
+        assert_eq!(&dataset_dst, b"data");
+        let dataset_expected: [&[u8]; 2] = [b"dat", b"a"];
+        let mut dataset_chunk_count = 0;
+        H5VL_pass_through_dataset_visit_chunks(&dataset, 3, |chunk| {
+            assert_eq!(chunk, dataset_expected[dataset_chunk_count]);
+            dataset_chunk_count += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(dataset_chunk_count, dataset_expected.len());
+
+        let mut blob = H5VL_new_vol_obj(0, "blob");
+        H5VL_pass_through_blob_put(&mut blob, b"abcdef");
+        assert_eq!(H5VL_pass_through_blob_view(&blob), b"abcdef");
+        let mut blob_dst = [0; 6];
+        assert_eq!(
+            H5VL_pass_through_blob_read_into(&blob, &mut blob_dst).unwrap(),
+            6
+        );
+        assert_eq!(&blob_dst, b"abcdef");
+
+        let blob_expected: [&[u8]; 2] = [b"abcd", b"ef"];
+        let mut blob_chunk_count = 0;
+        H5VL_pass_through_blob_visit_chunks(&blob, 4, |chunk| {
+            assert_eq!(chunk, blob_expected[blob_chunk_count]);
+            blob_chunk_count += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(blob_chunk_count, blob_expected.len());
+    }
+
+    #[test]
+    fn native_dataset_wrappers_expose_allocation_aware_byte_access() {
+        let parent = H5VL_new_vol_obj(0, "file");
+        let mut dataset = H5VL__native_dataset_create(&parent, "values");
+
+        H5VL__native_dataset_write(&mut dataset, b"native");
+        assert_eq!(H5VL__native_dataset_view(&dataset), b"native");
+        let mut dst = [0; 6];
+        assert_eq!(
+            H5VL__native_dataset_read_into(&dataset, &mut dst).unwrap(),
+            6
+        );
+        assert_eq!(&dst, b"native");
+
+        let expected: [&[u8]; 2] = [b"nativ", b"e"];
+        let mut chunk_count = 0;
+        H5VL__native_dataset_visit_chunks(&dataset, 5, |chunk| {
+            assert_eq!(chunk, expected[chunk_count]);
+            chunk_count += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(chunk_count, expected.len());
+    }
+
+    #[test]
+    fn token_and_connector_names_have_allocation_aware_accessors() {
+        let mut registry = VolRegistry::default();
+        let id = H5VLregister_connector(&mut registry, "native", 0);
+
+        assert_eq!(H5VLget_connector_name_view(&registry, id), Some("native"));
+        let mut connector_name = FixedStrBuf::<32>::new("connector=");
+        assert!(H5VLget_connector_name_fmt(&registry, id, &mut connector_name).unwrap());
+        assert_eq!(connector_name.as_str(), "connector=native");
+
+        let mut token = FixedStrBuf::<16>::new("token=");
+        H5VLtoken_fmt(42, &mut token).unwrap();
+        assert_eq!(token.as_str(), "token=42");
+
+        let mut passthrough_token = FixedStrBuf::<16>::new("");
+        H5VL_pass_through_token_fmt(7, &mut passthrough_token).unwrap();
+        assert_eq!(passthrough_token.as_str(), "7");
+
+        let mut native_token = FixedStrBuf::<16>::new("");
+        H5VL__native_token_fmt(9, &mut native_token).unwrap();
+        assert_eq!(native_token.as_str(), "9");
+    }
+
+    #[test]
+    fn object_and_connector_copy_wrappers_have_borrowed_and_into_paths() {
+        let mut object = H5VL_new_vol_obj(3, "object");
+        H5VL__native_blob_put(&mut object, b"payload");
+        let connector = VolConnector {
+            id: 3,
+            name: "native".to_string(),
+            value: 0,
+            refcount: 1,
+            cap_flags: 0x20,
+        };
+
+        assert!(std::ptr::eq(
+            H5VL_pass_through_object_copy_ref(&object),
+            &object
+        ));
+        assert!(std::ptr::eq(H5VL__native_object_copy_ref(&object), &object));
+        assert!(std::ptr::eq(H5VLobject_copy_ref(&object), &object));
+        assert!(std::ptr::eq(
+            H5VL__native_dataset_io_setup_ref(&object),
+            &object
+        ));
+        assert!(std::ptr::eq(
+            H5VL_pass_through_introspect_get_conn_cls_ref(&connector),
+            &connector
+        ));
+        assert!(std::ptr::eq(
+            H5VL__native_introspect_get_conn_cls_ref(&connector),
+            &connector
+        ));
+
+        let mut copied_object = VolObject {
+            name: "reuse-capacity".repeat(4),
+            payload: vec![0; 32],
+            ..VolObject::default()
+        };
+        H5VLobject_copy_into(&object, &mut copied_object);
+        assert_eq!(copied_object, object);
+
+        H5VL__native_dataset_io_setup_into(&object, &mut copied_object);
+        assert_eq!(copied_object, object);
+
+        let mut copied_connector = VolConnector {
+            name: "reuse-capacity".repeat(4),
+            ..VolConnector::default()
+        };
+        H5VL_pass_through_introspect_get_conn_cls_into(&connector, &mut copied_connector);
+        assert_eq!(copied_connector, connector);
+
+        H5VL__native_introspect_get_conn_cls_into(&connector, &mut copied_connector);
+        assert_eq!(copied_connector, connector);
+    }
 }

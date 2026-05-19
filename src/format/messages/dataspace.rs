@@ -186,11 +186,19 @@ fn trace_dataspace_extent(data: &[u8], flags: u8, message: &DataspaceMessage) {
 fn trace_dataspace_extent(_data: &[u8], _flags: u8, _message: &DataspaceMessage) {}
 
 fn read_dims(data: &[u8], pos: &mut usize, count: usize, context: &str) -> Result<Vec<u64>> {
+    let bytes_len = count
+        .checked_mul(8)
+        .ok_or_else(|| Error::InvalidFormat(format!("{context} length overflow")))?;
+    let bytes = checked_window(data, *pos, bytes_len, context)?;
     let mut dims = Vec::with_capacity(count);
-    for _ in 0..count {
-        let val = read_le_u64(data, pos, 8, context)?;
+    for chunk in bytes.chunks_exact(8) {
+        let mut val = 0u64;
+        for (i, byte) in chunk.iter().enumerate() {
+            val |= u64::from(*byte) << (i * 8);
+        }
         dims.push(val);
     }
+    advance_pos(pos, bytes_len, context)?;
     Ok(dims)
 }
 
@@ -213,21 +221,6 @@ fn ensure_available(data: &[u8], pos: usize, len: usize, context: &str) -> Resul
         return Err(Error::InvalidFormat(format!("{context} is truncated")));
     }
     Ok(())
-}
-
-fn read_le_u64(data: &[u8], pos: &mut usize, size: usize, context: &str) -> Result<u64> {
-    if !(1..=8).contains(&size) {
-        return Err(Error::InvalidFormat(format!(
-            "{context} has invalid byte width {size}"
-        )));
-    }
-    let bytes = checked_window(data, *pos, size, context)?;
-    let mut val = 0u64;
-    for (i, byte) in bytes.iter().enumerate() {
-        val |= u64::from(*byte) << (i * 8);
-    }
-    advance_pos(pos, size, context)?;
-    Ok(val)
 }
 
 fn checked_window<'a>(data: &'a [u8], pos: usize, len: usize, context: &str) -> Result<&'a [u8]> {

@@ -1,5 +1,6 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -898,12 +899,14 @@ pub fn H5FD_set_feature_flags(_driver: &mut LocalFileDriver, _flags: u64) {}
 
 /// Public API: read bytes from the file.
 #[allow(non_snake_case)]
+#[deprecated(note = "use driver-specific read methods")]
 pub fn H5FDread(driver: &mut LocalFileDriver, addr: u64, buf: &mut [u8]) -> Result<()> {
     driver.driver_read(addr, buf)
 }
 
 /// Public API: write bytes to the file.
 #[allow(non_snake_case)]
+#[deprecated(note = "use driver-specific write methods")]
 pub fn H5FDwrite(driver: &mut LocalFileDriver, addr: u64, data: &[u8]) -> Result<()> {
     driver.driver_write(addr, data)
 }
@@ -977,21 +980,58 @@ pub fn H5FD_locate_signature(image: &[u8]) -> Option<u64> {
 
 /// Translate selection requests into a flat vector form.
 #[allow(non_snake_case)]
+pub fn H5FD__read_selection_translate_view(requests: &[VfdIoRequest]) -> &[VfdIoRequest] {
+    requests
+}
+
+/// Translate selection requests into a caller-owned vector.
+#[allow(non_snake_case)]
+pub fn H5FD__read_selection_translate_into(requests: &[VfdIoRequest], out: &mut Vec<VfdIoRequest>) {
+    out.extend_from_slice(requests);
+}
+
+/// Translate selection requests into a flat vector form.
+#[allow(non_snake_case)]
+#[deprecated(
+    note = "use H5FD__read_selection_translate_view or H5FD__read_selection_translate_into"
+)]
 pub fn H5FD__read_selection_translate(requests: &[VfdIoRequest]) -> Vec<VfdIoRequest> {
-    requests.to_vec()
+    let mut out = Vec::with_capacity(requests.len());
+    H5FD__read_selection_translate_into(requests, &mut out);
+    out
 }
 
 /// Translate selection write requests into a flat vector form.
 #[allow(non_snake_case)]
+pub fn H5FD__write_selection_translate_view(requests: &[VfdIoRequest]) -> &[VfdIoRequest] {
+    requests
+}
+
+/// Translate selection write requests into a caller-owned vector.
+#[allow(non_snake_case)]
+pub fn H5FD__write_selection_translate_into(
+    requests: &[VfdIoRequest],
+    out: &mut Vec<VfdIoRequest>,
+) {
+    out.extend_from_slice(requests);
+}
+
+/// Translate selection write requests into a flat vector form.
+#[allow(non_snake_case)]
+#[deprecated(
+    note = "use H5FD__write_selection_translate_view or H5FD__write_selection_translate_into"
+)]
 pub fn H5FD__write_selection_translate(requests: &[VfdIoRequest]) -> Vec<VfdIoRequest> {
-    requests.to_vec()
+    let mut out = Vec::with_capacity(requests.len());
+    H5FD__write_selection_translate_into(requests, &mut out);
+    out
 }
 
 /// Write a list of selection requests via the active driver.
 #[allow(non_snake_case)]
 pub fn H5FD_write_selection(driver: &mut LocalFileDriver, requests: &[VfdIoRequest]) -> Result<()> {
     for request in requests {
-        H5FDwrite(driver, request.addr, &request.bytes)?;
+        driver.driver_write(request.addr, &request.bytes)?;
     }
     Ok(())
 }
@@ -1013,7 +1053,7 @@ pub fn H5FD_read_vector_from_selection(
     requests: &mut [VfdIoRequest],
 ) -> Result<()> {
     for request in requests {
-        H5FDread(driver, request.addr, &mut request.bytes)?;
+        driver.driver_read(request.addr, &mut request.bytes)?;
     }
     Ok(())
 }
@@ -1251,14 +1291,44 @@ pub fn H5FD__mpio_write(_addr: u64, _data: &[u8]) -> Result<()> {
 
 /// `H5FD__mpio_vector_build_types`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
+pub fn H5FD__mpio_vector_build_types_view(requests: &[VfdIoRequest]) -> &[VfdIoRequest] {
+    requests
+}
+
+/// `H5FD__mpio_vector_build_types`: distributed/cloud driver, not supported by the pure-Rust backend.
+#[allow(non_snake_case)]
+pub fn H5FD__mpio_vector_build_types_into(requests: &[VfdIoRequest], out: &mut Vec<VfdIoRequest>) {
+    out.extend_from_slice(requests);
+}
+
+/// `H5FD__mpio_vector_build_types`: distributed/cloud driver, not supported by the pure-Rust backend.
+#[allow(non_snake_case)]
+#[deprecated(note = "use H5FD__mpio_vector_build_types_view or H5FD__mpio_vector_build_types_into")]
 pub fn H5FD__mpio_vector_build_types(requests: &[VfdIoRequest]) -> Vec<VfdIoRequest> {
-    requests.to_vec()
+    let mut out = Vec::with_capacity(requests.len());
+    H5FD__mpio_vector_build_types_into(requests, &mut out);
+    out
 }
 
 /// VFD: selection build types.
 #[allow(non_snake_case)]
+pub fn H5FD__selection_build_types_view(requests: &[VfdIoRequest]) -> &[VfdIoRequest] {
+    requests
+}
+
+/// VFD: selection build types.
+#[allow(non_snake_case)]
+pub fn H5FD__selection_build_types_into(requests: &[VfdIoRequest], out: &mut Vec<VfdIoRequest>) {
+    out.extend_from_slice(requests);
+}
+
+/// VFD: selection build types.
+#[allow(non_snake_case)]
+#[deprecated(note = "use H5FD__selection_build_types_view or H5FD__selection_build_types_into")]
 pub fn H5FD__selection_build_types(requests: &[VfdIoRequest]) -> Vec<VfdIoRequest> {
-    requests.to_vec()
+    let mut out = Vec::with_capacity(requests.len());
+    H5FD__selection_build_types_into(requests, &mut out);
+    out
 }
 
 /// `H5FD__mpio_read_vector`: distributed/cloud driver, not supported by the pure-Rust backend.
@@ -1449,6 +1519,13 @@ pub struct S3ParsedUrl {
     pub key: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct S3ParsedUrlRef<'a> {
+    pub scheme: &'a str,
+    pub bucket: &'a str,
+    pub key: &'a str,
+}
+
 /// VFD: s3comms init.
 #[allow(non_snake_case)]
 pub fn H5FD__s3comms_init() -> Result<()> {
@@ -1517,17 +1594,29 @@ pub fn H5FD__s3comms_s3r_getsize_headers_cb(_headers: &[(&str, &str)]) -> Option
 
 /// VFD: s3comms parse url.
 #[allow(non_snake_case)]
-pub fn H5FD__s3comms_parse_url(url: &str) -> Result<S3ParsedUrl> {
+pub fn H5FD__s3comms_parse_url_ref(url: &str) -> Result<S3ParsedUrlRef<'_>> {
     let (scheme, rest) = url
         .split_once("://")
         .ok_or_else(|| Error::InvalidFormat("S3 URL missing scheme".into()))?;
     let (bucket, key) = rest
         .split_once('/')
         .ok_or_else(|| Error::InvalidFormat("S3 URL missing object key".into()))?;
+    Ok(S3ParsedUrlRef {
+        scheme,
+        bucket,
+        key,
+    })
+}
+
+/// VFD: s3comms parse url.
+#[allow(non_snake_case)]
+#[deprecated(note = "use H5FD__s3comms_parse_url_ref to borrow URL components")]
+pub fn H5FD__s3comms_parse_url(url: &str) -> Result<S3ParsedUrl> {
+    let parsed = H5FD__s3comms_parse_url_ref(url)?;
     Ok(S3ParsedUrl {
-        scheme: scheme.to_string(),
-        bucket: bucket.to_string(),
-        key: key.to_string(),
+        scheme: parsed.scheme.to_string(),
+        bucket: parsed.bucket.to_string(),
+        key: parsed.key.to_string(),
     })
 }
 
@@ -1537,11 +1626,17 @@ pub fn H5FD__s3comms_free_purl(_url: S3ParsedUrl) {}
 
 /// VFD: s3comms get aws region.
 #[allow(non_snake_case)]
-pub fn H5FD__s3comms_get_aws_region(endpoint: &str) -> Option<String> {
+pub fn H5FD__s3comms_get_aws_region_str(endpoint: &str) -> Option<&str> {
     endpoint
         .split('.')
         .find(|part| part.starts_with("us-") || part.starts_with("eu-") || part.starts_with("ap-"))
-        .map(str::to_string)
+}
+
+/// VFD: s3comms get aws region.
+#[allow(non_snake_case)]
+#[deprecated(note = "use H5FD__s3comms_get_aws_region_str")]
+pub fn H5FD__s3comms_get_aws_region(endpoint: &str) -> Option<String> {
+    H5FD__s3comms_get_aws_region_str(endpoint).map(str::to_string)
 }
 
 /// VFD: s3comms get credentials provider.
@@ -1552,8 +1647,30 @@ pub fn H5FD__s3comms_get_credentials_provider() -> Result<()> {
 
 /// VFD: s3comms format user agent header.
 #[allow(non_snake_case)]
+pub fn H5FD__s3comms_format_user_agent_header_to_writer(
+    writer: &mut impl fmt::Write,
+    product: &str,
+    version: &str,
+) -> fmt::Result {
+    write!(writer, "{product}/{version}")
+}
+
+/// VFD: s3comms format user agent header.
+#[allow(non_snake_case)]
+pub fn H5FD__s3comms_format_user_agent_header_into(product: &str, version: &str, out: &mut String) {
+    H5FD__s3comms_format_user_agent_header_to_writer(out, product, version)
+        .expect("writing to String should not fail");
+}
+
+/// VFD: s3comms format user agent header.
+#[allow(non_snake_case)]
+#[deprecated(
+    note = "use H5FD__s3comms_format_user_agent_header_to_writer or H5FD__s3comms_format_user_agent_header_into"
+)]
 pub fn H5FD__s3comms_format_user_agent_header(product: &str, version: &str) -> String {
-    format!("{product}/{version}")
+    let mut out = String::with_capacity(product.len() + 1 + version.len());
+    H5FD__s3comms_format_user_agent_header_into(product, version, &mut out);
+    out
 }
 
 /// VFD: s3comms httpcode to str.
@@ -1582,6 +1699,16 @@ pub enum MirrorXmit {
     Write { addr: u64, data: Vec<u8> },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MirrorXmitRef<'a> {
+    Close,
+    Lock,
+    Open { path: &'a str },
+    Reply { status: i32 },
+    SetEoa { eoa: u64 },
+    Write { addr: u64, data: &'a [u8] },
+}
+
 /// `H5FD__mirror_register`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__mirror_register() -> Result<()> {
@@ -1594,8 +1721,17 @@ pub fn H5FD__mirror_unregister() {}
 
 /// `H5FD__mirror_xmit_encode_uint8`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
+pub fn H5FD__mirror_xmit_encode_uint8_into(value: u8, out: &mut Vec<u8>) {
+    out.push(value);
+}
+
+/// `H5FD__mirror_xmit_encode_uint8`: distributed/cloud driver, not supported by the pure-Rust backend.
+#[allow(non_snake_case)]
+#[deprecated(note = "use H5FD__mirror_xmit_encode_uint8_into")]
 pub fn H5FD__mirror_xmit_encode_uint8(value: u8) -> Vec<u8> {
-    vec![value]
+    let mut out = Vec::with_capacity(1);
+    H5FD__mirror_xmit_encode_uint8_into(value, &mut out);
+    out
 }
 
 /// `H5FD__mirror_xmit_decode_uint64`: distributed/cloud driver, not supported by the pure-Rust backend.
@@ -1622,12 +1758,22 @@ pub fn H5FD_mirror_xmit_decode_lock(bytes: &[u8]) -> Result<MirrorXmit> {
 
 /// `mirror` VFD: xmit decode open.
 #[allow(non_snake_case)]
-pub fn H5FD_mirror_xmit_decode_open(bytes: &[u8]) -> Result<MirrorXmit> {
+pub fn H5FD_mirror_xmit_decode_open_ref(bytes: &[u8]) -> Result<MirrorXmitRef<'_>> {
     let path = std::str::from_utf8(bytes)
         .map_err(|_| Error::InvalidFormat("mirror transmit open path is not UTF-8".into()))?;
-    Ok(MirrorXmit::Open {
-        path: path.to_string(),
-    })
+    Ok(MirrorXmitRef::Open { path })
+}
+
+/// `mirror` VFD: xmit decode open.
+#[allow(non_snake_case)]
+#[deprecated(note = "use H5FD_mirror_xmit_decode_open_ref to borrow the path")]
+pub fn H5FD_mirror_xmit_decode_open(bytes: &[u8]) -> Result<MirrorXmit> {
+    match H5FD_mirror_xmit_decode_open_ref(bytes)? {
+        MirrorXmitRef::Open { path } => Ok(MirrorXmit::Open {
+            path: path.to_string(),
+        }),
+        _ => unreachable!("open decoder always returns an open message"),
+    }
 }
 
 /// `mirror` VFD: xmit decode reply.
@@ -1654,46 +1800,101 @@ pub fn H5FD_mirror_xmit_decode_set_eoa(bytes: &[u8]) -> Result<MirrorXmit> {
 
 /// `mirror` VFD: xmit decode write.
 #[allow(non_snake_case)]
-pub fn H5FD_mirror_xmit_decode_write(bytes: &[u8]) -> Result<MirrorXmit> {
+pub fn H5FD_mirror_xmit_decode_write_ref(bytes: &[u8]) -> Result<MirrorXmitRef<'_>> {
     if bytes.len() < 8 {
         return Err(Error::InvalidFormat(
             "mirror transmit write payload is truncated".into(),
         ));
     }
     let addr = read_le_u64_at(bytes, 0, "mirror transmit write address")?;
-    Ok(MirrorXmit::Write {
+    Ok(MirrorXmitRef::Write {
         addr,
-        data: bytes[8..].to_vec(),
+        data: &bytes[8..],
     })
+}
+
+/// `mirror` VFD: xmit decode write.
+#[allow(non_snake_case)]
+#[deprecated(note = "use H5FD_mirror_xmit_decode_write_ref to borrow the payload")]
+pub fn H5FD_mirror_xmit_decode_write(bytes: &[u8]) -> Result<MirrorXmit> {
+    match H5FD_mirror_xmit_decode_write_ref(bytes)? {
+        MirrorXmitRef::Write { addr, data } => Ok(MirrorXmit::Write {
+            addr,
+            data: data.to_vec(),
+        }),
+        _ => unreachable!("write decoder always returns a write message"),
+    }
 }
 
 /// `mirror` VFD: xmit encode open.
 #[allow(non_snake_case)]
+pub fn H5FD_mirror_xmit_encode_open_into(path: &str, out: &mut Vec<u8>) -> Result<()> {
+    out.extend_from_slice(path.as_bytes());
+    Ok(())
+}
+
+/// `mirror` VFD: xmit encode open.
+#[allow(non_snake_case)]
+#[deprecated(note = "use H5FD_mirror_xmit_encode_open_into")]
 pub fn H5FD_mirror_xmit_encode_open(path: &str) -> Result<Vec<u8>> {
-    Ok(path.as_bytes().to_vec())
+    let mut out = Vec::with_capacity(path.len());
+    H5FD_mirror_xmit_encode_open_into(path, &mut out)?;
+    Ok(out)
 }
 
 /// `mirror` VFD: xmit encode reply.
 #[allow(non_snake_case)]
+pub fn H5FD_mirror_xmit_encode_reply_into(status: i32, out: &mut Vec<u8>) -> Result<()> {
+    out.extend_from_slice(&status.to_le_bytes());
+    Ok(())
+}
+
+/// `mirror` VFD: xmit encode reply.
+#[allow(non_snake_case)]
+#[deprecated(note = "use H5FD_mirror_xmit_encode_reply_into")]
 pub fn H5FD_mirror_xmit_encode_reply(status: i32) -> Result<Vec<u8>> {
-    Ok(status.to_le_bytes().to_vec())
+    let mut out = Vec::with_capacity(4);
+    H5FD_mirror_xmit_encode_reply_into(status, &mut out)?;
+    Ok(out)
 }
 
 /// `mirror` VFD: xmit encode set eoa.
 #[allow(non_snake_case)]
+pub fn H5FD_mirror_xmit_encode_set_eoa_into(eoa: u64, out: &mut Vec<u8>) -> Result<()> {
+    out.extend_from_slice(&eoa.to_le_bytes());
+    Ok(())
+}
+
+/// `mirror` VFD: xmit encode set eoa.
+#[allow(non_snake_case)]
+#[deprecated(note = "use H5FD_mirror_xmit_encode_set_eoa_into")]
 pub fn H5FD_mirror_xmit_encode_set_eoa(eoa: u64) -> Result<Vec<u8>> {
-    Ok(eoa.to_le_bytes().to_vec())
+    let mut out = Vec::with_capacity(8);
+    H5FD_mirror_xmit_encode_set_eoa_into(eoa, &mut out)?;
+    Ok(out)
 }
 
 /// `mirror` VFD: xmit encode write.
 #[allow(non_snake_case)]
+pub fn H5FD_mirror_xmit_encode_write_into(addr: u64, data: &[u8], out: &mut Vec<u8>) -> Result<()> {
+    let image_len = 8usize.checked_add(data.len()).ok_or_else(|| {
+        Error::InvalidFormat("mirror transmit write image length overflow".into())
+    })?;
+    out.reserve(image_len);
+    out.extend_from_slice(&addr.to_le_bytes());
+    out.extend_from_slice(data);
+    Ok(())
+}
+
+/// `mirror` VFD: xmit encode write.
+#[allow(non_snake_case)]
+#[deprecated(note = "use H5FD_mirror_xmit_encode_write_into")]
 pub fn H5FD_mirror_xmit_encode_write(addr: u64, data: &[u8]) -> Result<Vec<u8>> {
     let image_len = 8usize.checked_add(data.len()).ok_or_else(|| {
         Error::InvalidFormat("mirror transmit write image length overflow".into())
     })?;
     let mut out = Vec::with_capacity(image_len);
-    out.extend_from_slice(&addr.to_le_bytes());
-    out.extend_from_slice(data);
+    H5FD_mirror_xmit_encode_write_into(addr, data, &mut out)?;
     Ok(out)
 }
 
@@ -1888,17 +2089,26 @@ pub fn H5FD__family_sb_size(config: &FamilyFileConfig) -> Result<usize> {
 
 /// `H5FD__family_sb_encode`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
-pub fn H5FD__family_sb_encode(config: &FamilyFileConfig) -> Result<Vec<u8>> {
+pub fn H5FD__family_sb_encode_into(config: &FamilyFileConfig, out: &mut Vec<u8>) -> Result<()> {
     if !H5FD__family_validate_config(config) {
         return Err(Error::InvalidFormat("invalid family VFD config".into()));
     }
     let filename = config.printf_filename.as_bytes();
     let filename_len = u32::try_from(filename.len())
         .map_err(|_| Error::InvalidFormat("family VFD filename length exceeds u32".into()))?;
-    let mut out = Vec::with_capacity(H5FD__family_sb_size(config)?);
+    out.reserve(H5FD__family_sb_size(config)?);
     out.extend_from_slice(&config.member_size.to_le_bytes());
     out.extend_from_slice(&filename_len.to_le_bytes());
     out.extend_from_slice(filename);
+    Ok(())
+}
+
+/// `H5FD__family_sb_encode`: distributed/cloud driver, not supported by the pure-Rust backend.
+#[allow(non_snake_case)]
+#[deprecated(note = "use H5FD__family_sb_encode_into")]
+pub fn H5FD__family_sb_encode(config: &FamilyFileConfig) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(H5FD__family_sb_size(config)?);
+    H5FD__family_sb_encode_into(config, &mut out)?;
     Ok(out)
 }
 
@@ -2056,6 +2266,18 @@ fn vfd_mem_type_from_code(code: u8) -> Option<VfdMemType> {
     })
 }
 
+const VFD_MEM_TYPES_IN_CODE_ORDER: [VfdMemType; 9] = [
+    VfdMemType::Default,
+    VfdMemType::Super,
+    VfdMemType::BTree,
+    VfdMemType::RawData,
+    VfdMemType::GlobalHeap,
+    VfdMemType::LocalHeap,
+    VfdMemType::ObjectHeader,
+    VfdMemType::Draw,
+    VfdMemType::Garbage,
+];
+
 /// VFD: file driver kind code.
 fn file_driver_kind_code(kind: FileDriverKind) -> u8 {
     match kind {
@@ -2096,20 +2318,29 @@ pub fn H5FD_multi_sb_size(config: &MultiFileConfig) -> Result<usize> {
 
 /// `multi` VFD: sb encode.
 #[allow(non_snake_case)]
-pub fn H5FD_multi_sb_encode(config: &MultiFileConfig) -> Result<Vec<u8>> {
+pub fn H5FD_multi_sb_encode_into(config: &MultiFileConfig, out: &mut Vec<u8>) -> Result<()> {
     if !H5FD_multi_validate_config(config) {
         return Err(Error::InvalidFormat("invalid multi VFD config".into()));
     }
     let count = u32::try_from(config.memb_map.len())
         .map_err(|_| Error::InvalidFormat("multi VFD member count exceeds u32".into()))?;
-    let mut out = Vec::with_capacity(H5FD_multi_sb_size(config)?);
+    out.reserve(H5FD_multi_sb_size(config)?);
     out.extend_from_slice(&count.to_le_bytes());
-    let mut entries: Vec<_> = config.memb_map.iter().collect();
-    entries.sort_by_key(|(mem_type, _)| vfd_mem_type_code(**mem_type));
-    for (mem_type, driver) in entries {
-        out.push(vfd_mem_type_code(*mem_type));
-        out.push(file_driver_kind_code(*driver));
+    for mem_type in VFD_MEM_TYPES_IN_CODE_ORDER {
+        if let Some(driver) = config.memb_map.get(&mem_type) {
+            out.push(vfd_mem_type_code(mem_type));
+            out.push(file_driver_kind_code(*driver));
+        }
     }
+    Ok(())
+}
+
+/// `multi` VFD: sb encode.
+#[allow(non_snake_case)]
+#[deprecated(note = "use H5FD_multi_sb_encode_into")]
+pub fn H5FD_multi_sb_encode(config: &MultiFileConfig) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(H5FD_multi_sb_size(config)?);
+    H5FD_multi_sb_encode_into(config, &mut out)?;
     Ok(out)
 }
 
@@ -2188,13 +2419,9 @@ pub fn H5FD_multi_get_type_map(config: &MultiFileConfig) -> &HashMap<VfdMemType,
 /// VFD: compute next.
 pub fn compute_next(file: &mut MultiFileState) {
     file.memb_next.clear();
-    let members: Vec<_> = file
-        .memb_addr
-        .iter()
-        .map(|(mt, addr)| (*mt, *addr))
-        .collect();
-    for (mt1, addr1) in &members {
-        let next = members
+    for (mt1, addr1) in &file.memb_addr {
+        let next = file
+            .memb_addr
             .iter()
             .filter_map(|(_, addr2)| (*addr2 > *addr1).then_some(*addr2))
             .min()
@@ -2417,7 +2644,7 @@ pub fn H5FD__splitter_sb_size(config: &SplitterFileConfig) -> Result<usize> {
 
 /// `H5FD__splitter_sb_encode`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
-pub fn H5FD__splitter_sb_encode(config: &SplitterFileConfig) -> Result<Vec<u8>> {
+pub fn H5FD__splitter_sb_encode_into(config: &SplitterFileConfig, out: &mut Vec<u8>) -> Result<()> {
     if !H5FD__splitter_validate_config(config) {
         return Err(Error::InvalidFormat("invalid splitter VFD config".into()));
     }
@@ -2428,10 +2655,19 @@ pub fn H5FD__splitter_sb_encode(config: &SplitterFileConfig) -> Result<Vec<u8>> 
         .unwrap_or(&[]);
     let path_len = u32::try_from(path.len())
         .map_err(|_| Error::InvalidFormat("splitter VFD path length exceeds u32".into()))?;
-    let mut out = Vec::with_capacity(H5FD__splitter_sb_size(config)?);
+    out.reserve(H5FD__splitter_sb_size(config)?);
     out.push(u8::from(config.ignore_wo_errors));
     out.extend_from_slice(&path_len.to_le_bytes());
     out.extend_from_slice(path);
+    Ok(())
+}
+
+/// `H5FD__splitter_sb_encode`: distributed/cloud driver, not supported by the pure-Rust backend.
+#[allow(non_snake_case)]
+#[deprecated(note = "use H5FD__splitter_sb_encode_into")]
+pub fn H5FD__splitter_sb_encode(config: &SplitterFileConfig) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(H5FD__splitter_sb_size(config)?);
+    H5FD__splitter_sb_encode_into(config, &mut out)?;
     Ok(out)
 }
 
@@ -2535,8 +2771,24 @@ pub fn H5FD__splitter_delete(_path: &str) -> Result<()> {
 
 /// `H5FD__splitter_log_error`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
+pub fn H5FD__splitter_log_error_str(message: &str) -> &str {
+    message
+}
+
+/// `H5FD__splitter_log_error`: distributed/cloud driver, not supported by the pure-Rust backend.
+#[allow(non_snake_case)]
+pub fn H5FD__splitter_log_error_to_writer(
+    writer: &mut impl fmt::Write,
+    message: &str,
+) -> fmt::Result {
+    fmt::Write::write_str(writer, message)
+}
+
+/// `H5FD__splitter_log_error`: distributed/cloud driver, not supported by the pure-Rust backend.
+#[allow(non_snake_case)]
+#[deprecated(note = "use H5FD__splitter_log_error_str or H5FD__splitter_log_error_to_writer")]
 pub fn H5FD__splitter_log_error(message: &str) -> String {
-    message.to_string()
+    H5FD__splitter_log_error_str(message).to_string()
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -2597,7 +2849,7 @@ pub fn H5FD__log_sb_size(config: &LogFileConfig) -> Result<usize> {
 
 /// `H5FD__log_sb_encode`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
-pub fn H5FD__log_sb_encode(config: &LogFileConfig) -> Result<Vec<u8>> {
+pub fn H5FD__log_sb_encode_into(config: &LogFileConfig, out: &mut Vec<u8>) -> Result<()> {
     if !H5FD__log_validate_config(config) {
         return Err(Error::InvalidFormat("invalid log VFD config".into()));
     }
@@ -2610,11 +2862,20 @@ pub fn H5FD__log_sb_encode(config: &LogFileConfig) -> Result<Vec<u8>> {
         .map_err(|_| Error::InvalidFormat("log VFD buffer size exceeds u64".into()))?;
     let path_len = u32::try_from(path.len())
         .map_err(|_| Error::InvalidFormat("log VFD path length exceeds u32".into()))?;
-    let mut out = Vec::with_capacity(H5FD__log_sb_size(config)?);
+    out.reserve(H5FD__log_sb_size(config)?);
     out.extend_from_slice(&config.flags.to_le_bytes());
     out.extend_from_slice(&buffer_size.to_le_bytes());
     out.extend_from_slice(&path_len.to_le_bytes());
     out.extend_from_slice(path);
+    Ok(())
+}
+
+/// `H5FD__log_sb_encode`: distributed/cloud driver, not supported by the pure-Rust backend.
+#[allow(non_snake_case)]
+#[deprecated(note = "use H5FD__log_sb_encode_into")]
+pub fn H5FD__log_sb_encode(config: &LogFileConfig) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(H5FD__log_sb_size(config)?);
+    H5FD__log_sb_encode_into(config, &mut out)?;
     Ok(out)
 }
 
@@ -2879,8 +3140,15 @@ pub fn H5FD__ros3_reset_stats() {}
 
 /// `H5FD__ros3_print_stats`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
+pub fn H5FD__ros3_print_stats_str() -> &'static str {
+    "ros3 statistics unavailable: ROS3 VFD unsupported"
+}
+
+/// `H5FD__ros3_print_stats`: distributed/cloud driver, not supported by the pure-Rust backend.
+#[allow(non_snake_case)]
+#[deprecated(note = "use H5FD__ros3_print_stats_str to borrow the static status text")]
 pub fn H5FD__ros3_print_stats() -> String {
-    "ros3 statistics unavailable: ROS3 VFD unsupported".into()
+    H5FD__ros3_print_stats_str().to_string()
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -2972,11 +3240,23 @@ pub fn H5FD__onion_revision_record_decode(bytes: &[u8]) -> Result<OnionRevisionR
 
 /// `H5FD__onion_revision_record_encode`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
-pub fn H5FD__onion_revision_record_encode(record: &OnionRevisionRecord) -> Result<Vec<u8>> {
-    let mut out = Vec::with_capacity(24);
+pub fn H5FD__onion_revision_record_encode_into(
+    record: &OnionRevisionRecord,
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    out.reserve(24);
     out.extend_from_slice(&record.revision.to_le_bytes());
     out.extend_from_slice(&record.address.to_le_bytes());
     out.extend_from_slice(&record.size.to_le_bytes());
+    Ok(())
+}
+
+/// `H5FD__onion_revision_record_encode`: distributed/cloud driver, not supported by the pure-Rust backend.
+#[allow(non_snake_case)]
+#[deprecated(note = "use H5FD__onion_revision_record_encode_into")]
+pub fn H5FD__onion_revision_record_encode(record: &OnionRevisionRecord) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(24);
+    H5FD__onion_revision_record_encode_into(record, &mut out)?;
     Ok(out)
 }
 
@@ -3012,14 +3292,32 @@ pub fn H5FD__onion_ingest_header(bytes: &[u8]) -> Result<OnionHeader> {
 
 /// `H5FD__onion_write_header`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
+pub fn H5FD__onion_write_header_into(header: &OnionHeader, out: &mut Vec<u8>) -> Result<()> {
+    H5FD__onion_header_encode_into(header, out)
+}
+
+/// `H5FD__onion_write_header`: distributed/cloud driver, not supported by the pure-Rust backend.
+#[allow(non_snake_case)]
+#[deprecated(note = "use H5FD__onion_write_header_into")]
 pub fn H5FD__onion_write_header(header: &OnionHeader) -> Result<Vec<u8>> {
-    H5FD__onion_header_encode(header)
+    let mut out = Vec::with_capacity(H5FD__onion_sb_size(header));
+    H5FD__onion_write_header_into(header, &mut out)?;
+    Ok(out)
 }
 
 /// `H5FD__onion_header_encode`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
+pub fn H5FD__onion_header_encode_into(header: &OnionHeader, out: &mut Vec<u8>) -> Result<()> {
+    H5FD__onion_sb_encode_into(header, out)
+}
+
+/// `H5FD__onion_header_encode`: distributed/cloud driver, not supported by the pure-Rust backend.
+#[allow(non_snake_case)]
+#[deprecated(note = "use H5FD__onion_header_encode_into")]
 pub fn H5FD__onion_header_encode(header: &OnionHeader) -> Result<Vec<u8>> {
-    H5FD__onion_sb_encode(header)
+    let mut out = Vec::with_capacity(H5FD__onion_sb_size(header));
+    H5FD__onion_header_encode_into(header, &mut out)?;
+    Ok(out)
 }
 
 /// `H5FD__onion_register`: distributed/cloud driver, not supported by the pure-Rust backend.
@@ -3040,11 +3338,20 @@ pub fn H5FD__onion_sb_size(_header: &OnionHeader) -> usize {
 
 /// `H5FD__onion_sb_encode`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
-pub fn H5FD__onion_sb_encode(header: &OnionHeader) -> Result<Vec<u8>> {
-    let mut out = Vec::with_capacity(10);
+pub fn H5FD__onion_sb_encode_into(header: &OnionHeader, out: &mut Vec<u8>) -> Result<()> {
+    out.reserve(H5FD__onion_sb_size(header));
     out.push(header.version);
     out.push(header.flags);
     out.extend_from_slice(&header.revision_count.to_le_bytes());
+    Ok(())
+}
+
+/// `H5FD__onion_sb_encode`: distributed/cloud driver, not supported by the pure-Rust backend.
+#[allow(non_snake_case)]
+#[deprecated(note = "use H5FD__onion_sb_encode_into")]
+pub fn H5FD__onion_sb_encode(header: &OnionHeader) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(H5FD__onion_sb_size(header));
+    H5FD__onion_sb_encode_into(header, &mut out)?;
     Ok(out)
 }
 
@@ -3178,8 +3485,20 @@ pub fn H5FD__get_onion_revision_count(header: &OnionHeader) -> u64 {
 
 /// `H5FD__onion_write_final_history`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
+pub fn H5FD__onion_write_final_history_into(
+    index: &OnionRevisionIndex,
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    H5FD__onion_history_encode_into(index, out)
+}
+
+/// `H5FD__onion_write_final_history`: distributed/cloud driver, not supported by the pure-Rust backend.
+#[allow(non_snake_case)]
+#[deprecated(note = "use H5FD__onion_write_final_history_into")]
 pub fn H5FD__onion_write_final_history(index: &OnionRevisionIndex) -> Result<Vec<u8>> {
-    H5FD__onion_history_encode(index)
+    let mut out = Vec::with_capacity(H5FD__onion_history_size(index)?);
+    H5FD__onion_write_final_history_into(index, &mut out)?;
+    Ok(out)
 }
 
 /// `H5FD__onion_ingest_history`: distributed/cloud driver, not supported by the pure-Rust backend.
@@ -3200,22 +3519,48 @@ pub fn H5FD__onion_ingest_history(bytes: &[u8]) -> Result<OnionRevisionIndex> {
 
 /// `H5FD__onion_write_history`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
+pub fn H5FD__onion_write_history_into(index: &OnionRevisionIndex, out: &mut Vec<u8>) -> Result<()> {
+    H5FD__onion_history_encode_into(index, out)
+}
+
+/// `H5FD__onion_write_history`: distributed/cloud driver, not supported by the pure-Rust backend.
+#[allow(non_snake_case)]
+#[deprecated(note = "use H5FD__onion_write_history_into")]
 pub fn H5FD__onion_write_history(index: &OnionRevisionIndex) -> Result<Vec<u8>> {
-    H5FD__onion_history_encode(index)
+    let mut out = Vec::with_capacity(H5FD__onion_history_size(index)?);
+    H5FD__onion_write_history_into(index, &mut out)?;
+    Ok(out)
 }
 
 /// `H5FD__onion_history_encode`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
-pub fn H5FD__onion_history_encode(index: &OnionRevisionIndex) -> Result<Vec<u8>> {
-    let len = index
+pub fn H5FD__onion_history_size(index: &OnionRevisionIndex) -> Result<usize> {
+    index
         .records
         .len()
         .checked_mul(24)
-        .ok_or_else(|| Error::InvalidFormat("onion revision history length overflow".into()))?;
-    let mut out = Vec::with_capacity(len);
+        .ok_or_else(|| Error::InvalidFormat("onion revision history length overflow".into()))
+}
+
+/// `H5FD__onion_history_encode`: distributed/cloud driver, not supported by the pure-Rust backend.
+#[allow(non_snake_case)]
+pub fn H5FD__onion_history_encode_into(
+    index: &OnionRevisionIndex,
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    out.reserve(H5FD__onion_history_size(index)?);
     for record in &index.records {
-        out.extend_from_slice(&H5FD__onion_revision_record_encode(record)?);
+        H5FD__onion_revision_record_encode_into(record, out)?;
     }
+    Ok(())
+}
+
+/// `H5FD__onion_history_encode`: distributed/cloud driver, not supported by the pure-Rust backend.
+#[allow(non_snake_case)]
+#[deprecated(note = "use H5FD__onion_history_encode_into")]
+pub fn H5FD__onion_history_encode(index: &OnionRevisionIndex) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(H5FD__onion_history_size(index)?);
+    H5FD__onion_history_encode_into(index, &mut out)?;
     Ok(out)
 }
 
@@ -3341,8 +3686,17 @@ pub fn H5FD__subfiling_setup_context(config: &SubfilingConfig) -> SubfilingConfi
 
 /// `H5FD__subfiling_init_app_topology`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
+pub fn H5FD__subfiling_init_app_topology_into(config: &SubfilingConfig, out: &mut Vec<u32>) {
+    out.extend(0..config.ioc_count);
+}
+
+/// `H5FD__subfiling_init_app_topology`: distributed/cloud driver, not supported by the pure-Rust backend.
+#[allow(non_snake_case)]
+#[deprecated(note = "use H5FD__subfiling_init_app_topology_into")]
 pub fn H5FD__subfiling_init_app_topology(config: &SubfilingConfig) -> Vec<u32> {
-    (0..config.ioc_count).collect()
+    let mut out = Vec::with_capacity(config.ioc_count as usize);
+    H5FD__subfiling_init_app_topology_into(config, &mut out);
+    out
 }
 
 /// `H5FD__subfiling_get_ioc_selection_criteria_from_env`: distributed/cloud driver, not supported by the pure-Rust backend.
@@ -3353,8 +3707,15 @@ pub fn H5FD__subfiling_get_ioc_selection_criteria_from_env() -> Option<String> {
 
 /// `H5FD__subfiling_find_cached_topology_info`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
-pub fn H5FD__subfiling_find_cached_topology_info() -> Option<Vec<u32>> {
+pub fn H5FD__subfiling_find_cached_topology_info_view() -> Option<&'static [u32]> {
     None
+}
+
+/// `H5FD__subfiling_find_cached_topology_info`: distributed/cloud driver, not supported by the pure-Rust backend.
+#[allow(non_snake_case)]
+#[deprecated(note = "use H5FD__subfiling_find_cached_topology_info_view")]
+pub fn H5FD__subfiling_find_cached_topology_info() -> Option<Vec<u32>> {
+    H5FD__subfiling_find_cached_topology_info_view().map(<[u32]>::to_vec)
 }
 
 /// `H5FD__subfiling_init_app_layout`: distributed/cloud driver, not supported by the pure-Rust backend.
@@ -3365,8 +3726,17 @@ pub fn H5FD__subfiling_init_app_layout(config: &SubfilingConfig) -> SubfilingCon
 
 /// `H5FD__subfiling_gather_topology_info`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
+pub fn H5FD__subfiling_gather_topology_info_into(config: &SubfilingConfig, out: &mut Vec<u32>) {
+    H5FD__subfiling_init_app_topology_into(config, out);
+}
+
+/// `H5FD__subfiling_gather_topology_info`: distributed/cloud driver, not supported by the pure-Rust backend.
+#[allow(non_snake_case)]
+#[deprecated(note = "use H5FD__subfiling_gather_topology_info_into")]
 pub fn H5FD__subfiling_gather_topology_info(config: &SubfilingConfig) -> Vec<u32> {
-    H5FD__subfiling_init_app_topology(config)
+    let mut out = Vec::with_capacity(config.ioc_count as usize);
+    H5FD__subfiling_gather_topology_info_into(config, &mut out);
+    out
 }
 
 /// `H5FD__subfiling_compare_layout_nodelocal`: distributed/cloud driver, not supported by the pure-Rust backend.
@@ -3383,8 +3753,17 @@ pub fn H5FD__subfiling_compare_layout_nodelocal(
 
 /// `H5FD__subfiling_identify_ioc_ranks`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
+pub fn H5FD__subfiling_identify_ioc_ranks_into(config: &SubfilingConfig, out: &mut Vec<u32>) {
+    H5FD__subfiling_init_app_topology_into(config, out);
+}
+
+/// `H5FD__subfiling_identify_ioc_ranks`: distributed/cloud driver, not supported by the pure-Rust backend.
+#[allow(non_snake_case)]
+#[deprecated(note = "use H5FD__subfiling_identify_ioc_ranks_into")]
 pub fn H5FD__subfiling_identify_ioc_ranks(config: &SubfilingConfig) -> Vec<u32> {
-    H5FD__subfiling_init_app_topology(config)
+    let mut out = Vec::with_capacity(config.ioc_count as usize);
+    H5FD__subfiling_identify_ioc_ranks_into(config, &mut out);
+    out
 }
 
 /// `H5FD__subfiling_init_context`: distributed/cloud driver, not supported by the pure-Rust backend.
@@ -3450,14 +3829,41 @@ pub fn H5FD__subfiling_set_config_prop(config: &mut SubfilingConfig, stripe_size
 
 /// `H5FD__subfiling_log`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
+pub fn H5FD__subfiling_log_to_writer(writer: &mut impl fmt::Write, message: &str) -> fmt::Result {
+    writeln!(writer, "{message}")
+}
+
+/// `H5FD__subfiling_log`: distributed/cloud driver, not supported by the pure-Rust backend.
+#[allow(non_snake_case)]
+#[deprecated(note = "use H5FD__subfiling_log_to_writer")]
 pub fn H5FD__subfiling_log(message: &str) -> String {
-    format!("{message}\n")
+    let mut out = String::new();
+    H5FD__subfiling_log_to_writer(&mut out, message).expect("writing to String should not fail");
+    out
 }
 
 /// `H5FD__subfiling_log_nonewline`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
+pub fn H5FD__subfiling_log_nonewline_str(message: &str) -> &str {
+    message
+}
+
+/// `H5FD__subfiling_log_nonewline`: distributed/cloud driver, not supported by the pure-Rust backend.
+#[allow(non_snake_case)]
+pub fn H5FD__subfiling_log_nonewline_to_writer(
+    writer: &mut impl fmt::Write,
+    message: &str,
+) -> fmt::Result {
+    fmt::Write::write_str(writer, message)
+}
+
+/// `H5FD__subfiling_log_nonewline`: distributed/cloud driver, not supported by the pure-Rust backend.
+#[allow(non_snake_case)]
+#[deprecated(
+    note = "use H5FD__subfiling_log_nonewline_str or H5FD__subfiling_log_nonewline_to_writer"
+)]
 pub fn H5FD__subfiling_log_nonewline(message: &str) -> String {
-    message.to_string()
+    H5FD__subfiling_log_nonewline_str(message).to_string()
 }
 
 /// `H5FD__ioc_register`: distributed/cloud driver, not supported by the pure-Rust backend.
@@ -3494,7 +3900,7 @@ pub fn H5FD__ioc_sb_size(_config: &IocConfig) -> usize {
 
 /// `H5FD__ioc_sb_encode`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
-pub fn H5FD__ioc_sb_encode(config: &IocConfig) -> Result<Vec<u8>> {
+pub fn H5FD__ioc_sb_encode_into(config: &IocConfig, out: &mut Vec<u8>) -> Result<()> {
     if !H5FD__ioc_validate_config(config) {
         return Err(Error::InvalidFormat("invalid subfiling IOC config".into()));
     }
@@ -3502,9 +3908,18 @@ pub fn H5FD__ioc_sb_encode(config: &IocConfig) -> Result<Vec<u8>> {
         .map_err(|_| Error::InvalidFormat("subfiling IOC thread pool size exceeds u64".into()))?;
     let queue_depth = u64::try_from(config.queue_depth)
         .map_err(|_| Error::InvalidFormat("subfiling IOC queue depth exceeds u64".into()))?;
-    let mut out = Vec::with_capacity(16);
+    out.reserve(H5FD__ioc_sb_size(config));
     out.extend_from_slice(&thread_pool_size.to_le_bytes());
     out.extend_from_slice(&queue_depth.to_le_bytes());
+    Ok(())
+}
+
+/// `H5FD__ioc_sb_encode`: distributed/cloud driver, not supported by the pure-Rust backend.
+#[allow(non_snake_case)]
+#[deprecated(note = "use H5FD__ioc_sb_encode_into")]
+pub fn H5FD__ioc_sb_encode(config: &IocConfig) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(H5FD__ioc_sb_size(config));
+    H5FD__ioc_sb_encode_into(config, &mut out)?;
     Ok(out)
 }
 
@@ -3770,8 +4185,17 @@ pub fn H5FD__subfiling_term() {}
 
 /// VFD: H5FDsubfiling get file mapping.
 #[allow(non_snake_case)]
+pub fn H5FDsubfiling_get_file_mapping_into(config: &SubfilingConfig, out: &mut Vec<u32>) {
+    H5FD__subfiling_identify_ioc_ranks_into(config, out);
+}
+
+/// VFD: H5FDsubfiling get file mapping.
+#[allow(non_snake_case)]
+#[deprecated(note = "use H5FDsubfiling_get_file_mapping_into")]
 pub fn H5FDsubfiling_get_file_mapping(config: &SubfilingConfig) -> Vec<u32> {
-    H5FD__subfiling_identify_ioc_ranks(config)
+    let mut out = Vec::with_capacity(config.ioc_count as usize);
+    H5FDsubfiling_get_file_mapping_into(config, &mut out);
+    out
 }
 
 /// `H5FD__subfiling_get_default_config`: distributed/cloud driver, not supported by the pure-Rust backend.
@@ -3792,14 +4216,23 @@ pub fn H5FD__subfiling_sb_size(_config: &SubfilingConfig) -> usize {
 
 /// `H5FD__subfiling_sb_encode`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
-pub fn H5FD__subfiling_sb_encode(config: &SubfilingConfig) -> Result<Vec<u8>> {
+pub fn H5FD__subfiling_sb_encode_into(config: &SubfilingConfig, out: &mut Vec<u8>) -> Result<()> {
     if config.stripe_size == 0 || config.ioc_count == 0 || config.stripe_count == 0 {
         return Err(Error::InvalidFormat("invalid subfiling VFD config".into()));
     }
-    let mut out = Vec::with_capacity(16);
+    out.reserve(H5FD__subfiling_sb_size(config));
     out.extend_from_slice(&config.stripe_size.to_le_bytes());
     out.extend_from_slice(&config.ioc_count.to_le_bytes());
     out.extend_from_slice(&config.stripe_count.to_le_bytes());
+    Ok(())
+}
+
+/// `H5FD__subfiling_sb_encode`: distributed/cloud driver, not supported by the pure-Rust backend.
+#[allow(non_snake_case)]
+#[deprecated(note = "use H5FD__subfiling_sb_encode_into")]
+pub fn H5FD__subfiling_sb_encode(config: &SubfilingConfig) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(H5FD__subfiling_sb_size(config));
+    H5FD__subfiling_sb_encode_into(config, &mut out)?;
     Ok(out)
 }
 
@@ -3932,53 +4365,141 @@ pub fn H5FD__subfiling_mirror_writes_to_stub(_enabled: bool) -> Result<()> {
 
 /// `H5FD__subfiling_generate_io_vectors`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
+pub fn H5FD__subfiling_generate_io_vectors_view(requests: &[VfdIoRequest]) -> &[VfdIoRequest] {
+    requests
+}
+
+/// `H5FD__subfiling_generate_io_vectors`: distributed/cloud driver, not supported by the pure-Rust backend.
+#[allow(non_snake_case)]
+pub fn H5FD__subfiling_generate_io_vectors_into(
+    requests: &[VfdIoRequest],
+    out: &mut Vec<VfdIoRequest>,
+) {
+    out.extend_from_slice(requests);
+}
+
+/// `H5FD__subfiling_generate_io_vectors`: distributed/cloud driver, not supported by the pure-Rust backend.
+#[allow(non_snake_case)]
+#[deprecated(
+    note = "use H5FD__subfiling_generate_io_vectors_view or H5FD__subfiling_generate_io_vectors_into"
+)]
 pub fn H5FD__subfiling_generate_io_vectors(requests: &[VfdIoRequest]) -> Vec<VfdIoRequest> {
-    requests.to_vec()
+    let mut out = Vec::with_capacity(requests.len());
+    H5FD__subfiling_generate_io_vectors_into(requests, &mut out);
+    out
 }
 
 /// `H5FD__subfiling_get_iovec_sizes`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
+pub fn H5FD__subfiling_iovec_sizes_iter(
+    requests: &[VfdIoRequest],
+) -> impl Iterator<Item = usize> + '_ {
+    requests.iter().map(|request| request.bytes.len())
+}
+
+/// `H5FD__subfiling_get_iovec_sizes`: distributed/cloud driver, not supported by the pure-Rust backend.
+#[allow(non_snake_case)]
+pub fn H5FD__subfiling_get_iovec_sizes_into(requests: &[VfdIoRequest], out: &mut Vec<usize>) {
+    out.extend(H5FD__subfiling_iovec_sizes_iter(requests));
+}
+
+/// `H5FD__subfiling_get_iovec_sizes`: distributed/cloud driver, not supported by the pure-Rust backend.
+#[allow(non_snake_case)]
+#[deprecated(note = "use H5FD__subfiling_get_iovec_sizes_into")]
 pub fn H5FD__subfiling_get_iovec_sizes(requests: &[VfdIoRequest]) -> Vec<usize> {
-    requests.iter().map(|request| request.bytes.len()).collect()
+    let mut out = Vec::with_capacity(requests.len());
+    H5FD__subfiling_get_iovec_sizes_into(requests, &mut out);
+    out
 }
 
 /// `H5FD__subfiling_translate_io_req_to_iovec`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
+pub fn H5FD__subfiling_translate_io_req_to_iovec_ref(request: &VfdIoRequest) -> &VfdIoRequest {
+    request
+}
+
+/// `H5FD__subfiling_translate_io_req_to_iovec`: distributed/cloud driver, not supported by the pure-Rust backend.
+#[allow(non_snake_case)]
+#[deprecated(note = "use H5FD__subfiling_translate_io_req_to_iovec_ref")]
 pub fn H5FD__subfiling_translate_io_req_to_iovec(request: &VfdIoRequest) -> VfdIoRequest {
-    request.clone()
+    H5FD__subfiling_translate_io_req_to_iovec_ref(request).clone()
 }
 
 /// `H5FD__subfiling_iovec_fill_first`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
+pub fn H5FD__subfiling_iovec_fill_first_ref(requests: &[VfdIoRequest]) -> Option<&VfdIoRequest> {
+    requests.first()
+}
+
+/// `H5FD__subfiling_iovec_fill_first`: distributed/cloud driver, not supported by the pure-Rust backend.
+#[allow(non_snake_case)]
+#[deprecated(note = "use H5FD__subfiling_iovec_fill_first_ref")]
 pub fn H5FD__subfiling_iovec_fill_first(requests: &[VfdIoRequest]) -> Option<VfdIoRequest> {
-    requests.first().cloned()
+    H5FD__subfiling_iovec_fill_first_ref(requests).cloned()
 }
 
 /// `H5FD__subfiling_iovec_fill_last`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
+pub fn H5FD__subfiling_iovec_fill_last_ref(requests: &[VfdIoRequest]) -> Option<&VfdIoRequest> {
+    requests.last()
+}
+
+/// `H5FD__subfiling_iovec_fill_last`: distributed/cloud driver, not supported by the pure-Rust backend.
+#[allow(non_snake_case)]
+#[deprecated(note = "use H5FD__subfiling_iovec_fill_last_ref")]
 pub fn H5FD__subfiling_iovec_fill_last(requests: &[VfdIoRequest]) -> Option<VfdIoRequest> {
-    requests.last().cloned()
+    H5FD__subfiling_iovec_fill_last_ref(requests).cloned()
 }
 
 /// `H5FD__subfiling_iovec_fill_first_last`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
-pub fn H5FD__subfiling_iovec_fill_first_last(requests: &[VfdIoRequest]) -> Vec<VfdIoRequest> {
-    let mut out = Vec::new();
-    if let Some(first) = H5FD__subfiling_iovec_fill_first(requests) {
-        out.push(first);
+pub fn H5FD__subfiling_iovec_fill_first_last_into(
+    requests: &[VfdIoRequest],
+    out: &mut Vec<VfdIoRequest>,
+) {
+    if let Some(first) = H5FD__subfiling_iovec_fill_first_ref(requests) {
+        out.push(first.clone());
     }
     if requests.len() > 1 {
-        if let Some(last) = H5FD__subfiling_iovec_fill_last(requests) {
-            out.push(last);
+        if let Some(last) = H5FD__subfiling_iovec_fill_last_ref(requests) {
+            out.push(last.clone());
         }
     }
+}
+
+/// `H5FD__subfiling_iovec_fill_first_last`: distributed/cloud driver, not supported by the pure-Rust backend.
+#[allow(non_snake_case)]
+#[deprecated(note = "use H5FD__subfiling_iovec_fill_first_last_into")]
+pub fn H5FD__subfiling_iovec_fill_first_last(requests: &[VfdIoRequest]) -> Vec<VfdIoRequest> {
+    let mut out = Vec::with_capacity(requests.len().min(2));
+    H5FD__subfiling_iovec_fill_first_last_into(requests, &mut out);
     out
 }
 
 /// `H5FD__subfiling_iovec_fill_uniform`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
+pub fn H5FD__subfiling_iovec_fill_uniform_view(requests: &[VfdIoRequest]) -> &[VfdIoRequest] {
+    requests
+}
+
+/// `H5FD__subfiling_iovec_fill_uniform`: distributed/cloud driver, not supported by the pure-Rust backend.
+#[allow(non_snake_case)]
+pub fn H5FD__subfiling_iovec_fill_uniform_into(
+    requests: &[VfdIoRequest],
+    out: &mut Vec<VfdIoRequest>,
+) {
+    out.extend_from_slice(requests);
+}
+
+/// `H5FD__subfiling_iovec_fill_uniform`: distributed/cloud driver, not supported by the pure-Rust backend.
+#[allow(non_snake_case)]
+#[deprecated(
+    note = "use H5FD__subfiling_iovec_fill_uniform_view or H5FD__subfiling_iovec_fill_uniform_into"
+)]
 pub fn H5FD__subfiling_iovec_fill_uniform(requests: &[VfdIoRequest]) -> Vec<VfdIoRequest> {
-    requests.to_vec()
+    let mut out = Vec::with_capacity(requests.len());
+    H5FD__subfiling_iovec_fill_uniform_into(requests, &mut out);
+    out
 }
 
 /// `H5FD__subfiling_cast_to_void`: distributed/cloud driver, not supported by the pure-Rust backend.
@@ -3993,8 +4514,8 @@ mod tests {
 
     use super::{
         Error, FamilyFileConfig, FileDriverKind, IocConfig, LocalFileDriver, LogFileConfig,
-        MirrorXmit, MultiFileConfig, OnionHeader, OnionRevisionIndex, OnionRevisionRecord,
-        SplitterFileConfig, SubfilingConfig, VfdMemType,
+        MirrorXmit, MirrorXmitRef, MultiFileConfig, OnionHeader, OnionRevisionIndex,
+        OnionRevisionRecord, SplitterFileConfig, SubfilingConfig, VfdMemType,
     };
 
     #[test]
@@ -4022,7 +4543,8 @@ mod tests {
             member_size: 4096,
             printf_filename: "member-%03d.h5".into(),
         };
-        let family_bytes = super::H5FD__family_sb_encode(&family).unwrap();
+        let mut family_bytes = Vec::new();
+        super::H5FD__family_sb_encode_into(&family, &mut family_bytes).unwrap();
         assert_eq!(
             super::H5FD__family_sb_size(&family).unwrap(),
             family_bytes.len()
@@ -4031,10 +4553,14 @@ mod tests {
             super::H5FD__family_sb_decode(&family_bytes).unwrap(),
             family
         );
-        assert!(super::H5FD__family_sb_encode(&FamilyFileConfig {
-            member_size: 0,
-            printf_filename: "member-%03d.h5".into(),
-        })
+        let mut invalid_family_bytes = Vec::new();
+        assert!(super::H5FD__family_sb_encode_into(
+            &FamilyFileConfig {
+                member_size: 0,
+                printf_filename: "member-%03d.h5".into(),
+            },
+            &mut invalid_family_bytes
+        )
         .is_err());
 
         let mut multi = MultiFileConfig::default();
@@ -4044,19 +4570,26 @@ mod tests {
         multi
             .memb_map
             .insert(VfdMemType::RawData, FileDriverKind::Core);
-        let multi_bytes = super::H5FD_multi_sb_encode(&multi).unwrap();
+        let mut multi_bytes = Vec::new();
+        super::H5FD_multi_sb_encode_into(&multi, &mut multi_bytes).unwrap();
         assert_eq!(
             super::H5FD_multi_sb_size(&multi).unwrap(),
             multi_bytes.len()
         );
         assert_eq!(super::H5FD_multi_sb_decode(&multi_bytes).unwrap(), multi);
-        assert!(super::H5FD_multi_sb_encode(&MultiFileConfig::default()).is_err());
+        let mut invalid_multi_bytes = Vec::new();
+        assert!(super::H5FD_multi_sb_encode_into(
+            &MultiFileConfig::default(),
+            &mut invalid_multi_bytes
+        )
+        .is_err());
 
         let splitter = SplitterFileConfig {
             write_only_path: Some(PathBuf::from("mirror.h5")),
             ignore_wo_errors: true,
         };
-        let splitter_bytes = super::H5FD__splitter_sb_encode(&splitter).unwrap();
+        let mut splitter_bytes = Vec::new();
+        super::H5FD__splitter_sb_encode_into(&splitter, &mut splitter_bytes).unwrap();
         assert_eq!(
             super::H5FD__splitter_sb_size(&splitter).unwrap(),
             splitter_bytes.len()
@@ -4065,10 +4598,14 @@ mod tests {
             super::H5FD__splitter_sb_decode(&splitter_bytes).unwrap(),
             splitter
         );
-        assert!(super::H5FD__splitter_sb_encode(&SplitterFileConfig {
-            write_only_path: Some(PathBuf::from("")),
-            ignore_wo_errors: true,
-        })
+        let mut invalid_splitter_bytes = Vec::new();
+        assert!(super::H5FD__splitter_sb_encode_into(
+            &SplitterFileConfig {
+                write_only_path: Some(PathBuf::from("")),
+                ignore_wo_errors: true,
+            },
+            &mut invalid_splitter_bytes
+        )
         .is_err());
 
         let log = LogFileConfig {
@@ -4076,50 +4613,53 @@ mod tests {
             flags: 0x55,
             buffer_size: 8192,
         };
-        let log_bytes = super::H5FD__log_sb_encode(&log).unwrap();
+        let mut log_bytes = Vec::new();
+        super::H5FD__log_sb_encode_into(&log, &mut log_bytes).unwrap();
         assert_eq!(super::H5FD__log_sb_size(&log).unwrap(), log_bytes.len());
         assert_eq!(super::H5FD__log_sb_decode(&log_bytes).unwrap(), log);
-        assert!(super::H5FD__log_sb_encode(&LogFileConfig {
-            log_path: Some(PathBuf::from("")),
-            flags: 0,
-            buffer_size: 0,
-        })
+        let mut invalid_log_bytes = Vec::new();
+        assert!(super::H5FD__log_sb_encode_into(
+            &LogFileConfig {
+                log_path: Some(PathBuf::from("")),
+                flags: 0,
+                buffer_size: 0,
+            },
+            &mut invalid_log_bytes
+        )
         .is_err());
 
         assert_eq!(
             super::H5FD_mirror_xmit_decode_lock(&[]).unwrap(),
             MirrorXmit::Lock
         );
-        assert_eq!(super::H5FD__mirror_xmit_encode_uint8(0xab), vec![0xab]);
+        let mut uint8_bytes = Vec::new();
+        super::H5FD__mirror_xmit_encode_uint8_into(0xab, &mut uint8_bytes);
+        assert_eq!(uint8_bytes, vec![0xab]);
+        let mut open_bytes = Vec::new();
+        super::H5FD_mirror_xmit_encode_open_into("mirror.h5", &mut open_bytes).unwrap();
         assert_eq!(
-            super::H5FD_mirror_xmit_decode_open(
-                &super::H5FD_mirror_xmit_encode_open("mirror.h5").unwrap()
-            )
-            .unwrap(),
-            MirrorXmit::Open {
-                path: "mirror.h5".into()
-            }
+            super::H5FD_mirror_xmit_decode_open_ref(&open_bytes).unwrap(),
+            MirrorXmitRef::Open { path: "mirror.h5" }
         );
+        let mut reply_bytes = Vec::new();
+        super::H5FD_mirror_xmit_encode_reply_into(0, &mut reply_bytes).unwrap();
         assert_eq!(
-            super::H5FD_mirror_xmit_decode_reply(&super::H5FD_mirror_xmit_encode_reply(0).unwrap())
-                .unwrap(),
+            super::H5FD_mirror_xmit_decode_reply(&reply_bytes).unwrap(),
             MirrorXmit::Reply { status: 0 }
         );
+        let mut set_eoa_bytes = Vec::new();
+        super::H5FD_mirror_xmit_encode_set_eoa_into(4096, &mut set_eoa_bytes).unwrap();
         assert_eq!(
-            super::H5FD_mirror_xmit_decode_set_eoa(
-                &super::H5FD_mirror_xmit_encode_set_eoa(4096).unwrap()
-            )
-            .unwrap(),
+            super::H5FD_mirror_xmit_decode_set_eoa(&set_eoa_bytes).unwrap(),
             MirrorXmit::SetEoa { eoa: 4096 }
         );
+        let mut write_bytes = Vec::new();
+        super::H5FD_mirror_xmit_encode_write_into(8192, b"abc", &mut write_bytes).unwrap();
         assert_eq!(
-            super::H5FD_mirror_xmit_decode_write(
-                &super::H5FD_mirror_xmit_encode_write(8192, b"abc").unwrap()
-            )
-            .unwrap(),
-            MirrorXmit::Write {
+            super::H5FD_mirror_xmit_decode_write_ref(&write_bytes).unwrap(),
+            MirrorXmitRef::Write {
                 addr: 8192,
-                data: b"abc".to_vec()
+                data: b"abc"
             }
         );
 
@@ -4128,15 +4668,24 @@ mod tests {
             flags: 0x2,
             revision_count: 3,
         };
-        let onion_bytes = super::H5FD__onion_sb_encode(&onion).unwrap();
+        let mut onion_bytes = Vec::new();
+        super::H5FD__onion_sb_encode_into(&onion, &mut onion_bytes).unwrap();
         assert_eq!(super::H5FD__onion_sb_size(&onion), onion_bytes.len());
         assert_eq!(super::H5FD__onion_sb_decode(&onion_bytes).unwrap(), onion);
         assert_eq!(
-            super::H5FD__onion_write_header(&onion).unwrap(),
+            {
+                let mut bytes = Vec::new();
+                super::H5FD__onion_write_header_into(&onion, &mut bytes).unwrap();
+                bytes
+            },
             onion_bytes
         );
         assert_eq!(
-            super::H5FD__onion_header_encode(&onion).unwrap(),
+            {
+                let mut bytes = Vec::new();
+                super::H5FD__onion_header_encode_into(&onion, &mut bytes).unwrap();
+                bytes
+            },
             onion_bytes
         );
 
@@ -4144,13 +4693,18 @@ mod tests {
             thread_pool_size: 4,
             queue_depth: 16,
         };
-        let ioc_bytes = super::H5FD__ioc_sb_encode(&ioc).unwrap();
+        let mut ioc_bytes = Vec::new();
+        super::H5FD__ioc_sb_encode_into(&ioc, &mut ioc_bytes).unwrap();
         assert_eq!(super::H5FD__ioc_sb_size(&ioc), ioc_bytes.len());
         assert_eq!(super::H5FD__ioc_sb_decode(&ioc_bytes).unwrap(), ioc);
-        assert!(super::H5FD__ioc_sb_encode(&IocConfig {
-            thread_pool_size: 0,
-            queue_depth: 16,
-        })
+        let mut invalid_ioc_bytes = Vec::new();
+        assert!(super::H5FD__ioc_sb_encode_into(
+            &IocConfig {
+                thread_pool_size: 0,
+                queue_depth: 16,
+            },
+            &mut invalid_ioc_bytes
+        )
         .is_err());
 
         let subfiling = SubfilingConfig {
@@ -4158,7 +4712,8 @@ mod tests {
             stripe_size: 1024,
             stripe_count: 8,
         };
-        let subfiling_bytes = super::H5FD__subfiling_sb_encode(&subfiling).unwrap();
+        let mut subfiling_bytes = Vec::new();
+        super::H5FD__subfiling_sb_encode_into(&subfiling, &mut subfiling_bytes).unwrap();
         assert_eq!(
             super::H5FD__subfiling_sb_size(&subfiling),
             subfiling_bytes.len()
@@ -4167,11 +4722,15 @@ mod tests {
             super::H5FD__subfiling_sb_decode(&subfiling_bytes).unwrap(),
             subfiling
         );
-        assert!(super::H5FD__subfiling_sb_encode(&SubfilingConfig {
-            ioc_count: 0,
-            stripe_size: 1024,
-            stripe_count: 8,
-        })
+        let mut invalid_subfiling_bytes = Vec::new();
+        assert!(super::H5FD__subfiling_sb_encode_into(
+            &SubfilingConfig {
+                ioc_count: 0,
+                stripe_size: 1024,
+                stripe_count: 8,
+            },
+            &mut invalid_subfiling_bytes
+        )
         .is_err());
         assert_eq!(
             super::H5FD__subfiling_new_object_id_checked(41).unwrap(),
@@ -4194,13 +4753,16 @@ mod tests {
                 },
             ],
         };
-        let history_bytes = super::H5FD__onion_history_encode(&history).unwrap();
+        let mut history_bytes = Vec::new();
+        super::H5FD__onion_history_encode_into(&history, &mut history_bytes).unwrap();
         assert_eq!(
             super::H5FD__onion_ingest_history(&history_bytes).unwrap(),
             history
         );
         assert_eq!(history_bytes.len(), 48);
-        let record_bytes = super::H5FD__onion_revision_record_encode(&history.records[0]).unwrap();
+        let mut record_bytes = Vec::new();
+        super::H5FD__onion_revision_record_encode_into(&history.records[0], &mut record_bytes)
+            .unwrap();
         assert_eq!(record_bytes.len(), 24);
         assert_eq!(
             super::H5FD__onion_revision_record_decode(&record_bytes).unwrap(),
@@ -4231,7 +4793,7 @@ mod tests {
             Error::InvalidFormat(_)
         ));
         assert!(matches!(
-            super::H5FD_mirror_xmit_decode_open(&[0xff]).unwrap_err(),
+            super::H5FD_mirror_xmit_decode_open_ref(&[0xff]).unwrap_err(),
             Error::InvalidFormat(_)
         ));
         assert!(matches!(
@@ -4243,7 +4805,7 @@ mod tests {
             Error::InvalidFormat(_)
         ));
         assert!(matches!(
-            super::H5FD_mirror_xmit_decode_write(&[0; 7]).unwrap_err(),
+            super::H5FD_mirror_xmit_decode_write_ref(&[0; 7]).unwrap_err(),
             Error::InvalidFormat(_)
         ));
         assert!(matches!(

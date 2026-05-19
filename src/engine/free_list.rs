@@ -44,7 +44,7 @@ impl FreeListManager {
         self.garbage_coll();
     }
 
-    pub fn malloc(size: usize) -> Result<Vec<u8>> {
+    fn malloc_vec(size: usize) -> Result<Vec<u8>> {
         if size == 0 {
             return Err(Error::InvalidFormat(
                 "free-list allocation size is zero".into(),
@@ -53,23 +53,61 @@ impl FreeListManager {
         Ok(vec![0; size])
     }
 
-    pub fn reg_malloc(&mut self, size: usize) -> Result<Vec<u8>> {
-        self.regular
-            .pop()
-            .filter(|buf| buf.len() >= size)
-            .map_or_else(
-                || Self::malloc(size),
-                |mut buf| {
-                    buf.resize(size, 0);
-                    Ok(buf)
-                },
-            )
+    fn checked_array_size(count: usize, elem_size: usize) -> Result<usize> {
+        count
+            .checked_mul(elem_size)
+            .ok_or_else(|| Error::InvalidFormat("free-list array size overflow".into()))
     }
 
-    pub fn reg_calloc(&mut self, size: usize) -> Result<Vec<u8>> {
-        let mut buf = self.reg_malloc(size)?;
-        buf.fill(0);
-        Ok(buf)
+    fn resize_allocation_in_place(buf: &mut Vec<u8>, new_size: usize) -> Result<()> {
+        if new_size == 0 {
+            return Err(Error::InvalidFormat(
+                "free-list allocation size is zero".into(),
+            ));
+        }
+        buf.resize(new_size, 0);
+        Ok(())
+    }
+
+    fn take_reusable_buffer(list: &mut Vec<Vec<u8>>, size: usize) -> Option<Vec<u8>> {
+        let pos = list.iter().position(|buf| buf.len() >= size)?;
+        Some(list.remove(pos))
+    }
+
+    pub fn malloc_into(size: usize, out: &mut Vec<u8>) -> Result<()> {
+        if size == 0 {
+            return Err(Error::InvalidFormat(
+                "free-list allocation size is zero".into(),
+            ));
+        }
+        out.clear();
+        out.resize(size, 0);
+        Ok(())
+    }
+
+    fn reg_malloc_vec(&mut self, size: usize) -> Result<Vec<u8>> {
+        Self::take_reusable_buffer(&mut self.regular, size).map_or_else(
+            || Self::malloc_vec(size),
+            |mut buf| {
+                buf.resize(size, 0);
+                Ok(buf)
+            },
+        )
+    }
+
+    pub fn reg_malloc_into(&mut self, size: usize, out: &mut Vec<u8>) -> Result<()> {
+        if out.capacity() >= size {
+            Self::malloc_into(size, out)
+        } else {
+            *out = self.reg_malloc_vec(size)?;
+            Ok(())
+        }
+    }
+
+    pub fn reg_calloc_into(&mut self, size: usize, out: &mut Vec<u8>) -> Result<()> {
+        self.reg_malloc_into(size, out)?;
+        out.fill(0);
+        Ok(())
     }
 
     pub fn reg_gc_list(&mut self) {
@@ -84,9 +122,18 @@ impl FreeListManager {
         self.reg_gc();
     }
 
-    pub fn blk_find_list(&mut self, size: usize) -> Option<Vec<u8>> {
-        let pos = self.blocks.iter().position(|buf| buf.len() >= size)?;
-        Some(self.blocks.remove(pos))
+    fn blk_find_list_vec(&mut self, size: usize) -> Option<Vec<u8>> {
+        Self::take_reusable_buffer(&mut self.blocks, size)
+    }
+
+    pub fn blk_find_list_into(&mut self, size: usize, out: &mut Vec<u8>) -> bool {
+        match self.blk_find_list_vec(size) {
+            Some(buf) => {
+                *out = buf;
+                true
+            }
+            None => false,
+        }
     }
 
     pub fn blk_create_list(&mut self) {
@@ -101,9 +148,9 @@ impl FreeListManager {
         self.blocks.iter().any(|buf| buf.len() >= size)
     }
 
-    pub fn blk_malloc(&mut self, size: usize) -> Result<Vec<u8>> {
-        self.blk_find_list(size).map_or_else(
-            || Self::malloc(size),
+    fn blk_malloc_vec(&mut self, size: usize) -> Result<Vec<u8>> {
+        self.blk_find_list_vec(size).map_or_else(
+            || Self::malloc_vec(size),
             |mut buf| {
                 buf.resize(size, 0);
                 Ok(buf)
@@ -111,10 +158,19 @@ impl FreeListManager {
         )
     }
 
-    pub fn blk_calloc(&mut self, size: usize) -> Result<Vec<u8>> {
-        let mut buf = self.blk_malloc(size)?;
-        buf.fill(0);
-        Ok(buf)
+    pub fn blk_malloc_into(&mut self, size: usize, out: &mut Vec<u8>) -> Result<()> {
+        if out.capacity() >= size {
+            Self::malloc_into(size, out)
+        } else {
+            *out = self.blk_malloc_vec(size)?;
+            Ok(())
+        }
+    }
+
+    pub fn blk_calloc_into(&mut self, size: usize, out: &mut Vec<u8>) -> Result<()> {
+        self.blk_malloc_into(size, out)?;
+        out.fill(0);
+        Ok(())
     }
 
     pub fn blk_free(&mut self, mut buf: Vec<u8>) {
@@ -124,14 +180,8 @@ impl FreeListManager {
         }
     }
 
-    pub fn blk_realloc(&mut self, mut buf: Vec<u8>, new_size: usize) -> Result<Vec<u8>> {
-        if new_size == 0 {
-            return Err(Error::InvalidFormat(
-                "free-list allocation size is zero".into(),
-            ));
-        }
-        buf.resize(new_size, 0);
-        Ok(buf)
+    pub fn blk_realloc_in_place(&mut self, buf: &mut Vec<u8>, new_size: usize) -> Result<()> {
+        Self::resize_allocation_in_place(buf, new_size)
     }
 
     pub fn blk_gc_list(&mut self) {
@@ -157,28 +207,44 @@ impl FreeListManager {
         }
     }
 
-    pub fn arr_malloc(&mut self, count: usize, elem_size: usize) -> Result<Vec<u8>> {
-        let size = count
-            .checked_mul(elem_size)
-            .ok_or_else(|| Error::InvalidFormat("free-list array size overflow".into()))?;
-        Self::malloc(size)
-    }
-
-    pub fn arr_calloc(&mut self, count: usize, elem_size: usize) -> Result<Vec<u8>> {
-        self.arr_malloc(count, elem_size)
-    }
-
-    pub fn arr_realloc(
+    pub fn arr_malloc_into(
         &mut self,
-        mut buf: Vec<u8>,
         count: usize,
         elem_size: usize,
-    ) -> Result<Vec<u8>> {
-        let size = count
-            .checked_mul(elem_size)
-            .ok_or_else(|| Error::InvalidFormat("free-list array size overflow".into()))?;
-        buf.resize(size, 0);
-        Ok(buf)
+        out: &mut Vec<u8>,
+    ) -> Result<()> {
+        let size = Self::checked_array_size(count, elem_size)?;
+        if out.capacity() >= size {
+            Self::malloc_into(size, out)
+        } else {
+            *out = Self::take_reusable_buffer(&mut self.arrays, size).map_or_else(
+                || Self::malloc_vec(size),
+                |mut buf| {
+                    buf.resize(size, 0);
+                    Ok(buf)
+                },
+            )?;
+            Ok(())
+        }
+    }
+
+    pub fn arr_calloc_into(
+        &mut self,
+        count: usize,
+        elem_size: usize,
+        out: &mut Vec<u8>,
+    ) -> Result<()> {
+        self.arr_malloc_into(count, elem_size, out)
+    }
+
+    pub fn arr_realloc_in_place(
+        &mut self,
+        buf: &mut Vec<u8>,
+        count: usize,
+        elem_size: usize,
+    ) -> Result<()> {
+        let size = Self::checked_array_size(count, elem_size)?;
+        Self::resize_allocation_in_place(buf, size)
     }
 
     pub fn arr_gc_list(&mut self) {
@@ -197,16 +263,31 @@ impl FreeListManager {
         self.arr_free(buf);
     }
 
-    pub fn seq_malloc(&mut self, count: usize, elem_size: usize) -> Result<Vec<u8>> {
-        self.arr_malloc(count, elem_size)
+    pub fn seq_malloc_into(
+        &mut self,
+        count: usize,
+        elem_size: usize,
+        out: &mut Vec<u8>,
+    ) -> Result<()> {
+        self.arr_malloc_into(count, elem_size, out)
     }
 
-    pub fn seq_calloc(&mut self, count: usize, elem_size: usize) -> Result<Vec<u8>> {
-        self.arr_calloc(count, elem_size)
+    pub fn seq_calloc_into(
+        &mut self,
+        count: usize,
+        elem_size: usize,
+        out: &mut Vec<u8>,
+    ) -> Result<()> {
+        self.arr_calloc_into(count, elem_size, out)
     }
 
-    pub fn seq_realloc(&mut self, buf: Vec<u8>, count: usize, elem_size: usize) -> Result<Vec<u8>> {
-        self.arr_realloc(buf, count, elem_size)
+    pub fn seq_realloc_in_place(
+        &mut self,
+        buf: &mut Vec<u8>,
+        count: usize,
+        elem_size: usize,
+    ) -> Result<()> {
+        self.arr_realloc_in_place(buf, count, elem_size)
     }
 
     pub fn fac_init(&mut self) {
@@ -220,23 +301,29 @@ impl FreeListManager {
         }
     }
 
-    pub fn fac_malloc(&mut self, size: usize) -> Result<Vec<u8>> {
-        self.factories
-            .pop()
-            .filter(|buf| buf.len() >= size)
-            .map_or_else(
-                || Self::malloc(size),
-                |mut buf| {
-                    buf.resize(size, 0);
-                    Ok(buf)
-                },
-            )
+    fn fac_malloc_vec(&mut self, size: usize) -> Result<Vec<u8>> {
+        Self::take_reusable_buffer(&mut self.factories, size).map_or_else(
+            || Self::malloc_vec(size),
+            |mut buf| {
+                buf.resize(size, 0);
+                Ok(buf)
+            },
+        )
     }
 
-    pub fn fac_calloc(&mut self, size: usize) -> Result<Vec<u8>> {
-        let mut buf = self.fac_malloc(size)?;
-        buf.fill(0);
-        Ok(buf)
+    pub fn fac_malloc_into(&mut self, size: usize, out: &mut Vec<u8>) -> Result<()> {
+        if out.capacity() >= size {
+            Self::malloc_into(size, out)
+        } else {
+            *out = self.fac_malloc_vec(size)?;
+            Ok(())
+        }
+    }
+
+    pub fn fac_calloc_into(&mut self, size: usize, out: &mut Vec<u8>) -> Result<()> {
+        self.fac_malloc_into(size, out)?;
+        out.fill(0);
+        Ok(())
     }
 
     pub fn fac_gc_list(&mut self) {
@@ -296,10 +383,27 @@ mod tests {
     #[test]
     fn block_free_list_reuses_buffers() {
         let mut lists = FreeListManager::new();
-        let buf = lists.blk_malloc(8).unwrap();
+        let mut buf = Vec::new();
+        lists.blk_malloc_into(8, &mut buf).unwrap();
         lists.blk_free(buf);
         assert!(lists.blk_free_block_avail(8));
-        let reused = lists.blk_malloc(4).unwrap();
+        let mut reused = Vec::new();
+        lists.blk_malloc_into(4, &mut reused).unwrap();
         assert_eq!(reused.len(), 4);
+    }
+
+    #[test]
+    fn array_free_list_reuses_buffers() {
+        let mut lists = FreeListManager::new();
+        let buf = vec![7; 16];
+        let original_capacity = buf.capacity();
+        lists.arr_free(buf);
+
+        let mut reused = Vec::new();
+        lists.arr_malloc_into(4, 2, &mut reused).unwrap();
+
+        assert_eq!(reused.len(), 8);
+        assert!(reused.capacity() >= original_capacity);
+        assert_eq!(lists.get_free_list_sizes().array_bytes, 0);
     }
 }

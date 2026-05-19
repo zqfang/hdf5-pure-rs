@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::fmt::{self, Write};
 
 use crate::error::{Error, Result};
 
@@ -191,13 +192,22 @@ impl FreeSpaceManager {
         Self::new()
     }
 
-    /// Open an existing file free-space info structure from a list of sections.
-    pub fn open(sections: Vec<FreeSpaceSection>) -> Result<Self> {
+    /// Open an existing file free-space info structure from section records.
+    pub fn open_from_iter<I>(sections: I) -> Result<Self>
+    where
+        I: IntoIterator<Item = FreeSpaceSection>,
+    {
         let mut manager = Self::new();
         for section in sections {
             manager.sect_add(section)?;
         }
         Ok(manager)
+    }
+
+    /// Open an existing file free-space info structure from a list of sections.
+    #[deprecated(note = "use open_from_iter to avoid requiring Vec storage")]
+    pub fn open(sections: Vec<FreeSpaceSection>) -> Result<Self> {
+        Self::open_from_iter(sections)
     }
 
     /// Delete the free-space manager state on disk.
@@ -245,9 +255,9 @@ impl FreeSpaceManager {
         self.dirty = true;
     }
 
-    /// Allocate space for the free-space manager header (returns the create params).
-    pub fn alloc_hdr(&self) -> FreeSpaceCreateParams {
-        self.params.clone()
+    /// Borrow the create parameters used for the free-space manager header.
+    pub fn alloc_hdr_ref(&self) -> &FreeSpaceCreateParams {
+        &self.params
     }
 
     /// Allocate a new free-space section record.
@@ -330,19 +340,20 @@ impl FreeSpaceManager {
         self.dirty = false;
     }
 
-    /// Serialize the free-space header into a byte buffer with trailing checksum.
-    pub fn cache_hdr_serialize(&self) -> Result<Vec<u8>> {
+    /// Append the serialized free-space header image with trailing checksum to `out`.
+    pub fn cache_hdr_serialize_into(&self, out: &mut Vec<u8>) -> Result<()> {
         if self.params.alignment == 0 {
             return Err(Error::InvalidFormat(
                 "free-space header alignment is zero".into(),
             ));
         }
-        let mut out = Vec::with_capacity(self.cache_hdr_image_len());
+        out.reserve(self.cache_hdr_image_len());
+        let start = out.len();
         out.extend_from_slice(&self.params.alignment.to_le_bytes());
         out.extend_from_slice(&self.params.threshold.to_le_bytes());
-        let checksum = crate::format::checksum::checksum_metadata(&out);
+        let checksum = crate::format::checksum::checksum_metadata(&out[start..]);
         out.extend_from_slice(&checksum.to_le_bytes());
-        Ok(out)
+        Ok(())
     }
 
     /// Cache action notification hook for the header (no-op).
@@ -376,8 +387,8 @@ impl FreeSpaceManager {
             ));
         }
         Self::cache_sinfo_verify_chksum(data)?;
+        let mut manager = Self::new();
         let mut pos = 0usize;
-        let mut sections = Vec::new();
         while pos < payload_end {
             let end = pos
                 .checked_add(section_size)
@@ -385,10 +396,10 @@ impl FreeSpaceManager {
             let section = data.get(pos..end).ok_or_else(|| {
                 Error::InvalidFormat("free-space section info is truncated".into())
             })?;
-            sections.push(FreeSpaceSection::deserialize(section)?);
+            manager.sect_add(FreeSpaceSection::deserialize(section)?)?;
             pos = end;
         }
-        Self::open(sections)
+        Ok(manager)
     }
 
     /// Compute the on-disk size of the section-info image including its checksum.
@@ -407,15 +418,16 @@ impl FreeSpaceManager {
         self.dirty = false;
     }
 
-    /// Serialize the section info into a byte buffer with trailing checksum.
-    pub fn cache_sinfo_serialize(&self) -> Result<Vec<u8>> {
-        let mut out = Vec::with_capacity(self.cache_sinfo_image_len()?);
+    /// Append the serialized section-info image with trailing checksum to `out`.
+    pub fn cache_sinfo_serialize_into(&self, out: &mut Vec<u8>) -> Result<()> {
+        out.reserve(self.cache_sinfo_image_len()?);
+        let start = out.len();
         for section in self.sections.values() {
-            section.serialize_checked(&mut out)?;
+            section.serialize_checked(out)?;
         }
-        let checksum = crate::format::checksum::checksum_metadata(&out);
+        let checksum = crate::format::checksum::checksum_metadata(&out[start..]);
         out.extend_from_slice(&checksum.to_le_bytes());
-        Ok(out)
+        Ok(())
     }
 
     /// Cache action notification hook for the section info (no-op).
@@ -437,17 +449,14 @@ impl FreeSpaceManager {
         Ok(())
     }
 
-    /// Initialize the common section-class table.
-    pub fn sect_init_cls() -> Vec<FreeSpaceClass> {
-        vec![
+    /// Borrow the common section-class table.
+    pub fn sect_classes() -> &'static [FreeSpaceClass] {
+        &[
             FreeSpaceClass::Simple,
             FreeSpaceClass::Small,
             FreeSpaceClass::Large,
         ]
     }
-
-    /// Terminate the common section-class table.
-    pub fn sect_term_cls(_classes: Vec<FreeSpaceClass>) {}
 
     /// Allocate a free-space section node of a particular type.
     pub fn sect_node_new(section: FreeSpaceSection) -> FreeSpaceSection {
@@ -481,26 +490,34 @@ impl FreeSpaceManager {
         Ok(stats)
     }
 
-    /// Print debugging info about the free-space manager.
-    pub fn debug(&self) -> String {
+    /// Write debugging info about the free-space manager into `out`.
+    pub fn write_debug<W: Write>(&self, out: &mut W) -> fmt::Result {
         let stats = self.stat_info();
-        format!(
+        write!(
+            out,
             "FreeSpaceManager(sections={}, total_space={}, largest_section={})",
             stats.section_count, stats.total_space, stats.largest_section
         )
     }
 
-    /// Print debugging info about a single free-space section.
-    pub fn sect_debug(section: &FreeSpaceSection) -> String {
-        format!(
+    /// Write debugging info about a single free-space section into `out`.
+    pub fn write_sect_debug<W: Write>(section: &FreeSpaceSection, out: &mut W) -> fmt::Result {
+        write!(
+            out,
             "FreeSpaceSection(addr={:#x}, size={}, class={:?})",
             section.addr, section.size, section.class
         )
     }
 
-    /// Print debugging info for all tracked sections.
-    pub fn sects_debug(&self) -> Vec<String> {
-        self.sections.values().map(Self::sect_debug).collect()
+    /// Write debugging info for all tracked sections into `out`.
+    pub fn write_sects_debug<W: Write>(&self, out: &mut W) -> fmt::Result {
+        for (idx, section) in self.sections.values().enumerate() {
+            if idx != 0 {
+                out.write_char('\n')?;
+            }
+            Self::write_sect_debug(section, out)?;
+        }
+        Ok(())
     }
 
     /// Create a fresh section-info structure.
@@ -637,25 +654,51 @@ impl FreeSpaceManager {
 
     /// Allocate space from the free list, splitting the section if necessary.
     pub fn sect_find(&mut self, size: u64) -> Result<Option<FreeSpaceSection>> {
-        let Some((&addr, section)) = self
+        self.sect_find_matching(size, |_| true)
+    }
+
+    /// Allocate space from a matching free-list section, splitting it if necessary.
+    pub fn sect_find_matching<F>(
+        &mut self,
+        size: u64,
+        mut predicate: F,
+    ) -> Result<Option<FreeSpaceSection>>
+    where
+        F: FnMut(&FreeSpaceSection) -> bool,
+    {
+        let Some((&addr, _)) = self
             .sections
             .iter()
-            .find(|(_, section)| section.size >= size)
+            .find(|(_, section)| section.size >= size && predicate(section))
         else {
             return Ok(None);
         };
-        let mut section = section.clone();
+        let mut section = self.sections.remove(&addr).ok_or_else(|| {
+            Error::InvalidFormat(format!("free-space section {addr:#x} not found"))
+        })?;
         if section.size == size {
-            self.sections.remove(&addr);
             self.dirty = true;
             Ok(Some(section))
         } else {
             let allocated = section.split(size)?;
-            self.sections.remove(&addr);
             self.sections.insert(section.addr, section);
             self.dirty = true;
             Ok(Some(allocated))
         }
+    }
+
+    /// Allocate space from a free-list section of `class`, splitting it if necessary.
+    pub fn sect_find_by_class(
+        &mut self,
+        class: FreeSpaceClass,
+        size: u64,
+    ) -> Result<Option<FreeSpaceSection>> {
+        self.sect_find_matching(size, |section| section.class == class)
+    }
+
+    /// Borrow all sections managed by the free-space header in address order.
+    pub fn sections(&self) -> impl Iterator<Item = &FreeSpaceSection> {
+        self.sections.values()
     }
 
     /// Skip-list iterator callback that invokes `f` for each section.
@@ -712,9 +755,9 @@ impl FreeSpaceManager {
         Ok(self.sections.remove(&addr))
     }
 
-    /// Retrieve the create parameters used by this manager (test helper).
-    pub fn get_cparam_test(&self) -> FreeSpaceCreateParams {
-        self.params.clone()
+    /// Borrow the create parameters used by this manager (test helper).
+    pub fn get_cparam_test_ref(&self) -> &FreeSpaceCreateParams {
+        &self.params
     }
 
     /// Compare two sets of create parameters for equality (test helper).
@@ -796,7 +839,8 @@ mod tests {
     fn section_info_roundtrips_with_checksum() {
         let mut fs = FreeSpaceManager::new();
         fs.free(64, 32).unwrap();
-        let image = fs.cache_sinfo_serialize().unwrap();
+        let mut image = Vec::new();
+        fs.cache_sinfo_serialize_into(&mut image).unwrap();
         let decoded = FreeSpaceManager::cache_sinfo_deserialize(&image).unwrap();
         assert_eq!(decoded.get_sect_count(), 1);
     }
@@ -807,7 +851,8 @@ mod tests {
         fs.params.alignment = 8;
         fs.params.threshold = 4096;
 
-        let image = fs.cache_hdr_serialize().unwrap();
+        let mut image = Vec::new();
+        fs.cache_hdr_serialize_into(&mut image).unwrap();
         let decoded = FreeSpaceManager::cache_hdr_deserialize(&image).unwrap();
         assert_eq!(decoded.params.alignment, 8);
         assert_eq!(decoded.params.threshold, 4096);
@@ -829,7 +874,7 @@ mod tests {
         assert!(matches!(err, Error::InvalidFormat(_)));
 
         fs.params.alignment = 0;
-        let err = fs.cache_hdr_serialize().unwrap_err();
+        let err = fs.cache_hdr_serialize_into(&mut Vec::new()).unwrap_err();
         assert!(matches!(err, Error::InvalidFormat(_)));
     }
 
@@ -853,13 +898,17 @@ mod tests {
     fn section_info_rejects_bad_checksum() {
         let mut fs = FreeSpaceManager::new();
         fs.free(64, 32).unwrap();
-        let mut image = fs.cache_sinfo_serialize().unwrap();
+        let mut image = Vec::new();
+        fs.cache_sinfo_serialize_into(&mut image).unwrap();
         *image.last_mut().unwrap() ^= 0x80;
 
         let err = FreeSpaceManager::cache_sinfo_deserialize(&image).unwrap_err();
         assert!(matches!(err, Error::InvalidFormat(_)));
 
-        let mut empty_image = FreeSpaceManager::new().cache_sinfo_serialize().unwrap();
+        let mut empty_image = Vec::new();
+        FreeSpaceManager::new()
+            .cache_sinfo_serialize_into(&mut empty_image)
+            .unwrap();
         assert_eq!(empty_image.len(), 4);
         *empty_image.last_mut().unwrap() ^= 0x80;
         let err = FreeSpaceManager::cache_sinfo_deserialize(&empty_image).unwrap_err();
@@ -878,7 +927,7 @@ mod tests {
 
         let mut fs = FreeSpaceManager::new();
         fs.sections.insert(invalid.addr, invalid);
-        assert!(fs.cache_sinfo_serialize().is_err());
+        assert!(fs.cache_sinfo_serialize_into(&mut Vec::new()).is_err());
 
         let valid = FreeSpaceSection::new(4, 8, FreeSpaceClass::Small).unwrap();
         assert!(FreeSpaceManager::sinfo_serialize_node_cb(&[valid], &mut out).is_ok());
@@ -907,6 +956,25 @@ mod tests {
         assert!(fs.stat_info_checked().is_err());
         assert!(fs.sect_stats_checked().is_err());
         assert_eq!(fs.stat_info().total_space, u64::MAX);
+    }
+
+    #[test]
+    fn matching_allocation_moves_section_without_staging_clone() {
+        let mut fs = FreeSpaceManager::new();
+        fs.sect_add(FreeSpaceSection::new(100, 8, FreeSpaceClass::Small).unwrap())
+            .unwrap();
+        fs.sect_add(FreeSpaceSection::new(200, 16, FreeSpaceClass::Large).unwrap())
+            .unwrap();
+
+        let allocated = fs
+            .sect_find_matching(4, |section| section.class == FreeSpaceClass::Large)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(allocated.addr, 200);
+        assert_eq!(allocated.size, 4);
+        assert_eq!(fs.sect_find_node(12).unwrap().addr, 204);
+        assert!(fs.sections().any(|section| section.addr == 100));
     }
 
     #[test]

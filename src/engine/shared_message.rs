@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::fmt::{self, Write};
 
 use crate::error::{Error, Result};
 
@@ -46,17 +47,16 @@ impl SharedMessage {
             .ok_or_else(|| Error::InvalidFormat("shared message image length overflow".into()))
     }
 
-    /// Serialize this shared message into a byte buffer.
-    pub fn encode(&self) -> Result<Vec<u8>> {
+    /// Append this shared message's encoded representation to `out`.
+    pub fn encode_into(&self, out: &mut impl Extend<u8>) -> Result<()> {
         let data_len = u32::try_from(self.data.len()).map_err(|_| {
             Error::InvalidFormat("shared message payload is too large to encode".into())
         })?;
-        let mut out = Vec::with_capacity(self.encoded_len_checked()?);
-        out.push(self.msg_type);
-        out.extend_from_slice(&self.heap_addr.to_le_bytes());
-        out.extend_from_slice(&data_len.to_le_bytes());
-        out.extend_from_slice(&self.data);
-        Ok(out)
+        out.extend([self.msg_type]);
+        out.extend(self.heap_addr.to_le_bytes());
+        out.extend(data_len.to_le_bytes());
+        out.extend(self.data.iter().copied());
+        Ok(())
     }
 }
 
@@ -93,13 +93,12 @@ impl SharedMessageStore {
         })
     }
 
-    /// Serialize the contents of the shared message table into a byte buffer.
-    pub fn cache_table_serialize(&self) -> Result<Vec<u8>> {
-        let mut out = Vec::with_capacity(self.cache_table_image_len_checked()?);
+    /// Append the serialized shared message table image to `out`.
+    pub fn cache_table_serialize_into(&self, out: &mut impl Extend<u8>) -> Result<()> {
         for message in self.messages.values() {
-            out.extend_from_slice(&message.encode()?);
+            message.encode_into(out)?;
         }
-        Ok(out)
+        Ok(())
     }
 
     /// Free memory used by the SOHM table image.
@@ -124,8 +123,15 @@ impl SharedMessageStore {
 
     /// Deserialize a buffer containing the on-disk image of a SOHM message list.
     pub fn cache_list_deserialize(bytes: &[u8]) -> Result<Self> {
+        let mut store = Self::default();
+        store.cache_list_deserialize_into(bytes)?;
+        Ok(store)
+    }
+
+    /// Deserialize a SOHM message list into this store, reusing the map allocation.
+    pub fn cache_list_deserialize_into(&mut self, bytes: &[u8]) -> Result<()> {
         let mut pos = 0usize;
-        let mut messages = BTreeMap::new();
+        self.messages.clear();
         while pos < bytes.len() {
             let remaining = bytes.len() - pos;
             if remaining < 13 {
@@ -152,9 +158,10 @@ impl SharedMessageStore {
                 })?
                 .to_vec();
             pos = data_end;
-            messages.insert(heap_addr, SharedMessage::new(msg_type, heap_addr, data));
+            self.messages
+                .insert(heap_addr, SharedMessage::new(msg_type, heap_addr, data));
         }
-        Ok(Self { messages })
+        Ok(())
     }
 
     /// Compute the on-disk size of the shared message list.
@@ -167,9 +174,9 @@ impl SharedMessageStore {
         self.cache_table_image_len_checked()
     }
 
-    /// Serialize the contents of the shared message list into a byte buffer.
-    pub fn cache_list_serialize(&self) -> Result<Vec<u8>> {
-        self.cache_table_serialize()
+    /// Append the serialized shared message list image to `out`.
+    pub fn cache_list_serialize_into(&self, out: &mut impl Extend<u8>) -> Result<()> {
+        self.cache_table_serialize_into(out)
     }
 
     /// Free memory used by the SOHM list image.
@@ -211,9 +218,26 @@ impl SharedMessageStore {
     /// Create a fresh list of SOHM messages for a newly created or converted index.
     pub fn create_list(&mut self) {}
 
-    /// B-tree remove callback that converts a SOHM B-tree index back to a list form.
-    pub fn bt2_convert_to_list_op(&self) -> Vec<SharedMessage> {
-        self.messages.values().cloned().collect()
+    /// Append cloned messages in key order to `out`.
+    pub fn clone_messages_into(&self, out: &mut impl Extend<SharedMessage>) {
+        out.extend(self.messages.values().cloned());
+    }
+
+    /// Consume the store and iterate over messages in key order without cloning.
+    pub fn into_messages(self) -> impl Iterator<Item = SharedMessage> {
+        self.messages.into_values()
+    }
+
+    /// Borrow all shared messages in key order.
+    pub fn messages(&self) -> impl Iterator<Item = &SharedMessage> {
+        self.messages.values()
+    }
+
+    /// Visit all shared messages in key order.
+    pub fn visit_messages<F: FnMut(&SharedMessage)>(&self, mut f: F) {
+        for message in self.messages.values() {
+            f(message);
+        }
     }
 
     /// Trivial check for whether an object header message is shareable.
@@ -278,8 +302,8 @@ impl SharedMessageStore {
         }
     }
 
-    /// Reconstitute a shared message store from a plain (key, message) collection.
-    pub fn reconstitute(messages: Vec<(u64, SharedMessage)>) -> Self {
+    /// Reconstitute a shared message store from a plain (key, message) iterator.
+    pub fn reconstitute(messages: impl IntoIterator<Item = (u64, SharedMessage)>) -> Self {
         Self {
             messages: messages.into_iter().collect(),
         }
@@ -310,14 +334,14 @@ impl SharedMessageStore {
         self.messages.clear();
     }
 
-    /// Format debugging information for the SOHM master table.
-    pub fn table_debug(&self) -> String {
-        format!("{:?}", self.messages)
+    /// Write debugging information for the SOHM master table into `out`.
+    pub fn write_table_debug<W: Write>(&self, out: &mut W) -> fmt::Result {
+        write!(out, "{:?}", self.messages)
     }
 
-    /// Format debugging information for a SOHM list.
-    pub fn list_debug(&self) -> String {
-        self.table_debug()
+    /// Write debugging information for a SOHM list into `out`.
+    pub fn write_list_debug<W: Write>(&self, out: &mut W) -> fmt::Result {
+        self.write_table_debug(out)
     }
 
     /// Sum of storage used by header, B-tree/list and fractal heap entries.
@@ -342,9 +366,9 @@ impl SharedMessageStore {
             .then_with(|| lhs.data.cmp(&rhs.data))
     }
 
-    /// Serialize a [`SharedMessage`] into a raw buffer.
-    pub fn message_encode(msg: &SharedMessage) -> Result<Vec<u8>> {
-        msg.encode()
+    /// Append a [`SharedMessage`] raw encoding into `out`.
+    pub fn message_encode_into(msg: &SharedMessage, out: &mut impl Extend<u8>) -> Result<()> {
+        msg.encode_into(out)
     }
 
     /// Create the client callback context used by the v2 B-tree backing store.
@@ -360,9 +384,9 @@ impl SharedMessageStore {
         self.write_mesg(key, msg);
     }
 
-    /// Format debugging information for a SOHM v2 B-tree record.
-    pub fn bt2_debug(&self) -> String {
-        self.table_debug()
+    /// Write debugging information for a SOHM v2 B-tree record into `out`.
+    pub fn write_bt2_debug<W: Write>(&self, out: &mut W) -> fmt::Result {
+        self.write_table_debug(out)
     }
 }
 
@@ -422,10 +446,13 @@ pub fn H5SM__cache_table_image_len_checked(store: &SharedMessageStore) -> Result
     store.cache_table_image_len_checked()
 }
 
-/// C-name alias for [`SharedMessageStore::cache_table_serialize`].
+/// C-name alias for [`SharedMessageStore::cache_table_serialize_into`].
 #[allow(non_snake_case)]
-pub fn H5SM__cache_table_serialize(store: &SharedMessageStore) -> Result<Vec<u8>> {
-    store.cache_table_serialize()
+pub fn H5SM__cache_table_serialize_into(
+    store: &SharedMessageStore,
+    out: &mut impl Extend<u8>,
+) -> Result<()> {
+    store.cache_table_serialize_into(out)
 }
 
 /// C-name alias for [`SharedMessageStore::cache_table_free_icr`].
@@ -458,6 +485,15 @@ pub fn H5SM__cache_list_deserialize(bytes: &[u8]) -> Result<SharedMessageStore> 
     SharedMessageStore::cache_list_deserialize(bytes)
 }
 
+/// C-name alias for [`SharedMessageStore::cache_list_deserialize_into`].
+#[allow(non_snake_case)]
+pub fn H5SM__cache_list_deserialize_into(
+    store: &mut SharedMessageStore,
+    bytes: &[u8],
+) -> Result<()> {
+    store.cache_list_deserialize_into(bytes)
+}
+
 /// C-name alias for [`SharedMessageStore::cache_list_image_len`].
 #[allow(non_snake_case)]
 pub fn H5SM__cache_list_image_len(store: &SharedMessageStore) -> usize {
@@ -470,10 +506,13 @@ pub fn H5SM__cache_list_image_len_checked(store: &SharedMessageStore) -> Result<
     store.cache_list_image_len_checked()
 }
 
-/// C-name alias for [`SharedMessageStore::cache_list_serialize`].
+/// C-name alias for [`SharedMessageStore::cache_list_serialize_into`].
 #[allow(non_snake_case)]
-pub fn H5SM__cache_list_serialize(store: &SharedMessageStore) -> Result<Vec<u8>> {
-    store.cache_list_serialize()
+pub fn H5SM__cache_list_serialize_into(
+    store: &SharedMessageStore,
+    out: &mut impl Extend<u8>,
+) -> Result<()> {
+    store.cache_list_serialize_into(out)
 }
 
 /// C-name alias for [`SharedMessageStore::cache_list_free_icr`].
@@ -530,10 +569,22 @@ pub fn H5SM__create_list(store: &mut SharedMessageStore) {
     store.create_list()
 }
 
-/// C-name alias for [`SharedMessageStore::bt2_convert_to_list_op`].
+/// C-name alias for [`SharedMessageStore::clone_messages_into`].
 #[allow(non_snake_case)]
-pub fn H5SM__bt2_convert_to_list_op(store: &SharedMessageStore) -> Vec<SharedMessage> {
-    store.bt2_convert_to_list_op()
+pub fn H5SM_clone_messages_into(store: &SharedMessageStore, out: &mut impl Extend<SharedMessage>) {
+    store.clone_messages_into(out)
+}
+
+/// C-name alias for [`SharedMessageStore::into_messages`].
+#[allow(non_snake_case)]
+pub fn H5SM_into_messages(store: SharedMessageStore) -> impl Iterator<Item = SharedMessage> {
+    store.into_messages()
+}
+
+/// C-name alias for [`SharedMessageStore::messages`].
+#[allow(non_snake_case)]
+pub fn H5SM_messages(store: &SharedMessageStore) -> impl Iterator<Item = &SharedMessage> {
+    store.messages()
 }
 
 /// C-name alias for [`SharedMessageStore::can_share_common`].
@@ -598,7 +649,9 @@ pub fn H5SM_get_info(store: &SharedMessageStore) -> SharedMessageInfo {
 
 /// C-name alias for [`SharedMessageStore::reconstitute`].
 #[allow(non_snake_case)]
-pub fn H5SM_reconstitute(messages: Vec<(u64, SharedMessage)>) -> SharedMessageStore {
+pub fn H5SM_reconstitute(
+    messages: impl IntoIterator<Item = (u64, SharedMessage)>,
+) -> SharedMessageStore {
     SharedMessageStore::reconstitute(messages)
 }
 
@@ -632,16 +685,16 @@ pub fn H5SM__list_free(store: &mut SharedMessageStore) {
     store.list_free()
 }
 
-/// C-name alias for [`SharedMessageStore::table_debug`].
+/// C-name alias for [`SharedMessageStore::write_table_debug`].
 #[allow(non_snake_case)]
-pub fn H5SM_table_debug(store: &SharedMessageStore) -> String {
-    store.table_debug()
+pub fn H5SM_write_table_debug<W: Write>(store: &SharedMessageStore, out: &mut W) -> fmt::Result {
+    store.write_table_debug(out)
 }
 
-/// C-name alias for [`SharedMessageStore::list_debug`].
+/// C-name alias for [`SharedMessageStore::write_list_debug`].
 #[allow(non_snake_case)]
-pub fn H5SM_list_debug(store: &SharedMessageStore) -> String {
-    store.list_debug()
+pub fn H5SM_write_list_debug<W: Write>(store: &SharedMessageStore, out: &mut W) -> fmt::Result {
+    store.write_list_debug(out)
 }
 
 /// C-name alias for [`SharedMessageStore::ih_size`].
@@ -668,10 +721,10 @@ pub fn H5SM__message_compare(lhs: &SharedMessage, rhs: &SharedMessage) -> std::c
     SharedMessageStore::message_compare(lhs, rhs)
 }
 
-/// C-name alias for [`SharedMessageStore::message_encode`].
+/// C-name alias for [`SharedMessageStore::message_encode_into`].
 #[allow(non_snake_case)]
-pub fn H5SM__message_encode(msg: &SharedMessage) -> Result<Vec<u8>> {
-    SharedMessageStore::message_encode(msg)
+pub fn H5SM__message_encode_into(msg: &SharedMessage, out: &mut impl Extend<u8>) -> Result<()> {
+    SharedMessageStore::message_encode_into(msg, out)
 }
 
 /// C-name alias for [`SharedMessageStore::bt2_crt_context`].
@@ -692,10 +745,10 @@ pub fn H5SM__bt2_store(store: &mut SharedMessageStore, key: u64, msg: SharedMess
     store.bt2_store(key, msg)
 }
 
-/// C-name alias for [`SharedMessageStore::bt2_debug`].
+/// C-name alias for [`SharedMessageStore::write_bt2_debug`].
 #[allow(non_snake_case)]
-pub fn H5SM__bt2_debug(store: &SharedMessageStore) -> String {
-    store.bt2_debug()
+pub fn H5SM__write_bt2_debug<W: Write>(store: &SharedMessageStore, out: &mut W) -> fmt::Result {
+    store.write_bt2_debug(out)
 }
 
 #[cfg(test)]
@@ -724,27 +777,39 @@ mod tests {
         assert!(store.cache_table_image_len() >= msg.encoded_len());
         assert_eq!(store.cache_table_image_len_checked().unwrap(), 16);
         assert_eq!(store.cache_list_image_len_checked().unwrap(), 16);
-        assert_eq!(
-            SharedMessageStore::message_encode(&msg).unwrap(),
-            msg.encode().unwrap()
-        );
+        let mut encoded = Vec::new();
+        SharedMessageStore::message_encode_into(&msg, &mut encoded).unwrap();
+        let mut encoded_direct = Vec::new();
+        msg.encode_into(&mut encoded_direct).unwrap();
+        assert_eq!(encoded, encoded_direct);
         assert_eq!(store.get_info().count, 1);
-        assert!(store.table_debug().contains("SharedMessage"));
+        let mut debug = String::new();
+        store.write_table_debug(&mut debug).unwrap();
+        assert!(debug.contains("SharedMessage"));
 
-        let bytes = store.cache_list_serialize().unwrap();
+        let mut bytes = Vec::new();
+        store.cache_list_serialize_into(&mut bytes).unwrap();
         let decoded = SharedMessageStore::cache_list_deserialize(&bytes).unwrap();
         assert_eq!(decoded.get_mesg_count_test(), 1);
         assert_eq!(decoded.find_in_list(99).unwrap().data, vec![1, 2, 3]);
         SharedMessageStore::cache_table_free_icr(bytes.clone());
         SharedMessageStore::cache_list_free_icr(bytes);
-        assert_eq!(store.bt2_convert_to_list_op().len(), 1);
+        assert_eq!(store.messages().count(), 1);
+        let mut cloned_messages = Vec::new();
+        store.clone_messages_into(&mut cloned_messages);
+        assert_eq!(cloned_messages, vec![msg.clone()]);
 
         let mut rebuilt = SharedMessageStore::reconstitute(vec![(1, msg.clone())]);
-        rebuilt.bt2_store(2, msg);
+        rebuilt.bt2_store(2, msg.clone());
         assert_eq!(rebuilt.ih_size(), 2);
         rebuilt.delete_from_index(1);
         rebuilt.table_free();
         assert_eq!(rebuilt.ih_size(), 0);
+
+        let consumed = SharedMessageStore::reconstitute([(3, msg)])
+            .into_messages()
+            .collect::<Vec<_>>();
+        assert_eq!(consumed.len(), 1);
     }
 
     #[test]
@@ -763,7 +828,11 @@ mod tests {
             H5SM__compare_iter_op(&msg, &other),
             std::cmp::Ordering::Less
         );
-        assert_eq!(H5SM__message_encode(&msg).unwrap(), msg.encode().unwrap());
+        let mut encoded = Vec::new();
+        H5SM__message_encode_into(&msg, &mut encoded).unwrap();
+        let mut encoded_direct = Vec::new();
+        msg.encode_into(&mut encoded_direct).unwrap();
+        assert_eq!(encoded, encoded_direct);
 
         let mut store = H5SM_init();
         H5SM__create_index(&mut store);
@@ -779,10 +848,15 @@ mod tests {
         assert_eq!(H5SM__find_in_list(&store, 10), Some(&msg));
         assert_eq!(H5SM_get_info(&store).count, 1);
         assert_eq!(H5SM_ih_size(&store), 1);
-        assert!(H5SM_table_debug(&store).contains("SharedMessage"));
-        assert!(H5SM_list_debug(&store).contains("SharedMessage"));
+        let mut table_debug = String::new();
+        H5SM_write_table_debug(&store, &mut table_debug).unwrap();
+        assert!(table_debug.contains("SharedMessage"));
+        let mut list_debug = String::new();
+        H5SM_write_list_debug(&store, &mut list_debug).unwrap();
+        assert!(list_debug.contains("SharedMessage"));
 
-        let table_image = H5SM__cache_table_serialize(&store).unwrap();
+        let mut table_image = Vec::new();
+        H5SM__cache_table_serialize_into(&store, &mut table_image).unwrap();
         let table_checksum = crc32fast::hash(&table_image);
         assert!(H5SM__cache_table_verify_chksum(
             &table_image,
@@ -800,7 +874,8 @@ mod tests {
         );
         H5SM__cache_table_free_icr(table_image.clone());
 
-        let list_image = H5SM__cache_list_serialize(&store).unwrap();
+        let mut list_image = Vec::new();
+        H5SM__cache_list_serialize_into(&store, &mut list_image).unwrap();
         let list_checksum = crc32fast::hash(&list_image);
         assert!(H5SM__cache_list_verify_chksum(&list_image, list_checksum));
         let decoded = H5SM__cache_list_deserialize(&list_image).unwrap();
@@ -817,11 +892,23 @@ mod tests {
             24
         );
         H5SM__cache_list_free_icr(list_image);
-        assert_eq!(H5SM__bt2_convert_to_list_op(&store), vec![msg.clone()]);
+        assert_eq!(
+            H5SM_messages(&store).cloned().collect::<Vec<_>>(),
+            vec![msg.clone()]
+        );
+        let mut cloned_messages = Vec::new();
+        H5SM_clone_messages_into(&store, &mut cloned_messages);
+        assert_eq!(cloned_messages, vec![msg.clone()]);
+        assert_eq!(
+            H5SM_into_messages(H5SM_reconstitute([(1, msg.clone())])).collect::<Vec<_>>(),
+            vec![msg.clone()]
+        );
 
         let mut bt2 = H5SM__bt2_crt_context();
         H5SM__bt2_store(&mut bt2, 1, msg.clone());
-        assert!(H5SM__bt2_debug(&bt2).contains("SharedMessage"));
+        let mut bt2_debug = String::new();
+        H5SM__write_bt2_debug(&bt2, &mut bt2_debug).unwrap();
+        assert!(bt2_debug.contains("SharedMessage"));
         H5SM__bt2_dst_context(bt2);
 
         H5SM__write_mesg(&mut store, 20, other.clone());

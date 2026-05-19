@@ -1,4 +1,6 @@
+use std::collections::btree_map;
 use std::collections::BTreeMap;
+use std::fmt;
 
 use crate::error::{Error, Result};
 
@@ -45,12 +47,28 @@ impl PageBuffer {
         self.stats = PageBufferStats::default();
     }
 
-    pub fn get_stats(&self) -> PageBufferStats {
-        self.stats.clone()
+    pub fn stats_ref(&self) -> &PageBufferStats {
+        &self.stats
     }
 
-    pub fn print_stats(&self) -> String {
-        format!(
+    pub fn entries(&self) -> btree_map::Values<'_, u64, PageEntry> {
+        self.entries.values()
+    }
+
+    pub fn entry_ref(&self, addr: u64) -> Option<&PageEntry> {
+        self.entries.get(&addr)
+    }
+
+    pub fn entry_data(&self, addr: u64) -> Option<&[u8]> {
+        self.entry_ref(addr).map(|entry| entry.data.as_slice())
+    }
+
+    pub fn print_stats_fmt<W>(&self, out: &mut W) -> fmt::Result
+    where
+        W: fmt::Write + ?Sized,
+    {
+        write!(
+            out,
             "PageBufferStats(accesses={}, hits={}, misses={}, evictions={}, writes={})",
             self.stats.accesses,
             self.stats.hits,
@@ -58,6 +76,12 @@ impl PageBuffer {
             self.stats.evictions,
             self.stats.writes
         )
+    }
+
+    pub fn print_stats_into(&self, out: &mut String) {
+        out.clear();
+        self.print_stats_fmt(out)
+            .expect("writing to String cannot fail");
     }
 
     pub fn flush_cb(entry: &mut PageEntry) {
@@ -91,7 +115,16 @@ impl PageBuffer {
     }
 
     pub fn add_new_page_from_slice(&mut self, addr: u64, data: &[u8]) -> Result<()> {
-        self.add_new_page(addr, data.to_vec())
+        if data.len() > self.page_size {
+            return Err(Error::InvalidFormat(
+                "page buffer entry exceeds page size".into(),
+            ));
+        }
+        self.insert_entry(PageEntry {
+            addr,
+            data: data.to_vec(),
+            dirty: false,
+        })
     }
 
     pub fn update_entry(&mut self, addr: u64, data: Vec<u8>) -> Result<()> {
@@ -118,28 +151,35 @@ impl PageBuffer {
         let entry = self.entries.get_mut(&addr).ok_or_else(|| {
             Error::InvalidFormat(format!("page buffer entry {addr:#x} not found"))
         })?;
-        entry.data.resize(data.len(), 0);
-        entry.data.copy_from_slice(data);
-        entry.dirty = true;
+        Self::write_entry_from_slice(entry, data);
         self.stats.writes = self.stats.writes.saturating_add(1);
         Ok(())
+    }
+
+    pub fn update_entry_from_slice_ref(&mut self, addr: u64, data: &[u8]) -> Result<&PageEntry> {
+        self.update_entry_from_slice(addr, data)?;
+        self.entry_ref(addr)
+            .ok_or_else(|| Error::InvalidFormat(format!("page buffer entry {addr:#x} not found")))
+    }
+
+    pub fn update_entry_from_slice_view(&mut self, addr: u64, data: &[u8]) -> Result<&[u8]> {
+        Ok(self
+            .update_entry_from_slice_ref(addr, data)?
+            .data
+            .as_slice())
+    }
+
+    pub fn replace_entry_data_from_slice(entry: &mut PageEntry, data: &[u8]) {
+        entry.data.clear();
+        entry.data.reserve(data.len());
+        entry.data.extend_from_slice(data);
+        entry.dirty = true;
     }
 
     pub fn remove_entry(&mut self, addr: u64) -> Result<PageEntry> {
         self.entries
             .remove(&addr)
             .ok_or_else(|| Error::InvalidFormat(format!("page buffer entry {addr:#x} not found")))
-    }
-
-    pub fn read(&mut self, addr: u64) -> Option<Vec<u8>> {
-        self.stats.accesses = self.stats.accesses.saturating_add(1);
-        if let Some(entry) = self.entries.get(&addr) {
-            self.stats.hits = self.stats.hits.saturating_add(1);
-            Some(entry.data.clone())
-        } else {
-            self.stats.misses = self.stats.misses.saturating_add(1);
-            None
-        }
     }
 
     pub fn read_view(&mut self, addr: u64) -> Option<&[u8]> {
@@ -171,31 +211,43 @@ impl PageBuffer {
     }
 
     pub fn write(&mut self, addr: u64, data: Vec<u8>) -> Result<()> {
-        if self.entries.contains_key(&addr) {
-            self.update_entry(addr, data)
-        } else {
-            self.insert_entry(PageEntry {
-                addr,
-                data,
-                dirty: true,
-            })?;
-            self.stats.writes = self.stats.writes.saturating_add(1);
-            Ok(())
+        if data.len() > self.page_size {
+            return Err(Error::InvalidFormat(
+                "page buffer entry exceeds page size".into(),
+            ));
         }
+        if let Some(entry) = self.entries.get_mut(&addr) {
+            Self::write_entry(entry, data);
+            self.stats.writes = self.stats.writes.saturating_add(1);
+            return Ok(());
+        }
+        self.insert_entry(PageEntry {
+            addr,
+            data,
+            dirty: true,
+        })?;
+        self.stats.writes = self.stats.writes.saturating_add(1);
+        Ok(())
     }
 
     pub fn write_slice(&mut self, addr: u64, data: &[u8]) -> Result<()> {
-        if self.entries.contains_key(&addr) {
-            self.update_entry_from_slice(addr, data)
-        } else {
-            self.insert_entry(PageEntry {
-                addr,
-                data: data.to_vec(),
-                dirty: true,
-            })?;
-            self.stats.writes = self.stats.writes.saturating_add(1);
-            Ok(())
+        if data.len() > self.page_size {
+            return Err(Error::InvalidFormat(
+                "page buffer entry exceeds page size".into(),
+            ));
         }
+        if let Some(entry) = self.entries.get_mut(&addr) {
+            Self::write_entry_from_slice(entry, data);
+            self.stats.writes = self.stats.writes.saturating_add(1);
+            return Ok(());
+        }
+        self.insert_entry(PageEntry {
+            addr,
+            data: data.to_vec(),
+            dirty: true,
+        })?;
+        self.stats.writes = self.stats.writes.saturating_add(1);
+        Ok(())
     }
 
     pub fn enabled(&self) -> bool {
@@ -226,6 +278,10 @@ impl PageBuffer {
         entry.data = data;
         entry.dirty = true;
     }
+
+    pub fn write_entry_from_slice(entry: &mut PageEntry, data: &[u8]) {
+        Self::replace_entry_data_from_slice(entry, data);
+    }
 }
 
 #[cfg(test)]
@@ -236,14 +292,18 @@ mod tests {
     fn page_buffer_tracks_hits_misses_and_evictions() {
         let mut pb = PageBuffer::create(8, 1).unwrap();
         pb.add_new_page(0, b"abc".to_vec()).unwrap();
-        assert_eq!(pb.read(0).unwrap(), b"abc");
-        assert!(pb.read(8).is_none());
+        assert_eq!(pb.read_view(0).unwrap(), b"abc");
+        assert!(pb.read_view(8).is_none());
         pb.add_new_page(8, b"def".to_vec()).unwrap();
-        assert!(pb.read(0).is_none());
-        let stats = pb.get_stats();
+        assert!(pb.read_view(0).is_none());
+        let stats = pb.stats_ref();
         assert_eq!(stats.hits, 1);
         assert_eq!(stats.misses, 2);
         assert_eq!(stats.evictions, 1);
+
+        let mut formatted = String::new();
+        pb.print_stats_into(&mut formatted);
+        assert!(formatted.contains("hits=1"));
     }
 
     #[test]
@@ -258,6 +318,12 @@ mod tests {
 
         pb.update_entry_from_slice(0, b"defg").unwrap();
         assert!(pb.read_into(0, &mut out).is_err());
-        assert_eq!(pb.read(0).unwrap(), b"defg");
+        assert_eq!(pb.read_view(0).unwrap(), b"defg");
+        assert_eq!(pb.entry_data(0).unwrap(), b"defg");
+        assert_eq!(pb.entries().count(), 1);
+
+        let updated = pb.update_entry_from_slice_view(0, b"xy").unwrap();
+        assert_eq!(updated, b"xy");
+        assert!(pb.entry_ref(0).unwrap().dirty);
     }
 }

@@ -5,7 +5,7 @@ use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use crate::error::{Error, Result};
 use crate::format::checksum::checksum_metadata;
 use crate::format::superblock::Superblock;
-use crate::hl::file::FileInner;
+use crate::hl::file::{FileInner, FileIntent};
 use crate::io::reader::HdfReader;
 
 use super::MutableFile;
@@ -15,7 +15,8 @@ impl MutableFile {
     pub(super) fn rewrite_oh_checksum(&mut self, oh_start: u64, check_len: usize) -> Result<()> {
         let mut guard = self.inner.lock();
         guard.reader.seek(oh_start)?;
-        let oh_data = guard.reader.read_bytes(check_len)?;
+        let mut oh_data = vec![0u8; check_len];
+        guard.reader.read_bytes_into(&mut oh_data)?;
         drop(guard);
 
         let checksum = checksum_metadata(&oh_data);
@@ -40,6 +41,7 @@ impl MutableFile {
             reader,
             superblock,
             path: Some(self.path.clone()),
+            intent: FileIntent::ReadWrite,
             access_plist: crate::hl::plist::file_access::FileAccess::default(),
             dset_no_attrs_hint: false,
             open_objects: HashMap::new(),
@@ -59,27 +61,22 @@ impl MutableFile {
             ));
         }
 
-        let chunks_per_dim: Vec<u64> = data_dims
-            .iter()
-            .zip(chunk_dims)
-            .map(|(&dim, &chunk)| {
-                if chunk == 0 {
-                    return Err(Error::InvalidFormat("zero chunk dimension".into()));
-                }
-                dim.checked_add(chunk - 1)
-                    .ok_or_else(|| Error::InvalidFormat("chunk count overflow".into()))
-                    .map(|extent| extent / chunk)
-            })
-            .collect::<Result<_>>()?;
         let mut index = 0usize;
-        for dim in 0..data_dims.len() {
-            let scaled = chunk_coords[dim] / chunk_dims[dim];
-            if scaled >= chunks_per_dim[dim] {
+        for ((&coord, &dim), &chunk) in chunk_coords.iter().zip(data_dims).zip(chunk_dims) {
+            if chunk == 0 {
+                return Err(Error::InvalidFormat("zero chunk dimension".into()));
+            }
+            let chunks_in_dim = dim
+                .checked_add(chunk - 1)
+                .ok_or_else(|| Error::InvalidFormat("chunk count overflow".into()))?
+                / chunk;
+            let scaled = coord / chunk;
+            if scaled >= chunks_in_dim {
                 return Err(Error::Unsupported(
                     "fixed-array chunk index updates can replace existing chunks only".into(),
                 ));
             }
-            let count = usize::try_from(chunks_per_dim[dim])
+            let count = usize::try_from(chunks_in_dim)
                 .map_err(|_| Error::InvalidFormat("chunks per dimension overflow".into()))?;
             let scaled = usize::try_from(scaled)
                 .map_err(|_| Error::InvalidFormat("chunk coordinate overflow".into()))?;
@@ -109,12 +106,29 @@ impl MutableFile {
     }
 
     pub(super) fn write_uint_le(&mut self, value: u64, size: usize) -> Result<()> {
-        let bytes = Self::encode_uint_le(value, size, "mutable metadata integer")?;
-        self.write_handle.write_all(&bytes)?;
+        let mut bytes = [0u8; 8];
+        let bytes = Self::encode_uint_le_into(value, &mut bytes, size, "mutable metadata integer")?;
+        self.write_handle.write_all(bytes)?;
         Ok(())
     }
 
-    pub(super) fn encode_uint_le(value: u64, size: usize, context: &str) -> Result<Vec<u8>> {
+    pub(super) fn encode_uint_le_into<'a>(
+        value: u64,
+        out: &'a mut [u8],
+        size: usize,
+        context: &str,
+    ) -> Result<&'a [u8]> {
+        Self::validate_uint_le(value, size, context)?;
+        if out.len() < size {
+            return Err(Error::InvalidFormat(format!(
+                "{context} output buffer is too small"
+            )));
+        }
+        out[..size].copy_from_slice(&value.to_le_bytes()[..size]);
+        Ok(&out[..size])
+    }
+
+    fn validate_uint_le(value: u64, size: usize, context: &str) -> Result<()> {
         if !(1..=8).contains(&size) {
             return Err(Error::InvalidFormat(format!(
                 "{context} integer width is invalid"
@@ -130,16 +144,31 @@ impl MutableFile {
                 )));
             }
         }
-        Ok(value.to_le_bytes()[..size].to_vec())
+        Ok(())
     }
 
-    pub(super) fn undefined_addr_bytes(size: usize, context: &str) -> Result<Vec<u8>> {
+    pub(super) fn undefined_addr_bytes_into<'a>(
+        out: &'a mut [u8],
+        size: usize,
+        context: &str,
+    ) -> Result<&'a [u8]> {
+        Self::validate_addr_size(size, context)?;
+        if out.len() < size {
+            return Err(Error::InvalidFormat(format!(
+                "{context} output buffer is too small"
+            )));
+        }
+        out[..size].fill(0xff);
+        Ok(&out[..size])
+    }
+
+    fn validate_addr_size(size: usize, context: &str) -> Result<()> {
         if !(1..=8).contains(&size) {
             return Err(Error::InvalidFormat(format!(
                 "{context} address width is invalid"
             )));
         }
-        Ok(vec![0xff; size])
+        Ok(())
     }
 
     pub(super) fn usize_to_u8(value: usize, context: &str) -> Result<u8> {
@@ -166,12 +195,21 @@ impl MutableFile {
         u32::try_from(value).map_err(|_| Error::InvalidFormat(format!("{context} exceeds u32")))
     }
 
-    pub(super) fn read_fresh_bytes(&self, offset: u64, len: usize) -> Result<Vec<u8>> {
+    pub(super) fn read_fresh_bytes_into(&self, offset: u64, out: &mut [u8]) -> Result<()> {
         let mut file = fs::File::open(&self.path)?;
         file.seek(SeekFrom::Start(offset))?;
-        let mut bytes = vec![0u8; len];
-        file.read_exact(&mut bytes)?;
-        Ok(bytes)
+        file.read_exact(out)?;
+        Ok(())
+    }
+
+    fn write_zeros(&mut self, mut size: usize) -> Result<()> {
+        const ZERO_BLOCK: [u8; 8192] = [0; 8192];
+        while size > 0 {
+            let chunk = size.min(ZERO_BLOCK.len());
+            self.write_handle.write_all(&ZERO_BLOCK[..chunk])?;
+            size -= chunk;
+        }
+        Ok(())
     }
 
     pub(super) fn append_aligned_zeros(&mut self, size: usize, align: u64) -> Result<u64> {
@@ -183,13 +221,13 @@ impl MutableFile {
         if padding != 0 {
             let padding = usize::try_from(padding)
                 .map_err(|_| Error::InvalidFormat("alignment padding overflow".into()))?;
-            self.write_handle.write_all(&vec![0u8; padding])?;
+            self.write_zeros(padding)?;
             let padding_u64 = Self::usize_to_u64(padding, "alignment padding")?;
             pos = pos
                 .checked_add(padding_u64)
                 .ok_or_else(|| Error::InvalidFormat("aligned append offset overflow".into()))?;
         }
-        self.write_handle.write_all(&vec![0u8; size])?;
+        self.write_zeros(size)?;
         Ok(pos)
     }
 }
@@ -252,11 +290,18 @@ mod tests {
             assert!(MutableFile::usize_to_u32(value, "element size").is_err());
         }
         assert!(MutableFile::u64_to_u32(u64::from(u32::MAX) + 1, "chunk size").is_err());
-        assert!(MutableFile::encode_uint_le(256, 1, "test integer").is_err());
-        assert!(MutableFile::encode_uint_le(0, 9, "test integer").is_err());
+        let mut out = [0u8; 8];
+        assert!(MutableFile::encode_uint_le_into(256, &mut out, 1, "test integer").is_err());
+        assert!(MutableFile::encode_uint_le_into(0, &mut out, 9, "test integer").is_err());
         assert_eq!(
-            MutableFile::undefined_addr_bytes(2, "test address").unwrap(),
-            vec![0xff, 0xff]
+            MutableFile::encode_uint_le_into(0x1234, &mut out, 2, "test integer").unwrap(),
+            &[0x34, 0x12]
         );
+        assert!(MutableFile::encode_uint_le_into(1, &mut out[..0], 1, "test integer").is_err());
+        assert_eq!(
+            MutableFile::undefined_addr_bytes_into(&mut out, 2, "test address").unwrap(),
+            &[0xff, 0xff]
+        );
+        assert!(MutableFile::undefined_addr_bytes_into(&mut out[..1], 2, "test address").is_err());
     }
 }

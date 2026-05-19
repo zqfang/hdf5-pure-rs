@@ -49,10 +49,10 @@ impl MutableFile {
         }
 
         let chunk_data_dims = Self::chunk_data_dims(&info)?;
-        Self::validate_chunk_coords(chunk_coords, &chunk_data_dims)?;
+        Self::validate_chunk_coords(chunk_coords, chunk_data_dims)?;
 
         let element_size = Self::u64_to_usize(u64::from(info.datatype.size), "datatype size")?;
-        let expected_len = Self::expected_chunk_len(&chunk_data_dims, element_size)?;
+        let expected_len = Self::expected_chunk_len(chunk_data_dims, element_size)?;
         Self::validate_chunk_write_len(data.len(), expected_len)?;
         let filtered = Self::encode_chunk_write_data(&info, data, element_size)?;
 
@@ -67,7 +67,7 @@ impl MutableFile {
             index_addr,
             &info,
             chunk_coords,
-            &chunk_data_dims,
+            chunk_data_dims,
             Self::usize_to_u64(filtered.len(), "filtered chunk size")?,
             chunk_addr,
             expected_len,
@@ -79,16 +79,16 @@ impl MutableFile {
         Ok(())
     }
 
-    fn chunk_data_dims(info: &crate::hl::dataset::DatasetInfo) -> Result<Vec<u64>> {
+    fn chunk_data_dims(info: &crate::hl::dataset::DatasetInfo) -> Result<&[u64]> {
         let chunk_dims = info
             .layout
             .chunk_dims
             .as_ref()
             .ok_or_else(|| Error::InvalidFormat("chunked layout missing chunk dims".into()))?;
         if chunk_dims.len() == info.dataspace.dims.len() + 1 {
-            Ok(chunk_dims[..info.dataspace.dims.len()].to_vec())
+            Ok(&chunk_dims[..info.dataspace.dims.len()])
         } else if chunk_dims.len() == info.dataspace.dims.len() {
-            Ok(chunk_dims.clone())
+            Ok(chunk_dims)
         } else {
             Err(Error::InvalidFormat(format!(
                 "chunk dimension rank {} does not match dataset rank {}",
@@ -142,26 +142,32 @@ impl MutableFile {
         element_size: usize,
     ) -> Result<Cow<'a, [u8]>> {
         let mut filtered = Cow::Borrowed(data);
+        let mut filter_buf = Vec::new();
         if let Some(ref pipeline) = info.filter_pipeline {
             for filter in &pipeline.filters {
                 match filter.id {
                     FILTER_SHUFFLE => {
-                        filtered = Cow::Owned(crate::filters::shuffle::shuffle(
+                        filter_buf.clear();
+                        filter_buf.resize(filtered.len(), 0);
+                        crate::filters::shuffle::shuffle_into(
                             filtered.as_ref(),
                             element_size,
-                        )?);
+                            &mut filter_buf,
+                        )?;
+                        Self::replace_encoded_filter_buffer(&mut filtered, &mut filter_buf);
                     }
                     FILTER_DEFLATE => {
                         let level = filter.client_data.first().copied().unwrap_or(6);
-                        filtered = Cow::Owned(crate::filters::deflate::compress(
+                        filter_buf.clear();
+                        crate::filters::deflate::compress_into(
                             filtered.as_ref(),
                             level,
-                        )?);
+                            &mut filter_buf,
+                        )?;
+                        Self::replace_encoded_filter_buffer(&mut filtered, &mut filter_buf);
                     }
                     FILTER_FLETCHER32 => {
-                        filtered = Cow::Owned(crate::filters::fletcher32::append_checksum(
-                            filtered.as_ref(),
-                        )?);
+                        crate::filters::fletcher32::append_checksum_in_place(filtered.to_mut())?;
                     }
                     other => {
                         return Err(Error::Unsupported(format!(
@@ -172,6 +178,14 @@ impl MutableFile {
             }
         }
         Ok(filtered)
+    }
+
+    fn replace_encoded_filter_buffer<'a>(filtered: &mut Cow<'a, [u8]>, filter_buf: &mut Vec<u8>) {
+        let previous = std::mem::replace(filtered, Cow::Owned(std::mem::take(filter_buf)));
+        if let Cow::Owned(mut previous) = previous {
+            previous.clear();
+            *filter_buf = previous;
+        }
     }
 
     fn rewrite_chunk_index(

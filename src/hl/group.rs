@@ -1,21 +1,88 @@
+use std::cmp::Ordering;
 use std::fs;
 use std::io::BufReader;
+use std::marker::PhantomData;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
 
 use crate::error::{Error, Result};
+use crate::format::btree_v1::{BTreeType, BTreeV1Node};
 use crate::format::btree_v2;
-use crate::format::fractal_heap::FractalHeapHeader;
+use crate::format::checksum::checksum_lookup3;
+use crate::format::fractal_heap::{FractalHeapHeader, FractalHeapManagedObjectCache};
+use crate::format::local_heap::LocalHeap;
+use crate::format::messages::attribute::AttributeMessage;
+use crate::format::messages::attribute_info::AttributeInfoMessage;
+use crate::format::messages::datatype::DatatypeMessage;
 use crate::format::messages::link::{LinkMessage, LinkType};
 use crate::format::messages::link_info::LinkInfoMessage;
 use crate::format::messages::symbol_table::SymbolTableMessage;
 use crate::format::object_header::{self, ObjectHeader};
+use crate::format::symbol_table::SymbolTableNode;
+use crate::hl::attribute::Attribute;
 use crate::hl::dataset::Dataset;
+use crate::hl::datatype::Datatype;
 use crate::hl::file::{
-    collect_v1_group_members, collect_v2_link_members, register_open_object,
-    unregister_open_object, File, FileInner, ObjectType, OpenObjectKind,
+    object_type_from_messages, register_open_object, unregister_open_object, File, FileInner,
+    FileIntent, ObjectType, OpenObjectKind,
 };
+use crate::hl::link::{get_val_cb_borrowed, LinkValueRef};
+use crate::hl::mutable_file::MutableFile;
+use crate::hl::types::H5Type;
+
+pub(crate) struct LinkMessageRef<'a> {
+    pub name: &'a str,
+    pub link_type: LinkType,
+    pub creation_order: Option<u64>,
+    pub char_encoding: u8,
+    pub hard_link_addr: Option<u64>,
+    pub soft_link_target: Option<&'a str>,
+    pub external_link: Option<(&'a str, &'a str)>,
+}
+
+impl<'a> LinkMessageRef<'a> {
+    fn from_message(link: &'a LinkMessage) -> Self {
+        Self {
+            name: &link.name,
+            link_type: link.link_type,
+            creation_order: link.creation_order,
+            char_encoding: link.char_encoding,
+            hard_link_addr: link.hard_link_addr,
+            soft_link_target: link.soft_link_target.as_deref(),
+            external_link: link
+                .external_link
+                .as_ref()
+                .map(|(filename, object_path)| (filename.as_str(), object_path.as_str())),
+        }
+    }
+
+    fn hard_link(name: &'a str, addr: u64) -> Self {
+        Self {
+            name,
+            link_type: LinkType::Hard,
+            creation_order: None,
+            char_encoding: 0,
+            hard_link_addr: Some(addr),
+            soft_link_target: None,
+            external_link: None,
+        }
+    }
+
+    fn to_owned(&self) -> LinkMessage {
+        LinkMessage {
+            name: self.name.to_string(),
+            link_type: self.link_type,
+            creation_order: self.creation_order,
+            char_encoding: self.char_encoding,
+            hard_link_addr: self.hard_link_addr,
+            soft_link_target: self.soft_link_target.map(str::to_string),
+            external_link: self
+                .external_link
+                .map(|(filename, object_path)| (filename.to_string(), object_path.to_string())),
+        }
+    }
+}
 
 /// An HDF5 group.
 pub struct Group {
@@ -64,6 +131,59 @@ pub struct GroupInfo {
     pub mounted: bool,
 }
 
+/// Safe placeholder for hdf5-metno dataset-builder compatibility.
+pub struct GroupDatasetBuilderStub {
+    parent_name: String,
+}
+
+impl GroupDatasetBuilderStub {
+    /// This function is part of the hdf5-metno compatibility layer and should not be removed.
+    pub fn empty<T: H5Type>(self) -> GroupDatasetBuilderEmptyStub<T> {
+        GroupDatasetBuilderEmptyStub {
+            parent_name: self.parent_name,
+            marker: PhantomData,
+        }
+    }
+}
+
+/// Safe placeholder for hdf5-metno typed dataset-builder compatibility.
+pub struct GroupDatasetBuilderEmptyStub<T: H5Type> {
+    parent_name: String,
+    marker: PhantomData<T>,
+}
+
+impl<T: H5Type> GroupDatasetBuilderEmptyStub<T> {
+    /// This function is part of the hdf5-metno compatibility layer and should not be removed.
+    pub fn shape<S>(self, _extents: S) -> GroupDatasetBuilderEmptyShapeStub<T> {
+        GroupDatasetBuilderEmptyShapeStub {
+            parent_name: self.parent_name,
+            marker: PhantomData,
+        }
+    }
+
+    /// This function is part of the hdf5-metno compatibility layer and should not be removed.
+    pub fn create<'n, N: Into<Option<&'n str>>>(self, name: N) -> Result<Dataset> {
+        self.shape(()).create(name)
+    }
+}
+
+/// Safe placeholder for hdf5-metno shaped dataset-builder compatibility.
+pub struct GroupDatasetBuilderEmptyShapeStub<T: H5Type> {
+    parent_name: String,
+    marker: PhantomData<T>,
+}
+
+impl<T: H5Type> GroupDatasetBuilderEmptyShapeStub<T> {
+    /// This function is part of the hdf5-metno compatibility layer and should not be removed.
+    pub fn create<'n, N: Into<Option<&'n str>>>(&self, name: N) -> Result<Dataset> {
+        let name = name.into().unwrap_or("<anonymous>");
+        Err(Error::Unsupported(format!(
+            "hdf5-metno compatibility dataset creation is not supported for group '{}' and dataset '{name}'",
+            self.parent_name
+        )))
+    }
+}
+
 impl Group {
     pub(crate) fn open(
         inner: Arc<Mutex<FileInner<BufReader<fs::File>>>>,
@@ -89,6 +209,26 @@ impl Group {
         self.addr
     }
 
+    fn mutable_file_for_group(&self) -> Result<MutableFile> {
+        let guard = self.inner.lock();
+        let intent = guard.intent;
+        let path = guard.path.clone();
+        drop(guard);
+
+        if intent != FileIntent::ReadWrite {
+            return Err(Error::Unsupported(format!(
+                "hdf5-metno compatibility group mutation requires a read-write File for group '{}'",
+                self.name
+            )));
+        }
+        let path = path.ok_or_else(|| {
+            Error::Unsupported(
+                "hdf5-metno compatibility group mutation requires a file path".into(),
+            )
+        })?;
+        MutableFile::open_rw(path)
+    }
+
     /// Return this group handle's high-level object id.
     pub fn object_id(&self) -> u64 {
         self.object_id
@@ -96,8 +236,20 @@ impl Group {
 
     /// List all member names in this group.
     pub fn member_names(&self) -> Result<Vec<String>> {
-        let members = self.members()?;
-        Ok(members.into_iter().map(|(name, _)| name).collect())
+        let mut names = Vec::new();
+        self.visit_member_names(|name| {
+            names.push(name.to_string());
+            Ok(())
+        })?;
+        Ok(names)
+    }
+
+    /// Visit all member names in this group without returning an owned list.
+    pub fn visit_member_names<F>(&self, mut visitor: F) -> Result<()>
+    where
+        F: FnMut(&str) -> Result<()>,
+    {
+        self.visit_link_refs(|link| visitor(link.name))
     }
 
     /// List all links in this group.
@@ -105,6 +257,26 @@ impl Group {
     /// v1 symbol-table groups do not store full v2 link messages, so their
     /// members are returned as synthesized hard-link records.
     pub fn links(&self) -> Result<Vec<LinkMessage>> {
+        let mut links = Vec::new();
+        self.visit_links_owned(|link| {
+            links.push(link);
+            Ok(())
+        })?;
+        Ok(links)
+    }
+
+    /// Visit all links in this group.
+    pub fn visit_links<F>(&self, mut visitor: F) -> Result<()>
+    where
+        F: FnMut(&LinkMessage) -> Result<()>,
+    {
+        self.visit_links_owned(|link| visitor(&link))
+    }
+
+    fn visit_links_owned<F>(&self, mut visitor: F) -> Result<()>
+    where
+        F: FnMut(LinkMessage) -> Result<()>,
+    {
         let mut guard = self.inner.lock();
         let sizeof_addr = guard.superblock.sizeof_addr;
         let oh = ObjectHeader::read_at(&mut guard.reader, self.addr)?;
@@ -112,55 +284,107 @@ impl Group {
         for msg in &oh.messages {
             if msg.msg_type == object_header::MSG_SYMBOL_TABLE {
                 let stab = SymbolTableMessage::decode(&msg.data, sizeof_addr)?;
-                let members = collect_v1_group_members(
+                return Self::visit_v1_group_members(
                     &mut guard.reader,
                     stab.btree_addr,
                     stab.name_heap_addr,
-                )?;
-                return Ok(members
-                    .into_iter()
-                    .map(|(name, addr)| LinkMessage {
-                        name,
-                        link_type: LinkType::Hard,
-                        creation_order: None,
-                        char_encoding: 0,
-                        hard_link_addr: Some(addr),
-                        soft_link_target: None,
-                        external_link: None,
-                    })
-                    .collect());
+                    |name, addr| visitor(LinkMessageRef::hard_link(name, addr).to_owned()),
+                );
             }
         }
 
-        let mut links = Vec::new();
+        let mut visited = false;
         for msg in &oh.messages {
             if msg.msg_type == object_header::MSG_LINK {
-                links.push(LinkMessage::decode(&msg.data, sizeof_addr)?);
+                let link = LinkMessage::decode(&msg.data, sizeof_addr)?;
+                visited = true;
+                visitor(link)?;
             }
         }
-        if !links.is_empty() {
-            return Ok(links);
+        if visited {
+            return Ok(());
         }
 
         for msg in &oh.messages {
             if msg.msg_type == object_header::MSG_LINK_INFO {
                 let link_info = LinkInfoMessage::decode(&msg.data, sizeof_addr)?;
                 if link_info.has_dense_storage() {
-                    return Self::read_dense_link_messages(
+                    return Self::visit_dense_link_messages(
                         &mut guard.reader,
                         &link_info,
                         sizeof_addr,
+                        |link| visitor(link),
                     );
                 }
             }
         }
 
-        Ok(Vec::new())
+        Ok(())
+    }
+
+    fn visit_link_refs<F>(&self, mut visitor: F) -> Result<()>
+    where
+        F: FnMut(LinkMessageRef<'_>) -> Result<()>,
+    {
+        let mut guard = self.inner.lock();
+        let sizeof_addr = guard.superblock.sizeof_addr;
+        let oh = ObjectHeader::read_at(&mut guard.reader, self.addr)?;
+
+        for msg in &oh.messages {
+            if msg.msg_type == object_header::MSG_SYMBOL_TABLE {
+                let stab = SymbolTableMessage::decode(&msg.data, sizeof_addr)?;
+                return Self::visit_v1_group_members(
+                    &mut guard.reader,
+                    stab.btree_addr,
+                    stab.name_heap_addr,
+                    |name, addr| visitor(LinkMessageRef::hard_link(name, addr)),
+                );
+            }
+        }
+
+        let mut visited = false;
+        for msg in &oh.messages {
+            if msg.msg_type == object_header::MSG_LINK {
+                let link = LinkMessage::decode(&msg.data, sizeof_addr)?;
+                visited = true;
+                visitor(LinkMessageRef::from_message(&link))?;
+            }
+        }
+        if visited {
+            return Ok(());
+        }
+
+        for msg in &oh.messages {
+            if msg.msg_type == object_header::MSG_LINK_INFO {
+                let link_info = LinkInfoMessage::decode(&msg.data, sizeof_addr)?;
+                if link_info.has_dense_storage() {
+                    return Self::visit_dense_link_refs(
+                        &mut guard.reader,
+                        &link_info,
+                        sizeof_addr,
+                        |link| visitor(link),
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn visit_link_refs_for_link_access<F>(&self, visitor: F) -> Result<()>
+    where
+        F: FnMut(LinkMessageRef<'_>) -> Result<()>,
+    {
+        self.visit_link_refs(visitor)
     }
 
     /// List all links sorted by tracked creation order.
     pub fn links_by_creation_order(&self) -> Result<Vec<LinkMessage>> {
-        let mut links = self.links()?;
+        let mut links = Vec::new();
+        self.visit_links_owned(|link| {
+            links.push(link);
+            Ok(())
+        })?;
         if links.is_empty() {
             return Ok(links);
         }
@@ -174,8 +398,44 @@ impl Group {
         Ok(links)
     }
 
+    /// Visit all links sorted by tracked creation order.
+    pub fn visit_links_by_creation_order<F>(&self, mut visitor: F) -> Result<()>
+    where
+        F: FnMut(&LinkMessage) -> Result<()>,
+    {
+        let mut links = Vec::new();
+        self.visit_links_owned(|link| {
+            links.push(link);
+            Ok(())
+        })?;
+        if links.iter().any(|link| link.creation_order.is_none()) {
+            return Err(Error::Unsupported(format!(
+                "group '{}' does not track link creation order",
+                self.name
+            )));
+        }
+        links.sort_by_key(|link| link.creation_order.unwrap_or(u64::MAX));
+        for link in &links {
+            visitor(link)?;
+        }
+        Ok(())
+    }
+
     /// List all members as (name, object_header_addr) pairs.
     pub fn members(&self) -> Result<Vec<(String, u64)>> {
+        let mut members = Vec::new();
+        self.visit_members(|name, addr| {
+            members.push((name.to_string(), addr));
+            Ok(())
+        })?;
+        Ok(members)
+    }
+
+    /// Visit all members as `(name, object_header_addr)` pairs.
+    pub fn visit_members<F>(&self, mut visitor: F) -> Result<()>
+    where
+        F: FnMut(&str, u64) -> Result<()>,
+    {
         let mut guard = self.inner.lock();
         let sizeof_addr = guard.superblock.sizeof_addr;
         let oh = ObjectHeader::read_at(&mut guard.reader, self.addr)?;
@@ -184,18 +444,27 @@ impl Group {
         for msg in &oh.messages {
             if msg.msg_type == object_header::MSG_SYMBOL_TABLE {
                 let stab = SymbolTableMessage::decode(&msg.data, sizeof_addr)?;
-                return collect_v1_group_members(
+                return Self::visit_v1_group_members(
                     &mut guard.reader,
                     stab.btree_addr,
                     stab.name_heap_addr,
+                    |name, addr| visitor(name, addr),
                 );
             }
         }
 
         // V2: collect from link messages
-        let members = collect_v2_link_members(&oh.messages, sizeof_addr);
-        if !members.is_empty() {
-            return Ok(members);
+        let mut visited = false;
+        for msg in &oh.messages {
+            if msg.msg_type == object_header::MSG_LINK {
+                if let Ok(link) = LinkMessage::decode(&msg.data, sizeof_addr) {
+                    visited = true;
+                    visitor(&link.name, link.hard_link_addr.unwrap_or(0))?;
+                }
+            }
+        }
+        if visited {
+            return Ok(());
         }
 
         // V2 dense storage: link info message with fractal heap + v2 B-tree
@@ -203,68 +472,275 @@ impl Group {
             if msg.msg_type == object_header::MSG_LINK_INFO {
                 let link_info = LinkInfoMessage::decode(&msg.data, sizeof_addr)?;
                 if link_info.has_dense_storage() {
-                    return Self::read_dense_links(&mut guard.reader, &link_info, sizeof_addr);
+                    return Self::visit_dense_link_refs(
+                        &mut guard.reader,
+                        &link_info,
+                        sizeof_addr,
+                        |link| visitor(link.name, link.hard_link_addr.unwrap_or(0)),
+                    );
                 }
             }
         }
 
-        Ok(Vec::new())
+        Ok(())
     }
 
-    /// Read dense links from fractal heap + v2 B-tree as full LinkMessage objects.
-    fn read_dense_link_messages<R: std::io::Read + std::io::Seek>(
+    fn visit_v1_group_members<R, F>(
         reader: &mut crate::io::reader::HdfReader<R>,
-        link_info: &LinkInfoMessage,
-        sizeof_addr: u8,
-    ) -> Result<Vec<LinkMessage>> {
-        let heap = FractalHeapHeader::read_at(reader, link_info.fractal_heap_addr)?;
-        let records = btree_v2::collect_all_records(reader, link_info.name_btree_addr)?;
-        let mut links = Vec::new();
+        btree_addr: u64,
+        heap_addr: u64,
+        mut visitor: F,
+    ) -> Result<()>
+    where
+        R: std::io::Read + std::io::Seek,
+        F: FnMut(&str, u64) -> Result<()>,
+    {
+        let heap = LocalHeap::read_at(reader, heap_addr)?;
+        let mut visited = Vec::new();
+        Self::visit_v1_btree_members(reader, btree_addr, 0, &mut visited, &heap, &mut visitor)
+    }
 
-        for record in &records {
-            let Some(heap_id) = dense_link_heap_id(record, usize::from(heap.heap_id_len))? else {
-                continue;
-            };
-            match heap.read_managed_object(reader, heap_id) {
-                Ok(link_data) => match LinkMessage::decode(&link_data, sizeof_addr) {
-                    Ok(link) => links.push(link),
-                    Err(_) => {}
-                },
-                Err(_) => {}
+    fn visit_v1_btree_members<R, F>(
+        reader: &mut crate::io::reader::HdfReader<R>,
+        btree_addr: u64,
+        depth: usize,
+        visited: &mut Vec<u64>,
+        heap: &LocalHeap,
+        visitor: &mut F,
+    ) -> Result<()>
+    where
+        R: std::io::Read + std::io::Seek,
+        F: FnMut(&str, u64) -> Result<()>,
+    {
+        const MAX_GROUP_BTREE_RECURSION: usize = 64;
+
+        if depth > MAX_GROUP_BTREE_RECURSION {
+            return Err(Error::InvalidFormat(
+                "v1 group B-tree recursion depth exceeded".into(),
+            ));
+        }
+        if crate::io::reader::is_undef_addr(btree_addr) {
+            return Err(Error::InvalidFormat(
+                "v1 group B-tree address is undefined".into(),
+            ));
+        }
+        if visited.contains(&btree_addr) {
+            return Err(Error::InvalidFormat(
+                "v1 group B-tree traversal cycle detected".into(),
+            ));
+        }
+        visited.push(btree_addr);
+
+        let node = BTreeV1Node::read_at(reader, btree_addr)?;
+        if node.node_type != BTreeType::Group {
+            visited.pop();
+            return Err(Error::InvalidFormat("expected group B-tree".into()));
+        }
+
+        if node.level == 0 {
+            for child_addr in &node.children {
+                let snod = SymbolTableNode::read_at(reader, *child_addr)?;
+                for entry in &snod.entries {
+                    let name_offset = usize::try_from(entry.name_offset).map_err(|_| {
+                        Error::InvalidFormat(
+                            "symbol-table name offset does not fit in usize".into(),
+                        )
+                    })?;
+                    let name = heap.get_str(name_offset)?;
+                    if !name.is_empty() {
+                        visitor(name, entry.obj_header_addr)?;
+                    }
+                }
+            }
+        } else {
+            for child_addr in &node.children {
+                Self::visit_v1_btree_members(
+                    reader,
+                    *child_addr,
+                    depth.checked_add(1).ok_or_else(|| {
+                        Error::InvalidFormat("v1 group B-tree recursion depth overflow".into())
+                    })?,
+                    visited,
+                    heap,
+                    visitor,
+                )?;
             }
         }
 
-        Ok(links)
+        visited.pop();
+        Ok(())
     }
 
-    /// Read dense links as (name, addr) pairs for member listing.
-    fn read_dense_links<R: std::io::Read + std::io::Seek>(
+    /// Visit dense links from fractal heap + v2 B-tree as full LinkMessage objects.
+    fn visit_dense_link_messages<R, F>(
         reader: &mut crate::io::reader::HdfReader<R>,
         link_info: &LinkInfoMessage,
         sizeof_addr: u8,
-    ) -> Result<Vec<(String, u64)>> {
-        let links = Self::read_dense_link_messages(reader, link_info, sizeof_addr)?;
-        Ok(links
-            .into_iter()
-            .map(|l| {
-                let addr = l.hard_link_addr.unwrap_or(0);
-                (l.name, addr)
-            })
-            .collect())
+        mut visitor: F,
+    ) -> Result<()>
+    where
+        R: std::io::Read + std::io::Seek,
+        F: FnMut(LinkMessage) -> Result<()>,
+    {
+        let heap = FractalHeapHeader::read_at(reader, link_info.fractal_heap_addr)?;
+        let heap_id_len = usize::from(heap.heap_id_len);
+        let mut heap_ids = Vec::new();
+        Self::collect_dense_link_heap_ids(reader, link_info, heap_id_len, &mut heap_ids)?;
+
+        let mut cache = FractalHeapManagedObjectCache::new();
+        for heap_id in &heap_ids {
+            if let Ok(link_data) = heap.read_managed_object_cached(reader, heap_id, &mut cache) {
+                if let Ok(link) = LinkMessage::decode(&link_data, sizeof_addr) {
+                    visitor(link)?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn collect_dense_link_heap_ids<R>(
+        reader: &mut crate::io::reader::HdfReader<R>,
+        link_info: &LinkInfoMessage,
+        heap_id_len: usize,
+        heap_ids: &mut Vec<Vec<u8>>,
+    ) -> Result<()>
+    where
+        R: std::io::Read + std::io::Seek,
+    {
+        heap_ids.clear();
+        btree_v2::visit_all_records(reader, link_info.name_btree_addr, |record| {
+            let Some(heap_id) = dense_link_heap_id(record, heap_id_len)? else {
+                return Ok(());
+            };
+            heap_ids.push(heap_id.to_vec());
+            Ok(())
+        })
+    }
+
+    /// Visit dense links from fractal heap + v2 B-tree as borrowed link views.
+    fn visit_dense_link_refs<R, F>(
+        reader: &mut crate::io::reader::HdfReader<R>,
+        link_info: &LinkInfoMessage,
+        sizeof_addr: u8,
+        mut visitor: F,
+    ) -> Result<()>
+    where
+        R: std::io::Read + std::io::Seek,
+        F: FnMut(LinkMessageRef<'_>) -> Result<()>,
+    {
+        let heap = FractalHeapHeader::read_at(reader, link_info.fractal_heap_addr)?;
+        let heap_id_len = usize::from(heap.heap_id_len);
+        let mut heap_ids = Vec::new();
+        Self::collect_dense_link_heap_ids(reader, link_info, heap_id_len, &mut heap_ids)?;
+
+        let mut cache = FractalHeapManagedObjectCache::new();
+        for heap_id in &heap_ids {
+            if let Ok(link_data) = heap.read_managed_object_cached(reader, heap_id, &mut cache) {
+                if let Ok(link) = LinkMessage::decode(&link_data, sizeof_addr) {
+                    visitor(LinkMessageRef::from_message(&link))?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn find_dense_link_by_name<R>(
+        reader: &mut crate::io::reader::HdfReader<R>,
+        link_info: &LinkInfoMessage,
+        sizeof_addr: u8,
+        name: &str,
+    ) -> Result<Option<LinkMessage>>
+    where
+        R: std::io::Read + std::io::Seek,
+    {
+        let heap = FractalHeapHeader::read_at(reader, link_info.fractal_heap_addr)?;
+        let target_hash = checksum_lookup3(name.as_bytes(), 0);
+        let heap_id_len = usize::from(heap.heap_id_len);
+        let mut heap_ids = Vec::new();
+        btree_v2::visit_matching_records(
+            reader,
+            link_info.name_btree_addr,
+            |record| match dense_link_name_hash(record) {
+                Some(hash) => hash.cmp(&target_hash),
+                None => Ordering::Less,
+            },
+            |record| {
+                let Some(heap_id) = dense_link_heap_id(record, heap_id_len)? else {
+                    return Ok(());
+                };
+                heap_ids.push(heap_id.to_vec());
+                Ok(())
+            },
+        )?;
+
+        let mut cache = FractalHeapManagedObjectCache::new();
+        for heap_id in &heap_ids {
+            if let Ok(link_data) = heap.read_managed_object_cached(reader, heap_id, &mut cache) {
+                if let Ok(link) = LinkMessage::decode(&link_data, sizeof_addr) {
+                    if link.name == name {
+                        return Ok(Some(link));
+                    }
+                }
+            }
+        }
+
+        Ok(None)
     }
 
     /// Find a specific link by name, checking both inline messages and dense storage.
     pub(crate) fn find_link_by_name(&self, name: &str) -> Result<LinkMessage> {
+        self.with_link_by_name(name, |link| Ok(link.clone()))
+    }
+
+    pub(crate) fn with_link_by_name<R, F>(&self, name: &str, visitor: F) -> Result<R>
+    where
+        F: FnOnce(&LinkMessage) -> Result<R>,
+    {
+        let mut visitor = Some(visitor);
         let mut guard = self.inner.lock();
         let sizeof_addr = guard.superblock.sizeof_addr;
         let oh = ObjectHeader::read_at(&mut guard.reader, self.addr)?;
+
+        // Check v1 symbol table messages
+        for msg in &oh.messages {
+            if msg.msg_type == object_header::MSG_SYMBOL_TABLE {
+                let stab = SymbolTableMessage::decode(&msg.data, sizeof_addr)?;
+                let mut found = None;
+                Self::visit_v1_group_members(
+                    &mut guard.reader,
+                    stab.btree_addr,
+                    stab.name_heap_addr,
+                    |member_name, addr| {
+                        if member_name == name {
+                            found = Some(LinkMessage {
+                                name: member_name.to_string(),
+                                link_type: LinkType::Hard,
+                                creation_order: None,
+                                char_encoding: 0,
+                                hard_link_addr: Some(addr),
+                                soft_link_target: None,
+                                external_link: None,
+                            });
+                        }
+                        Ok(())
+                    },
+                )?;
+                if let Some(link) = found {
+                    let visitor = visitor.take().expect("link visitor called more than once");
+                    return visitor(&link);
+                }
+            }
+        }
 
         // Check inline link messages
         for msg in &oh.messages {
             if msg.msg_type == object_header::MSG_LINK {
                 if let Ok(link) = LinkMessage::decode(&msg.data, sizeof_addr) {
                     if link.name == name {
-                        return Ok(link);
+                        let visitor = visitor.take().expect("link visitor called more than once");
+                        return visitor(&link);
                     }
                 }
             }
@@ -275,10 +751,14 @@ impl Group {
             if msg.msg_type == object_header::MSG_LINK_INFO {
                 let link_info = LinkInfoMessage::decode(&msg.data, sizeof_addr)?;
                 if link_info.has_dense_storage() {
-                    let links =
-                        Self::read_dense_link_messages(&mut guard.reader, &link_info, sizeof_addr)?;
-                    if let Some(link) = links.into_iter().find(|l| l.name == name) {
-                        return Ok(link);
+                    if let Some(link) = Self::find_dense_link_by_name(
+                        &mut guard.reader,
+                        &link_info,
+                        sizeof_addr,
+                        name,
+                    )? {
+                        let visitor = visitor.take().expect("link visitor called more than once");
+                        return visitor(&link);
                     }
                 }
             }
@@ -292,9 +772,27 @@ impl Group {
         File::from_inner(self.inner.clone()).group(&group_child_path(&self.name, name))
     }
 
+    /// This function is part of the hdf5-metno compatibility layer and should not be removed.
+    pub fn create_group(&self, name: &str) -> Result<Group> {
+        Err(Error::Unsupported(format!(
+            "hdf5-metno compatibility group creation is not supported for group '{}' and child '{name}'",
+            self.name
+        )))
+    }
+
+    /// This function is part of the hdf5-metno compatibility layer and should not be removed.
+    pub fn group(&self, name: &str) -> Result<Group> {
+        self.open_group(name)
+    }
+
     /// Get the number of members in this group.
     pub fn len(&self) -> Result<usize> {
-        Ok(self.members()?.len())
+        let mut len = 0usize;
+        self.visit_members(|_, _| {
+            len += 1;
+            Ok(())
+        })?;
+        Ok(len)
     }
 
     pub fn create_plist(&self) -> crate::hl::plist::object_create::ObjectCreate {
@@ -313,11 +811,26 @@ impl Group {
     }
 
     pub fn linkval(&self, name: &str) -> Result<Option<String>> {
-        let link = self.find_link_by_name(name)?;
-        Ok(link.soft_link_target.or_else(|| {
-            link.external_link
-                .map(|(file, path)| format!("{file}:{path}"))
-        }))
+        self.with_linkval(name, |value| Ok(value.map(str::to_string)))
+    }
+
+    pub fn with_linkval<R, F>(&self, name: &str, visitor: F) -> Result<R>
+    where
+        F: FnOnce(Option<&str>) -> Result<R>,
+    {
+        self.with_link_by_name(name, |link| {
+            if let Some(target) = link.soft_link_target.as_deref() {
+                return visitor(Some(target));
+            }
+            let mut external = String::new();
+            if let Some((file, path)) = link.external_link.as_ref() {
+                external.push_str(file);
+                external.push(':');
+                external.push_str(path);
+                return visitor(Some(&external));
+            }
+            visitor(None)
+        })
     }
 
     pub fn comment(&self, name: &str) -> Result<Option<String>> {
@@ -332,18 +845,132 @@ impl Group {
         self.len()
     }
 
+    /// This function is part of the hdf5-metno compatibility layer and should not be removed.
+    pub fn iter_visit_default<F, G>(&self, val: G, mut op: F) -> Result<G>
+    where
+        F: FnMut(&Self, &str, LinkInfo, &mut G) -> bool,
+    {
+        let mut val = val;
+        let mut stop = false;
+        self.visit_links(|link| {
+            if stop {
+                return Ok(());
+            }
+            let info = link_info_from_message(link)?;
+            if !op(self, &link.name, info, &mut val) {
+                stop = true;
+            }
+            Ok(())
+        })?;
+        Ok(val)
+    }
+
+    /// This function is part of the hdf5-metno compatibility layer and should not be removed.
+    pub fn groups(&self) -> Result<Vec<Group>> {
+        let mut groups = Vec::new();
+        let mut hard_links = Vec::new();
+        let mut fallback_names = Vec::new();
+        self.visit_links_owned(|link| {
+            if let Some(addr) = link.hard_link_addr {
+                hard_links.push((link.name, addr));
+            } else {
+                fallback_names.push(link.name);
+            }
+            Ok(())
+        })?;
+        for (name, addr) in hard_links {
+            if self.object_type_at(addr)? == ObjectType::Group {
+                groups.push(Group::open(
+                    self.inner.clone(),
+                    &group_child_path(&self.name, &name),
+                    addr,
+                )?);
+            }
+        }
+        for name in fallback_names {
+            if self.member_type(&name)? == ObjectType::Group {
+                groups.push(self.open_group(&name)?);
+            }
+        }
+        Ok(groups)
+    }
+
+    /// This function is part of the hdf5-metno compatibility layer and should not be removed.
+    pub fn datasets(&self) -> Result<Vec<Dataset>> {
+        let mut datasets = Vec::new();
+        let mut hard_links = Vec::new();
+        let mut fallback_names = Vec::new();
+        self.visit_links_owned(|link| {
+            if let Some(addr) = link.hard_link_addr {
+                hard_links.push((link.name, addr));
+            } else {
+                fallback_names.push(link.name);
+            }
+            Ok(())
+        })?;
+        for (name, addr) in hard_links {
+            if self.object_type_at(addr)? == ObjectType::Dataset {
+                datasets.push(Dataset::new(
+                    self.inner.clone(),
+                    &group_child_path(&self.name, &name),
+                    addr,
+                ));
+            }
+        }
+        for name in fallback_names {
+            if self.member_type(&name)? == ObjectType::Dataset {
+                datasets.push(self.open_dataset(&name)?);
+            }
+        }
+        Ok(datasets)
+    }
+
+    /// This function is part of the hdf5-metno compatibility layer and should not be removed.
+    pub fn named_datatypes(&self) -> Result<Vec<Datatype>> {
+        let mut datatypes = Vec::new();
+        let mut hard_links = Vec::new();
+        let mut fallback_names = Vec::new();
+        self.visit_links_owned(|link| {
+            if let Some(addr) = link.hard_link_addr {
+                hard_links.push((link.name, addr));
+            } else {
+                fallback_names.push(link.name);
+            }
+            Ok(())
+        })?;
+        for (_name, addr) in hard_links {
+            if self.object_type_at(addr)? == ObjectType::NamedDatatype {
+                datatypes.push(self.named_datatype_at(addr)?);
+            }
+        }
+        for name in fallback_names {
+            if self.member_type(&name)? == ObjectType::NamedDatatype {
+                let addr = self.hard_link_addr_by_name(&name)?;
+                datatypes.push(self.named_datatype_at(addr)?);
+            }
+        }
+        Ok(datatypes)
+    }
+
     pub fn objinfo(&self, name: &str) -> Result<ObjectInfo> {
         let addr = self.hard_link_addr_by_name(name)?;
         self.object_info_at(addr)
     }
 
     pub fn objname_by_idx(&self, index: usize) -> Result<String> {
-        self.link_name_by_idx(index)
+        let mut name = String::new();
+        self.link_name_by_idx_into(index, &mut name)?;
+        Ok(name)
     }
 
     pub fn objtype_by_idx(&self, index: usize) -> Result<ObjectType> {
-        let name = self.link_name_by_idx(index)?;
-        self.member_type(&name)
+        self.with_link_by_idx(index, |link| {
+            if let Some(addr) = link.hard_link_addr {
+                self.object_type_at(addr)
+            } else {
+                self.member_type(&link.name)
+            }
+        })
     }
 
     /// Check if the group is empty.
@@ -359,17 +986,81 @@ impl Group {
 
     /// List attribute names.
     pub fn attr_names(&self) -> Result<Vec<String>> {
-        crate::hl::attribute::attr_names(&self.inner, self.addr)
+        let mut names = Vec::new();
+        self.attr_names_into(&mut names)?;
+        Ok(names)
+    }
+
+    /// Visit attribute names in storage order.
+    pub fn visit_attr_names<F>(&self, mut f: F) -> Result<()>
+    where
+        F: FnMut(&str) -> Result<()>,
+    {
+        visit_attr_names_at(&self.inner, self.addr, &mut f)
+    }
+
+    /// Append attribute names in storage order into caller-provided storage.
+    pub fn attr_names_into(&self, out: &mut Vec<String>) -> Result<()> {
+        out.clear();
+        self.visit_attr_names(|name| {
+            out.push(name.to_string());
+            Ok(())
+        })
     }
 
     /// List attributes.
     pub fn attrs(&self) -> Result<Vec<crate::hl::attribute::Attribute>> {
-        crate::hl::attribute::collect_attributes(&self.inner, self.addr)
+        let mut attrs = Vec::new();
+        self.attrs_into(&mut attrs)?;
+        Ok(attrs)
+    }
+
+    /// Visit attributes in storage order.
+    pub fn visit_attrs<F>(&self, mut f: F) -> Result<()>
+    where
+        F: FnMut(&crate::hl::attribute::Attribute) -> Result<()>,
+    {
+        visit_attrs_at(&self.inner, self.addr, &mut f)
+    }
+
+    /// Store attributes in caller-provided storage.
+    pub fn attrs_into(&self, out: &mut Vec<crate::hl::attribute::Attribute>) -> Result<()> {
+        out.clear();
+        crate::hl::attribute::collect_attributes_into(&self.inner, self.addr, out)
     }
 
     /// List attributes sorted by tracked creation order.
     pub fn attrs_by_creation_order(&self) -> Result<Vec<crate::hl::attribute::Attribute>> {
-        crate::hl::attribute::collect_attributes_by_creation_order(&self.inner, self.addr)
+        let mut attrs = Vec::new();
+        self.attrs_by_creation_order_into(&mut attrs)?;
+        Ok(attrs)
+    }
+
+    /// Visit attributes sorted by tracked creation order.
+    pub fn visit_attrs_by_creation_order<F>(&self, mut f: F) -> Result<()>
+    where
+        F: FnMut(&crate::hl::attribute::Attribute) -> Result<()>,
+    {
+        let attrs =
+            crate::hl::attribute::collect_attributes_by_creation_order(&self.inner, self.addr)?;
+        for attr in &attrs {
+            f(attr)?;
+        }
+        Ok(())
+    }
+
+    /// Store attributes sorted by tracked creation order in caller-provided storage.
+    pub fn attrs_by_creation_order_into(
+        &self,
+        out: &mut Vec<crate::hl::attribute::Attribute>,
+    ) -> Result<()> {
+        out.clear();
+        crate::hl::attribute::collect_attributes_by_creation_order_into(
+            &self.inner,
+            self.addr,
+            out,
+        )?;
+        Ok(())
     }
 
     /// Get an attribute by name.
@@ -384,63 +1075,195 @@ impl Group {
 
     /// Get the link type of a member by name.
     pub fn link_type(&self, name: &str) -> Result<LinkType> {
-        let link = self.find_link_by_name(name)?;
-        Ok(link.link_type)
+        self.with_link_ref_by_name(name, |link| Ok(link.link_type))
     }
 
     /// Get link metadata by name.
     pub fn link_info(&self, name: &str) -> Result<LinkInfo> {
-        link_info_from_message(&self.find_link_by_name(name)?)
+        self.with_link_ref_by_name(name, link_info_from_ref)
     }
 
-    /// Get legacy v1-style link metadata by name.
-    pub fn link_info_v1(&self, name: &str) -> Result<LinkInfo> {
-        self.link_info(name)
+    pub(crate) fn with_link_ref_by_name<R, F>(&self, name: &str, visitor: F) -> Result<R>
+    where
+        F: FnOnce(LinkMessageRef<'_>) -> Result<R>,
+    {
+        let mut visitor = Some(visitor);
+        let mut guard = self.inner.lock();
+        let sizeof_addr = guard.superblock.sizeof_addr;
+        let oh = ObjectHeader::read_at(&mut guard.reader, self.addr)?;
+
+        for msg in &oh.messages {
+            if msg.msg_type == object_header::MSG_SYMBOL_TABLE {
+                let stab = SymbolTableMessage::decode(&msg.data, sizeof_addr)?;
+                let mut found = None;
+                Self::visit_v1_group_members(
+                    &mut guard.reader,
+                    stab.btree_addr,
+                    stab.name_heap_addr,
+                    |member_name, addr| {
+                        if member_name == name {
+                            found = Some((member_name.to_string(), addr));
+                        }
+                        Ok(())
+                    },
+                )?;
+                if let Some((member_name, addr)) = found {
+                    let visit = visitor
+                        .take()
+                        .expect("link ref visitor called more than once");
+                    return visit(LinkMessageRef::hard_link(&member_name, addr));
+                }
+            }
+        }
+
+        for msg in &oh.messages {
+            if msg.msg_type == object_header::MSG_LINK {
+                if let Ok(link) = LinkMessage::decode(&msg.data, sizeof_addr) {
+                    if link.name == name {
+                        let visit = visitor
+                            .take()
+                            .expect("link ref visitor called more than once");
+                        return visit(LinkMessageRef::from_message(&link));
+                    }
+                }
+            }
+        }
+
+        for msg in &oh.messages {
+            if msg.msg_type == object_header::MSG_LINK_INFO {
+                let link_info = LinkInfoMessage::decode(&msg.data, sizeof_addr)?;
+                if link_info.has_dense_storage() {
+                    if let Some(link) = Self::find_dense_link_by_name(
+                        &mut guard.reader,
+                        &link_info,
+                        sizeof_addr,
+                        name,
+                    )? {
+                        let visit = visitor
+                            .take()
+                            .expect("link ref visitor called more than once");
+                        return visit(LinkMessageRef::from_message(&link));
+                    }
+                }
+            }
+        }
+
+        Err(Error::InvalidFormat(format!("link '{name}' not found")))
+    }
+
+    fn with_link_by_idx<R, F>(&self, index: usize, visitor: F) -> Result<R>
+    where
+        F: FnOnce(&LinkMessage) -> Result<R>,
+    {
+        let mut found = None;
+        let mut pos = 0usize;
+        self.visit_links_owned(|link| {
+            if pos == index {
+                found = Some(link);
+            }
+            pos += 1;
+            Ok(())
+        })?;
+        match found {
+            Some(link) => visitor(&link),
+            None => Err(Error::InvalidFormat(format!(
+                "link index {index} is out of bounds"
+            ))),
+        }
     }
 
     /// Get link metadata by zero-based storage-order index.
     pub fn link_info_by_idx(&self, index: usize) -> Result<LinkInfo> {
-        let links = self.links()?;
-        let link = links
-            .get(index)
-            .ok_or_else(|| Error::InvalidFormat(format!("link index {index} is out of bounds")))?;
-        link_info_from_message(link)
-    }
-
-    /// Get legacy v1-style link metadata by zero-based storage-order index.
-    pub fn link_info_by_idx_v1(&self, index: usize) -> Result<LinkInfo> {
-        self.link_info_by_idx(index)
+        let mut info = None;
+        let mut pos = 0usize;
+        self.visit_link_refs(|link| {
+            if pos == index {
+                info = Some(link_info_from_ref(link)?);
+            }
+            pos += 1;
+            Ok(())
+        })?;
+        info.ok_or_else(|| Error::InvalidFormat(format!("link index {index} is out of bounds")))
     }
 
     /// Get a link name by zero-based storage-order index.
     pub fn link_name_by_idx(&self, index: usize) -> Result<String> {
-        self.links()?
-            .get(index)
-            .map(|link| link.name.clone())
-            .ok_or_else(|| Error::InvalidFormat(format!("link index {index} is out of bounds")))
+        let mut name = String::new();
+        self.link_name_by_idx_into(index, &mut name)?;
+        Ok(name)
+    }
+
+    /// Get a link name by zero-based storage-order index into caller-provided storage.
+    pub fn link_name_by_idx_into(&self, index: usize, out: &mut String) -> Result<()> {
+        let mut found = false;
+        let mut pos = 0usize;
+        self.visit_link_refs(|link| {
+            if pos == index {
+                out.clear();
+                out.push_str(link.name);
+                found = true;
+            }
+            pos += 1;
+            Ok(())
+        })?;
+        if found {
+            Ok(())
+        } else {
+            Err(Error::InvalidFormat(format!(
+                "link index {index} is out of bounds"
+            )))
+        }
     }
 
     /// Get a soft or external link value by zero-based storage-order index.
     pub fn link_value_by_idx(&self, index: usize) -> Result<Option<LinkValue>> {
-        let links = self.links()?;
-        let link = links
-            .get(index)
-            .ok_or_else(|| Error::InvalidFormat(format!("link index {index} is out of bounds")))?;
-        Ok(link_value_from_message(link))
+        self.link_value_by_idx_with(index, |value| Ok(value.map(LinkValueRef::to_owned)))
+    }
+
+    /// Visit a soft or external link value by zero-based storage-order index.
+    pub fn link_value_by_idx_with<R, F>(&self, index: usize, visitor: F) -> Result<R>
+    where
+        F: FnOnce(Option<LinkValueRef<'_>>) -> Result<R>,
+    {
+        self.with_link_by_idx(index, |link| visitor(get_val_cb_borrowed(link)))
     }
 
     /// Get the target path of a soft link.
     pub fn soft_link_target(&self, name: &str) -> Result<String> {
-        let link = self.find_link_by_name(name)?;
-        link.soft_link_target
-            .ok_or_else(|| Error::InvalidFormat(format!("'{name}' is not a soft link")))
+        self.soft_link_target_with(name, |target| Ok(target.to_string()))
+    }
+
+    /// Visit the target path of a soft link.
+    pub fn soft_link_target_with<R, F>(&self, name: &str, visitor: F) -> Result<R>
+    where
+        F: FnOnce(&str) -> Result<R>,
+    {
+        self.with_link_by_name(name, |link| {
+            link.soft_link_target
+                .as_deref()
+                .ok_or_else(|| Error::InvalidFormat(format!("'{name}' is not a soft link")))
+                .and_then(visitor)
+        })
     }
 
     /// Get the target (filename, object_path) of an external link.
     pub fn external_link_target(&self, name: &str) -> Result<(String, String)> {
-        let link = self.find_link_by_name(name)?;
-        link.external_link
-            .ok_or_else(|| Error::InvalidFormat(format!("'{name}' is not an external link")))
+        self.external_link_target_with(name, |filename, object_path| {
+            Ok((filename.to_string(), object_path.to_string()))
+        })
+    }
+
+    /// Visit the target (filename, object_path) of an external link.
+    pub fn external_link_target_with<R, F>(&self, name: &str, visitor: F) -> Result<R>
+    where
+        F: FnOnce(&str, &str) -> Result<R>,
+    {
+        self.with_link_by_name(name, |link| {
+            link.external_link
+                .as_ref()
+                .ok_or_else(|| Error::InvalidFormat(format!("'{name}' is not an external link")))
+                .and_then(|(filename, object_path)| visitor(filename, object_path))
+        })
     }
 
     /// Get this group's object comment, if present.
@@ -459,29 +1282,17 @@ impl Group {
         self.object_info_at(self.addr)
     }
 
-    /// Get legacy v1-style child object metadata by zero-based link index.
-    pub fn object_info_by_idx_v1(&self, index: usize) -> Result<ObjectInfo> {
-        self.object_info_by_idx(index)
-    }
-
-    /// Get v2-style child object metadata by zero-based link index.
-    pub fn object_info_by_idx_v2(&self, index: usize) -> Result<ObjectInfo> {
-        self.object_info_by_idx(index)
-    }
-
     /// Get v3-style child object metadata by zero-based link index.
     pub fn object_info_by_idx(&self, index: usize) -> Result<ObjectInfo> {
-        let links = self.links()?;
-        let link = links
-            .get(index)
-            .ok_or_else(|| Error::InvalidFormat(format!("link index {index} is out of bounds")))?;
-        let addr = link.hard_link_addr.ok_or_else(|| {
-            Error::InvalidFormat(format!(
-                "link '{}' does not reference an object header",
-                link.name
-            ))
-        })?;
-        self.object_info_at(addr)
+        self.with_link_by_idx(index, |link| {
+            let addr = link.hard_link_addr.ok_or_else(|| {
+                Error::InvalidFormat(format!(
+                    "link '{}' does not reference an object header",
+                    link.name
+                ))
+            })?;
+            self.object_info_at(addr)
+        })
     }
 
     /// Get native object-header metadata by zero-based link index.
@@ -499,10 +1310,75 @@ impl Group {
         File::from_inner(self.inner.clone()).dataset(&group_child_path(&self.name, name))
     }
 
+    /// This function is part of the hdf5-metno compatibility layer and should not be removed.
+    pub fn link_soft(&self, target: &str, link_name: &str) -> Result<()> {
+        Err(Error::Unsupported(format!(
+            "hdf5-metno compatibility soft-link creation is not supported for group '{}' (target '{target}', link '{link_name}')",
+            self.name
+        )))
+    }
+
+    /// This function is part of the hdf5-metno compatibility layer and should not be removed.
+    pub fn link_hard(&self, target: &str, link_name: &str) -> Result<()> {
+        Err(Error::Unsupported(format!(
+            "hdf5-metno compatibility hard-link creation is not supported for group '{}' (target '{target}', link '{link_name}')",
+            self.name
+        )))
+    }
+
+    /// This function is part of the hdf5-metno compatibility layer and should not be removed.
+    pub fn link_external(
+        &self,
+        target_file_name: &str,
+        target: &str,
+        link_name: &str,
+    ) -> Result<()> {
+        Err(Error::Unsupported(format!(
+            "hdf5-metno compatibility external-link creation is not supported for group '{}' (file '{target_file_name}', target '{target}', link '{link_name}')",
+            self.name
+        )))
+    }
+
+    /// This function is part of the hdf5-metno compatibility layer and should not be removed.
+    pub fn relink(&self, name: &str, path: &str) -> Result<()> {
+        if path.contains('/') {
+            return Err(Error::Unsupported(format!(
+                "hdf5-metno compatibility relink currently supports only same-group compact renames for group '{}' (from '{name}' to '{path}')",
+                self.name
+            )));
+        }
+        self.mutable_file_for_group()?
+            .rename_group_link(&self.name, name, path)
+    }
+
+    /// This function is part of the hdf5-metno compatibility layer and should not be removed.
+    pub fn unlink(&self, name: &str) -> Result<()> {
+        self.mutable_file_for_group()?
+            .unlink_group_link(&self.name, name)
+    }
+
+    /// This function is part of the hdf5-metno compatibility layer and should not be removed.
+    pub fn new_dataset<T: H5Type>(&self) -> GroupDatasetBuilderEmptyStub<T> {
+        self.new_dataset_builder().empty::<T>()
+    }
+
+    /// This function is part of the hdf5-metno compatibility layer and should not be removed.
+    pub fn new_dataset_builder(&self) -> GroupDatasetBuilderStub {
+        GroupDatasetBuilderStub {
+            parent_name: self.name.clone(),
+        }
+    }
+
+    /// This function is part of the hdf5-metno compatibility layer and should not be removed.
+    pub fn dataset(&self, name: &str) -> Result<Dataset> {
+        self.open_dataset(name)
+    }
+
     fn hard_link_addr_by_name(&self, name: &str) -> Result<u64> {
-        let link = self.find_link_by_name(name)?;
-        link.hard_link_addr.ok_or_else(|| {
-            Error::InvalidFormat(format!("link '{name}' does not reference an object header"))
+        self.with_link_ref_by_name(name, |link| {
+            link.hard_link_addr.ok_or_else(|| {
+                Error::InvalidFormat(format!("link '{name}' does not reference an object header"))
+            })
         })
     }
 
@@ -512,10 +1388,29 @@ impl Group {
         Ok(object_info_from_header(addr, &oh))
     }
 
+    fn object_type_at(&self, addr: u64) -> Result<ObjectType> {
+        let mut guard = self.inner.lock();
+        let oh = ObjectHeader::read_at(&mut guard.reader, addr)?;
+        Ok(object_type_from_messages(&oh.messages))
+    }
+
     fn object_comment_at(&self, addr: u64) -> Result<Option<String>> {
         let mut guard = self.inner.lock();
         let oh = ObjectHeader::read_at(&mut guard.reader, addr)?;
         object_comment_from_header(&oh)
+    }
+
+    fn named_datatype_at(&self, addr: u64) -> Result<Datatype> {
+        let mut guard = self.inner.lock();
+        let oh = ObjectHeader::read_at(&mut guard.reader, addr)?;
+        for msg in &oh.messages {
+            if msg.msg_type == object_header::MSG_DATATYPE {
+                return Ok(Datatype::from_message(DatatypeMessage::decode(&msg.data)?));
+            }
+        }
+        Err(Error::InvalidFormat(format!(
+            "object at address {addr} does not contain a named datatype message"
+        )))
     }
 }
 
@@ -535,19 +1430,14 @@ pub(crate) fn link_info_from_message(link: &LinkMessage) -> Result<LinkInfo> {
     })
 }
 
-fn link_value_from_message(link: &LinkMessage) -> Option<LinkValue> {
-    match link.link_type {
-        LinkType::Soft => link.soft_link_target.clone().map(LinkValue::Soft),
-        LinkType::External => {
-            link.external_link
-                .clone()
-                .map(|(filename, object_path)| LinkValue::External {
-                    filename,
-                    object_path,
-                })
-        }
-        _ => None,
-    }
+pub(crate) fn link_info_from_ref(link: LinkMessageRef<'_>) -> Result<LinkInfo> {
+    Ok(LinkInfo {
+        link_type: link.link_type,
+        creation_order_valid: link.creation_order.is_some(),
+        creation_order: link.creation_order.unwrap_or(0),
+        char_encoding: link.char_encoding,
+        hard_link_addr: link.hard_link_addr,
+    })
 }
 
 fn object_info_from_header(addr: u64, oh: &ObjectHeader) -> ObjectInfo {
@@ -575,11 +1465,129 @@ fn object_comment_from_header(oh: &ObjectHeader) -> Result<Option<String>> {
         .transpose()
 }
 
+pub(crate) fn visit_attr_names_at<F>(
+    inner: &Arc<Mutex<FileInner<BufReader<fs::File>>>>,
+    addr: u64,
+    mut visitor: F,
+) -> Result<()>
+where
+    F: FnMut(&str) -> Result<()>,
+{
+    visit_attr_messages_at(inner, addr, |attr_msg, _creation_order| {
+        visitor(&attr_msg.name)
+    })
+}
+
+pub(crate) fn visit_attrs_at<F>(
+    inner: &Arc<Mutex<FileInner<BufReader<fs::File>>>>,
+    addr: u64,
+    mut visitor: F,
+) -> Result<()>
+where
+    F: FnMut(&Attribute) -> Result<()>,
+{
+    visit_attr_messages_at(inner, addr, |attr_msg, creation_order| {
+        let attr = Attribute::from_message(attr_msg, creation_order, inner);
+        visitor(&attr)
+    })
+}
+
+fn visit_attr_messages_at<F>(
+    inner: &Arc<Mutex<FileInner<BufReader<fs::File>>>>,
+    addr: u64,
+    mut visitor: F,
+) -> Result<()>
+where
+    F: FnMut(AttributeMessage, Option<u64>) -> Result<()>,
+{
+    let (oh, sizeof_addr) = {
+        let mut guard = inner.lock();
+        let oh = ObjectHeader::read_at(&mut guard.reader, addr)?;
+        (oh, guard.superblock.sizeof_addr)
+    };
+
+    for msg in &oh.messages {
+        if msg.msg_type == object_header::MSG_ATTRIBUTE {
+            match AttributeMessage::decode(&msg.data) {
+                Ok(attr_msg) => visitor(attr_msg, msg.creation_index.map(u64::from))?,
+                Err(e) => {
+                    eprintln!("Warning: failed to decode attribute: {e}");
+                }
+            }
+        }
+    }
+
+    for msg in &oh.messages {
+        if msg.msg_type != object_header::MSG_ATTR_INFO {
+            continue;
+        }
+
+        let attr_info = AttributeInfoMessage::decode(&msg.data, sizeof_addr)?;
+        if !attr_info.has_dense_storage() {
+            continue;
+        }
+
+        let (heap, records) = {
+            let mut guard = inner.lock();
+            let heap = FractalHeapHeader::read_at(&mut guard.reader, attr_info.fractal_heap_addr)?;
+            let mut records = Vec::new();
+            btree_v2::collect_all_records_into(
+                &mut guard.reader,
+                attr_info.name_btree_addr,
+                &mut records,
+            )?;
+            (heap, records)
+        };
+        let heap_id_len = usize::from(heap.heap_id_len);
+
+        let mut heap_ids = Vec::new();
+        let mut creation_orders = Vec::new();
+        for record in &records {
+            if record.len() < heap_id_len {
+                continue;
+            }
+
+            heap_ids.push(&record[..heap_id_len]);
+            creation_orders.push(dense_attribute_record_creation_order(record, heap_id_len));
+        }
+
+        let attr_data = {
+            let mut guard = inner.lock();
+            heap.read_managed_objects_batched(&mut guard.reader, &heap_ids)
+        };
+
+        for (attr_data, creation_order) in attr_data.into_iter().zip(creation_orders) {
+            if let Ok(attr_data) = attr_data {
+                match AttributeMessage::decode(&attr_data) {
+                    Ok(attr_msg) => visitor(attr_msg, creation_order)?,
+                    Err(e) => {
+                        eprintln!("Warning: failed to decode dense attribute: {e}");
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn dense_attribute_record_creation_order(record: &[u8], heap_id_len: usize) -> Option<u64> {
+    let start = heap_id_len.checked_add(1)?;
+    let end = start.checked_add(4)?;
+    let bytes = record.get(start..end)?;
+    Some(u64::from(u32::from_le_bytes(bytes.try_into().ok()?)))
+}
+
 fn dense_link_heap_id(record: &[u8], heap_id_len: usize) -> Result<Option<&[u8]>> {
     let end = 4usize
         .checked_add(heap_id_len)
         .ok_or_else(|| Error::InvalidFormat("dense link heap ID length overflow".into()))?;
     Ok(record.get(4..end))
+}
+
+fn dense_link_name_hash(record: &[u8]) -> Option<u32> {
+    let bytes = record.get(0..4)?;
+    Some(u32::from_le_bytes(bytes.try_into().ok()?))
 }
 
 fn group_child_path(parent: &str, child: &str) -> String {

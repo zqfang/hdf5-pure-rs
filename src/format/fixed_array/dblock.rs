@@ -6,7 +6,10 @@
 
 #![allow(dead_code)]
 
-use std::io::{Read, Seek};
+use std::{
+    fmt,
+    io::{Read, Seek},
+};
 
 use crate::error::{Error, Result};
 use crate::format::checksum::checksum_metadata;
@@ -40,8 +43,12 @@ pub(super) struct FixedArrayDataBlockPrefix {
 }
 
 /// Format a data-block prefix for debug printing.
-pub(super) fn dblock_debug(prefix: &FixedArrayDataBlockPrefix) -> String {
-    format!(
+pub(super) fn write_dblock_debug(
+    prefix: &FixedArrayDataBlockPrefix,
+    out: &mut impl fmt::Write,
+) -> fmt::Result {
+    write!(
+        out,
         "FixedArrayDataBlockPrefix(paginated={}, pages={}, prefix_size={}, raw_element_size={}, page_elements={}, element_count={})",
         prefix.paginated,
         prefix.pages,
@@ -67,15 +74,19 @@ pub(super) fn cache_dblock_image_len(prefix: &FixedArrayDataBlockPrefix) -> Resu
 }
 
 /// Serialize a dirty data block to its on-disk image (payload + checksum).
-pub(super) fn cache_dblock_serialize(prefix_and_payload: &[u8]) -> Result<Vec<u8>> {
+pub(super) fn cache_dblock_serialize_into(
+    prefix_and_payload: &[u8],
+    out: &mut Vec<u8>,
+) -> Result<()> {
     let image_len = prefix_and_payload.len().checked_add(4).ok_or_else(|| {
         Error::InvalidFormat("fixed array data block image length overflow".into())
     })?;
-    let mut out = Vec::with_capacity(image_len);
+    out.clear();
+    out.reserve(image_len);
     out.extend_from_slice(prefix_and_payload);
     let checksum = crate::format::checksum::checksum_metadata(&out);
     out.extend_from_slice(&checksum.to_le_bytes());
-    Ok(out)
+    Ok(())
 }
 
 /// Handle metadata-cache action notifications for the data block.
@@ -118,13 +129,14 @@ pub(super) fn cache_dblk_page_image_len(payload_len: usize) -> Result<usize> {
 }
 
 /// Serialize a data-block page to its on-disk image (payload + checksum).
-pub(super) fn cache_dblk_page_serialize(payload: &[u8]) -> Result<Vec<u8>> {
+pub(super) fn cache_dblk_page_serialize_into(payload: &[u8], out: &mut Vec<u8>) -> Result<()> {
     let image_len = cache_dblk_page_image_len(payload.len())?;
-    let mut out = Vec::with_capacity(image_len);
+    out.clear();
+    out.reserve(image_len);
     out.extend_from_slice(payload);
     let checksum = crate::format::checksum::checksum_metadata(&out);
     out.extend_from_slice(&checksum.to_le_bytes());
-    Ok(out)
+    Ok(())
 }
 
 /// Handle metadata-cache action notifications for a data-block page.
@@ -200,8 +212,9 @@ pub(super) fn decode_data_block_prefix<R: Read + Seek>(
     chunk_size_len: usize,
 ) -> Result<FixedArrayDataBlockPrefix> {
     reader.seek(header.data_block_addr)?;
-    let magic = reader.read_bytes(4)?;
-    if magic != b"FADB" {
+    let mut magic = [0u8; 4];
+    reader.read_bytes_into(&mut magic)?;
+    if magic != *b"FADB" {
         return Err(Error::InvalidFormat(
             "invalid fixed array data block magic".into(),
         ));
@@ -256,7 +269,8 @@ pub(super) fn decode_data_block_prefix<R: Read + Seek>(
     if paginated {
         let pages = element_count.div_ceil(page_elements);
         let page_init_size = pages.div_ceil(8);
-        let page_init = reader.read_bytes(page_init_size)?;
+        let mut page_init = vec![0; page_init_size];
+        reader.read_bytes_into(&mut page_init)?;
         verify_reader_checksum(
             reader,
             header.data_block_addr,
@@ -315,14 +329,16 @@ fn verify_trailing_checksum(data: &[u8], context: &str) -> Result<()> {
 
 /// Walk a decoded data-block prefix and materialize its element vector,
 /// honoring page-init bitmaps for paginated blocks.
-pub(super) fn collect_data_block_elements<R: Read + Seek>(
+pub(super) fn collect_data_block_elements_into<R: Read + Seek>(
     reader: &mut HdfReader<R>,
     header: &FixedArrayHeader,
     prefix: &FixedArrayDataBlockPrefix,
     filtered: bool,
     chunk_size_len: usize,
-) -> Result<Vec<FixedArrayElement>> {
-    let mut elements = Vec::with_capacity(prefix.element_count);
+    elements: &mut Vec<FixedArrayElement>,
+) -> Result<()> {
+    elements.clear();
+    elements.reserve(prefix.element_count);
     if prefix.paginated {
         let page_payload = checked_usize_mul(
             prefix.page_elements,
@@ -362,7 +378,7 @@ pub(super) fn collect_data_block_elements<R: Read + Seek>(
                 }
                 verify_reader_checksum(reader, page_addr, "fixed array data block page")?;
             } else {
-                super::append_fill_elements(page_count, &mut elements);
+                super::append_fill_elements(page_count, elements);
             }
         }
     } else {
@@ -371,7 +387,77 @@ pub(super) fn collect_data_block_elements<R: Read + Seek>(
         }
         verify_reader_checksum(reader, header.data_block_addr, "fixed array data block")?;
     }
-    Ok(elements)
+    Ok(())
+}
+
+/// Walk a decoded data-block prefix and stream each element to `visitor`.
+pub(super) fn visit_data_block_elements<R, F>(
+    reader: &mut HdfReader<R>,
+    header: &FixedArrayHeader,
+    prefix: &FixedArrayDataBlockPrefix,
+    filtered: bool,
+    chunk_size_len: usize,
+    mut visitor: F,
+) -> Result<()>
+where
+    R: Read + Seek,
+    F: FnMut(FixedArrayElement) -> Result<()>,
+{
+    if prefix.paginated {
+        let page_payload = checked_usize_mul(
+            prefix.page_elements,
+            prefix.raw_element_size,
+            "fixed array data block page size",
+        )?;
+        let page_size = checked_usize_add(page_payload, 4, "fixed array data block page size")?;
+        for page_index in 0..prefix.pages {
+            let page_start = checked_usize_mul(
+                page_index,
+                prefix.page_elements,
+                "fixed array page start index",
+            )?;
+            let remaining = prefix
+                .element_count
+                .checked_sub(page_start)
+                .ok_or_else(|| {
+                    Error::InvalidFormat("fixed array page start exceeds element count".into())
+                })?;
+            let page_count = prefix.page_elements.min(remaining);
+            if bit_is_set(&prefix.page_init, page_index) {
+                let page_offset =
+                    checked_usize_mul(page_index, page_size, "fixed array data block page offset")?;
+                let offset = checked_usize_add(
+                    prefix.prefix_size,
+                    page_offset,
+                    "fixed array data block page offset",
+                )?;
+                let page_addr = checked_u64_add(
+                    header.data_block_addr,
+                    u64_from_usize(offset, "fixed array data block page offset")?,
+                    "fixed array data block page address",
+                )?;
+                reader.seek(page_addr)?;
+                for _ in 0..page_count {
+                    visitor(read_element(reader, filtered, chunk_size_len)?)?;
+                }
+                verify_reader_checksum(reader, page_addr, "fixed array data block page")?;
+            } else {
+                for _ in 0..page_count {
+                    visitor(FixedArrayElement {
+                        addr: crate::io::reader::UNDEF_ADDR,
+                        nbytes: None,
+                        filter_mask: 0,
+                    })?;
+                }
+            }
+        }
+    } else {
+        for _ in 0..header.elements {
+            visitor(read_element(reader, filtered, chunk_size_len)?)?;
+        }
+        verify_reader_checksum(reader, header.data_block_addr, "fixed array data block")?;
+    }
+    Ok(())
 }
 
 /// Read and validate the trailing checksum of the span starting at `start`.
@@ -389,7 +475,8 @@ fn verify_reader_checksum<R: Read + Seek>(
     )
     .map_err(|_| Error::InvalidFormat(format!("{context} checksum span is too large")))?;
     reader.seek(start)?;
-    let bytes = reader.read_bytes(check_len)?;
+    let mut bytes = vec![0; check_len];
+    reader.read_bytes_into(&mut bytes)?;
     let computed = checksum_metadata(&bytes);
     if stored != computed {
         return Err(Error::InvalidFormat(format!(
@@ -405,15 +492,33 @@ fn verify_reader_checksum<R: Read + Seek>(
 /// Protect (load) a fixed-array data block by composing
 /// `decode_data_block_prefix` and `collect_data_block_elements`. Mirrors
 /// `H5FA__dblock_protect` followed by the iterate path in `H5FA_iterate`.
-pub(super) fn read_data_block<R: Read + Seek>(
+pub(super) fn read_data_block_into<R: Read + Seek>(
     reader: &mut HdfReader<R>,
     header_addr: u64,
     header: &FixedArrayHeader,
     filtered: bool,
     chunk_size_len: usize,
-) -> Result<Vec<FixedArrayElement>> {
+    elements: &mut Vec<FixedArrayElement>,
+) -> Result<()> {
     let prefix = decode_data_block_prefix(reader, header_addr, header, filtered, chunk_size_len)?;
-    collect_data_block_elements(reader, header, &prefix, filtered, chunk_size_len)
+    collect_data_block_elements_into(reader, header, &prefix, filtered, chunk_size_len, elements)
+}
+
+/// Protect and stream a fixed-array data block to `visitor`.
+pub(super) fn visit_data_block<R, F>(
+    reader: &mut HdfReader<R>,
+    header_addr: u64,
+    header: &FixedArrayHeader,
+    filtered: bool,
+    chunk_size_len: usize,
+    visitor: F,
+) -> Result<()>
+where
+    R: Read + Seek,
+    F: FnMut(FixedArrayElement) -> Result<()>,
+{
+    let prefix = decode_data_block_prefix(reader, header_addr, header, filtered, chunk_size_len)?;
+    visit_data_block_elements(reader, header, &prefix, filtered, chunk_size_len, visitor)
 }
 
 /// Read a single chunk element (address, optional filtered size and mask) from the reader.
@@ -480,7 +585,8 @@ mod tests {
         bytes[last] ^= 0xff;
 
         let mut reader = HdfReader::new(Cursor::new(bytes));
-        let err = read_data_block(&mut reader, 100, &header(1, 4), false, 0)
+        let mut elements = Vec::new();
+        let err = read_data_block_into(&mut reader, 100, &header(1, 4), false, 0, &mut elements)
             .expect_err("bad fixed array data block checksum should fail");
         assert!(err.to_string().contains("checksum"));
     }
@@ -497,7 +603,8 @@ mod tests {
         let mut bad_prefix = bytes.clone();
         bad_prefix[14] ^= 0x02;
         let mut reader = HdfReader::new(Cursor::new(bad_prefix));
-        let err = read_data_block(&mut reader, 100, &header(2, 0), false, 0)
+        let mut elements = Vec::new();
+        let err = read_data_block_into(&mut reader, 100, &header(2, 0), false, 0, &mut elements)
             .expect_err("bad fixed array prefix checksum should fail");
         assert!(err.to_string().contains("checksum"));
 
@@ -505,7 +612,8 @@ mod tests {
         let last = bad_page.len() - 1;
         bad_page[last] ^= 0xff;
         let mut reader = HdfReader::new(Cursor::new(bad_page));
-        let err = read_data_block(&mut reader, 100, &header(2, 0), false, 0)
+        let mut elements = Vec::new();
+        let err = read_data_block_into(&mut reader, 100, &header(2, 0), false, 0, &mut elements)
             .expect_err("bad fixed array page checksum should fail");
         assert!(err.to_string().contains("checksum"));
         assert_eq!(page_start, 19);
@@ -514,7 +622,8 @@ mod tests {
     #[test]
     fn fixed_array_page_cache_serializes_and_validates_checksum() {
         let payload = 55u64.to_le_bytes();
-        let image = cache_dblk_page_serialize(&payload).unwrap();
+        let mut image = Vec::new();
+        cache_dblk_page_serialize_into(&payload, &mut image).unwrap();
         assert_eq!(
             cache_dblk_page_image_len(payload.len()).unwrap(),
             image.len()

@@ -1,7 +1,17 @@
 use std::fs;
 
 use hdf5_pure_rust::engine::writer::{DatasetSpec, DtypeSpec, HdfFileWriter};
-use hdf5_pure_rust::File;
+use hdf5_pure_rust::{Dataset, File, H5Type, Result};
+
+fn assert_dataset_shape(ds: &Dataset, expected: &[u64]) -> Result<()> {
+    let space = ds.space()?;
+    assert_eq!(space.shape(), expected);
+    Ok(())
+}
+
+fn read_dataset_into<T: H5Type + Default>(ds: &Dataset, values: &mut [T]) -> Result<()> {
+    ds.read_into(values)
+}
 
 #[test]
 fn test_write_chunked_no_compression() {
@@ -39,13 +49,10 @@ fn test_write_chunked_no_compression() {
     {
         let f = File::open(&path).unwrap();
         let ds = f.dataset("chunked").unwrap();
-        assert_eq!(ds.shape().unwrap(), vec![100]);
+        assert_dataset_shape(&ds, &[100]).unwrap();
 
-        let raw = ds.read_raw().unwrap();
-        let values: Vec<f32> = raw
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
-            .collect();
+        let mut values = vec![0.0f32; ds.size().unwrap() as usize];
+        read_dataset_into(&ds, &mut values).unwrap();
         assert_eq!(values.len(), 100);
         for (i, v) in values.iter().enumerate() {
             assert_eq!(*v, i as f32, "mismatch at index {i}");
@@ -117,11 +124,8 @@ fn test_write_chunked_with_deflate() {
     {
         let f = File::open(&path).unwrap();
         let ds = f.dataset("compressed").unwrap();
-        let raw = ds.read_raw().unwrap();
-        let values: Vec<f32> = raw
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
-            .collect();
+        let mut values = vec![0.0f32; ds.size().unwrap() as usize];
+        read_dataset_into(&ds, &mut values).unwrap();
         assert_eq!(values.len(), 100);
         for (i, v) in values.iter().enumerate() {
             assert_eq!(*v, i as f32, "mismatch at index {i}");
@@ -183,11 +187,8 @@ fn test_write_chunked_with_shuffle_and_deflate() {
     {
         let f = File::open(&path).unwrap();
         let ds = f.dataset("shuf_def").unwrap();
-        let raw = ds.read_raw().unwrap();
-        let values: Vec<i32> = raw
-            .chunks_exact(4)
-            .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
-            .collect();
+        let mut values = vec![0i32; ds.size().unwrap() as usize];
+        read_dataset_into(&ds, &mut values).unwrap();
         assert_eq!(values.len(), 50);
         for (i, v) in values.iter().enumerate() {
             assert_eq!(*v, i as i32, "mismatch at {i}");

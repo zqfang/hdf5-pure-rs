@@ -1,4 +1,26 @@
-use hdf5_pure_rust::File;
+use hdf5_pure_rust::{Attribute, Dataset, File};
+
+fn assert_dataset_strings<const N: usize>(ds: &Dataset, expected: [&str; N]) {
+    let mut index = 0;
+    ds.visit_strings(|value| {
+        assert_eq!(value, expected[index]);
+        index += 1;
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(index, N);
+}
+
+fn assert_attribute_strings<const N: usize>(attr: &Attribute, expected: [&str; N]) {
+    let mut index = 0;
+    attr.visit_strings(|value| {
+        assert_eq!(value, expected[index]);
+        index += 1;
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(index, N);
+}
 
 #[test]
 fn test_read_fixed_strings() {
@@ -9,10 +31,7 @@ fn test_read_fixed_strings() {
     assert!(dtype.is_string());
     assert_eq!(dtype.size(), 10);
 
-    let strings = ds.read_strings().unwrap();
-    assert_eq!(strings.len(), 2);
-    assert_eq!(strings[0], "hello");
-    assert_eq!(strings[1], "world");
+    assert_dataset_strings(&ds, ["hello", "world"]);
 }
 
 #[test]
@@ -21,8 +40,10 @@ fn test_read_vlen_string_attr() {
     let attr = f.attr("vlen_str").unwrap();
 
     assert!(attr.dtype().is_vlen());
-    assert_eq!(attr.read_strings().unwrap(), vec!["hello world"]);
-    assert_eq!(attr.read_string(), "hello world");
+    assert_attribute_strings(&attr, ["hello world"]);
+    let mut value = String::new();
+    attr.read_string_into(&mut value).unwrap();
+    assert_eq!(value, "hello world");
 }
 
 #[test]
@@ -33,10 +54,5 @@ fn test_read_vlen_string_dataset() {
     let dtype = ds.dtype().unwrap();
     assert!(dtype.is_vlen());
 
-    let strings = ds.read_strings().unwrap();
-    println!("vlen strings: {strings:?}");
-    assert_eq!(strings.len(), 3);
-    assert_eq!(strings[0], "alpha");
-    assert_eq!(strings[1], "beta");
-    assert_eq!(strings[2], "gamma");
+    assert_dataset_strings(&ds, ["alpha", "beta", "gamma"]);
 }

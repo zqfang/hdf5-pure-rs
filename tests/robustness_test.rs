@@ -1278,19 +1278,19 @@ fn test_declared_allocation_counts_are_capped() {
     let heap = LocalHeap {
         data: b"valid\0unterminated".to_vec(),
     };
-    assert_eq!(heap.get_string(0).unwrap(), "valid");
+    assert_eq!(heap.get_str(0).unwrap(), "valid");
     let err = heap
-        .get_string(6)
+        .get_str(6)
         .expect_err("unterminated local heap string should fail");
     assert!(matches!(err, hdf5_pure_rust::Error::InvalidFormat(_)));
     let err = LocalHeap {
         data: vec![0xff, 0],
     }
-    .get_string(0)
+    .get_str(0)
     .expect_err("invalid UTF-8 local heap string should fail");
     assert!(matches!(err, hdf5_pure_rust::Error::InvalidFormat(_)));
     let err = heap
-        .get_string(heap.data.len())
+        .get_str(heap.data.len())
         .expect_err("out-of-bounds local heap string should fail");
     assert!(matches!(err, hdf5_pure_rust::Error::InvalidFormat(_)));
 
@@ -1316,7 +1316,8 @@ fn test_declared_allocation_counts_are_capped() {
     fixed.extend_from_slice(&UNDEF_ADDR.to_le_bytes());
     fixed.extend_from_slice(&0u32.to_le_bytes());
     let mut reader = HdfReader::new(Cursor::new(fixed));
-    let err = fixed_array::read_fixed_array_chunks(&mut reader, 0, false, 0)
+    let mut elements = Vec::new();
+    let err = fixed_array::read_fixed_array_chunks_into(&mut reader, 0, false, 0, &mut elements)
         .expect_err("oversized fixed array should fail");
     assert!(matches!(err, hdf5_pure_rust::Error::InvalidFormat(_)));
 
@@ -1331,8 +1332,15 @@ fn test_declared_allocation_counts_are_capped() {
     extensible.extend_from_slice(&UNDEF_ADDR.to_le_bytes());
     extensible.extend_from_slice(&0u32.to_le_bytes());
     let mut reader = HdfReader::new(Cursor::new(extensible));
-    let err = extensible_array::read_extensible_array_chunks(&mut reader, 0, false, 0)
-        .expect_err("oversized extensible array should fail");
+    elements.clear();
+    let err = extensible_array::read_extensible_array_chunks_into(
+        &mut reader,
+        0,
+        false,
+        0,
+        &mut elements,
+    )
+    .expect_err("oversized extensible array should fail");
     assert!(matches!(err, hdf5_pure_rust::Error::InvalidFormat(_)));
 }
 
@@ -1351,7 +1359,11 @@ fn test_compound_field_preserves_member_byte_order() {
     data.extend_from_slice(&32u16.to_le_bytes()); // bit precision
 
     let dtype = DatatypeMessage::decode(&data).unwrap();
-    let fields = dtype.compound_fields().unwrap();
+    let fields: Vec<_> = dtype
+        .compound_fields_iter()
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
     assert_eq!(fields.len(), 1);
     assert_eq!(fields[0].name, "x");
     assert_eq!(fields[0].byte_order, Some(ByteOrder::BigEndian));
@@ -1381,11 +1393,22 @@ fn test_compound_fields_advance_padded_opaque_member_datatype() {
     data.extend_from_slice(&32u16.to_le_bytes());
 
     let dtype = DatatypeMessage::decode(&data).unwrap();
-    let fields = dtype.compound_fields().unwrap();
+    let fields: Vec<_> = dtype
+        .compound_fields_iter()
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
     assert_eq!(fields.len(), 2);
-    assert_eq!(fields[0].datatype.opaque_tag().as_deref(), Some("abc"));
+    assert_eq!(fields[0].datatype.opaque_tag_str(), Some("abc"));
     assert_eq!(fields[1].name, "i");
     assert_eq!(fields[1].datatype.size, 4);
+}
+
+fn validate_compound_fields(dtype: &DatatypeMessage) -> hdf5_pure_rust::Result<()> {
+    for field in dtype.compound_fields_iter()? {
+        field?;
+    }
+    Ok(())
 }
 
 #[test]
@@ -1412,9 +1435,8 @@ fn test_compound_fields_reject_overlapping_members() {
     data.extend_from_slice(&32u16.to_le_bytes());
 
     let dtype = DatatypeMessage::decode(&data).unwrap();
-    let err = dtype
-        .compound_fields()
-        .expect_err("overlapping compound members should fail");
+    let err =
+        validate_compound_fields(&dtype).expect_err("overlapping compound members should fail");
     assert!(matches!(err, hdf5_pure_rust::Error::InvalidFormat(_)));
 }
 
@@ -1515,7 +1537,8 @@ fn test_compound_fields_reject_truncated_member_metadata() {
     for data in cases {
         let dtype = DatatypeMessage::decode(&data).expect("compound header should decode");
         let err = dtype
-            .compound_fields()
+            .compound_fields_iter()
+            .and_then(|fields| fields.collect::<Result<Vec<_>, _>>())
             .expect_err("truncated compound member metadata should fail");
         assert!(matches!(err, hdf5_pure_rust::Error::InvalidFormat(_)));
     }
@@ -1581,7 +1604,8 @@ fn test_enum_members_reject_truncated_metadata() {
     for data in cases {
         let dtype = DatatypeMessage::decode(&data).expect("enum header should decode");
         let err = dtype
-            .enum_members()
+            .enum_members_iter()
+            .and_then(|members| members.collect::<Result<Vec<_>, _>>())
             .expect_err("truncated enum member metadata should fail");
         assert!(matches!(err, hdf5_pure_rust::Error::InvalidFormat(_)));
     }
@@ -1595,7 +1619,8 @@ fn test_enum_members_reject_invalid_utf8_names() {
     data.push(1);
     let dtype = DatatypeMessage::decode(&data).expect("enum header should decode");
     let err = dtype
-        .enum_members()
+        .enum_members_iter()
+        .and_then(|members| members.collect::<Result<Vec<_>, _>>())
         .expect_err("invalid enum member name should fail");
     assert!(format!("{err}").contains("not UTF-8"));
 }
@@ -1677,7 +1702,12 @@ fn test_array_dims_base_handles_v2_v3_v4_and_rejects_v1() {
     v2.extend_from_slice(&1u32.to_le_bytes());
     v2.extend_from_slice(&base_i16);
     let dtype = DatatypeMessage::decode(&v2).unwrap();
-    let (dims, base) = dtype.array_dims_base().unwrap();
+    let dims = dtype
+        .array_dims_iter()
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let base = dtype.array_base().unwrap();
     assert_eq!(dims, vec![2, 3]);
     assert_eq!(base.size, 2);
 
@@ -1686,7 +1716,12 @@ fn test_array_dims_base_handles_v2_v3_v4_and_rejects_v1() {
     v3.extend_from_slice(&3u32.to_le_bytes());
     v3.extend_from_slice(&base_i16);
     let dtype = DatatypeMessage::decode(&v3).unwrap();
-    let (dims, base) = dtype.array_dims_base().unwrap();
+    let dims = dtype
+        .array_dims_iter()
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let base = dtype.array_base().unwrap();
     assert_eq!(dims, vec![2, 3]);
     assert_eq!(base.size, 2);
 
@@ -1695,7 +1730,12 @@ fn test_array_dims_base_handles_v2_v3_v4_and_rejects_v1() {
     v4.extend_from_slice(&3u32.to_le_bytes());
     v4.extend_from_slice(&base_i16);
     let dtype = DatatypeMessage::decode(&v4).unwrap();
-    let (dims, base) = dtype.array_dims_base().unwrap();
+    let dims = dtype
+        .array_dims_iter()
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let base = dtype.array_base().unwrap();
     assert_eq!(dims, vec![2, 3]);
     assert_eq!(base.size, 2);
 }
@@ -2037,7 +2077,8 @@ fn test_compound_distinct_non_utf8_member_names_do_not_false_duplicate() {
 
     let datatype = DatatypeMessage::decode(&data).expect("compound datatype should parse");
     let fields = datatype
-        .compound_fields()
+        .compound_fields_iter()
+        .and_then(|fields| fields.collect::<Result<Vec<_>, _>>())
         .expect("distinct non-UTF8 names must not be treated as duplicates");
     assert_eq!(fields.len(), 2);
     assert_eq!(fields[0].byte_offset, 0);
@@ -2057,7 +2098,8 @@ fn test_enum_rejects_empty_member_name() {
 
     let datatype = DatatypeMessage::decode(&data).expect("enum datatype should decode");
     let err = datatype
-        .enum_members()
+        .enum_members_iter()
+        .and_then(|members| members.collect::<Result<Vec<_>, _>>())
         .expect_err("empty enum member names must be rejected");
     assert!(format!("{err}").contains("must not be empty"));
 }
@@ -2248,7 +2290,8 @@ fn test_huge_fractal_heap_direct_object_read() {
 fn test_filtered_huge_fractal_heap_direct_object_read() {
     let mut heap = test_fractal_heap(8);
     let payload = b"filtered huge heap object".to_vec();
-    let filtered = hdf5_pure_rust::filters::deflate::compress(&payload, 6).unwrap();
+    let mut filtered = Vec::new();
+    hdf5_pure_rust::filters::deflate::compress_into(&payload, 6, &mut filtered).unwrap();
     let mut file_bytes = vec![0u8; 48];
     file_bytes.extend_from_slice(&filtered);
     let addr = 48u64;
@@ -2279,7 +2322,8 @@ fn test_filtered_huge_fractal_heap_direct_object_read() {
 fn test_filtered_fractal_heap_direct_object_read() {
     let heap = test_fractal_heap(8);
     let payload = b"filtered heap object".to_vec();
-    let filtered = hdf5_pure_rust::filters::deflate::compress(&payload, 6).unwrap();
+    let mut filtered = Vec::new();
+    hdf5_pure_rust::filters::deflate::compress_into(&payload, 6, &mut filtered).unwrap();
     let mut file_bytes = vec![0u8; 64];
     file_bytes.extend_from_slice(&filtered);
 

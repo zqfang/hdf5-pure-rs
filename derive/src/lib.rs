@@ -104,11 +104,23 @@ fn impl_struct(
                 }
                 let inner_ty = &fields[0].ty;
                 return quote! {
-                    fn compound_fields() -> Option<Vec<::hdf5_pure_rust::hl::types::FieldDescriptor>> {
-                        <#inner_ty as ::hdf5_pure_rust::H5Type>::compound_fields()
+                    fn visit_compound_fields<F>(visitor: F) -> Option<()>
+                    where
+                        F: FnMut(::hdf5_pure_rust::hl::types::FieldDescriptor),
+                    {
+                        <#inner_ty as ::hdf5_pure_rust::H5Type>::visit_compound_fields(visitor)
                     }
-                    fn enum_members() -> Option<Vec<(String, i64)>> {
-                        <#inner_ty as ::hdf5_pure_rust::H5Type>::enum_members()
+                    fn compound_fields_into(out: &mut Vec<::hdf5_pure_rust::hl::types::FieldDescriptor>) -> Option<()> {
+                        <#inner_ty as ::hdf5_pure_rust::H5Type>::compound_fields_into(out)
+                    }
+                    fn visit_enum_members<F>(visitor: F) -> Option<()>
+                    where
+                        F: FnMut(&str, i64),
+                    {
+                        <#inner_ty as ::hdf5_pure_rust::H5Type>::visit_enum_members(visitor)
+                    }
+                    fn enum_members_into(out: &mut Vec<(String, i64)>) -> Option<()> {
+                        <#inner_ty as ::hdf5_pure_rust::H5Type>::enum_members_into(out)
                     }
                 };
             }
@@ -124,11 +136,12 @@ fn impl_struct(
             let field_types: Vec<_> = fields.iter().map(|f| &f.ty).collect();
 
             quote! {
-                fn compound_fields() -> Option<Vec<::hdf5_pure_rust::hl::types::FieldDescriptor>> {
+                fn compound_fields_into(out: &mut Vec<::hdf5_pure_rust::hl::types::FieldDescriptor>) -> Option<()> {
+                    out.clear();
                     let origin = ::std::mem::MaybeUninit::<#ty #ty_generics>::uninit();
                     let origin_ptr = origin.as_ptr();
-                    let fields = vec![#(
-                        ::hdf5_pure_rust::hl::types::FieldDescriptor {
+                    #(
+                        out.push(::hdf5_pure_rust::hl::types::FieldDescriptor {
                             name: #field_names.to_string(),
                             offset: unsafe {
                                 ::std::ptr::addr_of!((*origin_ptr).#field_idents).cast::<u8>()
@@ -136,10 +149,8 @@ fn impl_struct(
                             },
                             size: <#field_types as ::hdf5_pure_rust::H5Type>::type_size(),
                             type_class: {
-                                // Determine type class from size and signedness
                                 let size = <#field_types as ::hdf5_pure_rust::H5Type>::type_size();
                                 if size == 4 || size == 8 {
-                                    // Could be float or integer -- use type_id to distinguish
                                     if ::std::any::TypeId::of::<#field_types>() == ::std::any::TypeId::of::<f32>()
                                         || ::std::any::TypeId::of::<#field_types>() == ::std::any::TypeId::of::<f64>()
                                     {
@@ -153,20 +164,59 @@ fn impl_struct(
                                     } else {
                                         ::hdf5_pure_rust::hl::types::TypeClass::Integer { signed: false }
                                     }
+                                } else if ::std::any::TypeId::of::<#field_types>() == ::std::any::TypeId::of::<i8>()
+                                    || ::std::any::TypeId::of::<#field_types>() == ::std::any::TypeId::of::<i16>()
+                                {
+                                    ::hdf5_pure_rust::hl::types::TypeClass::Integer { signed: true }
                                 } else {
-                                    // Small sizes are likely integers
-                                    if ::std::any::TypeId::of::<#field_types>() == ::std::any::TypeId::of::<i8>()
+                                    ::hdf5_pure_rust::hl::types::TypeClass::Integer { signed: false }
+                                }
+                            },
+                        });
+                    )*
+                    Some(())
+                }
+                fn visit_compound_fields<F>(mut visitor: F) -> Option<()>
+                where
+                    F: FnMut(::hdf5_pure_rust::hl::types::FieldDescriptor),
+                {
+                    let origin = ::std::mem::MaybeUninit::<#ty #ty_generics>::uninit();
+                    let origin_ptr = origin.as_ptr();
+                    #(
+                        visitor(::hdf5_pure_rust::hl::types::FieldDescriptor {
+                            name: #field_names.to_string(),
+                            offset: unsafe {
+                                ::std::ptr::addr_of!((*origin_ptr).#field_idents).cast::<u8>()
+                                    .offset_from(origin_ptr.cast()) as usize
+                            },
+                            size: <#field_types as ::hdf5_pure_rust::H5Type>::type_size(),
+                            type_class: {
+                                let size = <#field_types as ::hdf5_pure_rust::H5Type>::type_size();
+                                if size == 4 || size == 8 {
+                                    if ::std::any::TypeId::of::<#field_types>() == ::std::any::TypeId::of::<f32>()
+                                        || ::std::any::TypeId::of::<#field_types>() == ::std::any::TypeId::of::<f64>()
+                                    {
+                                        ::hdf5_pure_rust::hl::types::TypeClass::Float
+                                    } else if ::std::any::TypeId::of::<#field_types>() == ::std::any::TypeId::of::<i8>()
                                         || ::std::any::TypeId::of::<#field_types>() == ::std::any::TypeId::of::<i16>()
+                                        || ::std::any::TypeId::of::<#field_types>() == ::std::any::TypeId::of::<i32>()
+                                        || ::std::any::TypeId::of::<#field_types>() == ::std::any::TypeId::of::<i64>()
                                     {
                                         ::hdf5_pure_rust::hl::types::TypeClass::Integer { signed: true }
                                     } else {
                                         ::hdf5_pure_rust::hl::types::TypeClass::Integer { signed: false }
                                     }
+                                } else if ::std::any::TypeId::of::<#field_types>() == ::std::any::TypeId::of::<i8>()
+                                    || ::std::any::TypeId::of::<#field_types>() == ::std::any::TypeId::of::<i16>()
+                                {
+                                    ::hdf5_pure_rust::hl::types::TypeClass::Integer { signed: true }
+                                } else {
+                                    ::hdf5_pure_rust::hl::types::TypeClass::Integer { signed: false }
                                 }
                             },
-                        }
-                    ),*];
-                    Some(fields)
+                        });
+                    )*
+                    Some(())
                 }
             }
         }
@@ -195,11 +245,12 @@ fn impl_struct(
             let field_types: Vec<_> = fields.iter().map(|(_, f)| &f.ty).collect();
 
             quote! {
-                fn compound_fields() -> Option<Vec<::hdf5_pure_rust::hl::types::FieldDescriptor>> {
+                fn compound_fields_into(out: &mut Vec<::hdf5_pure_rust::hl::types::FieldDescriptor>) -> Option<()> {
+                    out.clear();
                     let origin = ::std::mem::MaybeUninit::<#ty #ty_generics>::uninit();
                     let origin_ptr = origin.as_ptr();
-                    let fields = vec![#(
-                        ::hdf5_pure_rust::hl::types::FieldDescriptor {
+                    #(
+                        out.push(::hdf5_pure_rust::hl::types::FieldDescriptor {
                             name: #field_names.to_string(),
                             offset: unsafe {
                                 ::std::ptr::addr_of!((*origin_ptr).#field_indices).cast::<u8>()
@@ -207,9 +258,28 @@ fn impl_struct(
                             },
                             size: <#field_types as ::hdf5_pure_rust::H5Type>::type_size(),
                             type_class: ::hdf5_pure_rust::hl::types::TypeClass::Integer { signed: false },
-                        }
-                    ),*];
-                    Some(fields)
+                        });
+                    )*
+                    Some(())
+                }
+                fn visit_compound_fields<F>(mut visitor: F) -> Option<()>
+                where
+                    F: FnMut(::hdf5_pure_rust::hl::types::FieldDescriptor),
+                {
+                    let origin = ::std::mem::MaybeUninit::<#ty #ty_generics>::uninit();
+                    let origin_ptr = origin.as_ptr();
+                    #(
+                        visitor(::hdf5_pure_rust::hl::types::FieldDescriptor {
+                            name: #field_names.to_string(),
+                            offset: unsafe {
+                                ::std::ptr::addr_of!((*origin_ptr).#field_indices).cast::<u8>()
+                                    .offset_from(origin_ptr.cast()) as usize
+                            },
+                            size: <#field_types as ::hdf5_pure_rust::H5Type>::type_size(),
+                            type_class: ::hdf5_pure_rust::hl::types::TypeClass::Integer { signed: false },
+                        });
+                    )*
+                    Some(())
                 }
             }
         }
@@ -246,13 +316,25 @@ fn impl_enum(_ty: &Ident, data: &syn::DataEnum, attrs: &[Attribute]) -> TokenStr
         .iter()
         .map(|v| &v.discriminant.as_ref().unwrap().1)
         .collect();
-    let repr_iter = std::iter::repeat(&repr);
+    let repr_iter_visit = std::iter::repeat(&repr);
+    let repr_iter_into = std::iter::repeat(&repr);
 
     quote! {
-        fn enum_members() -> Option<Vec<(String, i64)>> {
-            Some(vec![#(
-                (#names.to_string(), (#values) as #repr_iter as i64)
-            ),*])
+        fn visit_enum_members<F>(mut visitor: F) -> Option<()>
+        where
+            F: FnMut(&str, i64),
+        {
+            #(
+                visitor(#names, (#values) as #repr_iter_visit as i64);
+            )*
+            Some(())
+        }
+        fn enum_members_into(out: &mut Vec<(String, i64)>) -> Option<()> {
+            out.clear();
+            #(
+                out.push((#names.to_string(), (#values) as #repr_iter_into as i64));
+            )*
+            Some(())
         }
     }
 }
