@@ -5,6 +5,12 @@ use std::fmt;
 use crate::error::{Error, Result};
 use crate::hl::selection::{Selection, SelectionType};
 
+fn unsupported_dataset_operation(name: &str, reason: &str) -> Error {
+    Error::Unsupported(format!(
+        "{name} is not supported by the pure-Rust dataset API: {reason}"
+    ))
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct VirtualMapping {
     pub source_file: String,
@@ -3004,6 +3010,29 @@ pub fn H5D__none_idx_get_addr_checked(index: &ChunkIndexState, coord: &[u64]) ->
 #[allow(non_snake_case)]
 pub fn H5D__none_idx_load_metadata(_index: &mut ChunkIndexState) {}
 
+/// Insert an explicit chunk record into an implicit "none" chunk index.
+#[allow(non_snake_case)]
+pub fn H5D__none_idx_insert(
+    _index: &mut ChunkIndexState,
+    _coord: &[u64],
+    _addr: u64,
+    _size: usize,
+) -> Result<()> {
+    Err(unsupported_dataset_operation(
+        "H5D__none_idx_insert",
+        "the none chunk index derives addresses from fixed geometry and has no explicit records",
+    ))
+}
+
+/// Resize an implicit "none" chunk index.
+#[allow(non_snake_case)]
+pub fn H5D__none_idx_resize(_index: &mut ChunkIndexState, _chunks_per_dim: &[u64]) -> Result<()> {
+    Err(unsupported_dataset_operation(
+        "H5D__none_idx_resize",
+        "resizing implicit chunk-index geometry is handled by high-level dataset extent changes",
+    ))
+}
+
 /// Iterate over the entries of a dataset.
 #[allow(non_snake_case)]
 pub fn H5D__none_idx_iterate_with<F>(index: &ChunkIndexState, mut visitor: F) -> Result<()>
@@ -4065,6 +4094,18 @@ pub mod explicit_index_wrappers {
         index.entries.len()
     }
 
+    /// Resize a v2 B-tree chunk index.
+    #[allow(non_snake_case)]
+    pub fn H5D__bt2_idx_resize(
+        _index: &mut ChunkIndexState,
+        _chunks_per_dim: &[u64],
+    ) -> Result<()> {
+        Err(unsupported_dataset_operation(
+            "H5D__bt2_idx_resize",
+            "v2 B-tree chunk-index growth is performed by the writer, not by this high-level API shim",
+        ))
+    }
+
     /// Reset a dataset to its default state.
     #[allow(non_snake_case)]
     pub fn H5D__bt2_idx_reset(index: &mut ChunkIndexState) {
@@ -4260,6 +4301,18 @@ pub mod explicit_index_wrappers {
         index.open = false;
     }
 
+    /// Resize a fixed-array chunk index.
+    #[allow(non_snake_case)]
+    pub fn H5D__farray_idx_resize(
+        _index: &mut ChunkIndexState,
+        _chunks_per_dim: &[u64],
+    ) -> Result<()> {
+        Err(unsupported_dataset_operation(
+            "H5D__farray_idx_resize",
+            "fixed-array chunk indexes have fixed geometry in this compatibility layer",
+        ))
+    }
+
     /// Dataset operation: btree get shared.
     #[allow(non_snake_case)]
     pub fn H5D__btree_get_shared() -> ChunkIndexState {
@@ -4341,6 +4394,20 @@ pub mod explicit_index_wrappers {
         index.space_allocated
     }
 
+    /// Insert an entry into a v1 B-tree chunk index.
+    #[allow(non_snake_case)]
+    pub fn H5D__btree_idx_insert(
+        _index: &mut ChunkIndexState,
+        _coord: &[u64],
+        _addr: u64,
+        _size: usize,
+    ) -> Result<()> {
+        Err(unsupported_dataset_operation(
+            "H5D__btree_idx_insert",
+            "v1 B-tree node mutation is performed by the writer, not by this high-level API shim",
+        ))
+    }
+
     /// Dataset operation: btree idx get addr.
     #[allow(non_snake_case)]
     pub fn H5D__btree_idx_get_addr(index: &ChunkIndexState, coord: &[u64]) -> Option<u64> {
@@ -4397,6 +4464,18 @@ pub mod explicit_index_wrappers {
     #[allow(non_snake_case)]
     pub fn H5D__btree_idx_size(index: &ChunkIndexState) -> usize {
         index.entries.len()
+    }
+
+    /// Resize a v1 B-tree chunk index.
+    #[allow(non_snake_case)]
+    pub fn H5D__btree_idx_resize(
+        _index: &mut ChunkIndexState,
+        _chunks_per_dim: &[u64],
+    ) -> Result<()> {
+        Err(unsupported_dataset_operation(
+            "H5D__btree_idx_resize",
+            "v1 B-tree chunk-index growth is performed by the writer, not by this high-level API shim",
+        ))
     }
 
     /// Reset a dataset to its default state.
@@ -4587,6 +4666,36 @@ mod tests {
         assert!(H5D__none_idx_get_addr_checked(&index, &[1]).is_err());
         assert!(H5D__none_idx_get_addr_checked(&index, &[2]).is_err());
         assert!(H5D__none_idx_get_addr_checked(&index, &[0, 0]).is_err());
+    }
+
+    #[test]
+    fn unsupported_chunk_index_mutation_stubs_are_explicit() {
+        let mut index = ChunkIndexState::default();
+
+        assert!(matches!(
+            H5D__none_idx_insert(&mut index, &[0], 0, 8),
+            Err(Error::Unsupported(_))
+        ));
+        assert!(matches!(
+            H5D__none_idx_resize(&mut index, &[2]),
+            Err(Error::Unsupported(_))
+        ));
+        assert!(matches!(
+            explicit_index_wrappers::H5D__farray_idx_resize(&mut index, &[2]),
+            Err(Error::Unsupported(_))
+        ));
+        assert!(matches!(
+            explicit_index_wrappers::H5D__bt2_idx_resize(&mut index, &[2]),
+            Err(Error::Unsupported(_))
+        ));
+        assert!(matches!(
+            explicit_index_wrappers::H5D__btree_idx_insert(&mut index, &[0], 0, 8),
+            Err(Error::Unsupported(_))
+        ));
+        assert!(matches!(
+            explicit_index_wrappers::H5D__btree_idx_resize(&mut index, &[2]),
+            Err(Error::Unsupported(_))
+        ));
     }
 
     #[test]

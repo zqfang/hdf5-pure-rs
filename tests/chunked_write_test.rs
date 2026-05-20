@@ -219,6 +219,12 @@ fn test_write_chunked_with_deflate() {
     {
         let f = File::open(&path).unwrap();
         let ds = f.dataset("compressed").unwrap();
+        let info = ds.info().unwrap();
+        assert_eq!(info.layout.version, 4);
+        assert_eq!(
+            info.layout.chunk_index_type,
+            Some(ChunkIndexType::FixedArray)
+        );
         let mut values = vec![0.0f32; ds.size().unwrap() as usize];
         read_dataset_into(&ds, &mut values).unwrap();
         assert_eq!(values.len(), 100);
@@ -244,6 +250,133 @@ fn test_write_chunked_with_deflate() {
             );
         }
     }
+}
+
+#[test]
+fn test_write_chunked_fixed_array_beyond_one_page() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("written_chunked_fixed_array_paged.h5");
+
+    {
+        let f = fs::File::create(&path).unwrap();
+        let mut w = HdfFileWriter::new(f);
+        w.begin().unwrap();
+        w.create_root_group().unwrap();
+
+        let data: Vec<u8> = (0..4_105).map(|i| (i % 251) as u8).collect();
+
+        w.create_chunked_dataset(
+            "/",
+            &DatasetSpec {
+                name: "paged_fixed_array",
+                shape: &[4_105],
+                max_shape: None,
+                dtype: DtypeSpec::U8,
+                data: &data,
+            },
+            &[1],
+            None,
+            false,
+        )
+        .unwrap();
+
+        w.finalize().unwrap();
+    }
+
+    let f = File::open(&path).unwrap();
+    let ds = f.dataset("paged_fixed_array").unwrap();
+    let info = ds.info().unwrap();
+    assert_eq!(info.layout.version, 4);
+    assert_eq!(
+        info.layout.chunk_index_type,
+        Some(ChunkIndexType::FixedArray)
+    );
+
+    let mut values = vec![0u8; ds.size().unwrap() as usize];
+    read_dataset_into(&ds, &mut values).unwrap();
+    let expected: Vec<u8> = (0..4_105).map(|i| (i % 251) as u8).collect();
+    assert_eq!(values, expected);
+}
+
+#[test]
+fn test_write_chunked_max_shape_uses_extensible_array_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("written_chunked_max_shape_ea.h5");
+
+    {
+        let f = fs::File::create(&path).unwrap();
+        let mut w = HdfFileWriter::new(f);
+        w.begin().unwrap();
+        w.create_root_group().unwrap();
+
+        let data: Vec<i32> = (0..12).collect();
+        let data_bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
+
+        w.create_chunked_dataset(
+            "/",
+            &DatasetSpec {
+                name: "max_shape_ea",
+                shape: &[12],
+                max_shape: Some(&[u64::MAX]),
+                dtype: DtypeSpec::I32,
+                data: &data_bytes,
+            },
+            &[3],
+            None,
+            false,
+        )
+        .unwrap();
+
+        w.finalize().unwrap();
+    }
+
+    let f = File::open(&path).unwrap();
+    let ds = f.dataset("max_shape_ea").unwrap();
+    let info = ds.info().unwrap();
+    assert_eq!(info.layout.version, 4);
+    assert_eq!(
+        info.layout.chunk_index_type,
+        Some(ChunkIndexType::ExtensibleArray)
+    );
+
+    let mut values = vec![0i32; ds.size().unwrap() as usize];
+    read_dataset_into(&ds, &mut values).unwrap();
+    assert_eq!(values, (0..12).collect::<Vec<_>>());
+}
+
+#[test]
+fn test_write_chunked_max_shape_large_grid_boundary_is_explicit() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir
+        .path()
+        .join("written_chunked_max_shape_large_boundary.h5");
+
+    let f = fs::File::create(&path).unwrap();
+    let mut w = HdfFileWriter::new(f);
+    w.begin().unwrap();
+    w.create_root_group().unwrap();
+
+    let data = vec![0u8; 256];
+    let err = w
+        .create_chunked_dataset(
+            "/",
+            &DatasetSpec {
+                name: "too_many_inline_ea_chunks",
+                shape: &[256],
+                max_shape: Some(&[u64::MAX]),
+                dtype: DtypeSpec::U8,
+                data: &data,
+            },
+            &[1],
+            None,
+            false,
+        )
+        .expect_err("large max-shape chunk grid should require full EA/v2 support");
+    assert!(
+        err.to_string()
+            .contains("full extensible-array or v2 B-tree index creation"),
+        "unexpected error: {err}"
+    );
 }
 
 #[test]

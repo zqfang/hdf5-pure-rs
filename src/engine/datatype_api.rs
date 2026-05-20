@@ -396,7 +396,10 @@ pub fn H5T__set_size(dtype: &mut RuntimeDatatype, size: u32) -> Result<()> {
                 }
             }
         }
-        DatatypeClass::String => {}
+        DatatypeClass::String => {
+            dtype.message.size = size;
+            return Ok(());
+        }
         DatatypeClass::Enum => {
             if enum_has_members(&dtype.message)? {
                 return Err(Error::InvalidFormat(
@@ -8530,22 +8533,28 @@ mod tests {
         assert_eq!(string.message.size, 2);
         assert_eq!(H5Tget_precision(&string), None);
 
-        H5Tset_size(&mut string, 8192).unwrap();
+        let large_fixed_string_size = u32::from(u16::MAX) + 1;
+        H5Tset_size(&mut string, large_fixed_string_size).unwrap();
         assert_eq!(string.message.class, DatatypeClass::String);
-        assert_eq!(string.message.size, 8192);
+        assert_eq!(string.message.size, large_fixed_string_size);
+        assert_eq!(H5Tget_size(&string), large_fixed_string_size as usize);
         assert_eq!(H5Tget_precision(&string), None);
         assert!(!H5Tis_variable_str(&string));
         let mut encoded = Vec::new();
         H5Tencode_into(&string, &mut encoded).unwrap();
+        let decoded = H5Tdecode(&encoded).unwrap();
+        assert_eq!(decoded.message.class, DatatypeClass::String);
+        assert_eq!(decoded.message.size, large_fixed_string_size);
+        assert_eq!(H5Tget_precision(&decoded), None);
 
         H5Tset_size(&mut string, u32::MAX).unwrap();
         assert_eq!(string.message.class, DatatypeClass::VarLen);
         assert!(H5Tis_variable_str(&string));
         assert!(string.force_conv);
-        H5Tset_size(&mut string, 8192).unwrap();
+        H5Tset_size(&mut string, large_fixed_string_size).unwrap();
         assert_eq!(string.message.class, DatatypeClass::VarLen);
         assert!(H5Tis_variable_str(&string));
-        assert_eq!(string.message.size, 8192);
+        assert_eq!(string.message.size, large_fixed_string_size);
     }
 
     #[test]

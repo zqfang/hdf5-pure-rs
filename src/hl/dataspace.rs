@@ -186,11 +186,9 @@ impl Dataspace {
         }
     }
 
-    /// hdf5-metno compatibility layer: dataspace encoding is not implemented in pure-Rust mode; do not remove.
+    /// hdf5-metno compatibility layer: encode this dataspace extent message.
     pub fn encode(&self) -> crate::Result<Vec<u8>> {
-        Err(crate::Error::Unsupported(
-            "hdf5-metno compatibility Dataspace::encode is not implemented".into(),
-        ))
+        self.msg.encode()
     }
 
     /// hdf5-metno compatibility layer: return current and maximum dimensions; do not remove.
@@ -676,5 +674,37 @@ mod tests {
         H5S_set_version(&mut space, 1).unwrap();
         assert_eq!(space.raw_message_ref().version, 1);
         H5S__close_cb(H5S_create(DataspaceType::Scalar));
+    }
+
+    #[test]
+    fn dataspace_encode_roundtrips_current_message() {
+        let space = Dataspace::simple(vec![2, 3], Some(vec![4, u64::MAX])).unwrap();
+        let encoded = space.encode().unwrap();
+        assert_eq!(encoded[..4], [2, 2, 1, 1]);
+        assert_eq!(
+            DataspaceMessage::decode(&encoded).unwrap(),
+            space.raw_message()
+        );
+
+        let scalar = Dataspace::scalar();
+        assert_eq!(scalar.encode().unwrap(), vec![2, 0, 0, 0]);
+
+        let null = Dataspace::null();
+        assert_eq!(null.encode().unwrap(), vec![2, 0, 0, 2]);
+    }
+
+    #[test]
+    fn dataspace_encode_honors_v1_layout() {
+        let mut space = Dataspace::simple(vec![6], None).unwrap();
+        space.set_version(1).unwrap();
+
+        let encoded = space.encode().unwrap();
+        let mut expected = vec![1, 1, 0, 0, 0, 0, 0, 0];
+        expected.extend_from_slice(&6u64.to_le_bytes());
+        assert_eq!(encoded, expected);
+        assert_eq!(
+            DataspaceMessage::decode(&encoded).unwrap(),
+            space.raw_message()
+        );
     }
 }

@@ -160,6 +160,43 @@ fn test_write_root_attrs() {
 }
 
 #[test]
+fn test_read_false_true_enum_attr_with_u64_base() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("written_bool_enum_u64_attr.h5");
+
+    {
+        let f = fs::File::create(&path).unwrap();
+        let mut w = HdfFileWriter::new(f);
+        w.begin().unwrap();
+        w.create_root_group().unwrap();
+
+        let value = 1u64.to_le_bytes();
+        w.add_root_attr(&AttrSpec {
+            name: "ordered",
+            shape: &[],
+            dtype: DtypeSpec::Enum {
+                base: Box::new(DtypeSpec::U64),
+                members: vec![("FALSE".to_string(), 0), ("TRUE".to_string(), 1)],
+            },
+            data: &value,
+        })
+        .unwrap();
+
+        w.finalize().unwrap();
+    }
+
+    {
+        let f = File::open(&path).unwrap();
+        let attr = f.attr("ordered").unwrap();
+
+        assert!(attr.dtype().is_enum());
+        assert_eq!(attr.element_size(), 8);
+        assert_eq!(attr.read_scalar::<u8>().unwrap(), 1);
+        assert!(attr.read_scalar_bool().unwrap());
+    }
+}
+
+#[test]
 fn test_write_dataset_with_many_compact_attrs() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("written_many_attrs.h5");

@@ -2,7 +2,7 @@
 
 use hdf5_pure_rust::format::messages::datatype::{DatatypeClass, FloatFields};
 use hdf5_pure_rust::hl::types::H5Type;
-use hdf5_pure_rust::{Dataset, Error, File};
+use hdf5_pure_rust::{Dataset, File};
 
 const FILE: &str = "tests/data/hdf5_ref/all_dtypes.h5";
 
@@ -486,7 +486,7 @@ fn t3d_reference_object_and_region_payloads() {
 }
 
 #[test]
-fn t3d_time_datatype_raw_read_and_typed_rejection() {
+fn t3d_time_datatype_raw_and_typed_reads() {
     let f = File::open("tests/data/hdf5_ref/time_cases.h5").unwrap();
 
     let d32 = f.dataset("unix_d32le").unwrap();
@@ -501,10 +501,7 @@ fn t3d_time_datatype_raw_read_and_typed_rejection() {
             .collect::<Vec<_>>()
             .as_slice()
     );
-    assert!(matches!(
-        read_array::<u32, 3>(&d32),
-        Err(Error::Unsupported(_))
-    ));
+    assert_eq!(read_array::<u32, 3>(&d32).unwrap(), [0, 1, 2_147_483_647]);
 
     let d64 = f.dataset("unix_d64be").unwrap();
     let dtype64 = d64.dtype().unwrap();
@@ -518,10 +515,7 @@ fn t3d_time_datatype_raw_read_and_typed_rejection() {
             .collect::<Vec<_>>()
             .as_slice()
     );
-    assert!(matches!(
-        read_array::<u64, 3>(&d64),
-        Err(Error::Unsupported(_))
-    ));
+    assert_eq!(read_array::<u64, 3>(&d64).unwrap(), [0, 1, 4_102_444_800]);
 }
 
 #[test]

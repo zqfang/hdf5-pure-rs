@@ -7,7 +7,7 @@ use crate::format::messages::attribute::AttributeMessage;
 use crate::format::messages::attribute_info::AttributeInfoMessage;
 use crate::format::messages::data_layout::{ChunkIndexType, DataLayoutMessage, LayoutClass};
 use crate::format::messages::dataspace::DataspaceMessage;
-use crate::format::messages::datatype::DatatypeMessage;
+use crate::format::messages::datatype::{DatatypeMessage, DATATYPE_MESSAGE_VERSION_LATEST};
 use crate::format::messages::fill_value::FillValueMessage;
 use crate::format::messages::filter_pipeline::{FilterDesc, FilterPipelineMessage};
 use crate::format::messages::link::LinkMessage;
@@ -8958,15 +8958,10 @@ pub fn H5O__dtype_decode_helper(bytes: &[u8]) -> Result<DatatypeMessage> {
     }
     let flags = read_le_u32_at(bytes, 0, "datatype message flags")?;
     let version = ((flags >> 4) & 0x0f) as u8;
-    if version == 0 || version > 5 {
+    if version == 0 || version > DATATYPE_MESSAGE_VERSION_LATEST {
         return Err(Error::InvalidFormat(format!(
             "bad version number for datatype message: {version}"
         )));
-    }
-    if version == 5 {
-        return Err(Error::Unsupported(
-            "datatype message version 5 is not supported".into(),
-        ));
     }
     let class_value = (flags & 0x0f) as u8;
     let class = crate::format::messages::datatype::DatatypeClass::from_u8(class_value)?;
@@ -9067,6 +9062,24 @@ pub fn H5O__dtype_decode_helper(bytes: &[u8]) -> Result<DatatypeMessage> {
                 }
             }
         }
+        crate::format::messages::datatype::DatatypeClass::Time => {
+            if class_bits[0] & !0x01 != 0 || class_bits[1] != 0 || class_bits[2] != 0 {
+                return Err(Error::Unsupported(
+                    "time datatype has unsupported class flags".into(),
+                ));
+            }
+            if properties.len() < 2 {
+                return Err(Error::InvalidFormat(
+                    "time datatype precision is truncated".into(),
+                ));
+            }
+            let precision = u64::from(read_le_u16_at(properties, 0, "time datatype precision")?);
+            if precision == 0 || precision > size_bits {
+                return Err(Error::InvalidFormat(
+                    "time datatype precision out of bounds".into(),
+                ));
+            }
+        }
         crate::format::messages::datatype::DatatypeClass::String => {}
         crate::format::messages::datatype::DatatypeClass::Opaque => {
             let tag_len = usize::from(class_bits[0]);
@@ -9115,14 +9128,9 @@ pub fn H5O__dtype_decode(bytes: &[u8]) -> Result<DatatypeMessage> {
 /// Encode an object to its on-disk representation.
 #[allow(non_snake_case)]
 pub fn H5O__dtype_encode_helper(message: &DatatypeMessage) -> Result<Vec<u8>> {
-    if message.version == 0 || message.version > 5 {
+    if message.version == 0 || message.version > DATATYPE_MESSAGE_VERSION_LATEST {
         return Err(Error::InvalidFormat(
             "datatype message version is invalid".into(),
-        ));
-    }
-    if message.version == 5 {
-        return Err(Error::Unsupported(
-            "datatype message version 5 is not supported".into(),
         ));
     }
     if message.size == 0 {

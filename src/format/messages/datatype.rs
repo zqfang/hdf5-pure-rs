@@ -132,6 +132,7 @@ pub struct DatatypeMessage {
 
 const MAX_DATATYPE_ARRAY_DIMS: usize = 32;
 const MAX_DATATYPE_MEMBERS: usize = 4096;
+pub(crate) const DATATYPE_MESSAGE_VERSION_LATEST: u8 = 4;
 
 impl DatatypeMessage {
     /// Decode the raw disk form of a Datatype (type 0x0003) message into an
@@ -181,15 +182,10 @@ impl DatatypeMessage {
         let class_and_version = data[0];
         let version = (class_and_version >> 4) & 0x0F;
         let class_val = class_and_version & 0x0F;
-        if version == 0 || version > 5 {
+        if version == 0 || version > DATATYPE_MESSAGE_VERSION_LATEST {
             return Err(Error::InvalidFormat(format!(
                 "invalid datatype message version {version}"
             )));
-        }
-        if version == 5 {
-            return Err(Error::Unsupported(
-                "datatype message version 5 is not supported".into(),
-            ));
         }
         let class = DatatypeClass::from_u8(class_val)?;
 
@@ -211,6 +207,9 @@ impl DatatypeMessage {
                 return Err(Error::InvalidFormat(
                     "datatype message truncated fixed-size properties".into(),
                 ));
+            }
+            DatatypeClass::Time => {
+                validate_time_properties(class_bits, size, properties_data)?;
             }
             DatatypeClass::Array if version < 2 => {
                 return Err(Error::InvalidFormat(
@@ -349,7 +348,10 @@ impl DatatypeMessage {
     /// Get byte order for numeric types.
     pub fn byte_order(&self) -> Option<ByteOrder> {
         match self.class {
-            DatatypeClass::FixedPoint | DatatypeClass::FloatingPoint | DatatypeClass::BitField => {
+            DatatypeClass::FixedPoint
+            | DatatypeClass::FloatingPoint
+            | DatatypeClass::Time
+            | DatatypeClass::BitField => {
                 if self.class_bits[0] & 0x01 == 0 {
                     Some(ByteOrder::LittleEndian)
                 } else {
@@ -1335,7 +1337,8 @@ fn datatype_encoded_len(data: &[u8]) -> Result<usize> {
     let prop_len = match class {
         DatatypeClass::FixedPoint | DatatypeClass::BitField => 4,
         DatatypeClass::FloatingPoint => 12,
-        DatatypeClass::Time | DatatypeClass::String | DatatypeClass::Reference => 0,
+        DatatypeClass::Time => 2,
+        DatatypeClass::String | DatatypeClass::Reference => 0,
         DatatypeClass::Opaque => datatype_opaque_prop_len(data, class_bits)?,
         DatatypeClass::Enum => return datatype_enum_encoded_len(data, version, class_bits),
         DatatypeClass::Compound => return datatype_compound_encoded_len(data, version, size),
@@ -1363,6 +1366,29 @@ fn datatype_opaque_prop_len(data: &[u8], class_bits: [u8; 3]) -> Result<usize> {
         ));
     }
     Ok(tag_len)
+}
+
+fn validate_time_properties(class_bits: [u8; 3], size: u32, properties: &[u8]) -> Result<()> {
+    if class_bits[0] & !0x01 != 0 || class_bits[1] != 0 || class_bits[2] != 0 {
+        return Err(Error::Unsupported(
+            "time datatype has unsupported class flags".into(),
+        ));
+    }
+    if properties.len() < 2 {
+        return Err(Error::InvalidFormat(
+            "time datatype precision is truncated".into(),
+        ));
+    }
+    let precision = u64::from(read_u16_le_at(properties, 0, "time datatype precision")?);
+    let size_bits = u64::from(size)
+        .checked_mul(8)
+        .ok_or_else(|| Error::InvalidFormat("time datatype bit size overflow".into()))?;
+    if precision == 0 || precision > size_bits {
+        return Err(Error::InvalidFormat(
+            "time datatype precision out of bounds".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Validate an opaque datatype's tag: properties must hold the full padded

@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 
+use crate::engine::writer::DatasetSpec;
 use crate::error::{Error, Result};
 use crate::format::btree_v1::{BTreeType, BTreeV1Node};
 use crate::format::btree_v2;
@@ -19,9 +20,11 @@ use crate::format::messages::link::{LinkMessage, LinkType};
 use crate::format::messages::link_info::LinkInfoMessage;
 use crate::format::messages::symbol_table::SymbolTableMessage;
 use crate::format::object_header::{self, ObjectHeader};
+use crate::format::superblock::Superblock;
 use crate::format::symbol_table::SymbolTableNode;
 use crate::hl::attribute::Attribute;
 use crate::hl::dataset::Dataset;
+use crate::hl::dataset_builder::dtype_for_type;
 use crate::hl::datatype::Datatype;
 use crate::hl::file::{
     object_type_from_messages, register_open_object, unregister_open_object, File, FileInner,
@@ -29,7 +32,8 @@ use crate::hl::file::{
 };
 use crate::hl::link::{get_val_cb_borrowed, LinkValueRef};
 use crate::hl::mutable_file::MutableFile;
-use crate::hl::types::H5Type;
+use crate::hl::types::{slice_as_bytes, H5Type};
+use crate::io::reader::HdfReader;
 
 pub(crate) struct LinkMessageRef<'a> {
     pub name: &'a str,
@@ -133,6 +137,7 @@ pub struct GroupInfo {
 
 /// Safe placeholder for hdf5-metno dataset-builder compatibility.
 pub struct GroupDatasetBuilderStub {
+    inner: Arc<Mutex<FileInner<BufReader<fs::File>>>>,
     parent_name: String,
 }
 
@@ -140,23 +145,40 @@ impl GroupDatasetBuilderStub {
     /// This function is part of the hdf5-metno compatibility layer and should not be removed.
     pub fn empty<T: H5Type>(self) -> GroupDatasetBuilderEmptyStub<T> {
         GroupDatasetBuilderEmptyStub {
+            inner: self.inner,
             parent_name: self.parent_name,
             marker: PhantomData,
+        }
+    }
+
+    /// This function is part of the hdf5-metno compatibility layer and should not be removed.
+    pub fn with_data<'d, T: H5Type>(self, data: &'d [T]) -> GroupDatasetBuilderDataStub<'d, T> {
+        GroupDatasetBuilderDataStub {
+            inner: self.inner,
+            parent_name: self.parent_name,
+            data,
+            shape: None,
         }
     }
 }
 
 /// Safe placeholder for hdf5-metno typed dataset-builder compatibility.
 pub struct GroupDatasetBuilderEmptyStub<T: H5Type> {
+    inner: Arc<Mutex<FileInner<BufReader<fs::File>>>>,
     parent_name: String,
     marker: PhantomData<T>,
 }
 
 impl<T: H5Type> GroupDatasetBuilderEmptyStub<T> {
     /// This function is part of the hdf5-metno compatibility layer and should not be removed.
-    pub fn shape<S>(self, _extents: S) -> GroupDatasetBuilderEmptyShapeStub<T> {
+    pub fn shape<S>(self, extents: S) -> GroupDatasetBuilderEmptyShapeStub<T>
+    where
+        S: IntoDatasetShape,
+    {
         GroupDatasetBuilderEmptyShapeStub {
+            inner: self.inner,
             parent_name: self.parent_name,
+            shape: extents.into_dataset_shape(),
             marker: PhantomData,
         }
     }
@@ -169,7 +191,9 @@ impl<T: H5Type> GroupDatasetBuilderEmptyStub<T> {
 
 /// Safe placeholder for hdf5-metno shaped dataset-builder compatibility.
 pub struct GroupDatasetBuilderEmptyShapeStub<T: H5Type> {
+    inner: Arc<Mutex<FileInner<BufReader<fs::File>>>>,
     parent_name: String,
+    shape: Vec<u64>,
     marker: PhantomData<T>,
 }
 
@@ -177,11 +201,211 @@ impl<T: H5Type> GroupDatasetBuilderEmptyShapeStub<T> {
     /// This function is part of the hdf5-metno compatibility layer and should not be removed.
     pub fn create<'n, N: Into<Option<&'n str>>>(&self, name: N) -> Result<Dataset> {
         let name = name.into().unwrap_or("<anonymous>");
-        Err(Error::Unsupported(format!(
-            "hdf5-metno compatibility dataset creation is not supported for group '{}' and dataset '{name}'",
-            self.parent_name
-        )))
+        create_root_compat_dataset::<T>(&self.inner, &self.parent_name, name, &self.shape, None)
     }
+}
+
+/// Safe placeholder for hdf5-metno data-backed dataset-builder compatibility.
+pub struct GroupDatasetBuilderDataStub<'d, T: H5Type> {
+    inner: Arc<Mutex<FileInner<BufReader<fs::File>>>>,
+    parent_name: String,
+    data: &'d [T],
+    shape: Option<Vec<u64>>,
+}
+
+impl<'d, T: H5Type> GroupDatasetBuilderDataStub<'d, T> {
+    /// This function is part of the hdf5-metno compatibility layer and should not be removed.
+    pub fn shape<S>(mut self, extents: S) -> Self
+    where
+        S: IntoDatasetShape,
+    {
+        self.shape = Some(extents.into_dataset_shape());
+        self
+    }
+
+    /// This function is part of the hdf5-metno compatibility layer and should not be removed.
+    pub fn create<'n, N: Into<Option<&'n str>>>(&self, name: N) -> Result<Dataset> {
+        let name = name.into().unwrap_or("<anonymous>");
+        let inferred_shape;
+        let shape = if let Some(shape) = self.shape.as_deref() {
+            shape
+        } else {
+            inferred_shape = vec![usize_to_u64(self.data.len(), "dataset element count")?];
+            &inferred_shape
+        };
+        create_root_compat_dataset::<T>(
+            &self.inner,
+            &self.parent_name,
+            name,
+            shape,
+            Some(slice_as_bytes(self.data)),
+        )
+    }
+}
+
+/// Shape conversion for the hdf5-metno compatibility dataset builder.
+pub trait IntoDatasetShape {
+    fn into_dataset_shape(self) -> Vec<u64>;
+}
+
+impl IntoDatasetShape for () {
+    fn into_dataset_shape(self) -> Vec<u64> {
+        Vec::new()
+    }
+}
+
+impl IntoDatasetShape for u64 {
+    fn into_dataset_shape(self) -> Vec<u64> {
+        vec![self]
+    }
+}
+
+impl IntoDatasetShape for usize {
+    fn into_dataset_shape(self) -> Vec<u64> {
+        vec![self as u64]
+    }
+}
+
+impl<const N: usize> IntoDatasetShape for [u64; N] {
+    fn into_dataset_shape(self) -> Vec<u64> {
+        self.to_vec()
+    }
+}
+
+impl<const N: usize> IntoDatasetShape for [usize; N] {
+    fn into_dataset_shape(self) -> Vec<u64> {
+        self.into_iter().map(|dim| dim as u64).collect()
+    }
+}
+
+impl IntoDatasetShape for &[u64] {
+    fn into_dataset_shape(self) -> Vec<u64> {
+        self.to_vec()
+    }
+}
+
+impl IntoDatasetShape for &[usize] {
+    fn into_dataset_shape(self) -> Vec<u64> {
+        self.iter().map(|&dim| dim as u64).collect()
+    }
+}
+
+fn create_root_compat_dataset<T: H5Type>(
+    inner: &Arc<Mutex<FileInner<BufReader<fs::File>>>>,
+    parent_name: &str,
+    name: &str,
+    shape: &[u64],
+    data: Option<&[u8]>,
+) -> Result<Dataset> {
+    if name == "<anonymous>" {
+        return Err(Error::Unsupported(
+            "anonymous dataset creation is not implemented".into(),
+        ));
+    }
+
+    let dtype = dtype_for_type::<T>()?;
+    let dtype_size = usize::try_from(dtype.size())
+        .map_err(|_| Error::InvalidFormat("dataset datatype size exceeds usize".into()))?;
+    if dtype_size == 0 {
+        return Err(Error::InvalidFormat(
+            "dataset datatype size must be nonzero".into(),
+        ));
+    }
+    let element_count = shape_element_count(shape)?;
+    let byte_len = usize::try_from(element_count)
+        .map_err(|_| Error::InvalidFormat("dataset element count exceeds usize".into()))?
+        .checked_mul(dtype_size)
+        .ok_or_else(|| Error::InvalidFormat("dataset byte size overflow".into()))?;
+
+    let zero_data;
+    let data = if let Some(data) = data {
+        if data.len() != byte_len {
+            return Err(Error::InvalidFormat(format!(
+                "dataset byte length {} does not match shape element count {element_count} * datatype size {dtype_size}",
+                data.len()
+            )));
+        }
+        data
+    } else {
+        zero_data = vec![0; byte_len];
+        &zero_data
+    };
+
+    let spec = DatasetSpec {
+        name,
+        shape,
+        max_shape: None,
+        dtype,
+        data,
+    };
+    let path = {
+        let guard = inner.lock();
+        if guard.intent != FileIntent::ReadWrite {
+            return Err(Error::Unsupported(format!(
+                "hdf5-metno compatibility dataset creation requires a read-write File for group '{parent_name}'"
+            )));
+        }
+        guard.path.clone().ok_or_else(|| {
+            Error::Unsupported(
+                "hdf5-metno compatibility dataset creation requires a file path".into(),
+            )
+        })?
+    };
+    let mut file = MutableFile::open_rw(path)?;
+    file.create_compact_contiguous_dataset(parent_name, &spec, None)?;
+    refresh_shared_reader(inner, parent_name, name)
+}
+
+fn refresh_shared_reader(
+    inner: &Arc<Mutex<FileInner<BufReader<fs::File>>>>,
+    parent_name: &str,
+    dataset_name: &str,
+) -> Result<Dataset> {
+    let (path, access_plist, dset_no_attrs_hint, open_objects, next_object_id) = {
+        let guard = inner.lock();
+        (
+            guard.path.clone().ok_or_else(|| {
+                Error::Unsupported(
+                    "hdf5-metno compatibility dataset creation requires a file path".into(),
+                )
+            })?,
+            guard.access_plist.clone(),
+            guard.dset_no_attrs_hint,
+            guard.open_objects.clone(),
+            guard.next_object_id,
+        )
+    };
+
+    let read_file = fs::File::open(&path)?;
+    let mut reader = HdfReader::new(BufReader::new(read_file));
+    let superblock = Superblock::read(&mut reader)?;
+    let root_addr = superblock.root_addr;
+    *inner.lock() = FileInner {
+        reader,
+        superblock,
+        path: Some(path),
+        intent: FileIntent::ReadWrite,
+        access_plist,
+        dset_no_attrs_hint,
+        open_objects,
+        next_object_id,
+    };
+    Group::open(inner.clone(), "/", root_addr)?
+        .open_dataset(&group_child_path(parent_name, dataset_name))
+}
+
+fn usize_to_u64(value: usize, context: &str) -> Result<u64> {
+    u64::try_from(value).map_err(|_| Error::InvalidFormat(format!("{context} exceeds u64")))
+}
+
+fn shape_element_count(shape: &[u64]) -> Result<u64> {
+    if shape.is_empty() {
+        return Ok(1);
+    }
+    shape.iter().try_fold(1u64, |acc, &dim| {
+        acc.checked_mul(dim)
+            .ok_or_else(|| Error::InvalidFormat("dataset shape element count overflow".into()))
+    })
 }
 
 impl Group {
@@ -209,6 +433,14 @@ impl Group {
         self.addr
     }
 
+    fn current_metadata_addr_locked(&self, inner: &FileInner<BufReader<fs::File>>) -> u64 {
+        if self.name == "/" {
+            inner.superblock.root_addr
+        } else {
+            self.addr
+        }
+    }
+
     fn mutable_file_for_group(&self) -> Result<MutableFile> {
         let guard = self.inner.lock();
         let intent = guard.intent;
@@ -227,6 +459,38 @@ impl Group {
             )
         })?;
         MutableFile::open_rw(path)
+    }
+
+    fn refresh_shared_reader_from_path(&self) -> Result<()> {
+        let (path, access_plist, dset_no_attrs_hint, open_objects, next_object_id) = {
+            let guard = self.inner.lock();
+            (
+                guard.path.clone().ok_or_else(|| {
+                    Error::Unsupported(
+                        "hdf5-metno compatibility group mutation requires a file path".into(),
+                    )
+                })?,
+                guard.access_plist.clone(),
+                guard.dset_no_attrs_hint,
+                guard.open_objects.clone(),
+                guard.next_object_id,
+            )
+        };
+
+        let read_file = fs::File::open(&path)?;
+        let mut reader = HdfReader::new(BufReader::new(read_file));
+        let superblock = Superblock::read(&mut reader)?;
+        *self.inner.lock() = FileInner {
+            reader,
+            superblock,
+            path: Some(path),
+            intent: FileIntent::ReadWrite,
+            access_plist,
+            dset_no_attrs_hint,
+            open_objects,
+            next_object_id,
+        };
+        Ok(())
     }
 
     /// Return this group handle's high-level object id.
@@ -279,7 +543,8 @@ impl Group {
     {
         let mut guard = self.inner.lock();
         let sizeof_addr = guard.superblock.sizeof_addr;
-        let oh = ObjectHeader::read_at(&mut guard.reader, self.addr)?;
+        let group_addr = self.current_metadata_addr_locked(&guard);
+        let oh = ObjectHeader::read_at(&mut guard.reader, group_addr)?;
 
         for msg in &oh.messages {
             if msg.msg_type == object_header::MSG_SYMBOL_TABLE {
@@ -328,7 +593,8 @@ impl Group {
     {
         let mut guard = self.inner.lock();
         let sizeof_addr = guard.superblock.sizeof_addr;
-        let oh = ObjectHeader::read_at(&mut guard.reader, self.addr)?;
+        let group_addr = self.current_metadata_addr_locked(&guard);
+        let oh = ObjectHeader::read_at(&mut guard.reader, group_addr)?;
 
         for msg in &oh.messages {
             if msg.msg_type == object_header::MSG_SYMBOL_TABLE {
@@ -438,7 +704,8 @@ impl Group {
     {
         let mut guard = self.inner.lock();
         let sizeof_addr = guard.superblock.sizeof_addr;
-        let oh = ObjectHeader::read_at(&mut guard.reader, self.addr)?;
+        let group_addr = self.current_metadata_addr_locked(&guard);
+        let oh = ObjectHeader::read_at(&mut guard.reader, group_addr)?;
 
         // Check for v1 symbol table message
         for msg in &oh.messages {
@@ -701,7 +968,8 @@ impl Group {
         let mut visitor = Some(visitor);
         let mut guard = self.inner.lock();
         let sizeof_addr = guard.superblock.sizeof_addr;
-        let oh = ObjectHeader::read_at(&mut guard.reader, self.addr)?;
+        let group_addr = self.current_metadata_addr_locked(&guard);
+        let oh = ObjectHeader::read_at(&mut guard.reader, group_addr)?;
 
         // Check v1 symbol table messages
         for msg in &oh.messages {
@@ -774,10 +1042,10 @@ impl Group {
 
     /// This function is part of the hdf5-metno compatibility layer and should not be removed.
     pub fn create_group(&self, name: &str) -> Result<Group> {
-        Err(Error::Unsupported(format!(
-            "hdf5-metno compatibility group creation is not supported for group '{}' and child '{name}'",
-            self.name
-        )))
+        let mut file = self.mutable_file_for_group()?;
+        file.create_compact_group_link(&self.name, name)?;
+        self.refresh_shared_reader_from_path()?;
+        File::from_inner(self.inner.clone()).group(&group_child_path(&self.name, name))
     }
 
     /// This function is part of the hdf5-metno compatibility layer and should not be removed.
@@ -1090,7 +1358,8 @@ impl Group {
         let mut visitor = Some(visitor);
         let mut guard = self.inner.lock();
         let sizeof_addr = guard.superblock.sizeof_addr;
-        let oh = ObjectHeader::read_at(&mut guard.reader, self.addr)?;
+        let group_addr = self.current_metadata_addr_locked(&guard);
+        let oh = ObjectHeader::read_at(&mut guard.reader, group_addr)?;
 
         for msg in &oh.messages {
             if msg.msg_type == object_header::MSG_SYMBOL_TABLE {
@@ -1312,18 +1581,33 @@ impl Group {
 
     /// This function is part of the hdf5-metno compatibility layer and should not be removed.
     pub fn link_soft(&self, target: &str, link_name: &str) -> Result<()> {
-        Err(Error::Unsupported(format!(
-            "hdf5-metno compatibility soft-link creation is not supported for group '{}' (target '{target}', link '{link_name}')",
-            self.name
-        )))
+        let mut file = self.mutable_file_for_group()?;
+        file.create_compact_soft_link(&self.name, link_name, target)?;
+        self.refresh_shared_reader_from_path()
     }
 
     /// This function is part of the hdf5-metno compatibility layer and should not be removed.
     pub fn link_hard(&self, target: &str, link_name: &str) -> Result<()> {
-        Err(Error::Unsupported(format!(
-            "hdf5-metno compatibility hard-link creation is not supported for group '{}' (target '{target}', link '{link_name}')",
-            self.name
-        )))
+        let target_addr = self.object_addr_for_hard_link_target(target)?;
+        let mut file = self.mutable_file_for_group()?;
+        if let Some(target_name) = same_group_direct_target_name(&self.name, target) {
+            file.create_compact_same_group_hard_link(
+                &self.name,
+                link_name,
+                target_name,
+                target_addr,
+            )?;
+        } else if normalized_absolute_child_path(target).is_some() {
+            file.create_compact_hard_link_to_target_path(
+                &self.name,
+                link_name,
+                target,
+                target_addr,
+            )?;
+        } else {
+            file.create_compact_hard_link(&self.name, link_name, target_addr)?;
+        }
+        self.refresh_shared_reader_from_path()
     }
 
     /// This function is part of the hdf5-metno compatibility layer and should not be removed.
@@ -1333,28 +1617,28 @@ impl Group {
         target: &str,
         link_name: &str,
     ) -> Result<()> {
-        Err(Error::Unsupported(format!(
-            "hdf5-metno compatibility external-link creation is not supported for group '{}' (file '{target_file_name}', target '{target}', link '{link_name}')",
-            self.name
-        )))
+        let mut file = self.mutable_file_for_group()?;
+        file.create_compact_external_link(&self.name, link_name, target_file_name, target)?;
+        self.refresh_shared_reader_from_path()
     }
 
     /// This function is part of the hdf5-metno compatibility layer and should not be removed.
     pub fn relink(&self, name: &str, path: &str) -> Result<()> {
+        let mut file = self.mutable_file_for_group()?;
         if path.contains('/') {
-            return Err(Error::Unsupported(format!(
-                "hdf5-metno compatibility relink currently supports only same-group compact renames for group '{}' (from '{name}' to '{path}')",
-                self.name
-            )));
+            let (dest_group, dest_name) = relink_destination(&self.name, path)?;
+            file.move_group_link(&self.name, name, &dest_group, &dest_name)?;
+        } else {
+            file.rename_group_link(&self.name, name, path)?;
         }
-        self.mutable_file_for_group()?
-            .rename_group_link(&self.name, name, path)
+        self.refresh_shared_reader_from_path()
     }
 
     /// This function is part of the hdf5-metno compatibility layer and should not be removed.
     pub fn unlink(&self, name: &str) -> Result<()> {
-        self.mutable_file_for_group()?
-            .unlink_group_link(&self.name, name)
+        let mut file = self.mutable_file_for_group()?;
+        file.unlink_group_link(&self.name, name)?;
+        self.refresh_shared_reader_from_path()
     }
 
     /// This function is part of the hdf5-metno compatibility layer and should not be removed.
@@ -1365,6 +1649,7 @@ impl Group {
     /// This function is part of the hdf5-metno compatibility layer and should not be removed.
     pub fn new_dataset_builder(&self) -> GroupDatasetBuilderStub {
         GroupDatasetBuilderStub {
+            inner: self.inner.clone(),
             parent_name: self.name.clone(),
         }
     }
@@ -1380,6 +1665,28 @@ impl Group {
                 Error::InvalidFormat(format!("link '{name}' does not reference an object header"))
             })
         })
+    }
+
+    fn object_addr_for_hard_link_target(&self, target: &str) -> Result<u64> {
+        if target.is_empty() {
+            return Err(Error::InvalidFormat(
+                "hard link target cannot be empty".into(),
+            ));
+        }
+        if target == "/" {
+            return Ok(File::from_inner(self.inner.clone()).root_group()?.addr());
+        }
+
+        let file = File::from_inner(self.inner.clone());
+        if let Ok(dataset) = file.dataset(target) {
+            return Ok(dataset.addr());
+        }
+        if let Ok(group) = file.group(target) {
+            return Ok(group.addr());
+        }
+        Err(Error::InvalidFormat(format!(
+            "hard link target '{target}' not found"
+        )))
     }
 
     fn object_info_at(&self, addr: u64) -> Result<ObjectInfo> {
@@ -1451,6 +1758,63 @@ fn object_info_from_header(addr: u64, oh: &ObjectHeader) -> ObjectInfo {
         ctime: oh.ctime,
         btime: oh.btime,
     }
+}
+
+fn same_group_direct_target_name<'a>(group_name: &str, target: &'a str) -> Option<&'a str> {
+    let target = target.strip_prefix('/')?;
+    if target.is_empty() || target.contains("/.") || target.contains("//") {
+        return None;
+    }
+
+    if group_name == "/" {
+        return (!target.contains('/')).then_some(target);
+    }
+
+    let group = group_name.strip_prefix('/')?;
+    let child = target.strip_prefix(group)?.strip_prefix('/')?;
+    (!child.is_empty() && !child.contains('/')).then_some(child)
+}
+
+fn normalized_absolute_child_path(path: &str) -> Option<(&str, &str)> {
+    if path == "/" || !path.starts_with('/') || path.contains("/.") || path.contains("//") {
+        return None;
+    }
+    let (parent, name) = path.rsplit_once('/')?;
+    if name.is_empty() {
+        return None;
+    }
+    Some((if parent.is_empty() { "/" } else { parent }, name))
+}
+
+fn relink_destination(group_name: &str, path: &str) -> Result<(String, String)> {
+    if path.is_empty() || path == "/" {
+        return Err(Error::InvalidFormat(
+            "relink destination cannot be empty".into(),
+        ));
+    }
+    if path.contains("/.") || path.contains("//") {
+        return Err(Error::Unsupported(
+            "cross-group compact relink currently supports only normalized paths".into(),
+        ));
+    }
+
+    let absolute = if path.starts_with('/') {
+        path.to_string()
+    } else if group_name == "/" {
+        format!("/{path}")
+    } else {
+        format!("{group_name}/{path}")
+    };
+    let (parent, name) = absolute.rsplit_once('/').ok_or_else(|| {
+        Error::InvalidFormat(format!("relink destination '{path}' is not a child path"))
+    })?;
+    if name.is_empty() {
+        return Err(Error::InvalidFormat(
+            "relink destination cannot be empty".into(),
+        ));
+    }
+    let parent = if parent.is_empty() { "/" } else { parent };
+    Ok((parent.to_string(), name.to_string()))
 }
 
 fn object_comment_from_header(oh: &ObjectHeader) -> Result<Option<String>> {

@@ -1,4 +1,5 @@
 use hdf5_pure_rust::engine::writer::{CompoundFieldSpec, DtypeSpec};
+use hdf5_pure_rust::format::messages::data_layout::ChunkIndexType;
 use hdf5_pure_rust::hl::types::{FieldDescriptor, H5Type, TypeClass};
 use hdf5_pure_rust::{Attribute, Dataset, H5Value, Location, Result, WritableFile};
 
@@ -600,6 +601,37 @@ fn test_writable_routes_oversized_attrs_to_dense_storage() {
 }
 
 #[test]
+fn test_writable_dense_attrs_support_wider_heap_ids() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("api_write_dense_attr_wide_heap_id.h5");
+    let large_len = (1usize << 24) + 1;
+
+    {
+        let mut wf = WritableFile::create(&path).unwrap();
+        let mut group = wf.create_group("metadata").unwrap();
+        group
+            .add_fixed_ascii_attr("very_large_attr", "z", large_len)
+            .unwrap();
+        for idx in 0..8 {
+            group.add_attr(&format!("attr_{idx}"), idx as i32).unwrap();
+        }
+        let f = wf.close().unwrap();
+
+        let group = f.group("metadata").unwrap();
+        assert_eq!(
+            attribute_string(&group.attr("very_large_attr").unwrap()).unwrap(),
+            "z"
+        );
+        assert_attribute_values::<i32>(&group.attr("attr_7").unwrap(), &[7]).unwrap();
+    }
+
+    assert!(std::fs::read(&path)
+        .unwrap()
+        .windows(4)
+        .any(|window| window == b"BTHD"));
+}
+
+#[test]
 fn test_writable_rejects_oversized_attribute_name_field() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("api_write_oversized_attr_name.h5");
@@ -818,6 +850,39 @@ fn test_writable_file_group_with_many_compact_links() {
 }
 
 #[test]
+fn test_writable_dense_links_support_wider_heap_ids() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("api_write_dense_link_wide_heap_id.h5");
+    let long_name = format!("value_{}", "x".repeat(u16::MAX as usize + 64));
+
+    {
+        let mut wf = WritableFile::create(&path).unwrap();
+        let mut g = wf.create_group("many").unwrap();
+        for idx in 0..8 {
+            let name = format!("value_{idx:02}");
+            g.new_dataset_builder(&name).write::<i32>(&[idx]).unwrap();
+        }
+        g.new_dataset_builder(&long_name)
+            .write::<i32>(&[99])
+            .unwrap();
+        let f = wf.close().unwrap();
+
+        let group = f.group("many").unwrap();
+        let expected = ["value_00", long_name.as_str()];
+        let mut found = [false, false];
+        let count = group_member_summary_into(&group, &expected, &mut found).unwrap();
+        assert_eq!(count, 9);
+        assert!(found[0]);
+        assert!(found[1]);
+    }
+
+    assert!(std::fs::read(&path)
+        .unwrap()
+        .windows(4)
+        .any(|window| window == b"BTHD"));
+}
+
+#[test]
 fn test_writable_file_chunked_compressed() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("api_write_chunked.h5");
@@ -914,11 +979,25 @@ fn test_dataset_builder_writes_max_shape_dataspace() {
         let finite_space = finite.space().unwrap();
         assert_eq!(finite_space.shape(), &[4]);
         assert_eq!(finite_space.maxdims().unwrap(), &[10]);
+        let finite_info = finite.info().unwrap();
+        assert_eq!(finite_info.layout.version, 4);
+        assert_eq!(
+            finite_info.layout.chunk_index_type,
+            Some(ChunkIndexType::ExtensibleArray)
+        );
+        assert_dataset_values::<i32>(&finite, &[1, 2, 3, 4]).unwrap();
 
         let unlimited = f.dataset("unlimited_2d").unwrap();
         let unlimited_space = unlimited.space().unwrap();
         assert_eq!(unlimited_space.shape(), &[2, 3]);
         assert_eq!(unlimited_space.maxdims().unwrap(), &[u64::MAX, u64::MAX]);
+        let unlimited_info = unlimited.info().unwrap();
+        assert_eq!(unlimited_info.layout.version, 4);
+        assert_eq!(
+            unlimited_info.layout.chunk_index_type,
+            Some(ChunkIndexType::ExtensibleArray)
+        );
+        assert_dataset_values::<i32>(&unlimited, &[1, 2, 3, 4, 5, 6]).unwrap();
     }
 }
 
@@ -1467,6 +1546,51 @@ fn test_writable_file_vlen_utf8_strings_accept_fill_values() {
 }
 
 #[test]
+fn test_writable_file_vlen_utf8_strings_encode_string_fill_value() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("api_write_vlen_string_text_fill.h5");
+
+    {
+        let mut wf = WritableFile::create(&path).unwrap();
+        wf.new_dataset_builder("contiguous")
+            .shape(&[2])
+            .vlen_utf8_fill_value("fallback")
+            .write_vlen_utf8_strings(&["alpha", "beta"])
+            .unwrap();
+        wf.new_dataset_builder("chunked")
+            .shape(&[3])
+            .chunk(&[1])
+            .vlen_utf8_fill_value("missing")
+            .write_vlen_utf8_strings(&["", "猫", "gamma"])
+            .unwrap();
+        let f = wf.close().unwrap();
+
+        let ds = f.dataset("contiguous").unwrap();
+        assert_dataset_strings(&ds, &["alpha", "beta"]).unwrap();
+        let plist = ds.create_plist().unwrap();
+        let fill = plist
+            .fill_value
+            .expect("vlen string fill should be encoded");
+        assert_eq!(fill.len(), 16);
+        assert_eq!(u32::from_le_bytes(fill[..4].try_into().unwrap()), 8);
+        assert_ne!(&fill[4..12], &[0; 8]);
+        assert_eq!(u32::from_le_bytes(fill[12..16].try_into().unwrap()), 1);
+
+        let ds = f.dataset("chunked").unwrap();
+        assert!(ds.is_chunked().unwrap());
+        assert_dataset_strings(&ds, &["", "猫", "gamma"]).unwrap();
+        let plist = ds.create_plist().unwrap();
+        let fill = plist
+            .fill_value
+            .expect("chunked vlen string fill should be encoded");
+        assert_eq!(fill.len(), 16);
+        assert_eq!(u32::from_le_bytes(fill[..4].try_into().unwrap()), 7);
+        assert_ne!(&fill[4..12], &[0; 8]);
+        assert_eq!(u32::from_le_bytes(fill[12..16].try_into().unwrap()), 1);
+    }
+}
+
+#[test]
 fn test_writable_file_vlen_utf8_strings_split_global_heap_collections() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("api_write_many_vlen_strings.h5");
@@ -1768,28 +1892,36 @@ fn test_writable_file_root_attr() {
 fn test_writable_file_oversized_object_header_uses_continuation_chunk() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("api_write_header_continuation.h5");
-    let names: Vec<String> = (0..8)
-        .map(|idx| format!("group_{idx}_{}", "x".repeat(20_000)))
-        .collect();
+    let payload = vec![7u8; 60_000];
+    let attr_len = 60_000;
 
     {
         let mut wf = WritableFile::create(&path).unwrap();
-        for name in &names {
-            wf.create_group(name).unwrap();
+        let mut builder = wf.new_dataset_builder("compact");
+        for idx in 0..8 {
+            builder = builder
+                .fixed_ascii_attr(&format!("attr_{idx}"), "x", attr_len)
+                .unwrap();
         }
+        builder.compact().write::<u8>(&payload).unwrap();
         let f = wf.close().unwrap();
 
-        let expected: Vec<&str> = names.iter().map(String::as_str).collect();
-        let mut found = vec![false; expected.len()];
-        let count =
-            group_member_summary_into(&f.root_group().unwrap(), &expected, &mut found).unwrap();
+        let ds = f.dataset("compact").unwrap();
+        assert_dataset_values::<u8>(&ds, &payload).unwrap();
+        let expected = [
+            "attr_0", "attr_1", "attr_2", "attr_3", "attr_4", "attr_5", "attr_6", "attr_7",
+        ];
+        let mut found = [false; 8];
+        let count = location_attr_summary_into(&ds, &expected, &mut found).unwrap();
         assert_eq!(count, expected.len());
         assert!(found.iter().all(|present| *present));
+        assert_eq!(attribute_string(&ds.attr("attr_7").unwrap()).unwrap(), "x");
     }
 
     let image = std::fs::read(&path).unwrap();
+    let continuation_chunks = image.windows(4).filter(|window| *window == b"OCHK").count();
     assert!(
-        image.windows(4).any(|window| window == b"OCHK"),
-        "oversized compact root header should be split into a v2 continuation chunk"
+        continuation_chunks >= 2,
+        "oversized compact root header should be split into chained v2 continuation chunks, found {continuation_chunks}"
     );
 }

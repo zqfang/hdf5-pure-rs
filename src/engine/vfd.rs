@@ -1418,6 +1418,14 @@ fn read_le_u64_at(data: &[u8], offset: usize, context: &str) -> Result<u64> {
     Ok(u64::from_le_bytes(bytes))
 }
 
+fn validate_config_string(value: &str) -> bool {
+    !value.is_empty() && !value.as_bytes().contains(&0)
+}
+
+fn validate_optional_config_string(value: Option<&str>) -> bool {
+    value.is_none_or(validate_config_string)
+}
+
 /// `H5FD__hdfs_register`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__hdfs_register() -> Result<()> {
@@ -1434,6 +1442,137 @@ pub fn H5FD__hdfs_init() -> Result<()> {
     Err(unsupported_vfd_driver("HDFS"))
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HdfsConfig {
+    pub namenode_name: String,
+    pub namenode_port: u16,
+    pub user_name: String,
+    pub buffer_size: u32,
+}
+
+const HDFS_FAPL_VERSION: u32 = 1;
+const HDFS_STRING_SPACE: usize = 128;
+const HDFS_STRING_FIELD_SIZE: usize = HDFS_STRING_SPACE + 1;
+const HDFS_CONFIG_IMAGE_SIZE: usize =
+    4 + HDFS_STRING_FIELD_SIZE + 4 + HDFS_STRING_FIELD_SIZE + HDFS_STRING_FIELD_SIZE + 4;
+
+/// `H5FD__hdfs_validate_config`: distributed/cloud driver, not supported by the pure-Rust backend.
+#[allow(non_snake_case)]
+pub fn H5FD__hdfs_validate_config(config: &HdfsConfig) -> bool {
+    validate_config_string(&config.namenode_name)
+        && validate_config_string(&config.user_name)
+        && hdfs_fixed_string_is_valid(&config.namenode_name)
+        && hdfs_fixed_string_is_valid(&config.user_name)
+}
+
+/// `H5FD__hdfs_sb_size`: distributed/cloud driver, not supported by the pure-Rust backend.
+#[allow(non_snake_case)]
+pub fn H5FD__hdfs_sb_size(_config: &HdfsConfig) -> usize {
+    HDFS_CONFIG_IMAGE_SIZE
+}
+
+/// `H5FD__hdfs_sb_encode`: distributed/cloud driver, not supported by the pure-Rust backend.
+#[allow(non_snake_case)]
+pub fn H5FD__hdfs_sb_encode_into(config: &HdfsConfig, out: &mut Vec<u8>) -> Result<()> {
+    if !H5FD__hdfs_validate_config(config) {
+        return Err(Error::InvalidFormat("invalid HDFS VFD config".into()));
+    }
+    out.reserve(H5FD__hdfs_sb_size(config));
+    out.extend_from_slice(&HDFS_FAPL_VERSION.to_le_bytes());
+    hdfs_encode_fixed_string(&config.namenode_name, out)?;
+    out.extend_from_slice(&u32::from(config.namenode_port).to_le_bytes());
+    hdfs_encode_fixed_string(&config.user_name, out)?;
+    hdfs_encode_fixed_string("", out)?;
+    out.extend_from_slice(&config.buffer_size.to_le_bytes());
+    Ok(())
+}
+
+/// `H5FD__hdfs_sb_encode`: distributed/cloud driver, not supported by the pure-Rust backend.
+#[allow(non_snake_case)]
+#[deprecated(note = "use H5FD__hdfs_sb_encode_into")]
+pub fn H5FD__hdfs_sb_encode(config: &HdfsConfig) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(H5FD__hdfs_sb_size(config));
+    H5FD__hdfs_sb_encode_into(config, &mut out)?;
+    Ok(out)
+}
+
+/// `H5FD__hdfs_sb_decode`: distributed/cloud driver, not supported by the pure-Rust backend.
+#[allow(non_snake_case)]
+pub fn H5FD__hdfs_sb_decode(bytes: &[u8]) -> Result<HdfsConfig> {
+    if bytes.len() != HDFS_CONFIG_IMAGE_SIZE {
+        return Err(Error::InvalidFormat(
+            "HDFS VFD config image has invalid length".into(),
+        ));
+    }
+    let version = read_le_u32_at(bytes, 0, "HDFS VFD config version")?;
+    if version != HDFS_FAPL_VERSION {
+        return Err(Error::InvalidFormat(
+            "unknown HDFS VFD config version".into(),
+        ));
+    }
+
+    let namenode_start = 4usize;
+    let port_offset = namenode_start + HDFS_STRING_FIELD_SIZE;
+    let user_start = port_offset + 4;
+    let kerberos_start = user_start + HDFS_STRING_FIELD_SIZE;
+    let buffer_offset = kerberos_start + HDFS_STRING_FIELD_SIZE;
+
+    let port = read_le_u32_at(bytes, port_offset, "HDFS VFD namenode port")?;
+    let namenode_port = u16::try_from(port)
+        .map_err(|_| Error::InvalidFormat("HDFS VFD namenode port exceeds u16".into()))?;
+    let config = HdfsConfig {
+        namenode_name: hdfs_decode_fixed_string(bytes, namenode_start, "HDFS VFD namenode name")?,
+        namenode_port,
+        user_name: hdfs_decode_fixed_string(bytes, user_start, "HDFS VFD user name")?,
+        buffer_size: read_le_u32_at(bytes, buffer_offset, "HDFS VFD stream buffer size")?,
+    };
+    let kerberos =
+        hdfs_decode_fixed_string(bytes, kerberos_start, "HDFS VFD Kerberos ticket cache")?;
+    if !kerberos.is_empty() {
+        return Err(Error::InvalidFormat(
+            "HDFS VFD Kerberos ticket cache is unsupported".into(),
+        ));
+    }
+    if !H5FD__hdfs_validate_config(&config) {
+        return Err(Error::InvalidFormat("invalid HDFS VFD config".into()));
+    }
+    Ok(config)
+}
+
+fn hdfs_fixed_string_is_valid(value: &str) -> bool {
+    value.len() <= HDFS_STRING_SPACE && !value.as_bytes().contains(&0)
+}
+
+fn hdfs_encode_fixed_string(value: &str, out: &mut Vec<u8>) -> Result<()> {
+    if !hdfs_fixed_string_is_valid(value) {
+        return Err(Error::InvalidFormat("invalid HDFS VFD string field".into()));
+    }
+    out.extend_from_slice(value.as_bytes());
+    out.resize(out.len() + HDFS_STRING_FIELD_SIZE - value.len(), 0);
+    Ok(())
+}
+
+fn hdfs_decode_fixed_string(bytes: &[u8], offset: usize, context: &str) -> Result<String> {
+    let end = offset
+        .checked_add(HDFS_STRING_FIELD_SIZE)
+        .ok_or_else(|| Error::InvalidFormat(format!("{context} offset overflow")))?;
+    let field = bytes
+        .get(offset..end)
+        .ok_or_else(|| Error::InvalidFormat(format!("{context} is truncated")))?;
+    let nul_pos = field
+        .iter()
+        .position(|&byte| byte == 0)
+        .ok_or_else(|| Error::InvalidFormat(format!("{context} is not NUL terminated")))?;
+    if field[nul_pos..].iter().any(|&byte| byte != 0) {
+        return Err(Error::InvalidFormat(format!(
+            "{context} has nonzero bytes after NUL terminator"
+        )));
+    }
+    std::str::from_utf8(&field[..nul_pos])
+        .map(str::to_string)
+        .map_err(|_| Error::InvalidFormat(format!("{context} is not UTF-8")))
+}
+
 /// `H5FD__hdfs_handle_open`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__hdfs_handle_open(_path: &str) -> Result<()> {
@@ -1446,23 +1585,23 @@ pub fn H5FD__hdfs_handle_close() {}
 
 /// `H5FD__hdfs_fapl_get`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
-pub fn H5FD__hdfs_fapl_get() -> Result<()> {
-    Err(unsupported_vfd_driver("HDFS"))
+pub fn H5FD__hdfs_fapl_get(config: &HdfsConfig) -> HdfsConfig {
+    config.clone()
 }
 
 /// `H5FD__hdfs_fapl_copy`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
-pub fn H5FD__hdfs_fapl_copy() -> Result<()> {
-    Err(unsupported_vfd_driver("HDFS"))
+pub fn H5FD__hdfs_fapl_copy(config: &HdfsConfig) -> HdfsConfig {
+    config.clone()
 }
 
 /// `H5FD__hdfs_fapl_free`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
-pub fn H5FD__hdfs_fapl_free() {}
+pub fn H5FD__hdfs_fapl_free(_config: HdfsConfig) {}
 
 /// `H5FD__hdfs_open`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
-pub fn H5FD__hdfs_open(_path: &str) -> Result<()> {
+pub fn H5FD__hdfs_open(_path: &str, _config: &HdfsConfig) -> Result<()> {
     Err(unsupported_vfd_driver("HDFS"))
 }
 
@@ -1506,9 +1645,39 @@ pub fn H5FD__hdfs_get_handle() -> Result<()> {
     Err(unsupported_vfd_driver("HDFS"))
 }
 
+/// `H5FD__hdfs_read`: distributed/cloud driver, not supported by the pure-Rust backend.
+#[allow(non_snake_case)]
+pub fn H5FD__hdfs_read(_addr: u64, _buf: &mut [u8]) -> Result<()> {
+    Err(unsupported_vfd_driver("HDFS"))
+}
+
+/// `H5FD__hdfs_write`: distributed/cloud driver, not supported by the pure-Rust backend.
+#[allow(non_snake_case)]
+pub fn H5FD__hdfs_write(_addr: u64, _data: &[u8]) -> Result<()> {
+    Err(unsupported_vfd_driver("HDFS"))
+}
+
 /// `H5FD__hdfs_truncate`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__hdfs_truncate() -> Result<()> {
+    Err(unsupported_vfd_driver("HDFS"))
+}
+
+/// `H5FD__hdfs_lock`: distributed/cloud driver, not supported by the pure-Rust backend.
+#[allow(non_snake_case)]
+pub fn H5FD__hdfs_lock() -> Result<()> {
+    Err(unsupported_vfd_driver("HDFS"))
+}
+
+/// `H5FD__hdfs_unlock`: distributed/cloud driver, not supported by the pure-Rust backend.
+#[allow(non_snake_case)]
+pub fn H5FD__hdfs_unlock() -> Result<()> {
+    Err(unsupported_vfd_driver("HDFS"))
+}
+
+/// `H5FD__hdfs_delete`: distributed/cloud driver, not supported by the pure-Rust backend.
+#[allow(non_snake_case)]
+pub fn H5FD__hdfs_delete(_path: &str) -> Result<()> {
     Err(unsupported_vfd_driver("HDFS"))
 }
 
@@ -1601,6 +1770,9 @@ pub fn H5FD__s3comms_parse_url_ref(url: &str) -> Result<S3ParsedUrlRef<'_>> {
     let (bucket, key) = rest
         .split_once('/')
         .ok_or_else(|| Error::InvalidFormat("S3 URL missing object key".into()))?;
+    if scheme.is_empty() || bucket.is_empty() || key.is_empty() {
+        return Err(Error::InvalidFormat("S3 URL has an empty component".into()));
+    }
     Ok(S3ParsedUrlRef {
         scheme,
         bucket,
@@ -2029,7 +2201,7 @@ pub struct FamilyFileConfig {
 impl Default for FamilyFileConfig {
     fn default() -> Self {
         Self {
-            member_size: 2 * 1024 * 1024 * 1024,
+            member_size: 100 * 1024 * 1024,
             printf_filename: "%05d.h5".into(),
         }
     }
@@ -2076,15 +2248,13 @@ pub fn H5FD__family_fapl_free(_config: FamilyFileConfig) {}
 /// `H5FD__family_validate_config`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__family_validate_config(config: &FamilyFileConfig) -> bool {
-    config.member_size != 0 && !config.printf_filename.is_empty()
+    !config.printf_filename.is_empty()
 }
 
 /// `H5FD__family_sb_size`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
-pub fn H5FD__family_sb_size(config: &FamilyFileConfig) -> Result<usize> {
-    12usize
-        .checked_add(config.printf_filename.len())
-        .ok_or_else(|| Error::InvalidFormat("family VFD config image length overflow".into()))
+pub fn H5FD__family_sb_size(_config: &FamilyFileConfig) -> Result<usize> {
+    Ok(8)
 }
 
 /// `H5FD__family_sb_encode`: distributed/cloud driver, not supported by the pure-Rust backend.
@@ -2093,13 +2263,8 @@ pub fn H5FD__family_sb_encode_into(config: &FamilyFileConfig, out: &mut Vec<u8>)
     if !H5FD__family_validate_config(config) {
         return Err(Error::InvalidFormat("invalid family VFD config".into()));
     }
-    let filename = config.printf_filename.as_bytes();
-    let filename_len = u32::try_from(filename.len())
-        .map_err(|_| Error::InvalidFormat("family VFD filename length exceeds u32".into()))?;
     out.reserve(H5FD__family_sb_size(config)?);
     out.extend_from_slice(&config.member_size.to_le_bytes());
-    out.extend_from_slice(&filename_len.to_le_bytes());
-    out.extend_from_slice(filename);
     Ok(())
 }
 
@@ -2115,26 +2280,15 @@ pub fn H5FD__family_sb_encode(config: &FamilyFileConfig) -> Result<Vec<u8>> {
 /// `H5FD__family_sb_decode`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__family_sb_decode(bytes: &[u8]) -> Result<FamilyFileConfig> {
-    let member_size = read_le_u64_at(bytes, 0, "family VFD member size")?;
-    let filename_len = read_le_u32_len_at(bytes, 8, "family VFD filename length")?;
-    let filename_start = 12usize;
-    let filename_end = filename_start
-        .checked_add(filename_len)
-        .ok_or_else(|| Error::InvalidFormat("family VFD filename length overflow".into()))?;
-    let filename_bytes = bytes
-        .get(filename_start..filename_end)
-        .ok_or_else(|| Error::InvalidFormat("family VFD filename is truncated".into()))?;
-    if bytes.len() != filename_end {
+    if bytes.len() != H5FD__family_sb_size(&FamilyFileConfig::default())? {
         return Err(Error::InvalidFormat(
-            "family VFD config has trailing bytes".into(),
+            "family VFD config image has invalid length".into(),
         ));
     }
-    let filename = std::str::from_utf8(filename_bytes)
-        .map_err(|_| Error::InvalidFormat("family VFD filename is not UTF-8".into()))?
-        .to_string();
+    let member_size = read_le_u64_at(bytes, 0, "family VFD member size")?;
     let config = FamilyFileConfig {
         member_size,
-        printf_filename: filename,
+        printf_filename: FamilyFileConfig::default().printf_filename,
     };
     if !H5FD__family_validate_config(&config) {
         return Err(Error::InvalidFormat("invalid family VFD config".into()));
@@ -2363,7 +2517,11 @@ pub fn H5FD_multi_sb_decode(bytes: &[u8]) -> Result<MultiFileConfig> {
             .ok_or_else(|| Error::InvalidFormat("invalid multi VFD memory type".into()))?;
         let driver = file_driver_kind_from_code(entry[1])
             .ok_or_else(|| Error::InvalidFormat("invalid multi VFD driver kind".into()))?;
-        memb_map.insert(mem_type, driver);
+        if memb_map.insert(mem_type, driver).is_some() {
+            return Err(Error::InvalidFormat(
+                "multi VFD member map contains duplicate memory type".into(),
+            ));
+        }
     }
     let config = MultiFileConfig { memb_map };
     if !H5FD_multi_validate_config(&config) {
@@ -2678,6 +2836,11 @@ pub fn H5FD__splitter_sb_decode(bytes: &[u8]) -> Result<SplitterFileConfig> {
         .first()
         .ok_or_else(|| Error::InvalidFormat("splitter VFD flags are truncated".into()))?
         != 0;
+    if bytes[0] > 1 {
+        return Err(Error::InvalidFormat(
+            "splitter VFD ignore-errors flag is invalid".into(),
+        ));
+    }
     let path_len = read_le_u32_len_at(bytes, 1, "splitter VFD path length")?;
     let path_end = 5usize
         .checked_add(path_len)
@@ -3042,8 +3205,9 @@ pub fn H5FD__ros3_term() {}
 /// `H5FD__ros3_validate_config`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__ros3_validate_config(config: &Ros3Config) -> bool {
-    config.endpoint.as_deref().is_none_or(|s| !s.is_empty())
-        && config.region.as_deref().is_none_or(|s| !s.is_empty())
+    validate_optional_config_string(config.endpoint.as_deref())
+        && validate_optional_config_string(config.region.as_deref())
+        && validate_optional_config_string(config.token.as_deref())
 }
 
 /// `H5FD__ros3_fapl_get`: distributed/cloud driver, not supported by the pure-Rust backend.
@@ -3061,6 +3225,96 @@ pub fn H5FD__ros3_fapl_copy(config: &Ros3Config) -> Ros3Config {
 /// `H5FD__ros3_fapl_free`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__ros3_fapl_free(_config: Ros3Config) {}
+
+/// `H5FD__ros3_sb_size`: distributed/cloud driver, not supported by the pure-Rust backend.
+#[allow(non_snake_case)]
+pub fn H5FD__ros3_sb_size(config: &Ros3Config) -> Result<usize> {
+    12usize
+        .checked_add(config.endpoint.as_ref().map(String::len).unwrap_or(0))
+        .and_then(|len| len.checked_add(config.region.as_ref().map(String::len).unwrap_or(0)))
+        .and_then(|len| len.checked_add(config.token.as_ref().map(String::len).unwrap_or(0)))
+        .ok_or_else(|| Error::InvalidFormat("ROS3 VFD config image length overflow".into()))
+}
+
+/// `H5FD__ros3_sb_encode`: distributed/cloud driver, not supported by the pure-Rust backend.
+#[allow(non_snake_case)]
+pub fn H5FD__ros3_sb_encode_into(config: &Ros3Config, out: &mut Vec<u8>) -> Result<()> {
+    if !H5FD__ros3_validate_config(config) {
+        return Err(Error::InvalidFormat("invalid ROS3 VFD config".into()));
+    }
+    let endpoint = config.endpoint.as_deref().unwrap_or("").as_bytes();
+    let region = config.region.as_deref().unwrap_or("").as_bytes();
+    let token = config.token.as_deref().unwrap_or("").as_bytes();
+    let endpoint_len = u32::try_from(endpoint.len())
+        .map_err(|_| Error::InvalidFormat("ROS3 VFD endpoint length exceeds u32".into()))?;
+    let region_len = u32::try_from(region.len())
+        .map_err(|_| Error::InvalidFormat("ROS3 VFD region length exceeds u32".into()))?;
+    let token_len = u32::try_from(token.len())
+        .map_err(|_| Error::InvalidFormat("ROS3 VFD token length exceeds u32".into()))?;
+    out.reserve(H5FD__ros3_sb_size(config)?);
+    out.extend_from_slice(&endpoint_len.to_le_bytes());
+    out.extend_from_slice(&region_len.to_le_bytes());
+    out.extend_from_slice(&token_len.to_le_bytes());
+    out.extend_from_slice(endpoint);
+    out.extend_from_slice(region);
+    out.extend_from_slice(token);
+    Ok(())
+}
+
+/// `H5FD__ros3_sb_encode`: distributed/cloud driver, not supported by the pure-Rust backend.
+#[allow(non_snake_case)]
+#[deprecated(note = "use H5FD__ros3_sb_encode_into")]
+pub fn H5FD__ros3_sb_encode(config: &Ros3Config) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(H5FD__ros3_sb_size(config)?);
+    H5FD__ros3_sb_encode_into(config, &mut out)?;
+    Ok(out)
+}
+
+/// `H5FD__ros3_sb_decode`: distributed/cloud driver, not supported by the pure-Rust backend.
+#[allow(non_snake_case)]
+pub fn H5FD__ros3_sb_decode(bytes: &[u8]) -> Result<Ros3Config> {
+    let endpoint_len = read_le_u32_len_at(bytes, 0, "ROS3 VFD endpoint length")?;
+    let region_len = read_le_u32_len_at(bytes, 4, "ROS3 VFD region length")?;
+    let token_len = read_le_u32_len_at(bytes, 8, "ROS3 VFD token length")?;
+    let endpoint_start = 12usize;
+    let region_start = endpoint_start
+        .checked_add(endpoint_len)
+        .ok_or_else(|| Error::InvalidFormat("ROS3 VFD endpoint length overflow".into()))?;
+    let token_start = region_start
+        .checked_add(region_len)
+        .ok_or_else(|| Error::InvalidFormat("ROS3 VFD region length overflow".into()))?;
+    let end = token_start
+        .checked_add(token_len)
+        .ok_or_else(|| Error::InvalidFormat("ROS3 VFD token length overflow".into()))?;
+    if bytes.len() != end {
+        return Err(Error::InvalidFormat(
+            "ROS3 VFD config has invalid length".into(),
+        ));
+    }
+    let decode_string = |range: std::ops::Range<usize>, context: &str| -> Result<Option<String>> {
+        let raw = bytes
+            .get(range)
+            .ok_or_else(|| Error::InvalidFormat(format!("{context} is truncated")))?;
+        if raw.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(
+                std::str::from_utf8(raw)
+                    .map_err(|_| Error::InvalidFormat(format!("{context} is not UTF-8")))?
+                    .to_string(),
+            ))
+        }
+    };
+    let config = Ros3Config {
+        endpoint: decode_string(endpoint_start..region_start, "ROS3 VFD endpoint")?,
+        region: decode_string(region_start..token_start, "ROS3 VFD region")?,
+        token: decode_string(token_start..end, "ROS3 VFD token")?,
+    };
+    if !H5FD__ros3_validate_config(&config) {
+        return Err(Error::InvalidFormat("invalid ROS3 VFD config".into()));
+    }
+    Ok(config)
+}
 
 /// `H5FD__ros3_str_token_close`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
@@ -4513,9 +4767,9 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        Error, FamilyFileConfig, FileDriverKind, IocConfig, LocalFileDriver, LogFileConfig,
-        MirrorXmit, MirrorXmitRef, MultiFileConfig, OnionHeader, OnionRevisionIndex,
-        OnionRevisionRecord, SplitterFileConfig, SubfilingConfig, VfdMemType,
+        Error, FamilyFileConfig, FileDriverKind, HdfsConfig, IocConfig, LocalFileDriver,
+        LogFileConfig, MirrorXmit, MirrorXmitRef, MultiFileConfig, OnionHeader, OnionRevisionIndex,
+        OnionRevisionRecord, Ros3Config, SplitterFileConfig, SubfilingConfig, VfdMemType,
     };
 
     #[test]
@@ -4551,13 +4805,25 @@ mod tests {
         );
         assert_eq!(
             super::H5FD__family_sb_decode(&family_bytes).unwrap(),
-            family
+            FamilyFileConfig {
+                member_size: family.member_size,
+                printf_filename: FamilyFileConfig::default().printf_filename,
+            }
         );
+        assert_eq!(family_bytes, 4096u64.to_le_bytes());
+        let family_default_size = FamilyFileConfig {
+            member_size: 0,
+            printf_filename: "member-%03d.h5".into(),
+        };
+        let mut family_default_size_bytes = Vec::new();
+        super::H5FD__family_sb_encode_into(&family_default_size, &mut family_default_size_bytes)
+            .unwrap();
+        assert_eq!(family_default_size_bytes, 0u64.to_le_bytes());
         let mut invalid_family_bytes = Vec::new();
         assert!(super::H5FD__family_sb_encode_into(
             &FamilyFileConfig {
-                member_size: 0,
-                printf_filename: "member-%03d.h5".into(),
+                member_size: 4096,
+                printf_filename: String::new(),
             },
             &mut invalid_family_bytes
         )
@@ -4625,6 +4891,26 @@ mod tests {
                 buffer_size: 0,
             },
             &mut invalid_log_bytes
+        )
+        .is_err());
+
+        let ros3 = Ros3Config {
+            endpoint: Some("s3.us-east-1.amazonaws.com".into()),
+            region: Some("us-east-1".into()),
+            token: Some("session-token".into()),
+        };
+        let mut ros3_bytes = Vec::new();
+        super::H5FD__ros3_sb_encode_into(&ros3, &mut ros3_bytes).unwrap();
+        assert_eq!(super::H5FD__ros3_sb_size(&ros3).unwrap(), ros3_bytes.len());
+        assert_eq!(super::H5FD__ros3_sb_decode(&ros3_bytes).unwrap(), ros3);
+        let mut invalid_ros3_bytes = Vec::new();
+        assert!(super::H5FD__ros3_sb_encode_into(
+            &Ros3Config {
+                endpoint: Some(String::new()),
+                region: None,
+                token: None,
+            },
+            &mut invalid_ros3_bytes,
         )
         .is_err());
 
@@ -4777,11 +5063,23 @@ mod tests {
             Error::InvalidFormat(_)
         ));
         assert!(matches!(
+            super::H5FD__family_sb_decode(&[0; 9]).unwrap_err(),
+            Error::InvalidFormat(_)
+        ));
+        assert!(matches!(
             super::H5FD_multi_sb_decode(&[1, 0, 0, 0, 99, 0]).unwrap_err(),
             Error::InvalidFormat(_)
         ));
         assert!(matches!(
+            super::H5FD_multi_sb_decode(&[2, 0, 0, 0, 0, 0, 0, 1]).unwrap_err(),
+            Error::InvalidFormat(_)
+        ));
+        assert!(matches!(
             super::H5FD__splitter_sb_decode(&[0, 4, 0, 0, 0, b'a']).unwrap_err(),
+            Error::InvalidFormat(_)
+        ));
+        assert!(matches!(
+            super::H5FD__splitter_sb_decode(&[2, 0, 0, 0, 0]).unwrap_err(),
             Error::InvalidFormat(_)
         ));
         assert!(matches!(
@@ -4835,6 +5133,118 @@ mod tests {
         assert!(matches!(
             super::H5FD__subfiling_sb_decode(&[0; 16]).unwrap_err(),
             Error::InvalidFormat(_)
+        ));
+        assert!(matches!(
+            super::H5FD__hdfs_sb_decode(&[0; 16]).unwrap_err(),
+            Error::InvalidFormat(_)
+        ));
+        let mut hdfs_bad_version = vec![0; super::H5FD__hdfs_sb_size(&HdfsConfig::default())];
+        hdfs_bad_version[0..4].copy_from_slice(&2u32.to_le_bytes());
+        assert!(matches!(
+            super::H5FD__hdfs_sb_decode(&hdfs_bad_version).unwrap_err(),
+            Error::InvalidFormat(_)
+        ));
+        let mut hdfs_bad_port = vec![0; super::H5FD__hdfs_sb_size(&HdfsConfig::default())];
+        hdfs_bad_port[0..4].copy_from_slice(&1u32.to_le_bytes());
+        hdfs_bad_port[4..7].copy_from_slice(b"nn\0");
+        hdfs_bad_port[133..137].copy_from_slice(&65536u32.to_le_bytes());
+        hdfs_bad_port[137..142].copy_from_slice(b"user\0");
+        assert!(matches!(
+            super::H5FD__hdfs_sb_decode(&hdfs_bad_port).unwrap_err(),
+            Error::InvalidFormat(_)
+        ));
+        let mut hdfs_bad_string = vec![0; super::H5FD__hdfs_sb_size(&HdfsConfig::default())];
+        hdfs_bad_string[0..4].copy_from_slice(&1u32.to_le_bytes());
+        hdfs_bad_string[4..].fill(b'a');
+        assert!(matches!(
+            super::H5FD__hdfs_sb_decode(&hdfs_bad_string).unwrap_err(),
+            Error::InvalidFormat(_)
+        ));
+        let mut hdfs_bad_trailing = vec![0; super::H5FD__hdfs_sb_size(&HdfsConfig::default())];
+        hdfs_bad_trailing[0..4].copy_from_slice(&1u32.to_le_bytes());
+        hdfs_bad_trailing[4..7].copy_from_slice(b"nn\0");
+        hdfs_bad_trailing[8] = b'x';
+        hdfs_bad_trailing[137..142].copy_from_slice(b"user\0");
+        assert!(matches!(
+            super::H5FD__hdfs_sb_decode(&hdfs_bad_trailing).unwrap_err(),
+            Error::InvalidFormat(_)
+        ));
+        assert!(matches!(
+            super::H5FD__ros3_sb_decode(&[1, 0, 0, 0, 0, 0, 0, 0]).unwrap_err(),
+            Error::InvalidFormat(_)
+        ));
+        let mut ros3_truncated = Vec::new();
+        ros3_truncated.extend_from_slice(&4u32.to_le_bytes());
+        ros3_truncated.extend_from_slice(&0u32.to_le_bytes());
+        ros3_truncated.extend_from_slice(&0u32.to_le_bytes());
+        ros3_truncated.extend_from_slice(b"s3");
+        assert!(matches!(
+            super::H5FD__ros3_sb_decode(&ros3_truncated).unwrap_err(),
+            Error::InvalidFormat(_)
+        ));
+        let mut ros3_nul = Vec::new();
+        ros3_nul.extend_from_slice(&4u32.to_le_bytes());
+        ros3_nul.extend_from_slice(&0u32.to_le_bytes());
+        ros3_nul.extend_from_slice(&0u32.to_le_bytes());
+        ros3_nul.extend_from_slice(b"s3\0x");
+        assert!(matches!(
+            super::H5FD__ros3_sb_decode(&ros3_nul).unwrap_err(),
+            Error::InvalidFormat(_)
+        ));
+        assert!(matches!(
+            super::H5FD__s3comms_parse_url_ref("s3://bucket/").unwrap_err(),
+            Error::InvalidFormat(_)
+        ));
+    }
+
+    #[test]
+    fn hdfs_vfd_config_helpers_round_trip_copy_and_runtime_ops_are_unsupported() {
+        let config = HdfsConfig {
+            namenode_name: "nn.example.org".into(),
+            namenode_port: 8020,
+            user_name: "hdf5".into(),
+            buffer_size: 65536,
+        };
+        assert!(super::H5FD__hdfs_validate_config(&config));
+        let mut bytes = Vec::new();
+        super::H5FD__hdfs_sb_encode_into(&config, &mut bytes).unwrap();
+        assert_eq!(bytes.len(), super::H5FD__hdfs_sb_size(&config));
+        assert_eq!(super::H5FD__hdfs_sb_decode(&bytes).unwrap(), config);
+        assert_eq!(super::H5FD__hdfs_fapl_get(&config), config);
+        assert_eq!(super::H5FD__hdfs_fapl_copy(&config), config);
+        super::H5FD__hdfs_fapl_free(config.clone());
+
+        let invalid = HdfsConfig {
+            namenode_name: String::new(),
+            ..config.clone()
+        };
+        assert!(!super::H5FD__hdfs_validate_config(&invalid));
+        assert!(super::H5FD__hdfs_sb_encode_into(&invalid, &mut Vec::new()).is_err());
+
+        let mut buf = [0; 4];
+        assert!(matches!(
+            super::H5FD__hdfs_open("hdfs://nn.example.org/data.h5", &config).unwrap_err(),
+            Error::Unsupported(_)
+        ));
+        assert!(matches!(
+            super::H5FD__hdfs_read(0, &mut buf).unwrap_err(),
+            Error::Unsupported(_)
+        ));
+        assert!(matches!(
+            super::H5FD__hdfs_write(0, &buf).unwrap_err(),
+            Error::Unsupported(_)
+        ));
+        assert!(matches!(
+            super::H5FD__hdfs_delete("hdfs://nn.example.org/data.h5").unwrap_err(),
+            Error::Unsupported(_)
+        ));
+        assert!(matches!(
+            super::H5FD__hdfs_lock().unwrap_err(),
+            Error::Unsupported(_)
+        ));
+        assert!(matches!(
+            super::H5FD__hdfs_unlock().unwrap_err(),
+            Error::Unsupported(_)
         ));
     }
 }

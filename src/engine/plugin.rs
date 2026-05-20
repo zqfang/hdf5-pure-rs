@@ -339,6 +339,11 @@ pub fn H5PLset_loading_state(registry: &mut PluginRegistry, enabled: bool) {
 }
 
 #[allow(non_snake_case)]
+pub fn H5PLget_loading_state(registry: &PluginRegistry) -> bool {
+    registry.loading_enabled
+}
+
+#[allow(non_snake_case)]
 pub fn H5PLappend(registry: &mut PluginRegistry, path: impl Into<PathBuf>) {
     H5PL__append_path(&mut registry.paths, path);
 }
@@ -389,6 +394,29 @@ pub fn H5PLget(registry: &PluginRegistry, index: usize) -> Result<&Path> {
 }
 
 #[allow(non_snake_case)]
+pub fn H5PLget_into(registry: &PluginRegistry, index: usize, path: &mut PathBuf) -> Result<()> {
+    *path = H5PLget(registry, index)?.to_path_buf();
+    Ok(())
+}
+
+#[allow(non_snake_case)]
+pub fn H5PLget_str_into(
+    registry: &PluginRegistry,
+    index: usize,
+    out: &mut String,
+) -> Result<usize> {
+    let path = H5PLget(registry, index)?;
+    let Some(path) = path.to_str() else {
+        return Err(Error::InvalidFormat(
+            "plugin path is not valid UTF-8".into(),
+        ));
+    };
+    out.clear();
+    out.push_str(path);
+    Ok(out.len())
+}
+
+#[allow(non_snake_case)]
 pub fn H5PLsize(registry: &PluginRegistry) -> usize {
     H5PL__get_num_paths(&registry.paths)
 }
@@ -403,8 +431,17 @@ mod tests {
         H5PLappend(&mut registry, "/b");
         H5PLprepend(&mut registry, "/a");
         H5PLinsert(&mut registry, 1, "/mid").unwrap();
+        assert!(H5PLget_loading_state(&registry));
+        H5PLset_loading_state(&mut registry, false);
+        assert!(!H5PLget_loading_state(&registry));
         assert_eq!(H5PLsize(&registry), 3);
         assert_eq!(H5PLget(&registry, 1).unwrap(), Path::new("/mid"));
+        let mut path = PathBuf::new();
+        H5PLget_into(&registry, 1, &mut path).unwrap();
+        assert_eq!(path, PathBuf::from("/mid"));
+        let mut path_str = String::from("stale");
+        assert_eq!(H5PLget_str_into(&registry, 1, &mut path_str).unwrap(), 4);
+        assert_eq!(path_str, "/mid");
         assert_eq!(
             H5PL__path_table_paths(&registry.paths).collect::<Vec<_>>(),
             vec![Path::new("/a"), Path::new("/mid"), Path::new("/b")]

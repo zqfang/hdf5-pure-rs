@@ -20,6 +20,7 @@ pub struct DatasetBuilder<'a> {
     fletcher32: bool,
     compact: bool,
     fill_value: Option<Vec<u8>>,
+    vlen_utf8_fill_value: Option<String>,
     alloc_time: u8,
     fill_time: u8,
     attrs: Vec<OwnedBuilderAttr>,
@@ -76,6 +77,7 @@ impl<'a> DatasetBuilder<'a> {
             fletcher32: false,
             compact: false,
             fill_value: None,
+            vlen_utf8_fill_value: None,
             alloc_time: 1,
             fill_time: 2,
             attrs: Vec::new(),
@@ -142,6 +144,12 @@ impl<'a> DatasetBuilder<'a> {
     /// Set a scalar fill value for missing or newly allocated dataset storage.
     pub fn fill_value<T: H5Type>(mut self, value: T) -> Self {
         self.fill_value = Some(slice_as_bytes(std::slice::from_ref(&value)).to_vec());
+        self
+    }
+
+    /// Set a scalar variable-length UTF-8 string fill value.
+    pub fn vlen_utf8_fill_value(mut self, value: &str) -> Self {
+        self.vlen_utf8_fill_value = Some(value.to_string());
         self
     }
 
@@ -613,12 +621,20 @@ impl<'a> DatasetBuilder<'a> {
             self.alloc_time,
             self.fill_time,
         )?;
+        if self.vlen_utf8_fill_value.is_some()
+            && fill.as_ref().and_then(|fill| fill.value).is_some()
+        {
+            return Err(Error::InvalidFormat(
+                "vlen UTF-8 fill value conflicts with raw fill-value bytes".into(),
+            ));
+        }
         let shape = match self.shape.as_deref() {
             Some(shape) => Cow::Borrowed(shape),
             None => Cow::Owned(vec![usize_to_u64(data.len(), "dataset element count")?]),
         };
         let max_shape =
             Self::effective_max_shape(self.resizable, self.max_shape.as_deref(), shape.as_ref())?;
+        let vlen_fill = self.vlen_utf8_fill_value.as_deref();
         with_attr_specs(&self.attrs, |attrs| {
             if self.chunk_dims.is_some()
                 || self.deflate_level.is_some()
@@ -627,7 +643,7 @@ impl<'a> DatasetBuilder<'a> {
             {
                 let chunk_dims = self.chunk_dims.as_deref().unwrap_or_else(|| shape.as_ref());
                 self.writer
-                    .create_chunked_vlen_utf8_string_dataset_with_attrs(
+                    .create_chunked_vlen_utf8_string_dataset_with_attrs_and_vlen_fill(
                         &self.parent,
                         &self.name,
                         shape.as_ref(),
@@ -638,18 +654,21 @@ impl<'a> DatasetBuilder<'a> {
                         self.shuffle,
                         self.fletcher32,
                         fill,
+                        vlen_fill,
                         attrs,
                     )
             } else {
-                self.writer.create_vlen_utf8_string_dataset_with_attrs(
-                    &self.parent,
-                    &self.name,
-                    shape.as_ref(),
-                    data,
-                    max_shape.as_ref().map(|shape| shape.as_ref()),
-                    fill,
-                    attrs,
-                )
+                self.writer
+                    .create_vlen_utf8_string_dataset_with_attrs_and_vlen_fill(
+                        &self.parent,
+                        &self.name,
+                        shape.as_ref(),
+                        data,
+                        max_shape.as_ref().map(|shape| shape.as_ref()),
+                        fill,
+                        vlen_fill,
+                        attrs,
+                    )
             }
         })?;
         Ok(())

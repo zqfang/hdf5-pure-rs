@@ -70,6 +70,8 @@ pub struct ErrorEvent {
 pub struct ErrorEventSet {
     events: Vec<ErrorEvent>,
     op_counter: u64,
+    insert_callback_registered: bool,
+    complete_callback_registered: bool,
 }
 
 /// One error stack entry.
@@ -356,6 +358,26 @@ impl ErrorEventSet {
     /// Internal close-failed callback alias.
     pub fn close_failed_cb(&mut self) {
         self.events.retain(|event| event.error.is_none());
+    }
+
+    /// Register whether an insert callback is installed on this event set.
+    pub fn register_insert_func(&mut self, registered: bool) {
+        self.insert_callback_registered = registered;
+    }
+
+    /// Register whether a completion callback is installed on this event set.
+    pub fn register_complete_func(&mut self, registered: bool) {
+        self.complete_callback_registered = registered;
+    }
+
+    /// Return whether an insert callback is installed.
+    pub fn has_insert_callback(&self) -> bool {
+        self.insert_callback_registered
+    }
+
+    /// Return whether a completion callback is installed.
+    pub fn has_complete_callback(&self) -> bool {
+        self.complete_callback_registered
     }
 }
 

@@ -1056,6 +1056,41 @@ impl Attribute {
         }
     }
 
+    /// Read a scalar FALSE/TRUE enum attribute as a Rust boolean.
+    pub fn read_scalar_bool(&self) -> Result<bool> {
+        if self.msg.datatype.class != DatatypeClass::Enum {
+            return Err(Error::Unsupported(format!(
+                "attribute '{}' is not a FALSE/TRUE enum attribute",
+                self.msg.name
+            )));
+        }
+        let false_value = self.msg.datatype.enum_valueof("FALSE")?;
+        let true_value = self.msg.datatype.enum_valueof("TRUE")?;
+        if false_value != Some(0) || true_value.is_none() {
+            return Err(Error::Unsupported(format!(
+                "attribute '{}' is not a FALSE/TRUE enum attribute",
+                self.msg.name
+            )));
+        }
+
+        let elem_size = self.element_size();
+        if elem_size == 0 {
+            return Err(Error::InvalidFormat(format!(
+                "attribute '{}' has zero-sized enum datatype",
+                self.msg.name
+            )));
+        }
+        if self.msg.data.len() != elem_size {
+            return Err(Error::InvalidFormat(format!(
+                "attribute '{}' boolean scalar has {} bytes, expected {elem_size}",
+                self.msg.name,
+                self.msg.data.len()
+            )));
+        }
+
+        Ok(self.msg.data.iter().any(|&byte| byte != 0))
+    }
+
     /// Read the attribute value as a typed Vec.
     pub fn read<T: crate::hl::types::H5Type>(&self) -> crate::Result<Vec<T>> {
         self.read_vec()

@@ -1,7 +1,31 @@
+use crate::engine::property::{H5P__decode_hdfs_fapl_config, H5P__decode_ros3_fapl_config};
+use crate::engine::vfd::{
+    CoreFileConfig, DirectFileConfig, FamilyFileConfig, H5FD__family_sb_decode,
+    H5FD__hdfs_validate_config, H5FD__log_sb_decode, H5FD__onion_sb_decode,
+    H5FD__ros3_validate_config, H5FD__splitter_sb_decode, H5FD__subfiling_sb_decode,
+    H5FD_multi_sb_decode, HdfsConfig, IocConfig, LogFileConfig, MultiFileConfig, OnionHeader,
+    Ros3Config, SplitterFileConfig, SubfilingConfig,
+};
+
+const ROS3_DEFAULT_PAGE_BUFFER_SIZE: usize = 64 * 1024 * 1024;
+
 /// File access properties used by this pure-Rust reader.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileAccess {
     driver: String,
+    hdfs_config: Option<HdfsConfig>,
+    direct_config: Option<DirectFileConfig>,
+    family_config: Option<FamilyFileConfig>,
+    family_offset: Option<u64>,
+    multi_config: Option<MultiFileConfig>,
+    multi_type: Option<u32>,
+    ioc_config: Option<IocConfig>,
+    subfiling_config: Option<SubfilingConfig>,
+    splitter_config: Option<SplitterFileConfig>,
+    log_config: Option<LogFileConfig>,
+    onion_config: Option<OnionHeader>,
+    core_config: Option<CoreFileConfig>,
+    ros3_config: Option<Ros3Config>,
     userblock: u64,
     alignment: (u64, u64),
     cache: (usize, usize, usize, u64),
@@ -70,6 +94,19 @@ impl Default for FileAccess {
     fn default() -> Self {
         Self {
             driver: "sec2".to_string(),
+            hdfs_config: None,
+            direct_config: None,
+            family_config: None,
+            family_offset: None,
+            multi_config: None,
+            multi_type: None,
+            ioc_config: None,
+            subfiling_config: None,
+            splitter_config: None,
+            log_config: None,
+            onion_config: None,
+            core_config: None,
+            ros3_config: None,
             userblock: 0,
             alignment: (1, 1),
             cache: (0, 521, 1024 * 1024, 0.75f64.to_bits()),
@@ -115,6 +152,17 @@ impl FileAccess {
         &self.driver
     }
 
+    /// Return an explicit error when a stored FAPL driver cannot be honored by
+    /// this pure-Rust local-file backend.
+    pub fn ensure_runtime_supported_driver(&self) -> crate::Result<()> {
+        match self.driver.as_str() {
+            "sec2" | "stdio" | "windows" => Ok(()),
+            driver => Err(crate::Error::Unsupported(format!(
+                "file access driver '{driver}' is not supported by the pure Rust local backend"
+            ))),
+        }
+    }
+
     /// Set file-driver name as stored property-list state.
     pub fn set_driver<S: Into<String>>(&mut self, driver: S) {
         self.driver = driver.into();
@@ -143,6 +191,181 @@ impl FileAccess {
     /// Select the stdio-style local file driver.
     pub fn set_fapl_stdio(&mut self) {
         self.driver = "stdio".to_string();
+    }
+
+    /// Select the direct VFD and retain its driver-specific config as
+    /// property-list state. Runtime I/O remains unsupported.
+    pub fn set_fapl_direct(&mut self, config: DirectFileConfig) {
+        self.driver = "direct".to_string();
+        self.direct_config = Some(config);
+    }
+
+    /// Select the core VFD and retain its driver-specific config as
+    /// property-list state. Runtime I/O remains unsupported.
+    pub fn set_fapl_core(&mut self, config: CoreFileConfig) {
+        self.driver = "core".to_string();
+        self.core_config = Some(config);
+    }
+
+    /// Select the family VFD and retain its driver-specific config as
+    /// property-list state. Runtime I/O remains unsupported.
+    pub fn set_fapl_family(&mut self, config: FamilyFileConfig) {
+        self.driver = "family".to_string();
+        self.family_config = Some(config);
+    }
+
+    /// Parse and retain the family VFD superblock-driver-info image as
+    /// property-list state. Runtime I/O remains unsupported.
+    pub fn set_fapl_family_from_config_image(&mut self, bytes: &[u8]) -> crate::Result<()> {
+        let config = H5FD__family_sb_decode(bytes)?;
+        self.set_fapl_family(config);
+        Ok(())
+    }
+
+    /// Set the family VFD member offset as property-list state.
+    pub fn set_family_offset(&mut self, offset: Option<u64>) {
+        self.family_offset = offset;
+    }
+
+    /// Select the multi VFD and retain its driver-specific config as
+    /// property-list state. Runtime I/O remains unsupported.
+    pub fn set_fapl_multi(&mut self, config: MultiFileConfig) {
+        self.driver = "multi".to_string();
+        self.multi_config = Some(config);
+    }
+
+    /// Parse and retain the multi VFD superblock-driver-info image as
+    /// property-list state. Runtime I/O remains unsupported.
+    pub fn set_fapl_multi_from_config_image(&mut self, bytes: &[u8]) -> crate::Result<()> {
+        let config = H5FD_multi_sb_decode(bytes)?;
+        self.set_fapl_multi(config);
+        Ok(())
+    }
+
+    /// Set the multi VFD memory type as property-list state.
+    pub fn set_multi_type(&mut self, memory_type: Option<u32>) {
+        self.multi_type = memory_type;
+    }
+
+    /// Retain IOC VFD config as property-list state. Runtime I/O remains
+    /// unsupported.
+    pub fn set_fapl_ioc(&mut self, config: IocConfig) {
+        self.driver = "ioc".to_string();
+        self.ioc_config = Some(config);
+    }
+
+    /// Select the subfiling VFD and retain its driver-specific config as
+    /// property-list state. Runtime I/O remains unsupported.
+    pub fn set_fapl_subfiling(&mut self, config: SubfilingConfig) {
+        self.driver = "subfiling".to_string();
+        self.subfiling_config = Some(config);
+    }
+
+    /// Parse and retain the subfiling VFD superblock-driver-info image as
+    /// property-list state. Runtime I/O remains unsupported.
+    pub fn set_fapl_subfiling_from_config_image(&mut self, bytes: &[u8]) -> crate::Result<()> {
+        let config = H5FD__subfiling_sb_decode(bytes)?;
+        self.set_fapl_subfiling(config);
+        Ok(())
+    }
+
+    /// Select the splitter VFD and retain its driver-specific config as
+    /// property-list state. Runtime I/O remains unsupported.
+    pub fn set_fapl_splitter(&mut self, config: SplitterFileConfig) {
+        self.driver = "splitter".to_string();
+        self.splitter_config = Some(config);
+    }
+
+    /// Parse and retain the splitter VFD config image as property-list state.
+    /// Runtime I/O remains unsupported.
+    pub fn set_fapl_splitter_from_config_image(&mut self, bytes: &[u8]) -> crate::Result<()> {
+        let config = H5FD__splitter_sb_decode(bytes)?;
+        self.set_fapl_splitter(config);
+        Ok(())
+    }
+
+    /// Select the log VFD and retain its driver-specific config as
+    /// property-list state. Runtime I/O remains unsupported.
+    pub fn set_fapl_log(&mut self, config: LogFileConfig) {
+        self.driver = "log".to_string();
+        self.log_config = Some(config);
+    }
+
+    /// Parse and retain the log VFD config image as property-list state.
+    /// Runtime I/O remains unsupported.
+    pub fn set_fapl_log_from_config_image(&mut self, bytes: &[u8]) -> crate::Result<()> {
+        let config = H5FD__log_sb_decode(bytes)?;
+        self.set_fapl_log(config);
+        Ok(())
+    }
+
+    /// Select the onion VFD and retain its driver-specific config as
+    /// property-list state. Runtime I/O remains unsupported.
+    pub fn set_fapl_onion(&mut self, config: OnionHeader) {
+        self.driver = "onion".to_string();
+        self.onion_config = Some(config);
+    }
+
+    /// Parse and retain the onion VFD superblock-driver-info image as
+    /// property-list state. Runtime I/O remains unsupported.
+    pub fn set_fapl_onion_from_config_image(&mut self, bytes: &[u8]) -> crate::Result<()> {
+        let config = H5FD__onion_sb_decode(bytes)?;
+        self.set_fapl_onion(config);
+        Ok(())
+    }
+
+    /// Select the HDFS VFD and retain its driver-specific config as
+    /// property-list state. Runtime I/O remains unsupported.
+    pub fn set_fapl_hdfs(&mut self, config: HdfsConfig) {
+        self.driver = "hdfs".to_string();
+        self.hdfs_config = Some(config);
+    }
+
+    /// Parse and retain the HDFS FAPL config buffer as property-list state.
+    /// Runtime I/O remains unsupported.
+    pub fn set_fapl_hdfs_from_fapl_config_image(&mut self, bytes: &[u8]) -> crate::Result<()> {
+        let decoded = H5P__decode_hdfs_fapl_config(bytes)?;
+        let config = HdfsConfig {
+            namenode_name: decoded.namenode_name,
+            namenode_port: decoded.namenode_port,
+            user_name: decoded.user_name,
+            buffer_size: decoded.buffer_size,
+        };
+        if !H5FD__hdfs_validate_config(&config) {
+            return Err(crate::Error::InvalidFormat(
+                "invalid HDFS VFD config".into(),
+            ));
+        }
+        self.set_fapl_hdfs(config);
+        Ok(())
+    }
+
+    /// Select the ROS3 VFD and retain its driver-specific config as
+    /// property-list state. Runtime I/O remains unsupported.
+    pub fn set_fapl_ros3(&mut self, config: Ros3Config) {
+        self.driver = "ros3".to_string();
+        self.ros3_config = Some(config);
+        if self.page_buffer_size.0 == 0 {
+            self.page_buffer_size.0 = ROS3_DEFAULT_PAGE_BUFFER_SIZE;
+        }
+    }
+
+    /// Parse and retain the ROS3 FAPL config buffer as property-list state.
+    /// Runtime I/O remains unsupported.
+    pub fn set_fapl_ros3_from_fapl_config_image(&mut self, bytes: &[u8]) -> crate::Result<()> {
+        let decoded = H5P__decode_ros3_fapl_config(bytes)?;
+        let config = Ros3Config {
+            endpoint: decoded.endpoint,
+            region: decoded.region,
+            token: decoded.token,
+        };
+        if !H5FD__ros3_validate_config(&config) {
+            return Err(crate::Error::InvalidFormat(
+                "invalid ROS3 VFD config".into(),
+            ));
+        }
+        self.set_fapl_ros3(config);
+        Ok(())
     }
 
     /// Driver-specific info. The direct file driver has no extra info here.
@@ -363,13 +586,13 @@ impl FileAccess {
     }
 
     /// HDFS VFD configuration. Not active for the direct reader.
-    pub fn fapl_hdfs(&self) -> Option<()> {
-        None
+    pub fn fapl_hdfs(&self) -> Option<&HdfsConfig> {
+        self.hdfs_config.as_ref()
     }
 
     /// Direct VFD configuration. Not active for the direct reader.
-    pub fn fapl_direct(&self) -> Option<()> {
-        None
+    pub fn fapl_direct(&self) -> Option<&DirectFileConfig> {
+        self.direct_config.as_ref()
     }
 
     /// Mirror VFD configuration. Not active for the direct reader.
@@ -388,43 +611,48 @@ impl FileAccess {
     }
 
     /// Family VFD configuration. Not active for the direct reader.
-    pub fn fapl_family(&self) -> Option<()> {
-        None
+    pub fn fapl_family(&self) -> Option<&FamilyFileConfig> {
+        self.family_config.as_ref()
     }
 
     /// Family VFD member offset. Not active for the direct reader.
     pub fn family_offset(&self) -> Option<u64> {
-        None
+        self.family_offset
     }
 
     /// Multi VFD memory type. Not active for the direct reader.
     pub fn multi_type(&self) -> Option<u32> {
-        None
+        self.multi_type
     }
 
     /// IOC VFD configuration. Not active for the direct reader.
-    pub fn fapl_ioc(&self) -> Option<()> {
-        None
+    pub fn fapl_ioc(&self) -> Option<&IocConfig> {
+        self.ioc_config.as_ref()
     }
 
     /// Subfiling VFD configuration. Not active for the direct reader.
-    pub fn fapl_subfiling(&self) -> Option<()> {
-        None
+    pub fn fapl_subfiling(&self) -> Option<&SubfilingConfig> {
+        self.subfiling_config.as_ref()
     }
 
     /// Splitter VFD configuration. Not active for the direct reader.
-    pub fn fapl_splitter(&self) -> Option<()> {
-        None
+    pub fn fapl_splitter(&self) -> Option<&SplitterFileConfig> {
+        self.splitter_config.as_ref()
+    }
+
+    /// Log VFD configuration. Not active for the direct reader.
+    pub fn fapl_log(&self) -> Option<&LogFileConfig> {
+        self.log_config.as_ref()
     }
 
     /// Legacy multi VFD configuration. Not active for the direct reader.
-    pub fn fapl_multi(&self) -> Option<()> {
-        None
+    pub fn fapl_multi(&self) -> Option<&MultiFileConfig> {
+        self.multi_config.as_ref()
     }
 
     /// Onion VFD configuration. Not active for the direct reader.
-    pub fn fapl_onion(&self) -> Option<()> {
-        None
+    pub fn fapl_onion(&self) -> Option<&OnionHeader> {
+        self.onion_config.as_ref()
     }
 
     /// Core VFD write-tracking flag. Not active for the direct reader.
@@ -438,18 +666,20 @@ impl FileAccess {
     }
 
     /// Core VFD configuration. Not active for the direct reader.
-    pub fn fapl_core(&self) -> Option<()> {
-        None
+    pub fn fapl_core(&self) -> Option<&CoreFileConfig> {
+        self.core_config.as_ref()
     }
 
     /// ROS3 VFD configuration. Not active for the direct reader.
-    pub fn fapl_ros3(&self) -> Option<()> {
-        None
+    pub fn fapl_ros3(&self) -> Option<&Ros3Config> {
+        self.ros3_config.as_ref()
     }
 
     /// ROS3 endpoint string. Not active for the direct reader.
     pub fn fapl_ros3_endpoint(&self) -> Option<&str> {
-        None
+        self.ros3_config
+            .as_ref()
+            .and_then(|config| config.endpoint.as_deref())
     }
 
     /// Object flush callback. This reader does not install one.

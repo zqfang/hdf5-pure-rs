@@ -276,6 +276,125 @@ fn test_misc_property_list_defaults() {
 }
 
 #[test]
+fn test_file_access_parses_unsupported_vfd_config_images() {
+    use hdf5_pure_rust::engine::property::{
+        H5P__encode_hdfs_fapl_config_into, H5P__encode_ros3_fapl_config_into, HdfsFaplConfig,
+        Ros3FaplConfig,
+    };
+    use hdf5_pure_rust::engine::vfd::{
+        FamilyFileConfig, H5FD__family_sb_encode_into, H5FD__log_sb_encode_into,
+        H5FD__onion_sb_encode_into, H5FD__splitter_sb_encode_into, H5FD__subfiling_sb_encode_into,
+        H5FD_multi_populate_config, H5FD_multi_sb_encode_into, HdfsConfig, LogFileConfig,
+        OnionHeader, Ros3Config, SplitterFileConfig, SubfilingConfig,
+    };
+    use hdf5_pure_rust::hl::plist::file_access::FileAccess;
+    use std::path::PathBuf;
+
+    let mut access = FileAccess::default();
+    let mut bytes = Vec::new();
+
+    let family = FamilyFileConfig {
+        member_size: 4096,
+        printf_filename: "ignored-by-superblock-image.h5".into(),
+    };
+    H5FD__family_sb_encode_into(&family, &mut bytes).unwrap();
+    access.set_fapl_family_from_config_image(&bytes).unwrap();
+    assert_eq!(access.driver(), "family");
+    assert_eq!(access.fapl_family().unwrap().member_size, 4096);
+    assert!(access.set_fapl_family_from_config_image(&[0; 4]).is_err());
+
+    let multi = H5FD_multi_populate_config();
+    bytes.clear();
+    H5FD_multi_sb_encode_into(&multi, &mut bytes).unwrap();
+    access.set_fapl_multi_from_config_image(&bytes).unwrap();
+    assert_eq!(access.fapl_multi(), Some(&multi));
+    assert!(access
+        .set_fapl_multi_from_config_image(&[1, 0, 0, 0, 99, 0])
+        .is_err());
+
+    let splitter = SplitterFileConfig {
+        write_only_path: Some(PathBuf::from("mirror.h5")),
+        ignore_wo_errors: true,
+    };
+    bytes.clear();
+    H5FD__splitter_sb_encode_into(&splitter, &mut bytes).unwrap();
+    access.set_fapl_splitter_from_config_image(&bytes).unwrap();
+    assert_eq!(access.fapl_splitter(), Some(&splitter));
+
+    let log = LogFileConfig {
+        log_path: Some(PathBuf::from("driver.log")),
+        flags: 3,
+        buffer_size: 8192,
+    };
+    bytes.clear();
+    H5FD__log_sb_encode_into(&log, &mut bytes).unwrap();
+    access.set_fapl_log_from_config_image(&bytes).unwrap();
+    assert_eq!(access.fapl_log(), Some(&log));
+
+    let onion = OnionHeader {
+        version: 1,
+        flags: 2,
+        revision_count: 3,
+    };
+    bytes.clear();
+    H5FD__onion_sb_encode_into(&onion, &mut bytes).unwrap();
+    access.set_fapl_onion_from_config_image(&bytes).unwrap();
+    assert_eq!(access.fapl_onion(), Some(&onion));
+
+    let subfiling = SubfilingConfig {
+        ioc_count: 2,
+        stripe_size: 1024,
+        stripe_count: 8,
+    };
+    bytes.clear();
+    H5FD__subfiling_sb_encode_into(&subfiling, &mut bytes).unwrap();
+    access.set_fapl_subfiling_from_config_image(&bytes).unwrap();
+    assert_eq!(access.fapl_subfiling(), Some(&subfiling));
+
+    let hdfs = HdfsFaplConfig {
+        namenode_name: "nn.example.org".into(),
+        namenode_port: 8020,
+        user_name: "reader".into(),
+        buffer_size: 4096,
+    };
+    bytes.clear();
+    H5P__encode_hdfs_fapl_config_into(&hdfs, &mut bytes).unwrap();
+    access.set_fapl_hdfs_from_fapl_config_image(&bytes).unwrap();
+    assert_eq!(
+        access.fapl_hdfs(),
+        Some(&HdfsConfig {
+            namenode_name: "nn.example.org".into(),
+            namenode_port: 8020,
+            user_name: "reader".into(),
+            buffer_size: 4096,
+        })
+    );
+    assert!(access.set_fapl_hdfs_from_fapl_config_image(&[1]).is_err());
+
+    let ros3 = Ros3FaplConfig {
+        endpoint: Some("https://s3.us-east-1.amazonaws.com".into()),
+        region: Some("us-east-1".into()),
+        token: Some("session-token".into()),
+    };
+    bytes.clear();
+    H5P__encode_ros3_fapl_config_into(&ros3, &mut bytes).unwrap();
+    access.set_fapl_ros3_from_fapl_config_image(&bytes).unwrap();
+    assert_eq!(
+        access.fapl_ros3(),
+        Some(&Ros3Config {
+            endpoint: Some("https://s3.us-east-1.amazonaws.com".into()),
+            region: Some("us-east-1".into()),
+            token: Some("session-token".into()),
+        })
+    );
+    assert_eq!(access.page_buffer_size().0, 64 * 1024 * 1024);
+    assert!(matches!(
+        access.ensure_runtime_supported_driver(),
+        Err(hdf5_pure_rust::Error::Unsupported(_))
+    ));
+}
+
+#[test]
 fn test_dataset_metadata_queries() {
     let f = File::open("tests/data/datasets_v0.h5").unwrap();
 

@@ -38,11 +38,6 @@ enum ConversionKind {
 
 impl ReadConversion {
     pub(crate) fn for_dataset<T: H5Type>(datatype: &DatatypeMessage) -> Result<Self> {
-        if datatype.class == DatatypeClass::Time {
-            return Err(Error::Unsupported(
-                "typed reads for HDF5 time datatypes are not supported".into(),
-            ));
-        }
         let requested = T::type_size();
         let stored = usize::try_from(datatype.size)
             .map_err(|_| Error::InvalidFormat("datatype size does not fit in usize".into()))?;
@@ -55,7 +50,7 @@ impl ReadConversion {
         // dispatcher's fallthrough so each helper can stay focused on
         // the type-class-specific decisions.
         let kind = match datatype.class {
-            DatatypeClass::FixedPoint | DatatypeClass::Enum | DatatypeClass::BitField => {
+            class if is_integer_like_class(class) => {
                 Self::kind_for_integer_source::<T>(datatype, requested, stored)?
             }
             DatatypeClass::FloatingPoint => Self::kind_for_float_source::<T>(requested, stored)?,
@@ -69,7 +64,7 @@ impl ReadConversion {
         })
     }
 
-    /// Source class is FixedPoint / Enum / BitField. Mirrors libhdf5's
+    /// Source class is FixedPoint / Enum / BitField / Time. Mirrors libhdf5's
     /// `H5T__conv_i_i` / `H5T__conv_i_f` selection.
     fn kind_for_integer_source<T: H5Type>(
         datatype: &DatatypeMessage,
@@ -306,44 +301,43 @@ pub(crate) fn convert_between_datatypes_into(
     let dst_size = usize::try_from(destination.size).map_err(|_| {
         Error::InvalidFormat("destination datatype size does not fit in usize".into())
     })?;
+    if is_integer_like_class(source.class) {
+        if is_integer_like_class(destination.class) {
+            return convert_integer_bytes_to_order_into(
+                bytes,
+                src_size,
+                source.is_signed().unwrap_or(false),
+                source.byte_order(),
+                dst_size,
+                destination.is_signed().unwrap_or(false),
+                destination.byte_order(),
+                out,
+            );
+        }
+        if destination.class == DatatypeClass::FloatingPoint {
+            return convert_integer_to_float_bytes_to_order_into(
+                bytes,
+                src_size,
+                source.is_signed().unwrap_or(false),
+                source.byte_order(),
+                dst_size,
+                destination.byte_order(),
+                out,
+            );
+        }
+    }
+    if source.class == DatatypeClass::FloatingPoint && is_integer_like_class(destination.class) {
+        return convert_float_to_integer_bytes_to_order_into(
+            bytes,
+            src_size,
+            source.byte_order(),
+            dst_size,
+            destination.is_signed().unwrap_or(false),
+            destination.byte_order(),
+            out,
+        );
+    }
     match (source.class, destination.class) {
-        (
-            DatatypeClass::FixedPoint | DatatypeClass::Enum | DatatypeClass::BitField,
-            DatatypeClass::FixedPoint | DatatypeClass::Enum | DatatypeClass::BitField,
-        ) => convert_integer_bytes_to_order_into(
-            bytes,
-            src_size,
-            source.is_signed().unwrap_or(false),
-            source.byte_order(),
-            dst_size,
-            destination.is_signed().unwrap_or(false),
-            destination.byte_order(),
-            out,
-        ),
-        (
-            DatatypeClass::FixedPoint | DatatypeClass::Enum | DatatypeClass::BitField,
-            DatatypeClass::FloatingPoint,
-        ) => convert_integer_to_float_bytes_to_order_into(
-            bytes,
-            src_size,
-            source.is_signed().unwrap_or(false),
-            source.byte_order(),
-            dst_size,
-            destination.byte_order(),
-            out,
-        ),
-        (
-            DatatypeClass::FloatingPoint,
-            DatatypeClass::FixedPoint | DatatypeClass::Enum | DatatypeClass::BitField,
-        ) => convert_float_to_integer_bytes_to_order_into(
-            bytes,
-            src_size,
-            source.byte_order(),
-            dst_size,
-            destination.is_signed().unwrap_or(false),
-            destination.byte_order(),
-            out,
-        ),
         (DatatypeClass::FloatingPoint, DatatypeClass::FloatingPoint) => {
             convert_float_bytes_to_order_into(
                 bytes,
@@ -368,6 +362,16 @@ pub(crate) fn convert_between_datatypes_into(
             source.class, source.size, destination.class, destination.size
         ))),
     }
+}
+
+fn is_integer_like_class(class: DatatypeClass) -> bool {
+    matches!(
+        class,
+        DatatypeClass::FixedPoint
+            | DatatypeClass::Enum
+            | DatatypeClass::BitField
+            | DatatypeClass::Time
+    )
 }
 
 pub(crate) fn convert_between_datatypes(
@@ -1040,6 +1044,20 @@ mod tests {
         }
     }
 
+    fn time_type(size: u32, order: ByteOrder) -> DatatypeMessage {
+        let mut class_bits = [0u8; 3];
+        if matches!(order, ByteOrder::BigEndian) {
+            class_bits[0] |= 0x01;
+        }
+        DatatypeMessage {
+            version: 1,
+            class: DatatypeClass::Time,
+            class_bits,
+            size,
+            properties: Vec::new(),
+        }
+    }
+
     #[test]
     fn reads_big_endian_u128_same_size() {
         let datatype = fixed_type(16, false, ByteOrder::BigEndian);
@@ -1094,6 +1112,38 @@ mod tests {
         let raw = u128::MAX.to_le_bytes();
         let values = conversion.bytes_into_vec::<i128>(raw.to_vec()).unwrap();
         assert_eq!(values, vec![i128::MAX]);
+    }
+
+    #[test]
+    fn converts_time_datatype_between_integer_payloads() {
+        let source = time_type(8, ByteOrder::BigEndian);
+        let destination = fixed_type(4, false, ByteOrder::LittleEndian);
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&1u64.to_be_bytes());
+        raw.extend_from_slice(&5_000_000_000u64.to_be_bytes());
+
+        let converted = convert_between_datatypes(&raw, &source, &destination).unwrap();
+        let values = converted
+            .chunks_exact(4)
+            .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(values, vec![1, u32::MAX]);
+    }
+
+    #[test]
+    fn converts_time_datatype_to_float_payloads() {
+        let source = time_type(4, ByteOrder::LittleEndian);
+        let destination = float_type(8, ByteOrder::BigEndian);
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&0u32.to_le_bytes());
+        raw.extend_from_slice(&1_700_000_000u32.to_le_bytes());
+
+        let converted = convert_between_datatypes(&raw, &source, &destination).unwrap();
+        let values = converted
+            .chunks_exact(8)
+            .map(|chunk| f64::from_be_bytes(chunk.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(values, vec![0.0, 1_700_000_000.0]);
     }
 
     #[test]

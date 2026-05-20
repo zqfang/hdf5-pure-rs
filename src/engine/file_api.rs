@@ -975,6 +975,11 @@ pub fn H5F__get_mpi_atomicity(file: &FileApiState) -> bool {
     file.mpi_atomicity
 }
 
+/// Public API to query MPI atomicity; unsupported in pure-Rust mode.
+pub fn H5Fget_mpi_atomicity(_file: &FileApiState) -> Result<bool> {
+    Err(unsupported_file("H5Fget_mpi_atomicity"))
+}
+
 /// Retrieve the MPI communicator from the file; unsupported in pure-Rust mode.
 pub fn H5F_mpi_retrieve_comm() -> Result<()> {
     Err(unsupported_file("H5F_mpi_retrieve_comm"))
@@ -1363,6 +1368,11 @@ pub fn H5F_get_vfd_handle() -> Result<()> {
     Err(unsupported_file("H5F_get_vfd_handle"))
 }
 
+/// Public API to return the underlying VFD file handle; unsupported in pure-Rust mode.
+pub fn H5Fget_vfd_handle(_file: &FileApiState) -> Result<()> {
+    Err(unsupported_file("H5Fget_vfd_handle"))
+}
+
 /// Return whether `addr` is in the "temporary" range used for unallocated objects.
 pub fn H5F_is_tmp_addr(_addr: u64) -> bool {
     false
@@ -1525,6 +1535,19 @@ mod tests {
         assert!(flags.metadata_logging);
         assert!(flags.coll_metadata_reads);
         assert!(flags.mpi_atomicity);
+    }
+
+    #[test]
+    fn public_mpi_and_vfd_handle_apis_are_explicit_unsupported_boundaries() {
+        let file = FileApiState::default();
+        assert!(matches!(
+            H5Fget_mpi_atomicity(&file),
+            Err(Error::Unsupported(_))
+        ));
+        assert!(matches!(
+            H5Fget_vfd_handle(&file),
+            Err(Error::Unsupported(_))
+        ));
     }
 
     #[test]

@@ -12,6 +12,8 @@ pub struct HdfReader<R: Read + Seek> {
     sizeof_addr: u8,
     /// Size of file lengths in bytes (from superblock, typically 8).
     sizeof_size: u8,
+    /// Physical file offset of logical HDF5 address zero.
+    base_addr: u64,
 }
 
 impl<R: Read + Seek> HdfReader<R> {
@@ -22,6 +24,7 @@ impl<R: Read + Seek> HdfReader<R> {
             inner,
             sizeof_addr: 8,
             sizeof_size: 8,
+            base_addr: 0,
         }
     }
 
@@ -43,32 +46,71 @@ impl<R: Read + Seek> HdfReader<R> {
         self.sizeof_size
     }
 
+    /// Set the physical file offset corresponding to logical HDF5 address zero.
+    pub fn set_base_addr(&mut self, base_addr: u64) {
+        self.base_addr = base_addr;
+    }
+
+    /// Return the physical file offset corresponding to logical HDF5 address zero.
+    pub fn base_addr(&self) -> u64 {
+        self.base_addr
+    }
+
     /// Borrow the wrapped reader.
     pub fn get_ref(&self) -> &R {
         &self.inner
     }
 
-    /// Get the current position in the stream.
+    /// Get the current logical HDF5 position in the stream.
     pub fn position(&mut self) -> Result<u64> {
+        let physical = self.inner.stream_position()?;
+        physical.checked_sub(self.base_addr).ok_or_else(|| {
+            Error::InvalidFormat("physical stream position is before HDF5 base address".into())
+        })
+    }
+
+    /// Get the current physical byte position in the underlying stream.
+    pub fn position_physical(&mut self) -> Result<u64> {
         Ok(self.inner.stream_position()?)
     }
 
-    /// Get the stream length while preserving the current position.
+    /// Get the logical HDF5 stream length while preserving the current position.
     pub fn len(&mut self) -> Result<u64> {
+        let pos = self.inner.stream_position()?;
+        let len = self.inner.seek(SeekFrom::End(0))?;
+        self.inner.seek(SeekFrom::Start(pos))?;
+        len.checked_sub(self.base_addr).ok_or_else(|| {
+            Error::InvalidFormat("file length is smaller than HDF5 base address".into())
+        })
+    }
+
+    /// Get the physical stream length while preserving the current position.
+    pub fn len_physical(&mut self) -> Result<u64> {
         let pos = self.inner.stream_position()?;
         let len = self.inner.seek(SeekFrom::End(0))?;
         self.inner.seek(SeekFrom::Start(pos))?;
         Ok(len)
     }
 
-    /// Seek to an absolute position.
+    /// Seek to a logical HDF5 address.
     pub fn seek(&mut self, pos: u64) -> Result<u64> {
+        let physical = self
+            .base_addr
+            .checked_add(pos)
+            .ok_or_else(|| Error::InvalidFormat("logical seek address overflow".into()))?;
+        self.inner.seek(SeekFrom::Start(physical))?;
+        Ok(pos)
+    }
+
+    /// Seek to a physical byte offset in the underlying stream.
+    pub fn seek_physical(&mut self, pos: u64) -> Result<u64> {
         Ok(self.inner.seek(SeekFrom::Start(pos))?)
     }
 
     /// Seek relative to current position.
     pub fn seek_relative(&mut self, offset: i64) -> Result<u64> {
-        Ok(self.inner.seek(SeekFrom::Current(offset))?)
+        self.inner.seek(SeekFrom::Current(offset))?;
+        self.position()
     }
 
     /// Read bytes into a provided buffer.
@@ -254,5 +296,23 @@ mod tests {
         let mut r = HdfReader::new(Cursor::new(data));
         let err = r.skip(i64::MAX as u64 + 1).unwrap_err();
         assert!(err.to_string().contains("skip distance"));
+    }
+
+    #[test]
+    fn logical_seek_and_position_are_relative_to_base_addr() {
+        let data: Vec<u8> = (0..16).collect();
+        let mut r = HdfReader::new(Cursor::new(data));
+        r.set_base_addr(8);
+
+        assert_eq!(r.len().unwrap(), 8);
+        assert_eq!(r.len_physical().unwrap(), 16);
+        assert_eq!(r.seek(2).unwrap(), 2);
+        assert_eq!(r.position().unwrap(), 2);
+        assert_eq!(r.position_physical().unwrap(), 10);
+        assert_eq!(r.read_u8().unwrap(), 10);
+        assert_eq!(r.position().unwrap(), 3);
+
+        r.seek_physical(1).unwrap();
+        assert!(r.position().is_err());
     }
 }

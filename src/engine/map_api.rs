@@ -60,8 +60,33 @@ pub fn H5M__create_api_common(key_type: impl Into<String>, value_type: impl Into
 }
 
 #[allow(non_snake_case)]
+pub fn H5Mcreate(
+    _loc: impl Into<String>,
+    _name: impl Into<String>,
+    key_type: impl Into<String>,
+    value_type: impl Into<String>,
+) -> H5Map {
+    H5M__create_api_common(key_type, value_type)
+}
+
+#[allow(non_snake_case)]
+pub fn H5Mcreate_async(
+    loc: impl Into<String>,
+    name: impl Into<String>,
+    key_type: impl Into<String>,
+    value_type: impl Into<String>,
+) -> H5Map {
+    H5Mcreate(loc, name, key_type, value_type)
+}
+
+#[allow(non_snake_case)]
 pub fn H5Mcreate_anon(key_type: impl Into<String>, value_type: impl Into<String>) -> H5Map {
     H5M__create_api_common(key_type, value_type)
+}
+
+#[allow(non_snake_case)]
+pub fn H5Mcreate_anon_async(key_type: impl Into<String>, value_type: impl Into<String>) -> H5Map {
+    H5Mcreate_anon(key_type, value_type)
 }
 
 #[allow(non_snake_case)]
@@ -70,15 +95,56 @@ pub fn H5M__open_api_common_ref(map: &H5Map) -> Result<&H5Map> {
     Ok(map)
 }
 
+#[allow(non_snake_case)]
+pub fn H5Mopen_ref<'a>(
+    map: &'a H5Map,
+    _loc: impl Into<String>,
+    _name: impl Into<String>,
+) -> Result<&'a H5Map> {
+    H5M__open_api_common_ref(map)
+}
+
+#[allow(non_snake_case)]
+pub fn H5Mopen_async_ref<'a>(
+    map: &'a H5Map,
+    loc: impl Into<String>,
+    name: impl Into<String>,
+) -> Result<&'a H5Map> {
+    H5Mopen_ref(map, loc, name)
+}
+
 #[deprecated(note = "use H5M__open_api_common_ref to borrow the map without cloning")]
 #[allow(non_snake_case)]
 pub fn H5M__open_api_common(map: &H5Map) -> Result<H5Map> {
     Ok(H5M__open_api_common_ref(map)?.clone())
 }
 
+#[deprecated(note = "use H5Mopen_ref to borrow the map without cloning")]
+#[allow(non_snake_case)]
+#[allow(deprecated)]
+pub fn H5Mopen(map: &H5Map, _loc: impl Into<String>, _name: impl Into<String>) -> Result<H5Map> {
+    H5M__open_api_common(map)
+}
+
+#[deprecated(note = "use H5Mopen_async_ref to borrow the map without cloning")]
+#[allow(non_snake_case)]
+#[allow(deprecated)]
+pub fn H5Mopen_async(
+    map: &H5Map,
+    loc: impl Into<String>,
+    name: impl Into<String>,
+) -> Result<H5Map> {
+    H5Mopen(map, loc, name)
+}
+
 #[allow(non_snake_case)]
 pub fn H5Mclose(map: &mut H5Map) {
     H5M__close_cb(map);
+}
+
+#[allow(non_snake_case)]
+pub fn H5Mclose_async(map: &mut H5Map) {
+    H5Mclose(map);
 }
 
 #[allow(non_snake_case)]
@@ -266,11 +332,21 @@ mod tests {
 
     #[test]
     fn map_api_put_get_iterate_delete() {
-        let mut map = H5Mcreate_anon("u8", "bytes");
+        let mut map = H5Mcreate("file", "map", "u8", "bytes");
+        assert_eq!(H5Mget_key_type(&map).unwrap(), "u8");
+        assert_eq!(H5Mget_val_type(&map).unwrap(), "bytes");
         H5Mput(&mut map, b"k".to_vec(), b"v".to_vec()).unwrap();
         assert_eq!(H5Mget_count(&map).unwrap(), 1);
         assert!(H5Mexists(&map, b"k").unwrap());
         assert!(std::ptr::eq(H5M__open_api_common_ref(&map).unwrap(), &map));
+        assert!(std::ptr::eq(
+            H5Mopen_ref(&map, "file", "map").unwrap(),
+            &map
+        ));
+        assert!(std::ptr::eq(
+            H5Mopen_async_ref(&map, "file", "map").unwrap(),
+            &map
+        ));
         assert_eq!(H5Mget_ref(&map, b"k").unwrap(), Some(b"v".as_slice()));
         let entries: Vec<_> = H5M_iter_entries(&map).unwrap().collect();
         assert_eq!(entries, vec![(b"k".as_slice(), b"v".as_slice())]);
@@ -288,7 +364,10 @@ mod tests {
         assert_eq!(copied, vec![(b"k".to_vec(), b"v".to_vec())]);
 
         assert_eq!(H5Mdelete(&mut map, b"k").unwrap(), Some(b"v".to_vec()));
-        H5Mclose(&mut map);
+        H5Mclose_async(&mut map);
         assert!(H5Mget_count(&map).is_err());
+
+        let anon = H5Mcreate_anon_async("u8", "bytes");
+        assert_eq!(H5Mget_count(&anon).unwrap(), 0);
     }
 }

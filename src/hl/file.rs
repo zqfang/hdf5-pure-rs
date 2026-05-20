@@ -200,6 +200,7 @@ impl FileBuilder {
     ///
     /// Part of the hdf5-metno compatibility layer and should not be removed.
     pub fn open_as<P: AsRef<Path>>(&self, filename: P, mode: OpenMode) -> Result<File> {
+        self.fapl.ensure_runtime_supported_driver()?;
         let file = match mode {
             OpenMode::Read => File::open(filename)?,
             OpenMode::ReadSWMR => Err(Error::Unsupported(
@@ -479,7 +480,7 @@ impl File {
     ///
     /// Part of the hdf5-metno compatibility layer and should not be removed.
     pub fn userblock(&self) -> u64 {
-        0
+        self.superblock.base_addr
     }
 
     /// Flushes the file to the storage medium.
@@ -600,8 +601,8 @@ impl File {
     /// Return the current file image bytes.
     pub fn file_image(&self) -> Result<Vec<u8>> {
         let mut guard = self.inner.lock();
-        let pos = guard.reader.position()?;
-        let len = guard.reader.len()?;
+        let pos = guard.reader.position_physical()?;
+        let len = guard.reader.len_physical()?;
         let len = usize::try_from(len)
             .map_err(|_| Error::InvalidFormat("file image length does not fit usize".into()))?;
         let mut image = vec![0u8; len];
@@ -612,8 +613,8 @@ impl File {
     /// Read the current file image into caller-provided storage.
     pub fn file_image_into(&self, out: &mut [u8]) -> Result<()> {
         let mut guard = self.inner.lock();
-        let pos = guard.reader.position()?;
-        let len = guard.reader.len()?;
+        let pos = guard.reader.position_physical()?;
+        let len = guard.reader.len_physical()?;
         let len = usize::try_from(len)
             .map_err(|_| Error::InvalidFormat("file image length does not fit usize".into()))?;
         if out.len() != len {
@@ -630,9 +631,9 @@ impl File {
         pos: u64,
         out: &mut [u8],
     ) -> Result<()> {
-        reader.seek(0)?;
+        reader.seek_physical(0)?;
         let read = reader.read_bytes_into(out);
-        let restore = reader.seek(pos);
+        let restore = reader.seek_physical(pos);
         match (read, restore) {
             (Ok(_), Ok(_)) => Ok(()),
             (Err(err), _) => Err(err),
@@ -801,7 +802,11 @@ impl File {
 
     /// Get the root group.
     pub fn root_group(&self) -> Result<Group> {
-        Group::open(self.inner.clone(), "/", self.superblock.root_addr)
+        Group::open(self.inner.clone(), "/", self.root_addr())
+    }
+
+    fn root_addr(&self) -> u64 {
+        self.inner.lock().superblock.root_addr
     }
 
     /// List all member names in the root group.
@@ -860,7 +865,7 @@ impl File {
     where
         F: FnMut(&str) -> Result<()>,
     {
-        visit_attr_names_at(&self.inner, self.superblock.root_addr, &mut f)
+        visit_attr_names_at(&self.inner, self.root_addr(), &mut f)
     }
 
     /// Append root-group attribute names into caller-provided storage.
@@ -884,7 +889,7 @@ impl File {
     where
         F: FnMut(&crate::hl::attribute::Attribute) -> Result<()>,
     {
-        visit_attrs_at(&self.inner, self.superblock.root_addr, &mut f)
+        visit_attrs_at(&self.inner, self.root_addr(), &mut f)
     }
 
     /// Store root-group attributes in caller-provided storage.
@@ -892,7 +897,7 @@ impl File {
         out.clear();
         out.extend(crate::hl::attribute::collect_attributes(
             &self.inner,
-            self.superblock.root_addr,
+            self.root_addr(),
         )?);
         Ok(())
     }
@@ -925,7 +930,7 @@ impl File {
         out.clear();
         crate::hl::attribute::collect_attributes_by_creation_order_into(
             &self.inner,
-            self.superblock.root_addr,
+            self.root_addr(),
             out,
         )?;
         Ok(())
@@ -933,12 +938,12 @@ impl File {
 
     /// Get an attribute by name on the root group.
     pub fn attr(&self, name: &str) -> Result<crate::hl::attribute::Attribute> {
-        crate::hl::attribute::get_attr(&self.inner, self.superblock.root_addr, name)
+        crate::hl::attribute::get_attr(&self.inner, self.root_addr(), name)
     }
 
     /// Check whether an attribute exists on the root group.
     pub fn attr_exists(&self, name: &str) -> Result<bool> {
-        crate::hl::attribute::attr_exists(&self.inner, self.superblock.root_addr, name)
+        crate::hl::attribute::attr_exists(&self.inner, self.root_addr(), name)
     }
 
     /// Async-compatible alias for attribute-existence checks.
@@ -1023,7 +1028,7 @@ impl File {
         ResolvedObject {
             inner: self.inner.clone(),
             path,
-            addr: self.superblock.root_addr,
+            addr: self.root_addr(),
             object_type: ObjectType::Group,
         }
     }

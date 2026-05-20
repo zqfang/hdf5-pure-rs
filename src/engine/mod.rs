@@ -1,6 +1,7 @@
 pub mod allocator;
 pub mod dataset_api;
 pub mod datatype_api;
+pub mod event_set;
 pub mod file_api;
 pub mod file_space;
 pub mod free_list;

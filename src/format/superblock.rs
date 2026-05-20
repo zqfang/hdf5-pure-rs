@@ -82,17 +82,9 @@ impl Default for Superblock {
 impl Superblock {
     /// Read and parse the superblock from the beginning of an HDF5 file.
     pub fn read<R: Read + Seek>(reader: &mut HdfReader<R>) -> Result<Self> {
-        // Seek to beginning
-        reader.seek(0)?;
+        reader.set_base_addr(0);
+        let superblock_offset = Self::find_signature(reader)?;
 
-        // Read and verify signature
-        let mut sig = [0u8; 8];
-        reader.read_bytes_into(&mut sig)?;
-        if sig != HDF5_SIGNATURE {
-            return Err(Error::InvalidFormat("invalid HDF5 file signature".into()));
-        }
-
-        // Read superblock version
         let version = reader.read_u8()?;
         if version > 3 {
             return Err(Error::Unsupported(format!(
@@ -100,11 +92,30 @@ impl Superblock {
             )));
         }
 
-        if version < 2 {
+        let superblock = if version < 2 {
             Self::read_v0_v1(reader, version)
         } else {
-            Self::read_v2_v3(reader, version)
+            Self::read_v2_v3(reader, version, superblock_offset)
+        }?;
+        reader.set_base_addr(superblock.base_addr);
+        Ok(superblock)
+    }
+
+    fn find_signature<R: Read + Seek>(reader: &mut HdfReader<R>) -> Result<u64> {
+        let mut sig = [0u8; 8];
+        let candidates = std::iter::once(0u64).chain((9u32..=24).map(|shift| 1u64 << shift));
+        for offset in candidates {
+            if reader.seek_physical(offset).is_err() {
+                break;
+            }
+            if reader.read_bytes_into(&mut sig).is_err() {
+                break;
+            }
+            if sig == HDF5_SIGNATURE {
+                return Ok(offset);
+            }
         }
+        Err(Error::InvalidFormat("invalid HDF5 file signature".into()))
     }
 
     /// Read superblock version 0 or 1.
@@ -249,7 +260,11 @@ impl Superblock {
     }
 
     /// Read superblock version 2 or 3.
-    fn read_v2_v3<R: Read + Seek>(reader: &mut HdfReader<R>, version: u8) -> Result<Self> {
+    fn read_v2_v3<R: Read + Seek>(
+        reader: &mut HdfReader<R>,
+        version: u8,
+        superblock_offset: u64,
+    ) -> Result<Self> {
         // For v2+, we need to capture raw bytes for checksum verification.
         // The superblock starts at offset 0 (signature already read at 0..8, version at 8).
         // After version byte: sizeof_addr, sizeof_size, status_flags, then 4 addresses, then checksum.
@@ -275,7 +290,7 @@ impl Superblock {
         // Superblock v2: signature(8) + version(1) + sizeof_addr(1) + sizeof_size(1) +
         //                status_flags(1) + 4*sizeof_addr addresses = 12 + 4*sizeof_addr bytes
         let sb_size = Self::v2_checksum_span(sizeof_addr)?;
-        reader.seek(0)?;
+        reader.seek_physical(superblock_offset)?;
         let mut checksum_input = [0u8; 44];
         let checksum_input = checksum_input.get_mut(..sb_size).ok_or_else(|| {
             Error::InvalidFormat("superblock checksum span exceeds stack buffer".into())
@@ -294,7 +309,9 @@ impl Superblock {
             .ok()
             .and_then(|value| value.checked_add(4))
             .ok_or_else(|| Error::InvalidFormat("superblock checksum offset overflow".into()))?;
-        reader.seek(checksum_end)?;
+        reader.seek_physical(superblock_offset.checked_add(checksum_end).ok_or_else(|| {
+            Error::InvalidFormat("superblock checksum end offset overflow".into())
+        })?)?;
 
         Ok(Superblock {
             version,

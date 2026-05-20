@@ -11,6 +11,8 @@ use crate::io::reader::UNDEF_ADDR;
 
 const MAX_DATASPACE_RANK: usize = 32;
 const OBJECT_HEADER_CHUNK_DATA_LIMIT: usize = 128 * 1024;
+const FIXED_ARRAY_CHUNK_PAGE_BITS: u8 = 12;
+const EXTENSIBLE_ARRAY_INDEX_BLOCK_ELEMENTS_LIMIT: usize = u8::MAX as usize;
 
 /// A writable HDF5 file under construction.
 pub struct HdfFileWriter<W: Write + Seek> {
@@ -639,6 +641,23 @@ fn append_encoded_size(out: &mut Vec<u8>, value: u64, sizeof_size: u8) -> Result
     Ok(())
 }
 
+/// Append an unsigned integer using an arbitrary 1..=8 byte little-endian width.
+fn append_encoded_uint(out: &mut Vec<u8>, value: u64, width: usize, context: &str) -> Result<()> {
+    if width == 0 || width > 8 {
+        return Err(Error::InvalidFormat(format!(
+            "{context} field width {width} is invalid"
+        )));
+    }
+    let max = encoded_width_max(u8::try_from(width).unwrap_or(8));
+    if value > max {
+        return Err(Error::InvalidFormat(format!(
+            "{context} value {value:#x} does not fit in {width} bytes"
+        )));
+    }
+    out.extend_from_slice(&value.to_le_bytes()[..width]);
+    Ok(())
+}
+
 /// Maximum representable value for a given encoded width in bytes.
 fn encoded_width_max(width: u8) -> u64 {
     if width == 8 {
@@ -646,6 +665,25 @@ fn encoded_width_max(width: u8) -> u64 {
     } else {
         (1u64 << (u32::from(width) * 8)) - 1
     }
+}
+
+fn filtered_chunk_size_len_v4(unfiltered_chunk_bytes: usize) -> usize {
+    let bits = if unfiltered_chunk_bytes == 0 {
+        0
+    } else {
+        usize::try_from(usize::BITS - unfiltered_chunk_bytes.leading_zeros()).unwrap_or(usize::MAX)
+    };
+    (1 + ((bits + 8) / 8)).min(8)
+}
+
+fn extensible_array_max_elements_bits(elements: usize) -> Result<u8> {
+    if elements == 0 {
+        return Err(Error::InvalidFormat(
+            "extensible-array element count must be positive".into(),
+        ));
+    }
+    u8::try_from(usize::BITS - elements.leading_zeros())
+        .map_err(|_| Error::InvalidFormat("extensible-array element count bits exceed u8".into()))
 }
 
 /// Append a dataspace message.
@@ -893,6 +931,7 @@ fn encode_single_chunk_layout_v4_into(
     buf: &mut Vec<u8>,
     chunk_addr: u64,
     chunk_dims: &[u64],
+    element_size: u32,
     filtered_size: Option<u64>,
     filter_mask: u32,
     sizeof_addr: u8,
@@ -904,7 +943,11 @@ fn encode_single_chunk_layout_v4_into(
     let flags = if filtered_size.is_some() { 0x02 } else { 0 };
     buf.push(flags);
 
-    let ndims = u8::try_from(chunk_dims.len())
+    let encoded_ndims = chunk_dims
+        .len()
+        .checked_add(1)
+        .ok_or_else(|| Error::InvalidFormat("chunked layout rank overflow".into()))?;
+    let ndims = u8::try_from(encoded_ndims)
         .map_err(|_| Error::InvalidFormat("chunked layout rank exceeds u8".into()))?;
     if ndims == 0 {
         return Err(Error::InvalidFormat(
@@ -913,7 +956,12 @@ fn encode_single_chunk_layout_v4_into(
     }
     buf.push(ndims);
 
-    let max_dim = chunk_dims.iter().copied().max().unwrap_or(0);
+    let max_dim = chunk_dims
+        .iter()
+        .copied()
+        .chain(std::iter::once(u64::from(element_size)))
+        .max()
+        .unwrap_or(0);
     let enc_bytes_per_dim = (1usize..=8)
         .find(|width| u128::from(max_dim) < (1u128 << (width * 8)))
         .unwrap_or(8);
@@ -926,6 +974,12 @@ fn encode_single_chunk_layout_v4_into(
         }
         buf.extend_from_slice(&dim.to_le_bytes()[..enc_bytes_per_dim]);
     }
+    if element_size == 0 {
+        return Err(Error::InvalidFormat(
+            "chunk element size must be positive".into(),
+        ));
+    }
+    buf.extend_from_slice(&u64::from(element_size).to_le_bytes()[..enc_bytes_per_dim]);
 
     buf.push(1); // chunk index type = single chunk
     if let Some(size) = filtered_size {
@@ -933,6 +987,161 @@ fn encode_single_chunk_layout_v4_into(
         buf.extend_from_slice(&filter_mask.to_le_bytes());
     }
     append_encoded_addr(buf, chunk_addr, sizeof_addr)?;
+
+    Ok(())
+}
+
+/// Append a data layout message (v4, fixed-array chunk index).
+fn encode_fixed_array_chunk_layout_v4_into(
+    buf: &mut Vec<u8>,
+    fixed_array_addr: u64,
+    chunk_dims: &[u64],
+    element_size: u32,
+    page_bits: u8,
+    sizeof_addr: u8,
+) -> Result<()> {
+    if page_bits == 0 {
+        return Err(Error::InvalidFormat(
+            "fixed-array chunk page bits must be positive".into(),
+        ));
+    }
+
+    buf.push(4); // version 4
+    buf.push(2); // layout class = chunked
+    buf.push(0); // flags
+
+    let encoded_ndims = chunk_dims
+        .len()
+        .checked_add(1)
+        .ok_or_else(|| Error::InvalidFormat("chunked layout rank overflow".into()))?;
+    let ndims = u8::try_from(encoded_ndims)
+        .map_err(|_| Error::InvalidFormat("chunked layout rank exceeds u8".into()))?;
+    if ndims == 0 {
+        return Err(Error::InvalidFormat(
+            "chunked layout rank must be positive".into(),
+        ));
+    }
+    buf.push(ndims);
+
+    let max_dim = chunk_dims
+        .iter()
+        .copied()
+        .chain(std::iter::once(u64::from(element_size)))
+        .max()
+        .unwrap_or(0);
+    let enc_bytes_per_dim = (1usize..=8)
+        .find(|width| u128::from(max_dim) < (1u128 << (width * 8)))
+        .unwrap_or(8);
+    buf.push(u8::try_from(enc_bytes_per_dim).unwrap_or(8));
+    for &dim in chunk_dims {
+        if dim == 0 {
+            return Err(Error::InvalidFormat(
+                "chunk dimension must be positive".into(),
+            ));
+        }
+        buf.extend_from_slice(&dim.to_le_bytes()[..enc_bytes_per_dim]);
+    }
+    if element_size == 0 {
+        return Err(Error::InvalidFormat(
+            "chunk element size must be positive".into(),
+        ));
+    }
+    buf.extend_from_slice(&u64::from(element_size).to_le_bytes()[..enc_bytes_per_dim]);
+
+    buf.push(3); // chunk index type = fixed array
+    buf.push(page_bits);
+    append_encoded_addr(buf, fixed_array_addr, sizeof_addr)?;
+
+    Ok(())
+}
+
+/// Append a data layout message (v4, extensible-array chunk index).
+#[allow(clippy::too_many_arguments)]
+fn encode_extensible_array_chunk_layout_v4_into(
+    buf: &mut Vec<u8>,
+    extensible_array_addr: u64,
+    chunk_dims: &[u64],
+    element_size: u32,
+    max_elements_bits: u8,
+    index_block_elements: u8,
+    super_block_min_data_ptrs: u8,
+    data_block_min_elements: u8,
+    max_data_block_page_elements_bits: u8,
+    sizeof_addr: u8,
+) -> Result<()> {
+    for (value, context) in [
+        (max_elements_bits, "extensible-array max elements bits"),
+        (
+            index_block_elements,
+            "extensible-array index block elements",
+        ),
+        (
+            super_block_min_data_ptrs,
+            "extensible-array super block min data pointers",
+        ),
+        (
+            data_block_min_elements,
+            "extensible-array data block min elements",
+        ),
+        (
+            max_data_block_page_elements_bits,
+            "extensible-array max data block page elements bits",
+        ),
+    ] {
+        if value == 0 {
+            return Err(Error::InvalidFormat(format!("{context} must be positive")));
+        }
+    }
+
+    buf.push(4); // version 4
+    buf.push(2); // layout class = chunked
+    buf.push(0); // flags
+
+    let encoded_ndims = chunk_dims
+        .len()
+        .checked_add(1)
+        .ok_or_else(|| Error::InvalidFormat("chunked layout rank overflow".into()))?;
+    let ndims = u8::try_from(encoded_ndims)
+        .map_err(|_| Error::InvalidFormat("chunked layout rank exceeds u8".into()))?;
+    if ndims == 0 {
+        return Err(Error::InvalidFormat(
+            "chunked layout rank must be positive".into(),
+        ));
+    }
+    buf.push(ndims);
+
+    let max_dim = chunk_dims
+        .iter()
+        .copied()
+        .chain(std::iter::once(u64::from(element_size)))
+        .max()
+        .unwrap_or(0);
+    let enc_bytes_per_dim = (1usize..=8)
+        .find(|width| u128::from(max_dim) < (1u128 << (width * 8)))
+        .unwrap_or(8);
+    buf.push(u8::try_from(enc_bytes_per_dim).unwrap_or(8));
+    for &dim in chunk_dims {
+        if dim == 0 {
+            return Err(Error::InvalidFormat(
+                "chunk dimension must be positive".into(),
+            ));
+        }
+        buf.extend_from_slice(&dim.to_le_bytes()[..enc_bytes_per_dim]);
+    }
+    if element_size == 0 {
+        return Err(Error::InvalidFormat(
+            "chunk element size must be positive".into(),
+        ));
+    }
+    buf.extend_from_slice(&u64::from(element_size).to_le_bytes()[..enc_bytes_per_dim]);
+
+    buf.push(4); // chunk index type = extensible array
+    buf.push(max_elements_bits);
+    buf.push(index_block_elements);
+    buf.push(super_block_min_data_ptrs);
+    buf.push(data_block_min_elements);
+    buf.push(max_data_block_page_elements_bits);
+    append_encoded_addr(buf, extensible_array_addr, sizeof_addr)?;
 
     Ok(())
 }
@@ -1354,6 +1563,7 @@ fn dense_btree_internal_capacity(
     node_size: usize,
     record_size: usize,
     leaf_max_records: usize,
+    child_all_nrec_size: usize,
     sizeof_addr: u8,
 ) -> Result<usize> {
     if record_size == 0 || leaf_max_records == 0 {
@@ -1366,7 +1576,7 @@ fn dense_btree_internal_capacity(
         "dense B-tree leaf capacity",
     )?);
     let pointer_size = checked_usize_sum_writer(
-        &[usize::from(sizeof_addr), max_nrec_size],
+        &[usize::from(sizeof_addr), max_nrec_size, child_all_nrec_size],
         "dense B-tree pointer size",
     )?;
     let prefix_and_pointer =
@@ -1386,6 +1596,73 @@ fn dense_btree_internal_capacity(
         ));
     }
     Ok(capacity)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DenseBtreeLevelInfo {
+    max_nrecords: usize,
+    cumulative_max_records: u64,
+    cumulative_max_record_size: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DenseBtreeChild {
+    addr: u64,
+    node_nrecords: usize,
+    total_records: u64,
+}
+
+fn dense_btree_level_info(
+    node_size: usize,
+    record_size: usize,
+    record_count: usize,
+    sizeof_addr: u8,
+) -> Result<Vec<DenseBtreeLevelInfo>> {
+    let leaf_max_records = dense_btree_leaf_capacity(node_size, record_size)?;
+    let leaf_max_records_u64 =
+        u64_from_usize_writer(leaf_max_records, "dense B-tree leaf capacity")?;
+    let target_count = u64_from_usize_writer(record_count, "dense B-tree record count")?;
+    let mut levels = vec![DenseBtreeLevelInfo {
+        max_nrecords: leaf_max_records,
+        cumulative_max_records: leaf_max_records_u64,
+        cumulative_max_record_size: 0,
+    }];
+
+    while levels
+        .last()
+        .map(|level| level.cumulative_max_records < target_count)
+        .unwrap_or(false)
+    {
+        let child_level = *levels
+            .last()
+            .ok_or_else(|| Error::InvalidFormat("dense B-tree level info is empty".into()))?;
+        let child_all_nrec_size = if levels.len() > 1 {
+            child_level.cumulative_max_record_size
+        } else {
+            0
+        };
+        let max_nrecords = dense_btree_internal_capacity(
+            node_size,
+            record_size,
+            leaf_max_records,
+            child_all_nrec_size,
+            sizeof_addr,
+        )?;
+        let max_nrecords_u64 =
+            u64_from_usize_writer(max_nrecords, "dense B-tree internal capacity")?;
+        let cumulative_max_records = max_nrecords_u64
+            .checked_add(1)
+            .and_then(|children| children.checked_mul(child_level.cumulative_max_records))
+            .and_then(|child_records| child_records.checked_add(max_nrecords_u64))
+            .ok_or_else(|| Error::InvalidFormat("dense B-tree capacity overflow".into()))?;
+        levels.push(DenseBtreeLevelInfo {
+            max_nrecords,
+            cumulative_max_records,
+            cumulative_max_record_size: dense_btree_bytes_needed(cumulative_max_records),
+        });
+    }
+
+    Ok(levels)
 }
 
 fn dense_btree_bytes_needed(mut value: u64) -> usize {
@@ -1415,6 +1692,23 @@ fn append_dense_btree_var_uint(out: &mut Vec<u8>, value: u64, size: usize) -> Re
     }
     out.extend_from_slice(&value.to_le_bytes()[..size]);
     Ok(())
+}
+
+fn dense_heap_id_len_for_payloads(
+    payloads: &[Vec<u8>],
+    offset_bytes: usize,
+    min_heap_id_len: u16,
+) -> Result<u16> {
+    let max_payload_len = payloads.iter().map(Vec::len).max().unwrap_or(0);
+    let length_bytes = dense_btree_bytes_needed(u64_from_usize_writer(
+        max_payload_len,
+        "dense heap payload length",
+    )?);
+    let heap_id_len =
+        checked_usize_sum_writer(&[1, offset_bytes, length_bytes], "managed heap ID length")?;
+    let heap_id_len = heap_id_len.max(usize::from(min_heap_id_len));
+    u16::try_from(heap_id_len)
+        .map_err(|_| Error::InvalidFormat("managed heap ID length exceeds u16".into()))
 }
 
 /// Verify a chunked dataset spec for consistency before writing.
@@ -2139,6 +2433,23 @@ impl<W: Write + Seek> HdfFileWriter<W> {
         fill: Option<FillValueSpec<'_>>,
         attrs: &[AttrSpec],
     ) -> Result<u64> {
+        self.create_vlen_utf8_string_dataset_with_attrs_and_vlen_fill(
+            parent, name, shape, strings, max_shape, fill, None, attrs,
+        )
+    }
+
+    /// Variable-length UTF-8 string dataset with attached attributes and optional string fill.
+    pub(crate) fn create_vlen_utf8_string_dataset_with_attrs_and_vlen_fill(
+        &mut self,
+        parent: &str,
+        name: &str,
+        shape: &[u64],
+        strings: &[&str],
+        max_shape: Option<&[u64]>,
+        fill: Option<FillValueSpec<'_>>,
+        vlen_fill: Option<&str>,
+        attrs: &[AttrSpec],
+    ) -> Result<u64> {
         self.ensure_child_name_available(parent, name)?;
         validate_unique_attr_names(attrs)?;
 
@@ -2187,8 +2498,26 @@ impl<W: Write + Seek> HdfFileWriter<W> {
             self.sizeof_addr,
             self.sizeof_size,
         )?;
+        let vlen_fill_data;
+        let effective_fill = if let Some(value) = vlen_fill {
+            if fill.as_ref().and_then(|fill| fill.value).is_some() {
+                return Err(Error::InvalidFormat(
+                    "vlen UTF-8 fill value conflicts with raw fill-value bytes".into(),
+                ));
+            }
+            let alloc_time = fill.map(|fill| fill.alloc_time).unwrap_or(1);
+            let fill_time = fill.map(|fill| fill.fill_time).unwrap_or(2);
+            vlen_fill_data = self.prepare_vlen_utf8_string_data(&[value])?;
+            Some(FillValueSpec::with_value(
+                alloc_time,
+                fill_time,
+                &vlen_fill_data,
+            ))
+        } else {
+            fill
+        };
         let mut fill_value_bytes = Vec::new();
-        encode_fill_value_message_into(&mut fill_value_bytes, fill)?;
+        encode_fill_value_message_into(&mut fill_value_bytes, effective_fill)?;
 
         let mut messages: Vec<(u16, Vec<u8>)> = vec![
             (MSG_DATASPACE, ds_bytes),
@@ -2248,6 +2577,38 @@ impl<W: Write + Seek> HdfFileWriter<W> {
         fill: Option<FillValueSpec<'_>>,
         attrs: &[AttrSpec],
     ) -> Result<u64> {
+        self.create_chunked_vlen_utf8_string_dataset_with_attrs_and_vlen_fill(
+            parent,
+            name,
+            shape,
+            strings,
+            max_shape,
+            chunk_dims,
+            compression_level,
+            shuffle,
+            fletcher32,
+            fill,
+            None,
+            attrs,
+        )
+    }
+
+    /// Chunked variable-length UTF-8 string dataset with optional string fill.
+    pub(crate) fn create_chunked_vlen_utf8_string_dataset_with_attrs_and_vlen_fill(
+        &mut self,
+        parent: &str,
+        name: &str,
+        shape: &[u64],
+        strings: &[&str],
+        max_shape: Option<&[u64]>,
+        chunk_dims: &[u64],
+        compression_level: Option<u32>,
+        shuffle: bool,
+        fletcher32: bool,
+        fill: Option<FillValueSpec<'_>>,
+        vlen_fill: Option<&str>,
+        attrs: &[AttrSpec],
+    ) -> Result<u64> {
         self.ensure_child_name_available(parent, name)?;
         validate_unique_attr_names(attrs)?;
 
@@ -2261,6 +2622,24 @@ impl<W: Write + Seek> HdfFileWriter<W> {
         }
 
         let data = self.prepare_vlen_utf8_string_data(strings)?;
+        let vlen_fill_data;
+        let effective_fill = if let Some(value) = vlen_fill {
+            if fill.as_ref().and_then(|fill| fill.value).is_some() {
+                return Err(Error::InvalidFormat(
+                    "vlen UTF-8 fill value conflicts with raw fill-value bytes".into(),
+                ));
+            }
+            let alloc_time = fill.map(|fill| fill.alloc_time).unwrap_or(1);
+            let fill_time = fill.map(|fill| fill.fill_time).unwrap_or(2);
+            vlen_fill_data = self.prepare_vlen_utf8_string_data(&[value])?;
+            Some(FillValueSpec::with_value(
+                alloc_time,
+                fill_time,
+                &vlen_fill_data,
+            ))
+        } else {
+            fill
+        };
         let spec = DatasetSpec {
             name,
             shape,
@@ -2275,7 +2654,7 @@ impl<W: Write + Seek> HdfFileWriter<W> {
             compression_level,
             shuffle,
             fletcher32,
-            fill,
+            effective_fill,
             attrs,
         )
     }
@@ -2725,6 +3104,9 @@ impl<W: Write + Seek> HdfFileWriter<W> {
         let element_size = u32::try_from(element_size)
             .map_err(|_| Error::InvalidFormat("chunk element size exceeds u32".into()))?;
         let use_single_chunk_index = total_chunks == 1 && spec.max_shape.is_none();
+        let use_fixed_array_index = !use_single_chunk_index && spec.max_shape.is_none();
+        let use_extensible_array_index =
+            spec.max_shape.is_some() && total_chunks <= EXTENSIBLE_ARRAY_INDEX_BLOCK_ELEMENTS_LIMIT;
 
         let mut layout_bytes = Vec::new();
         if use_single_chunk_index {
@@ -2735,22 +3117,55 @@ impl<W: Write + Seek> HdfFileWriter<W> {
                 &mut layout_bytes,
                 entry.child_addr,
                 chunk_dims,
+                element_size,
                 has_filters.then_some(u64::from(entry.chunk_size)),
                 entry.filter_mask,
                 self.sizeof_addr,
                 self.sizeof_size,
             )?;
-        } else {
-            // Multi-chunk writer creation still uses the legacy v1 B-tree index.
-            let btree_addr =
-                self.write_chunk_btree_entries_v1(&chunk_entries, ndims, element_size)?;
-            encode_chunked_layout_v3_into(
+        } else if use_fixed_array_index {
+            let fixed_array_addr = self.write_fixed_array_chunk_index(
+                &chunk_entries,
+                FIXED_ARRAY_CHUNK_PAGE_BITS,
+                has_filters,
+                chunk_raw_bytes,
+            )?;
+            encode_fixed_array_chunk_layout_v4_into(
                 &mut layout_bytes,
-                btree_addr,
+                fixed_array_addr,
                 chunk_dims,
                 element_size,
+                FIXED_ARRAY_CHUNK_PAGE_BITS,
                 self.sizeof_addr,
             )?;
+        } else if use_extensible_array_index {
+            let index_block_elements = u8::try_from(total_chunks).map_err(|_| {
+                Error::InvalidFormat("extensible-array inline chunk count exceeds u8".into())
+            })?;
+            let max_elements_bits = extensible_array_max_elements_bits(total_chunks)?;
+            let extensible_array_addr = self.write_inline_extensible_array_chunk_index(
+                &chunk_entries,
+                index_block_elements,
+                has_filters,
+                chunk_raw_bytes,
+                max_elements_bits,
+            )?;
+            encode_extensible_array_chunk_layout_v4_into(
+                &mut layout_bytes,
+                extensible_array_addr,
+                chunk_dims,
+                element_size,
+                max_elements_bits,
+                index_block_elements,
+                1,
+                1,
+                1,
+                self.sizeof_addr,
+            )?;
+        } else {
+            return Err(Error::Unsupported(format!(
+                "max-shape chunked writer currently supports at most {EXTENSIBLE_ARRAY_INDEX_BLOCK_ELEMENTS_LIMIT} chunks with inline extensible-array indexing; larger chunk grids need full extensible-array or v2 B-tree index creation"
+            )));
         }
 
         // Encode filter pipeline message
@@ -3337,6 +3752,289 @@ impl<W: Write + Seek> HdfFileWriter<W> {
         Ok(buf)
     }
 
+    /// Write a v4 fixed-array chunk index for a fully materialized chunk grid.
+    fn write_fixed_array_chunk_index(
+        &mut self,
+        entries: &[ChunkBTreeEntry],
+        page_bits: u8,
+        filtered: bool,
+        unfiltered_chunk_bytes: usize,
+    ) -> Result<u64> {
+        let sa = usize::from(self.sizeof_addr);
+        let ss = usize::from(self.sizeof_size);
+        if page_bits == 0 {
+            return Err(Error::InvalidFormat(
+                "fixed-array chunk page bits must be positive".into(),
+            ));
+        }
+        let page_elements = 1usize.checked_shl(u32::from(page_bits)).ok_or_else(|| {
+            Error::InvalidFormat("fixed-array page element count overflow".into())
+        })?;
+        if u8::try_from(sa).is_err() {
+            return Err(Error::InvalidFormat(
+                "fixed-array address width exceeds raw element size field".into(),
+            ));
+        }
+        let chunk_size_len = if filtered {
+            filtered_chunk_size_len_v4(unfiltered_chunk_bytes)
+        } else {
+            0
+        };
+        let raw_element_size = if filtered {
+            checked_usize_sum_writer(
+                &[sa, chunk_size_len, 4],
+                "fixed-array chunk raw element size",
+            )?
+        } else {
+            sa
+        };
+        let class_id = if filtered { 1 } else { 0 };
+        let raw_element_size_u8 = u8::try_from(raw_element_size)
+            .map_err(|_| Error::InvalidFormat("fixed-array raw element size exceeds u8".into()))?;
+
+        let header_len =
+            checked_usize_sum_writer(&[4, 1, 1, 1, 1, ss, sa, 4], "fixed-array chunk header size")?;
+        let prefix_payload_len =
+            checked_usize_sum_writer(&[4, 1, 1, sa], "fixed-array chunk data block prefix size")?;
+        let paginated = entries.len() > page_elements;
+        let data_block_len = if paginated {
+            let page_count = entries.len().div_ceil(page_elements);
+            let page_init_len = page_count.div_ceil(8);
+            let page_payload_len =
+                page_elements.checked_mul(raw_element_size).ok_or_else(|| {
+                    Error::InvalidFormat("fixed-array chunk page payload size overflow".into())
+                })?;
+            let page_len =
+                checked_usize_sum_writer(&[page_payload_len, 4], "fixed-array chunk page size")?;
+            let pages_len = page_count.checked_mul(page_len).ok_or_else(|| {
+                Error::InvalidFormat("fixed-array chunk page block size overflow".into())
+            })?;
+            checked_usize_sum_writer(
+                &[prefix_payload_len, page_init_len, 4, pages_len],
+                "fixed-array chunk data block size",
+            )?
+        } else {
+            let payload_len = entries.len().checked_mul(raw_element_size).ok_or_else(|| {
+                Error::InvalidFormat("fixed-array chunk payload size overflow".into())
+            })?;
+            checked_usize_sum_writer(
+                &[prefix_payload_len, payload_len, 4],
+                "fixed-array chunk data block size",
+            )?
+        };
+
+        let header_addr = self.allocator.allocate(
+            u64_from_usize_writer(header_len, "fixed-array chunk header size")?,
+            8,
+        );
+        let data_block_addr = self.allocator.allocate(
+            u64_from_usize_writer(data_block_len, "fixed-array chunk data block size")?,
+            8,
+        );
+
+        let mut data_block = Vec::with_capacity(data_block_len);
+        data_block.extend_from_slice(b"FADB");
+        data_block.push(0); // version
+        data_block.push(class_id);
+        append_encoded_addr(&mut data_block, header_addr, self.sizeof_addr)?;
+        if paginated {
+            let page_count = entries.len().div_ceil(page_elements);
+            let page_init_len = page_count.div_ceil(8);
+            let page_init_start = data_block.len();
+            data_block.resize(page_init_start + page_init_len, 0);
+            for page_index in 0..page_count {
+                let byte = data_block
+                    .get_mut(page_init_start + page_index / 8)
+                    .ok_or_else(|| {
+                        Error::InvalidFormat("fixed-array chunk page bitmap overflow".into())
+                    })?;
+                *byte |= 0x80 >> (page_index % 8);
+            }
+            let prefix_checksum = checksum_metadata(&data_block);
+            data_block.extend_from_slice(&prefix_checksum.to_le_bytes());
+
+            let page_payload_len =
+                page_elements.checked_mul(raw_element_size).ok_or_else(|| {
+                    Error::InvalidFormat("fixed-array chunk page payload size overflow".into())
+                })?;
+            for page_entries in entries.chunks(page_elements) {
+                let page_start = data_block.len();
+                for entry in page_entries {
+                    append_encoded_addr(&mut data_block, entry.child_addr, self.sizeof_addr)?;
+                    if filtered {
+                        append_encoded_uint(
+                            &mut data_block,
+                            u64::from(entry.chunk_size),
+                            chunk_size_len,
+                            "fixed-array filtered chunk size",
+                        )?;
+                        data_block.extend_from_slice(&entry.filter_mask.to_le_bytes());
+                    }
+                }
+                data_block.resize(page_start + page_payload_len, 0);
+                let page_checksum = checksum_metadata(&data_block[page_start..]);
+                data_block.extend_from_slice(&page_checksum.to_le_bytes());
+            }
+        } else {
+            for entry in entries {
+                append_encoded_addr(&mut data_block, entry.child_addr, self.sizeof_addr)?;
+                if filtered {
+                    append_encoded_uint(
+                        &mut data_block,
+                        u64::from(entry.chunk_size),
+                        chunk_size_len,
+                        "fixed-array filtered chunk size",
+                    )?;
+                    data_block.extend_from_slice(&entry.filter_mask.to_le_bytes());
+                }
+            }
+            let data_checksum = checksum_metadata(&data_block);
+            data_block.extend_from_slice(&data_checksum.to_le_bytes());
+        }
+        self.write_at(data_block_addr, &data_block)?;
+
+        let mut header = Vec::with_capacity(header_len);
+        header.extend_from_slice(b"FAHD");
+        header.push(0); // version
+        header.push(class_id);
+        header.push(raw_element_size_u8);
+        header.push(page_bits);
+        append_encoded_size(
+            &mut header,
+            u64_from_usize_writer(entries.len(), "fixed-array chunk element count")?,
+            self.sizeof_size,
+        )?;
+        append_encoded_addr(&mut header, data_block_addr, self.sizeof_addr)?;
+        let header_checksum = checksum_metadata(&header);
+        header.extend_from_slice(&header_checksum.to_le_bytes());
+        self.write_at(header_addr, &header)?;
+
+        Ok(header_addr)
+    }
+
+    /// Write a v4 extensible-array chunk index whose chunks fit in the index block.
+    fn write_inline_extensible_array_chunk_index(
+        &mut self,
+        entries: &[ChunkBTreeEntry],
+        index_block_elements: u8,
+        filtered: bool,
+        unfiltered_chunk_bytes: usize,
+        max_elements_bits: u8,
+    ) -> Result<u64> {
+        let sa = usize::from(self.sizeof_addr);
+        let ss = usize::from(self.sizeof_size);
+        if entries.is_empty() {
+            return Err(Error::InvalidFormat(
+                "cannot write empty extensible-array chunk index".into(),
+            ));
+        }
+        if usize::from(index_block_elements) != entries.len() {
+            return Err(Error::InvalidFormat(
+                "inline extensible-array chunk count mismatch".into(),
+            ));
+        }
+        let chunk_size_len = if filtered {
+            filtered_chunk_size_len_v4(unfiltered_chunk_bytes)
+        } else {
+            0
+        };
+        let raw_element_size = if filtered {
+            checked_usize_sum_writer(
+                &[sa, chunk_size_len, 4],
+                "extensible-array chunk raw element size",
+            )?
+        } else {
+            sa
+        };
+        let raw_element_size_u8 = u8::try_from(raw_element_size).map_err(|_| {
+            Error::InvalidFormat("extensible-array raw element size exceeds u8".into())
+        })?;
+        let class_id = if filtered { 1 } else { 0 };
+        let super_block_addr_count =
+            usize::from(max_elements_bits)
+                .checked_add(1)
+                .ok_or_else(|| {
+                    Error::InvalidFormat("extensible-array super block count overflow".into())
+                })?;
+
+        let header_len =
+            checked_usize_sum_writer(&[4, 8, ss * 6, sa, 4], "extensible-array chunk header size")?;
+        let inline_bytes = entries.len().checked_mul(raw_element_size).ok_or_else(|| {
+            Error::InvalidFormat("extensible-array inline element bytes overflow".into())
+        })?;
+        let super_block_addr_bytes = super_block_addr_count.checked_mul(sa).ok_or_else(|| {
+            Error::InvalidFormat("extensible-array super block address bytes overflow".into())
+        })?;
+        let index_block_len = checked_usize_sum_writer(
+            &[4, 1, 1, sa, inline_bytes, super_block_addr_bytes, 4],
+            "extensible-array chunk index block size",
+        )?;
+
+        let header_addr = self.allocator.allocate(
+            u64_from_usize_writer(header_len, "extensible-array chunk header size")?,
+            8,
+        );
+        let index_block_addr = self.allocator.allocate(
+            u64_from_usize_writer(index_block_len, "extensible-array chunk index block size")?,
+            8,
+        );
+
+        let mut index = Vec::with_capacity(index_block_len);
+        index.extend_from_slice(b"EAIB");
+        index.push(0); // version
+        index.push(class_id);
+        append_encoded_addr(&mut index, header_addr, self.sizeof_addr)?;
+        for entry in entries {
+            append_encoded_addr(&mut index, entry.child_addr, self.sizeof_addr)?;
+            if filtered {
+                append_encoded_uint(
+                    &mut index,
+                    u64::from(entry.chunk_size),
+                    chunk_size_len,
+                    "extensible-array filtered chunk size",
+                )?;
+                index.extend_from_slice(&entry.filter_mask.to_le_bytes());
+            }
+        }
+        for _ in 0..super_block_addr_count {
+            append_encoded_addr(&mut index, UNDEF_ADDR, self.sizeof_addr)?;
+        }
+        let index_checksum = checksum_metadata(&index);
+        index.extend_from_slice(&index_checksum.to_le_bytes());
+        self.write_at(index_block_addr, &index)?;
+
+        let mut header = Vec::with_capacity(header_len);
+        header.extend_from_slice(b"EAHD");
+        header.push(0); // version
+        header.push(class_id);
+        header.push(raw_element_size_u8);
+        header.push(max_elements_bits);
+        header.push(index_block_elements);
+        header.push(1); // data block min elements
+        header.push(1); // super block min data pointers
+        header.push(1); // max data block page elements bits
+        append_encoded_size(&mut header, 0, self.sizeof_size)?; // super block count
+        append_encoded_size(&mut header, 0, self.sizeof_size)?; // super block size
+        append_encoded_size(&mut header, 0, self.sizeof_size)?; // data block count
+        append_encoded_size(&mut header, 0, self.sizeof_size)?; // data block size
+        append_encoded_size(
+            &mut header,
+            u64_from_usize_writer(entries.len(), "extensible-array max index set")?,
+            self.sizeof_size,
+        )?;
+        append_encoded_size(
+            &mut header,
+            u64_from_usize_writer(entries.len(), "extensible-array realized elements")?,
+            self.sizeof_size,
+        )?;
+        append_encoded_addr(&mut header, index_block_addr, self.sizeof_addr)?;
+        let header_checksum = checksum_metadata(&header);
+        header.extend_from_slice(&header_checksum.to_le_bytes());
+        self.write_at(header_addr, &header)?;
+
+        Ok(header_addr)
+    }
+
     /// Write the fractal-heap and B-tree storage for dense links (mirrors `H5G__dense_create`).
     fn write_dense_link_storage(&mut self, links: &[(String, Vec<u8>)]) -> Result<(u64, u64)> {
         let payloads: Vec<Vec<u8>> = links
@@ -3409,9 +4107,10 @@ impl<W: Write + Seek> HdfFileWriter<W> {
     fn write_managed_fractal_heap(
         &mut self,
         payloads: &[Vec<u8>],
-        heap_id_len: u16,
+        min_heap_id_len: u16,
     ) -> Result<(u64, Vec<Vec<u8>>)> {
         let offset_bytes = 4usize;
+        let heap_id_len = dense_heap_id_len_for_payloads(payloads, offset_bytes, min_heap_id_len)?;
         let offset_bytes_u16 = u16::try_from(offset_bytes)
             .map_err(|_| Error::InvalidFormat("managed heap ID offset width exceeds u16".into()))?;
         let length_bytes = usize::from(
@@ -3576,7 +4275,13 @@ impl<W: Write + Seek> HdfFileWriter<W> {
             ));
         }
 
-        let leaf_max_records = dense_btree_leaf_capacity(DENSE_BTREE_NODE_SIZE, record_size)?;
+        let level_info = dense_btree_level_info(
+            DENSE_BTREE_NODE_SIZE,
+            record_size,
+            records.len(),
+            self.sizeof_addr,
+        )?;
+        let leaf_max_records = level_info[0].max_nrecords;
         let (root_addr, root_nrecords, depth, node_size) = if tree_type != 5 {
             let record_bytes = records
                 .len()
@@ -3596,14 +4301,17 @@ impl<W: Write + Seek> HdfFileWriter<W> {
                 DENSE_BTREE_NODE_SIZE,
             )
         } else {
-            let (root_addr, root_nrecords, depth) = self.write_dense_btree_depth1_root(
+            let depth = u16::try_from(level_info.len() - 1)
+                .map_err(|_| Error::Unsupported("dense name B-tree depth exceeds u16".into()))?;
+            let root = self.write_dense_btree_subtree(
                 tree_type,
                 records,
                 record_size,
                 DENSE_BTREE_NODE_SIZE,
-                leaf_max_records,
+                &level_info,
+                usize::from(depth),
             )?;
-            (root_addr, root_nrecords, depth, DENSE_BTREE_NODE_SIZE)
+            (root.addr, root.node_nrecords, depth, DENSE_BTREE_NODE_SIZE)
         };
 
         let mut header = Vec::new();
@@ -3641,49 +4349,71 @@ impl<W: Write + Seek> HdfFileWriter<W> {
         Ok(header_addr)
     }
 
-    fn write_dense_btree_depth1_root(
+    fn write_dense_btree_subtree(
         &mut self,
         tree_type: u8,
         records: &[Vec<u8>],
         record_size: usize,
         node_size: usize,
-        leaf_max_records: usize,
-    ) -> Result<(u64, usize, u16)> {
-        let internal_max_records = dense_btree_internal_capacity(
-            node_size,
-            record_size,
-            leaf_max_records,
-            self.sizeof_addr,
-        )?;
-        let max_children = internal_max_records.checked_add(1).ok_or_else(|| {
-            Error::InvalidFormat("dense B-tree internal capacity overflow".into())
+        level_info: &[DenseBtreeLevelInfo],
+        depth: usize,
+    ) -> Result<DenseBtreeChild> {
+        if depth == 0 {
+            let max_records = level_info
+                .first()
+                .ok_or_else(|| Error::InvalidFormat("dense B-tree level info is empty".into()))?
+                .max_nrecords;
+            if records.len() > max_records {
+                return Err(Error::InvalidFormat(
+                    "dense B-tree leaf receives too many records".into(),
+                ));
+            }
+            let addr = self.write_dense_btree_leaf_node(tree_type, records, node_size)?;
+            return Ok(DenseBtreeChild {
+                addr,
+                node_nrecords: records.len(),
+                total_records: u64_from_usize_writer(records.len(), "dense B-tree leaf records")?,
+            });
+        }
+
+        let level = level_info.get(depth).ok_or_else(|| {
+            Error::InvalidFormat("dense B-tree subtree depth is out of range".into())
         })?;
-        let max_total_records = leaf_max_records
-            .checked_mul(max_children)
-            .and_then(|value| value.checked_add(internal_max_records))
-            .ok_or_else(|| Error::InvalidFormat("dense B-tree depth-1 capacity overflow".into()))?;
-        if records.len() > max_total_records {
-            return Err(Error::Unsupported(format!(
-                "dense name B-tree writer supports at most {max_total_records} records before a deeper tree is needed"
-            )));
+        let child_level = level_info.get(depth - 1).ok_or_else(|| {
+            Error::InvalidFormat("dense B-tree child depth is out of range".into())
+        })?;
+        let total_records = u64_from_usize_writer(records.len(), "dense B-tree subtree records")?;
+        if total_records > level.cumulative_max_records {
+            return Err(Error::InvalidFormat(
+                "dense B-tree subtree receives too many records".into(),
+            ));
         }
 
         let mut child_addrs = Vec::new();
         let mut child_nrecords = Vec::new();
+        let mut child_total_records = Vec::new();
         let mut root_records: Vec<&[u8]> = Vec::new();
         let mut start = 0usize;
         while start < records.len() {
             let remaining = records.len() - start;
-            let child_len = remaining.min(leaf_max_records);
+            let child_len =
+                remaining.min(usize::try_from(child_level.cumulative_max_records).map_err(
+                    |_| Error::InvalidFormat("dense B-tree child capacity exceeds usize".into()),
+                )?);
             let child_end = start
                 .checked_add(child_len)
                 .ok_or_else(|| Error::InvalidFormat("dense B-tree child range overflow".into()))?;
-            child_addrs.push(self.write_dense_btree_leaf_node(
+            let child = self.write_dense_btree_subtree(
                 tree_type,
                 &records[start..child_end],
+                record_size,
                 node_size,
-            )?);
-            child_nrecords.push(child_len);
+                level_info,
+                depth - 1,
+            )?;
+            child_addrs.push(child.addr);
+            child_nrecords.push(child.node_nrecords);
+            child_total_records.push(child.total_records);
             start = child_end;
             if start < records.len() {
                 root_records.push(records[start].as_slice());
@@ -3694,21 +4424,27 @@ impl<W: Write + Seek> HdfFileWriter<W> {
         }
 
         let root_nrecords = root_records.len();
-        if root_nrecords > internal_max_records {
+        if root_nrecords > level.max_nrecords {
             return Err(Error::Unsupported(
-                "dense name B-tree root has too many separator records".into(),
+                "dense name B-tree node has too many separator records".into(),
             ));
         }
-        let root_addr = self.write_dense_btree_internal_node(
+        let addr = self.write_dense_btree_internal_node(
             tree_type,
             record_size,
-            leaf_max_records,
+            level_info[0].max_nrecords,
+            child_level.cumulative_max_record_size,
             node_size,
             &root_records,
             &child_addrs,
             &child_nrecords,
+            &child_total_records,
         )?;
-        Ok((root_addr, root_nrecords, 1))
+        Ok(DenseBtreeChild {
+            addr,
+            node_nrecords: root_nrecords,
+            total_records,
+        })
     }
 
     fn write_dense_btree_leaf_node(
@@ -3750,13 +4486,16 @@ impl<W: Write + Seek> HdfFileWriter<W> {
         tree_type: u8,
         record_size: usize,
         leaf_max_records: usize,
+        child_all_nrec_size: usize,
         node_size: usize,
         records: &[&[u8]],
         child_addrs: &[u64],
         child_nrecords: &[usize],
+        child_total_records: &[u64],
     ) -> Result<u64> {
         if child_addrs.len() != records.len().saturating_add(1)
             || child_nrecords.len() != child_addrs.len()
+            || child_total_records.len() != child_addrs.len()
         {
             return Err(Error::InvalidFormat(
                 "dense B-tree internal child count is inconsistent".into(),
@@ -3773,7 +4512,11 @@ impl<W: Write + Seek> HdfFileWriter<W> {
             "dense B-tree leaf capacity",
         )?);
         let pointer_size = checked_usize_sum_writer(
-            &[usize::from(self.sizeof_addr), max_nrec_size],
+            &[
+                usize::from(self.sizeof_addr),
+                max_nrec_size,
+                child_all_nrec_size,
+            ],
             "dense B-tree pointer size",
         )?;
         let record_bytes = records.len().checked_mul(record_size).ok_or_else(|| {
@@ -3799,13 +4542,20 @@ impl<W: Write + Seek> HdfFileWriter<W> {
         for record in records {
             node.extend_from_slice(record);
         }
-        for (&child_addr, &child_nrecords) in child_addrs.iter().zip(child_nrecords) {
+        for ((&child_addr, &child_nrecords), &child_total_records) in child_addrs
+            .iter()
+            .zip(child_nrecords)
+            .zip(child_total_records)
+        {
             append_encoded_addr(&mut node, child_addr, self.sizeof_addr)?;
             append_dense_btree_var_uint(
                 &mut node,
                 u64_from_usize_writer(child_nrecords, "dense B-tree child record count")?,
                 max_nrec_size,
             )?;
+            if child_all_nrec_size > 0 {
+                append_dense_btree_var_uint(&mut node, child_total_records, child_all_nrec_size)?;
+            }
         }
         let checksum = checksum_metadata(&node);
         node.extend_from_slice(&checksum.to_le_bytes());
@@ -4102,6 +4852,8 @@ mod tests {
         dense_record_hash, encode_global_heap_collection, read_encoded_size_le_at, read_u64_le_at,
         CompoundFieldSpec, DtypeSpec, FillValueSpec, HdfFileWriter,
     };
+    use crate::format::btree_v2::{collect_all_records_into, BTreeV2Header};
+    use crate::io::reader::HdfReader;
     use crate::io::reader::UNDEF_ADDR;
     use std::io::Cursor;
 
@@ -4145,6 +4897,29 @@ mod tests {
                 .contains("dense B-tree record hash is truncated"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn dense_name_btree_writer_round_trips_depth2_tree() {
+        let mut records = Vec::new();
+        for idx in 0..4096u32 {
+            let mut record = Vec::new();
+            record.extend_from_slice(&idx.to_le_bytes());
+            record.push((idx & 0xff) as u8);
+            records.push(record);
+        }
+
+        let mut writer = HdfFileWriter::new(Cursor::new(Vec::new()));
+        let header_addr = writer.write_dense_name_btree(5, &records).unwrap();
+        let bytes = writer.writer.get_ref().clone();
+        let mut reader = HdfReader::new(Cursor::new(bytes));
+        let header = BTreeV2Header::read_at(&mut reader, header_addr).unwrap();
+        assert_eq!(header.depth, 2);
+        assert_eq!(header.total_records, 4096);
+
+        let mut decoded = Vec::new();
+        collect_all_records_into(&mut reader, header_addr, &mut decoded).unwrap();
+        assert_eq!(decoded, records);
     }
 
     #[test]
@@ -4287,5 +5062,96 @@ mod tests {
             })
         )
         .is_err());
+    }
+
+    #[test]
+    fn v4_chunk_layout_encoders_include_trailing_element_size_dimension() {
+        let mut single = Vec::new();
+        super::encode_single_chunk_layout_v4_into(
+            &mut single,
+            0x1122_3344_5566_7788,
+            &[25],
+            4,
+            Some(64),
+            0,
+            8,
+            8,
+        )
+        .unwrap();
+        let decoded =
+            crate::format::messages::data_layout::DataLayoutMessage::decode(&single, 8, 8).unwrap();
+        assert_eq!(decoded.chunk_encoded_dims, Some(vec![25, 4]));
+        assert_eq!(decoded.chunk_dims, Some(vec![25, 4]));
+        assert_eq!(decoded.single_chunk_filtered_size, Some(64));
+
+        let mut fixed = Vec::new();
+        super::encode_fixed_array_chunk_layout_v4_into(
+            &mut fixed,
+            0x8877_6655_4433_2211,
+            &[25],
+            4,
+            6,
+            8,
+        )
+        .unwrap();
+        let decoded =
+            crate::format::messages::data_layout::DataLayoutMessage::decode(&fixed, 8, 8).unwrap();
+        assert_eq!(decoded.chunk_encoded_dims, Some(vec![25, 4]));
+        assert_eq!(decoded.chunk_dims, Some(vec![25, 4]));
+        assert_eq!(
+            decoded.chunk_index_type,
+            Some(crate::format::messages::data_layout::ChunkIndexType::FixedArray)
+        );
+
+        let mut extensible = Vec::new();
+        super::encode_extensible_array_chunk_layout_v4_into(
+            &mut extensible,
+            0x0102_0304_0506_0708,
+            &[10],
+            4,
+            4,
+            10,
+            1,
+            1,
+            1,
+            8,
+        )
+        .unwrap();
+        let decoded =
+            crate::format::messages::data_layout::DataLayoutMessage::decode(&extensible, 8, 8)
+                .unwrap();
+        assert_eq!(decoded.chunk_encoded_dims, Some(vec![10, 4]));
+        assert_eq!(
+            decoded.chunk_index_type,
+            Some(crate::format::messages::data_layout::ChunkIndexType::ExtensibleArray)
+        );
+    }
+
+    #[test]
+    fn link_name_length_encoder_uses_hdf5_size_flags() {
+        fn encoded_len(name_len: usize) -> Vec<u8> {
+            let size_flag = super::link_name_size_flag(name_len).unwrap();
+            let mut encoded = Vec::new();
+            super::encode_link_name_len(&mut encoded, name_len, size_flag).unwrap();
+            encoded
+        }
+
+        assert_eq!(super::link_name_size_flag(255).unwrap(), 0);
+        assert_eq!(encoded_len(255), vec![0xff]);
+
+        assert_eq!(super::link_name_size_flag(256).unwrap(), 1);
+        assert_eq!(encoded_len(256), 256u16.to_le_bytes());
+        assert_eq!(super::link_name_size_flag(65_535).unwrap(), 1);
+
+        assert_eq!(super::link_name_size_flag(65_536).unwrap(), 2);
+        assert_eq!(encoded_len(65_536), 65_536u32.to_le_bytes());
+        assert_eq!(super::link_name_size_flag(u32::MAX as usize).unwrap(), 2);
+
+        if usize::BITS > u32::BITS {
+            let eight_byte_len = usize::try_from(u64::from(u32::MAX) + 1)
+                .expect("test value should fit on this target");
+            assert_eq!(super::link_name_size_flag(eight_byte_len).unwrap(), 3);
+            assert_eq!(encoded_len(eight_byte_len), eight_byte_len.to_le_bytes());
+        }
     }
 }

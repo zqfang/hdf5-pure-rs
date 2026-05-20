@@ -1092,9 +1092,11 @@ fn test_datatype_rejects_truncated_fixed_size_properties() {
 
 #[test]
 fn test_message_decoders_reject_invalid_versions_and_classes_as_format_errors() {
+    let datatype_v5 = vec![0x50, 0, 0, 0, 4, 0, 0, 0, 0, 0, 32, 0];
     let datatype_cases = [
         vec![0x00, 0, 0, 0, 1, 0, 0, 0, 0, 8, 0, 8],
         vec![0x10, 0, 0, 0, 0, 0, 0, 0, 0, 8, 0, 8],
+        datatype_v5.clone(),
         vec![0x1a, 1, 0, 0, 4, 0, 0, 0, 1, 4, 0, 0, 0],
         vec![0x19, 2, 0, 0, 8, 0, 0, 0, 1, 2, 3, 4],
     ];
@@ -1103,6 +1105,10 @@ fn test_message_decoders_reject_invalid_versions_and_classes_as_format_errors() 
             .expect_err("invalid datatype version/class combination should fail");
         assert!(matches!(err, hdf5_pure_rust::Error::InvalidFormat(_)));
     }
+
+    let err = hdf5_pure_rust::engine::object_api::H5O__dtype_decode_helper(&datatype_v5)
+        .expect_err("datatype message v5 should be outside the supported libhdf5 bound");
+    assert!(matches!(err, hdf5_pure_rust::Error::InvalidFormat(_)));
 
     for err in [
         DataspaceMessage::decode(&[3, 0, 0, 0]).expect_err("invalid dataspace version"),
@@ -2122,6 +2128,28 @@ fn test_unsupported_filters_fail_explicitly() {
     }
 }
 
+#[cfg(not(feature = "blosc"))]
+#[test]
+fn test_blosc_filter_fails_explicitly_without_feature() {
+    let pipeline = FilterPipelineMessage {
+        version: 2,
+        filters: vec![FilterDesc {
+            id: 32_001,
+            name: None,
+            flags: 0,
+            client_data: Vec::new(),
+        }],
+    };
+    let err = hdf5_pure_rust::filters::apply_pipeline_reverse(&[1, 2, 3, 4], &pipeline, 4)
+        .expect_err("blosc filter should require the blosc feature");
+    match err {
+        hdf5_pure_rust::Error::Unsupported(message) => {
+            assert!(message.contains("Blosc decompression requires the 'blosc' feature"));
+        }
+        other => panic!("expected unsupported Blosc error, got {other:?}"),
+    }
+}
+
 #[test]
 fn test_branchable_error_messages_are_stable() {
     let pipeline = FilterPipelineMessage {
@@ -2197,6 +2225,43 @@ fn test_datatype_aware_filters_reject_missing_parameters() {
             .expect_err("datatype-aware filter should reject missing parameters");
         assert!(matches!(err, hdf5_pure_rust::Error::InvalidFormat(_)));
     }
+}
+
+#[test]
+fn test_nbit_top_level_nooptype_filter_copies_payload() {
+    let pipeline = FilterPipelineMessage {
+        version: 2,
+        filters: vec![FilterDesc {
+            id: FILTER_NBIT,
+            name: Some("nbit".into()),
+            flags: 0,
+            client_data: vec![5, 0, 2, 4, 2],
+        }],
+    };
+    let decoded =
+        hdf5_pure_rust::filters::apply_pipeline_reverse(&[0x12, 0x34, 0xab, 0xcd], &pipeline, 2)
+            .expect("top-level NBit NOOPTYPE should copy each element");
+    assert_eq!(&*decoded, &[0x12, 0x34, 0xab, 0xcd]);
+}
+
+#[test]
+fn test_scaleoffset_constant_integer_filter_expands_minimum_value() {
+    let pipeline = FilterPipelineMessage {
+        version: 2,
+        filters: vec![FilterDesc {
+            id: FILTER_SCALEOFFSET,
+            name: Some("scaleoffset".into()),
+            flags: 0,
+            client_data: vec![2, 0, 3, 0, 1, 0, 0],
+        }],
+    };
+    let mut chunk = vec![0u8; 21];
+    chunk[4] = 1;
+    chunk[5] = 42;
+
+    let decoded = hdf5_pure_rust::filters::apply_pipeline_reverse(&chunk, &pipeline, 1)
+        .expect("constant ScaleOffset integer chunks should expand from the minimum value");
+    assert_eq!(&*decoded, &[42, 42, 42]);
 }
 
 #[test]
@@ -2711,6 +2776,16 @@ fn fixed_point_datatype_bytes(size_bytes: u32, bit_offset: u16, precision: u16) 
     buf
 }
 
+fn time_datatype_bytes(size_bytes: u32, big_endian: bool, precision: u16) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(10);
+    buf.push(0x12); // version=1, class=2 (Time)
+    buf.push(u8::from(big_endian));
+    buf.extend_from_slice(&[0, 0]);
+    buf.extend_from_slice(&size_bytes.to_le_bytes());
+    buf.extend_from_slice(&precision.to_le_bytes());
+    buf
+}
+
 #[test]
 fn test_datatype_rejects_zero_precision() {
     let bytes = fixed_point_datatype_bytes(4, 0, 0);
@@ -2754,6 +2829,44 @@ fn test_datatype_accepts_canonical_integer_widths() {
             .unwrap_or_else(|e| panic!("size={size_bytes} should parse: {e}"));
         assert_eq!(dt.size, size_bytes);
     }
+}
+
+#[test]
+fn test_time_datatype_validates_precision_and_byte_order_flags() {
+    let le = DatatypeMessage::decode(&time_datatype_bytes(4, false, 32)).unwrap();
+    assert_eq!(le.class, DatatypeClass::Time);
+    assert_eq!(le.byte_order(), Some(ByteOrder::LittleEndian));
+
+    let be = DatatypeMessage::decode(&time_datatype_bytes(8, true, 64)).unwrap();
+    assert_eq!(be.byte_order(), Some(ByteOrder::BigEndian));
+
+    let err = DatatypeMessage::decode(&time_datatype_bytes(4, false, 0)).unwrap_err();
+    assert!(
+        format!("{err}").contains("time datatype precision"),
+        "expected time precision error, got: {err}"
+    );
+
+    let err = DatatypeMessage::decode(&time_datatype_bytes(4, false, 33)).unwrap_err();
+    assert!(
+        format!("{err}").contains("time datatype precision"),
+        "expected time precision error, got: {err}"
+    );
+
+    let mut unsupported_flags = time_datatype_bytes(4, false, 32);
+    unsupported_flags[1] = 0x02;
+    let err = DatatypeMessage::decode(&unsupported_flags).unwrap_err();
+    assert!(
+        format!("{err}").contains("time datatype has unsupported class flags"),
+        "expected time flag error, got: {err}"
+    );
+
+    let truncated = time_datatype_bytes(4, false, 32);
+    let err = DatatypeMessage::decode(&truncated[..9]).unwrap_err();
+    assert!(
+        format!("{err}").contains("time datatype precision")
+            || format!("{err}").contains("properties are truncated"),
+        "expected time truncation error, got: {err}"
+    );
 }
 
 #[test]

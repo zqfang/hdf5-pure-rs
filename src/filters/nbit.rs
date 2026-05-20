@@ -107,6 +107,12 @@ pub fn decompress_into(data: &[u8], client_data: &[u32], out: &mut Vec<u8>) -> R
                 decompress_compound(out, offset, &mut stream, client_data, &mut pidx)?;
             }
         }
+        NBIT_NOOPTYPE => {
+            for idx in 0..nelmts {
+                let offset = nbit_nested_offset(0, idx, dtype_size)?;
+                stream.copy_bytes(out, offset, dtype_size)?;
+            }
+        }
         other => {
             return Err(Error::Unsupported(format!(
                 "nbit datatype class parameter {other}"
@@ -175,6 +181,12 @@ pub fn nbit_compress_into(data: &[u8], client_data: &[u32], out: &mut Vec<u8>) -
                 let mut pidx = 4usize;
                 let offset = nbit_nested_offset(0, idx, dtype_size)?;
                 compress_compound(data, offset, &mut writer, client_data, &mut pidx)?;
+            }
+        }
+        NBIT_NOOPTYPE => {
+            for idx in 0..nelmts {
+                let offset = nbit_nested_offset(0, idx, dtype_size)?;
+                compress_one_nooptype(data, offset, dtype_size, &mut writer)?;
             }
         }
         other => {
@@ -461,7 +473,6 @@ fn decompress_compound(
 ) -> Result<()> {
     let size = take_usize(parms, pidx, "nbit compound size")?;
     let nmembers = take_usize(parms, pidx, "nbit compound member count")?;
-    let mut used_size = 0usize;
 
     for _ in 0..nmembers {
         let member_offset = take_usize(parms, pidx, "nbit compound member offset")?;
@@ -474,13 +485,10 @@ fn decompress_compound(
             "nbit compound member size",
         )?;
 
-        used_size = used_size
-            .checked_add(member_size)
-            .ok_or_else(|| Error::InvalidFormat("nbit compound member size overflow".into()))?;
         let member_end = member_offset
             .checked_add(member_size)
             .ok_or_else(|| Error::InvalidFormat("nbit compound member bounds overflow".into()))?;
-        if used_size > size || member_end > size {
+        if member_end > size {
             return Err(Error::InvalidFormat(
                 "nbit compound member exceeds compound bounds".into(),
             ));
@@ -982,6 +990,59 @@ mod tests {
     }
 
     #[test]
+    fn rejects_truncated_atomic_payload() {
+        let err = decompress_err(&[], &atomic_params(8, 0));
+        assert!(
+            err.to_string().contains("nbit data too short"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_truncated_noop_payload_inside_array() {
+        let params = vec![7, 0, 1, NBIT_ARRAY, 2, NBIT_NOOPTYPE, 2];
+        let err = decompress_err(&[0xab], &params);
+        assert!(
+            err.to_string().contains("nbit data too short"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_compound_member_exceeding_compound_size() {
+        let params = vec![
+            12,
+            0,
+            1,
+            NBIT_COMPOUND,
+            2,
+            2,
+            1,
+            NBIT_NOOPTYPE,
+            2,
+            0,
+            NBIT_NOOPTYPE,
+            2,
+        ];
+        let err = decompress_err(&[], &params);
+        assert!(
+            err.to_string()
+                .contains("nbit compound member exceeds compound bounds"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_truncated_nested_array_parameters() {
+        let params = vec![6, 0, 1, NBIT_ARRAY, 2, NBIT_ATOMIC];
+        let err = decompress_err(&[], &params);
+        assert!(
+            err.to_string().contains("truncated nbit parameters"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn copy_bytes_rejects_output_offset_overflow() {
         let mut stream = BitStream::new(&[]);
         let mut out = [];
@@ -1029,6 +1090,79 @@ mod tests {
         let input = [0b0011_1100, 0b0000_0011];
         let mut compressed = Vec::new();
         nbit_compress_into(&input, &params, &mut compressed).unwrap();
+        let mut decoded = Vec::new();
+        decompress_into(&compressed, &params, &mut decoded).unwrap();
+        assert_eq!(decoded, input);
+    }
+
+    #[test]
+    fn nbit_top_level_nooptype_roundtrips() {
+        let params = vec![5, 0, 3, NBIT_NOOPTYPE, 2];
+        let input = [0x12, 0x34, 0xab, 0xcd, 0xfe, 0xdc];
+        let mut compressed = Vec::new();
+        nbit_compress_into(&input, &params, &mut compressed).unwrap();
+        assert_eq!(compressed, input);
+
+        let mut decoded = Vec::new();
+        decompress_into(&compressed, &params, &mut decoded).unwrap();
+        assert_eq!(decoded, input);
+    }
+
+    #[test]
+    fn nbit_array_of_atomic_roundtrips() {
+        let params = vec![
+            10,
+            0,
+            2,
+            NBIT_ARRAY,
+            4,
+            NBIT_ATOMIC,
+            2,
+            NBIT_ORDER_LE,
+            12,
+            2,
+        ];
+        let input = [
+            0b0011_1100,
+            0b0000_0011,
+            0b1100_0000,
+            0b0000_1111,
+            0b0101_0100,
+            0b0000_0101,
+            0b1010_1000,
+            0b0000_1010,
+        ];
+        let mut compressed = Vec::new();
+        nbit_compress_into(&input, &params, &mut compressed).unwrap();
+
+        let mut decoded = Vec::new();
+        decompress_into(&compressed, &params, &mut decoded).unwrap();
+        assert_eq!(decoded, input);
+    }
+
+    #[test]
+    fn nbit_compound_with_padding_roundtrips() {
+        let params = vec![
+            15,
+            0,
+            2,
+            NBIT_COMPOUND,
+            4,
+            2,
+            0,
+            NBIT_ATOMIC,
+            1,
+            NBIT_ORDER_LE,
+            4,
+            2,
+            3,
+            NBIT_NOOPTYPE,
+            1,
+        ];
+        let input = [0b0001_0100, 0, 0, 0xab, 0b0011_1000, 0, 0, 0xcd];
+        let mut compressed = Vec::new();
+        nbit_compress_into(&input, &params, &mut compressed).unwrap();
+
         let mut decoded = Vec::new();
         decompress_into(&compressed, &params, &mut decoded).unwrap();
         assert_eq!(decoded, input);
