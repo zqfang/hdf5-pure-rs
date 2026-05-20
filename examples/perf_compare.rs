@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
-use hdf5_pure_rust::{File, WritableFile};
+use hdf5_pure_rust::{File, H5Type, WritableFile};
 
 fn parse_usize(name: &str, value: &str) -> usize {
     value
@@ -47,12 +47,35 @@ fn write_dataset(
     Ok(())
 }
 
-fn read_dataset(path: &PathBuf, dataset_name: &str) -> hdf5_pure_rust::Result<f64> {
+trait ChecksumValue: Copy + Default {
+    fn checksum_value(self) -> f64;
+}
+
+impl ChecksumValue for f64 {
+    fn checksum_value(self) -> f64 {
+        self
+    }
+}
+
+impl ChecksumValue for i32 {
+    fn checksum_value(self) -> f64 {
+        f64::from(self)
+    }
+}
+
+fn read_dataset_typed<T: ChecksumValue + H5Type>(
+    path: &PathBuf,
+    dataset_name: &str,
+) -> hdf5_pure_rust::Result<f64> {
     let file = File::open(path)?;
     let dataset = file.dataset(dataset_name)?;
-    let mut values = vec![0.0; dataset.size()? as usize];
+    let mut values = vec![T::default(); dataset.size()? as usize];
     dataset.read_into(&mut values)?;
-    Ok(values.iter().copied().sum())
+    Ok(values.iter().copied().map(T::checksum_value).sum())
+}
+
+fn read_dataset(path: &PathBuf, dataset_name: &str) -> hdf5_pure_rust::Result<f64> {
+    read_dataset_typed::<f64>(path, dataset_name)
 }
 
 fn read_dataset_raw(path: &PathBuf, dataset_name: &str) -> hdf5_pure_rust::Result<f64> {
@@ -63,7 +86,7 @@ fn read_dataset_raw(path: &PathBuf, dataset_name: &str) -> hdf5_pure_rust::Resul
     Ok(raw.iter().map(|&b| b as f64).sum())
 }
 
-fn benchmark_reads(
+fn benchmark_reads<T: ChecksumValue + H5Type>(
     path: &PathBuf,
     dataset_name: &str,
     target_seconds: f64,
@@ -76,7 +99,7 @@ fn benchmark_reads(
 
     while benchmark_start.elapsed().as_secs_f64() < target_seconds {
         let start = Instant::now();
-        last_checksum = read_dataset(path, dataset_name)?;
+        last_checksum = read_dataset_typed::<T>(path, dataset_name)?;
         let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
         best_ms = best_ms.min(elapsed_ms);
         total_ms += elapsed_ms;
@@ -124,7 +147,7 @@ fn main() -> hdf5_pure_rust::Result<()> {
     let mode = args
         .next()
         .unwrap_or_else(|| {
-            "usage: perf_compare <write|read|bench-read|read-raw|bench-read-raw> <path> [dataset|len] [chunk|seconds] [deflate]"
+            "usage: perf_compare <write|read|read-f64|read-i32|bench-read|bench-read-f64|bench-read-i32|read-raw|bench-read-raw> <path> [dataset|len] [chunk|seconds] [deflate]"
                 .into()
         });
     let path = PathBuf::from(
@@ -154,13 +177,49 @@ fn main() -> hdf5_pure_rust::Result<()> {
                 checksum
             );
         }
+        "read-f64" => {
+            let dataset_name = args.next().unwrap_or_else(|| "data".to_string());
+            let start = Instant::now();
+            let checksum = read_dataset_typed::<f64>(&path, &dataset_name)?;
+            println!(
+                "read_ms={:.3} checksum={:.1}",
+                start.elapsed().as_secs_f64() * 1000.0,
+                checksum
+            );
+        }
+        "read-i32" => {
+            let dataset_name = args.next().unwrap_or_else(|| "data".to_string());
+            let start = Instant::now();
+            let checksum = read_dataset_typed::<i32>(&path, &dataset_name)?;
+            println!(
+                "read_ms={:.3} checksum={:.1}",
+                start.elapsed().as_secs_f64() * 1000.0,
+                checksum
+            );
+        }
         "bench-read" => {
             let dataset_name = args.next().unwrap_or_else(|| "data".to_string());
             let target_seconds = args
                 .next()
                 .map(|s| parse_f64("target_seconds", &s))
                 .unwrap_or(5.0);
-            benchmark_reads(&path, &dataset_name, target_seconds)?;
+            benchmark_reads::<f64>(&path, &dataset_name, target_seconds)?;
+        }
+        "bench-read-f64" => {
+            let dataset_name = args.next().unwrap_or_else(|| "data".to_string());
+            let target_seconds = args
+                .next()
+                .map(|s| parse_f64("target_seconds", &s))
+                .unwrap_or(5.0);
+            benchmark_reads::<f64>(&path, &dataset_name, target_seconds)?;
+        }
+        "bench-read-i32" => {
+            let dataset_name = args.next().unwrap_or_else(|| "data".to_string());
+            let target_seconds = args
+                .next()
+                .map(|s| parse_f64("target_seconds", &s))
+                .unwrap_or(5.0);
+            benchmark_reads::<i32>(&path, &dataset_name, target_seconds)?;
         }
         "read-raw" => {
             let dataset_name = args.next().unwrap_or_else(|| "data".to_string());

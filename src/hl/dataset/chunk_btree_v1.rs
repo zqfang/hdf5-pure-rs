@@ -1,4 +1,5 @@
 use std::io::{Read, Seek};
+use std::thread;
 
 use crate::error::{Error, Result};
 use crate::filters;
@@ -8,6 +9,8 @@ use super::chunk_read::{BorrowedChunkPayloadRead, ChunkBTreeRecord, ChunkReadCon
 use super::{usize_from_u64, Dataset, DatasetInfo};
 
 const MAX_CHUNK_BTREE_V1_RECURSION: usize = 64;
+const MIN_PARALLEL_DEFLATE_CHUNKS_1D: usize = 8;
+const MIN_PARALLEL_DEFLATE_BYTES_1D: usize = 64 * 1024;
 
 /// Output of `decode_chunk_btree_node`: either a leaf node's chunk
 /// records (coords, addr, size, filter_mask) or an internal node's
@@ -61,7 +64,7 @@ impl Dataset {
         let mut compressed_scratch = Vec::new();
         let mut raw_scratch = Vec::new();
         let mut scaled_scratch = Vec::new();
-        let handled = if Self::btree_v1_uses_unfiltered_coalescing(info) {
+        let mut handled = if Self::btree_v1_uses_unfiltered_coalescing(info) {
             Self::try_read_coalesced_borrowed_unfiltered_chunks_1d(
                 reader,
                 info,
@@ -80,6 +83,17 @@ impl Dataset {
         } else {
             Vec::new()
         };
+        if handled.is_empty() {
+            handled.resize(chunk_records.len(), false);
+        }
+        Self::try_read_parallel_deflate_btree_v1_chunks_1d(
+            reader,
+            info,
+            chunk_ctx,
+            &chunk_records,
+            output,
+            &mut handled,
+        )?;
 
         for (chunk_index, chunk_record) in chunk_records.iter().enumerate() {
             if handled.get(chunk_index).copied().unwrap_or(false) {
@@ -121,6 +135,125 @@ impl Dataset {
             .as_ref()
             .map(|pipeline| pipeline.filters.is_empty())
             .unwrap_or(true)
+    }
+
+    fn try_read_parallel_deflate_btree_v1_chunks_1d<R: Read + Seek>(
+        reader: &mut HdfReader<R>,
+        info: &DatasetInfo,
+        chunk_ctx: &ChunkReadContext<'_>,
+        chunk_records: &[ChunkBTreeRecord],
+        output: &mut [u8],
+        handled: &mut [bool],
+    ) -> Result<()> {
+        let Some(pipeline) = info.filter_pipeline.as_ref() else {
+            return Ok(());
+        };
+        if !Self::is_deflate_only_pipeline(pipeline) || chunk_ctx.data_dims.len() != 1 {
+            return Ok(());
+        }
+        if chunk_ctx.chunk_dims.len() != 1 || output.len() != chunk_ctx.total_bytes {
+            return Ok(());
+        }
+
+        let data_size = usize_from_u64(chunk_ctx.data_dims[0], "dataset dimension")?;
+        let chunk_size = usize_from_u64(chunk_ctx.chunk_dims[0], "chunk dimension")?;
+        if chunk_size == 0 {
+            return Ok(());
+        }
+        let full_chunk_count = data_size / chunk_size;
+        if full_chunk_count < 2 || chunk_records.len() < full_chunk_count {
+            return Ok(());
+        }
+        let chunk_bytes = chunk_size
+            .checked_mul(chunk_ctx.element_size)
+            .ok_or_else(|| Error::InvalidFormat("chunk byte size overflow".into()))?;
+        if chunk_bytes == 0 || chunk_bytes != chunk_ctx.chunk_bytes {
+            return Ok(());
+        }
+        let full_output_len = full_chunk_count
+            .checked_mul(chunk_bytes)
+            .ok_or_else(|| Error::InvalidFormat("parallel chunk output length overflow".into()))?;
+        if full_output_len > output.len() {
+            return Ok(());
+        }
+        if full_chunk_count < MIN_PARALLEL_DEFLATE_CHUNKS_1D
+            || full_output_len < MIN_PARALLEL_DEFLATE_BYTES_1D
+        {
+            return Ok(());
+        }
+
+        let worker_count = thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(1)
+            .min(full_chunk_count);
+        if worker_count <= 1 {
+            return Ok(());
+        }
+
+        let mut payloads = Vec::with_capacity(full_chunk_count);
+        for (chunk_index, record) in chunk_records.iter().take(full_chunk_count).enumerate() {
+            if handled.get(chunk_index).copied().unwrap_or(false) {
+                return Ok(());
+            }
+            if record.filter_mask != 0
+                || record.coords.len() != 1
+                || crate::io::reader::is_undef_addr(record.chunk_addr)
+            {
+                return Ok(());
+            }
+            let expected_start = chunk_index
+                .checked_mul(chunk_size)
+                .ok_or_else(|| Error::InvalidFormat("chunk coordinate overflow".into()))?;
+            if usize_from_u64(record.coords[0], "chunk coordinate")? != expected_start {
+                return Ok(());
+            }
+
+            let read_size = usize_from_u64(record.chunk_size, "v1 B-tree chunk size")?;
+            let mut payload = vec![0u8; read_size];
+            reader.seek(record.chunk_addr)?;
+            reader.read_bytes_into(&mut payload)?;
+            payloads.push(payload);
+        }
+
+        let chunks_per_worker = full_chunk_count.div_ceil(worker_count);
+        let full_output = &mut output[..full_output_len];
+        let parallel_result: Result<()> = thread::scope(|scope| {
+            let mut handles = Vec::new();
+            let mut remaining_output = full_output;
+            let mut payload_start = 0usize;
+            while payload_start < full_chunk_count {
+                let payload_end = (payload_start + chunks_per_worker).min(full_chunk_count);
+                let group_chunks = payload_end - payload_start;
+                let group_bytes = group_chunks * chunk_bytes;
+                let (group_output, next_output) = remaining_output.split_at_mut(group_bytes);
+                let group_payloads = &payloads[payload_start..payload_end];
+                handles.push(scope.spawn(move || -> Result<()> {
+                    for (chunk_offset, payload) in group_payloads.iter().enumerate() {
+                        let start = chunk_offset * chunk_bytes;
+                        let end = start + chunk_bytes;
+                        crate::filters::deflate::decompress_exact_into(
+                            payload,
+                            &mut group_output[start..end],
+                        )?;
+                    }
+                    Ok(())
+                }));
+                remaining_output = next_output;
+                payload_start = payload_end;
+            }
+            for handle in handles {
+                handle.join().map_err(|_| {
+                    Error::InvalidFormat("parallel deflate worker panicked".into())
+                })??;
+            }
+            Ok(())
+        });
+        parallel_result?;
+
+        for flag in handled.iter_mut().take(full_chunk_count) {
+            *flag = true;
+        }
+        Ok(())
     }
 
     #[cfg(feature = "tracehash")]

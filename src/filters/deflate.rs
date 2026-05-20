@@ -1,6 +1,7 @@
 use std::io::Read;
 
 use flate2::read::ZlibDecoder;
+use flate2::{Decompress, FlushDecompress, Status};
 
 use crate::error::{Error, Result};
 
@@ -29,20 +30,34 @@ pub fn decompress_with_hint_into(
 /// Decompress deflate (zlib) compressed data into the provided output buffer
 /// and require the decoded size to match exactly.
 pub fn decompress_exact_into(data: &[u8], out: &mut [u8]) -> Result<()> {
-    let mut decoder = ZlibDecoder::new(data);
-    decoder
-        .read_exact(out)
+    let mut decoder = Decompress::new(true);
+    let status = decoder
+        .decompress(data, out, FlushDecompress::Finish)
         .map_err(|e| Error::InvalidFormat(format!("deflate decompression failed: {e}")))?;
-    let mut tail = [0u8; 1];
-    match decoder.read(&mut tail) {
-        Ok(0) => Ok(()),
-        Ok(_) => Err(Error::InvalidFormat(
-            "deflate decompression produced more bytes than expected".into(),
-        )),
-        Err(e) => Err(Error::InvalidFormat(format!(
-            "deflate decompression tail check failed: {e}"
-        ))),
+
+    if status != Status::StreamEnd {
+        if decoder.total_out() == out.len() as u64 {
+            return Err(Error::InvalidFormat(
+                "deflate decompression produced more bytes than expected".into(),
+            ));
+        }
+        return Err(Error::InvalidFormat(
+            "deflate decompression ended before zlib stream end".into(),
+        ));
     }
+    if decoder.total_out() != out.len() as u64 {
+        return Err(Error::InvalidFormat(format!(
+            "deflate decompression output length mismatch: expected {}, got {}",
+            out.len(),
+            decoder.total_out()
+        )));
+    }
+    if decoder.total_in() != data.len() as u64 {
+        return Err(Error::InvalidFormat(
+            "deflate decompression left trailing input bytes".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Compress data with deflate at the given level (0-9), appending to `out`.
