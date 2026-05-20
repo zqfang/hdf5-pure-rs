@@ -159,14 +159,15 @@ impl<R: Read + Seek> HdfReader<R> {
         Ok(i32::from_le_bytes(buf))
     }
 
-    /// Read a variable-width unsigned integer (1, 2, 4, or 8 bytes, little-endian).
+    /// Read a variable-width unsigned integer (1-8 bytes, little-endian).
     pub fn read_uint(&mut self, size: u8) -> Result<u64> {
         match size {
             1 => self.read_u8().map(u64::from),
             2 => self.read_u16().map(u64::from),
             4 => self.read_u32().map(u64::from),
             8 => self.read_u64(),
-            _ => Err(Error::InvalidFormat(format!(
+            3 | 5..=7 => self.read_var_uint(size),
+            0 | 9..=u8::MAX => Err(Error::InvalidFormat(format!(
                 "unsupported integer size: {size}"
             ))),
         }
@@ -257,6 +258,13 @@ mod tests {
         let data = vec![0x03, 0x02, 0x01];
         let mut r = HdfReader::new(Cursor::new(data));
         assert_eq!(r.read_var_uint(3).unwrap(), 0x010203);
+    }
+
+    #[test]
+    fn test_read_uint_accepts_three_byte_width() {
+        let data = vec![0xef, 0xcd, 0xab];
+        let mut r = HdfReader::new(Cursor::new(data));
+        assert_eq!(r.read_uint(3).unwrap(), 0xabcdef);
     }
 
     #[test]

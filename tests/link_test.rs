@@ -613,6 +613,36 @@ fn test_group_compat_relink_same_size_dense_root_link() {
 }
 
 #[test]
+fn test_group_compat_relink_changed_size_dense_root_link_shrinks() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir
+        .path()
+        .join("open_rw_root_dense_relink_changed_size_shrink.h5");
+    {
+        let mut wf = WritableFile::create(&path).unwrap();
+        for idx in 0..9 {
+            wf.new_dataset_builder(&format!("data_{idx:02}"))
+                .write::<i32>(&[idx])
+                .unwrap();
+        }
+        wf.flush().unwrap();
+    }
+
+    let file = File::open_rw(&path).unwrap();
+    let root = file.root_group().unwrap();
+    root.relink("data_08", "d8").unwrap();
+
+    assert!(!root.link_exists("data_08").unwrap());
+    assert!(root.link_exists("d8").unwrap());
+    assert_i32_dataset_values(&file.dataset("d8").unwrap(), &[8]).unwrap();
+
+    let reopened = File::open(&path).unwrap();
+    assert!(!file_has_member(&reopened, "data_08").unwrap());
+    assert!(file_has_member(&reopened, "d8").unwrap());
+    assert_i32_dataset_values(&reopened.dataset("d8").unwrap(), &[8]).unwrap();
+}
+
+#[test]
 fn test_group_compat_create_links_under_direct_nested_existing_file_group() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("open_rw_nested_links.h5");

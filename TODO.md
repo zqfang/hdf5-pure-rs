@@ -23,18 +23,45 @@ notes and completed migration details should live outside this active backlog.
 
 - [x] Add dense-link same-size rename support.
 - [x] Add dense-link non-hard unlink support.
+- [x] Add open_rw same-group hard-link creation for direct dense parents,
+  including persistent refcount materialization and dense target address
+  patching when the target object header is rewritten.
 - [ ] Extend hard-link deletion beyond the current safe compact cases by
-  emitting and maintaining persistent object refcount messages.
+  emitting and maintaining persistent object refcount messages. Compact
+  deletion can now handle compact and direct dense no-explicit-refcount cases
+  when a root reachability walk proves exactly one other hard link remains;
+  compact deletion can also materialize a persistent refcount and patch
+  remaining compact hard links when more than one link remains and all
+  reachable links to the target are in compact v2 parents. Direct dense
+  same-parent deletion can now materialize a persistent refcount and patch the
+  remaining dense links when all reachable links to the target are in that
+  dense parent. Dense cross-parent deletion can now materialize a persistent
+  refcount and patch remaining compact and direct dense single-leaf links.
+  Dense cross-parent deletion with creation-order indexes, non-leaf dense name
+  indexes, filtered/indirect heaps, or v1 parent groups remains explicit.
+  Existing v2 persistent refcount messages are removed again when a deletion
+  leaves one hard link, matching the original object-header refcount-message
+  lifecycle.
 - [x] Emit or increment persistent object refcount messages for compact
   same-group hard-link aliases and decrement them on compact unlink.
 - [x] Add compact root link-name size changes by rebuilding root metadata.
 - [x] Generalize compact same-group link-name size changes beyond root relinks
   by rebuilding compact hard-link parent chains.
-- [ ] Generalize link-name size changes to dense, creation-order indexed, v1,
-  and non-compact parent chains.
+- [ ] Generalize link-name size changes to dense layouts beyond direct
+  unfiltered single-leaf name-index shrink-in-place, creation-order indexed,
+  v1, and non-compact parent chains. Dense link growth that needs a new heap
+  object or larger direct block remains explicit.
 - [x] Add compact v2/v3 cross-group relink support with parent propagation.
 - [ ] Generalize cross-group relink to dense, creation-order indexed, v1, and
-  non-compact parent chains.
+  non-compact parent chains. Compact root-source relink into a direct,
+  unfiltered dense destination with a single-leaf name index is supported;
+  nested compact sources into that same dense destination shape are supported.
+  Dense sources in compact parent chains can move to compact destinations for
+  that same direct, unfiltered single-leaf name-index shape; dense sources can
+  move to dense destinations through dense hard-link parent paths when neither
+  endpoint group object header must be rebuilt. Creation-order indexes,
+  non-leaf dense indexes, and v1 symbol-table groups remain explicit
+  unsupported boundaries.
 - [ ] Add v1 symbol-table group mutation only after SNOD, B-tree, local-heap
   write-location tracking, refcounts, and free-space semantics are modeled.
 - [x] Add root-only existing-file `create_group` for v2/v3 compact root groups
@@ -47,7 +74,15 @@ notes and completed migration details should live outside this active backlog.
 - [x] Generalize existing-file creation to deeper nested compact hard-link
   parent chains by propagating rewritten addresses up to the root and updating
   the superblock.
-- [ ] Generalize existing-file creation to non-compact parent chains.
+- [ ] Generalize existing-file creation to all non-compact parent chains.
+  Direct, unfiltered dense parents with a leaf name index can now grow groups,
+  datasets, and links within the existing heap direct block. Cross-group
+  hard-link creation can now bridge
+  compact destinations with direct dense target groups and direct dense
+  destinations with compact target groups when the endpoint parent paths are
+  compact-reachable; indirect heaps, filtered heaps, creation-order indexes,
+  dense parent-chain propagation for rebuilt compact target parents, and v1
+  symbol-table groups remain explicit unsupported boundaries.
 
 ## Reader And Format Coverage
 
@@ -67,12 +102,18 @@ notes and completed migration details should live outside this active backlog.
 - [ ] Broaden datatype conversion behavior beyond the current supported numeric,
   string, enum, compound, reference, and VDS conversion paths.
 - [ ] Broaden VDS mapping, selection, missing-source, and conversion coverage.
+  Upstream libhdf5 multi-file 3D mosaic, fill-gap, and 3D printf-source VDS
+  fixtures are now pinned by integration tests, along with an unlimited
+  source-block VDS fixture.
 - [ ] Broaden chunk-index mutation support beyond the current append/replace
   cases for fixed-array, extensible-array, and v2 B-tree indexes.
 
 ## Writer Coverage
 
-- [ ] Broaden writer-side modern chunk-index parity.
+- [ ] Broaden writer-side modern chunk-index parity beyond the current
+  fixed-array, fixed max-shape, at-most-one-growable-dimension extensible-array,
+  fill-only max-shape undefined-index layouts, and multi-growable or large-grid
+  v2 B-tree creation cases.
 - [ ] Create new chunked datasets with fixed-array, extensible-array, or v2
   B-tree indexes where appropriate instead of always using v1 B-tree indexes.
 - [x] Create unfiltered fixed-size fully materialized multi-chunk datasets with
@@ -86,12 +127,15 @@ notes and completed migration details should live outside this active backlog.
 - [x] Add sparse/fill-only chunked dataset creation and streaming chunk
   insertion so huge logical datasets do not require a full in-memory payload or
   full chunk enumeration.
+- [x] Create explicit sparse chunk-list datasets, including filtered chunks,
+  with v4 fixed-array indexes for fixed shapes and inline v4 extensible-array
+  indexes for small max-shape grids.
 - [x] Allow vlen UTF-8 datasets to use chunked storage and filters by writing
   chunked 16-byte heap descriptors while keeping string payloads in heap
   storage.
 - [x] Add vlen UTF-8 fill values by encoding a null or heap-backed vlen
   descriptor in the fill-value message.
-- [ ] Make global-heap collection encoding width-aware instead of assuming
+- [x] Make global-heap collection encoding width-aware instead of assuming
   8-byte size fields, if superblock size-width configurability is added.
 - [x] Remove arbitrary 4 GiB caps from global-heap object and reference-region
   helpers where the on-disk size fields can represent larger payloads; keep
@@ -101,9 +145,11 @@ notes and completed migration details should live outside this active backlog.
   single-chunk boundary.
 - [x] Route oversized attributes to dense attribute storage even when attribute
   count is below the compact-to-dense threshold.
-- [ ] Generalize dense link and dense attribute storage beyond one leaf B-tree
-  node and one direct fractal-heap block; support internal nodes, wider heap
-  offsets, larger heap IDs, and indirect/filtered heap blocks.
+- [ ] Generalize dense link and dense attribute storage beyond one root direct
+  fractal-heap block; support indirect/filtered heap blocks. Internal name
+  B-tree nodes, wider heap offsets, and larger heap IDs are covered, and the
+  root-direct overflow boundary now fails explicitly as the next heap-growth
+  slice.
 - [x] Widen dense link and dense attribute heap IDs when payload lengths exceed
   the previous fixed-width length fields.
 - [x] Build dense link storage from one unified link list so soft, external,
@@ -121,8 +167,10 @@ notes and completed migration details should live outside this active backlog.
 - [x] Keep hdf5-metno public functions present and not deprecated.
 - [ ] Add explicit unsupported API stubs for low-level libhdf5 entry points that
   do not map to this crate's high-level API, especially additional `H5F*`,
-  `H5FD*`, `H5VL*`, `H5ES*`, `H5PL*`, and `H5M*` surfaces.
-- [ ] Extend deterministic property/config parsing for unsupported VFDs:
+  `H5FD*`, `H5VL*`, `H5ES*`, `H5PL*`, and `H5M*` surfaces. Keep this limited
+  to real libhdf5 symbols or true unsupported runtime boundaries; avoid adding
+  Rust-only pass-through aliases.
+- [x] Extend deterministic property/config parsing for unsupported VFDs:
   family, multi, splitter, log, onion, subfiling, HDFS, ROS3/S3, and related
   malformed-buffer tests.
 - [x] Add generated malformed fixtures for remaining NBit and ScaleOffset edge

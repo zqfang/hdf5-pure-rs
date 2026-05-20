@@ -1123,9 +1123,48 @@ impl MutableFile {
         let name_offset = link.name_offset;
         let name_size = link.name_size;
         if new_name.len() != name_size {
-            return Err(Error::Unsupported(
-                "in-place dense link rename cannot grow or shrink the encoded name field".into(),
-            ));
+            let link = LinkMessage::decode(&location.raw_data, self.superblock.sizeof_addr)?;
+            let mut renamed =
+                encode_renamed_link_message(&link, new_name, self.superblock.sizeof_addr)?;
+            if renamed.len() > location.raw_data.len() {
+                return Err(Error::Unsupported(
+                    "in-place dense link rename cannot grow the encoded heap object yet".into(),
+                ));
+            }
+            renamed.resize(location.raw_data.len(), 0);
+
+            let object_addr = location
+                .heap
+                .root_block_addr
+                .checked_add(location.object_offset)
+                .ok_or_else(|| Error::InvalidFormat("dense link object address overflow".into()))?;
+            self.write_handle.seek(SeekFrom::Start(object_addr))?;
+            self.write_handle.write_all(&renamed)?;
+
+            let record_size = usize::from(location.btree.record_size);
+            let record_start = location
+                .record_index
+                .checked_mul(record_size)
+                .ok_or_else(|| Error::InvalidFormat("dense link record offset overflow".into()))?;
+            let record_end = record_start
+                .checked_add(record_size)
+                .ok_or_else(|| Error::InvalidFormat("dense link record offset overflow".into()))?;
+            let record = location
+                .leaf_records
+                .get_mut(record_start..record_end)
+                .ok_or_else(|| Error::InvalidFormat("dense link record index is invalid".into()))?;
+            record[..4].copy_from_slice(&dense_link_name_hash(new_name).to_le_bytes());
+            Self::reposition_dense_link_record_by_hash(
+                &mut location.leaf_records,
+                location.record_index,
+                record_size,
+            )?;
+
+            self.rewrite_dense_link_direct_block_checksum(&location.heap, object_addr, &renamed)?;
+            self.rewrite_dense_link_name_index(&location)?;
+            self.write_handle.flush()?;
+            self.reopen_reader()?;
+            return Ok(());
         }
 
         let name_offset_u64 = Self::usize_to_u64(name_offset, "dense link name offset")?;

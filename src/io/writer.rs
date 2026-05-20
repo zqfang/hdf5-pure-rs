@@ -88,14 +88,15 @@ impl<W: Write + Seek> HdfWriter<W> {
         Ok(())
     }
 
-    /// Write a variable-width unsigned integer (1, 2, 4, or 8 bytes, little-endian).
+    /// Write a variable-width unsigned integer (1-8 bytes, little-endian).
     pub fn write_uint(&mut self, val: u64, size: u8) -> Result<()> {
         match size {
             1 => self.write_u8(val as u8),
             2 => self.write_u16(val as u16),
             4 => self.write_u32(val as u32),
             8 => self.write_u64(val),
-            _ => Err(Error::InvalidFormat(format!(
+            3 | 5..=7 => self.write_var_uint(val, size),
+            0 | 9..=u8::MAX => Err(Error::InvalidFormat(format!(
                 "unsupported integer size: {size}"
             ))),
         }
@@ -206,6 +207,15 @@ mod tests {
         buf.set_position(0);
         let mut r = HdfReader::new(&mut buf);
         assert_eq!(r.read_var_uint(5).unwrap(), 0xABCDEF);
+    }
+
+    #[test]
+    fn test_write_uint_accepts_three_byte_width() {
+        let mut buf = Cursor::new(Vec::new());
+        let mut w = HdfWriter::new(&mut buf);
+        w.write_uint(0xabcdef, 3).unwrap();
+
+        assert_eq!(buf.into_inner(), vec![0xef, 0xcd, 0xab]);
     }
 
     #[test]

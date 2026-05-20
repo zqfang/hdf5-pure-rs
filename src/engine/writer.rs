@@ -12,7 +12,12 @@ use crate::io::reader::UNDEF_ADDR;
 const MAX_DATASPACE_RANK: usize = 32;
 const OBJECT_HEADER_CHUNK_DATA_LIMIT: usize = 128 * 1024;
 const FIXED_ARRAY_CHUNK_PAGE_BITS: u8 = 12;
+const BTREE_V2_CHUNK_NODE_SIZE: usize = 512;
+const BTREE_V2_CHUNK_SPLIT_PERCENT: u8 = 100;
+const BTREE_V2_CHUNK_MERGE_PERCENT: u8 = 40;
 const EXTENSIBLE_ARRAY_INDEX_BLOCK_ELEMENTS_LIMIT: usize = u8::MAX as usize;
+const EXTENSIBLE_ARRAY_MAX_WRITER_ELEMENTS: usize = 1_000_000;
+const WRITER_MANAGED_HEAP_MIN_SIZE_BITS: u16 = 32;
 
 /// A writable HDF5 file under construction.
 pub struct HdfFileWriter<W: Write + Seek> {
@@ -91,6 +96,79 @@ struct ChunkBTreeEntry {
     chunk_size: u32,
     filter_mask: u32,
     child_addr: u64,
+}
+
+enum ChunkIndexEntries<'a> {
+    Materialized(&'a [ChunkBTreeEntry]),
+    LinearSlots {
+        slots: &'a [Option<ChunkBTreeEntry>],
+    },
+    Sequential {
+        first_addr: u64,
+        chunk_size: u32,
+        filter_mask: u32,
+        count: usize,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriterChunkIndexType {
+    SingleChunk,
+    FixedArray,
+    ExtensibleArray,
+    BTreeV2,
+}
+
+impl<'a> ChunkIndexEntries<'a> {
+    fn len(&self) -> usize {
+        match self {
+            Self::Materialized(entries) => entries.len(),
+            Self::LinearSlots { slots } => slots.len(),
+            Self::Sequential { count, .. } => *count,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn entry_at(&self, index: usize) -> Result<(u64, u32, u32)> {
+        match self {
+            Self::Materialized(entries) => {
+                let entry = entries.get(index).ok_or_else(|| {
+                    Error::InvalidFormat("chunk index entry out of bounds".into())
+                })?;
+                Ok((entry.child_addr, entry.chunk_size, entry.filter_mask))
+            }
+            Self::LinearSlots { slots } => match slots.get(index) {
+                Some(Some(entry)) => Ok((entry.child_addr, entry.chunk_size, entry.filter_mask)),
+                Some(None) => Ok((UNDEF_ADDR, 0, 0)),
+                None => Err(Error::InvalidFormat(
+                    "linear chunk index slot out of bounds".into(),
+                )),
+            },
+            Self::Sequential {
+                first_addr,
+                chunk_size,
+                filter_mask,
+                count,
+            } => {
+                if index >= *count {
+                    return Err(Error::InvalidFormat(
+                        "sequential chunk index entry out of bounds".into(),
+                    ));
+                }
+                let byte_offset = u64::try_from(index)
+                    .map_err(|_| Error::InvalidFormat("chunk index exceeds u64".into()))?
+                    .checked_mul(u64::from(*chunk_size))
+                    .ok_or_else(|| Error::InvalidFormat("chunk address offset overflow".into()))?;
+                let addr = first_addr
+                    .checked_add(byte_offset)
+                    .ok_or_else(|| Error::InvalidFormat("chunk address overflow".into()))?;
+                Ok((addr, *chunk_size, *filter_mask))
+            }
+        }
+    }
 }
 
 /// Describes the dataset fill-value message to write.
@@ -1146,6 +1224,86 @@ fn encode_extensible_array_chunk_layout_v4_into(
     Ok(())
 }
 
+/// Append a data layout message (v4, v2 B-tree chunk index).
+fn encode_btree_v2_chunk_layout_v4_into(
+    buf: &mut Vec<u8>,
+    btree_addr: u64,
+    chunk_dims: &[u64],
+    element_size: u32,
+    node_size: usize,
+    split_percent: u8,
+    merge_percent: u8,
+    sizeof_addr: u8,
+) -> Result<()> {
+    let node_size = u32::try_from(node_size)
+        .map_err(|_| Error::InvalidFormat("v2 B-tree chunk node size exceeds u32".into()))?;
+    if node_size == 0 {
+        return Err(Error::InvalidFormat(
+            "v2 B-tree chunk node size must be positive".into(),
+        ));
+    }
+    for (percent, context) in [
+        (split_percent, "v2 B-tree chunk split percent"),
+        (merge_percent, "v2 B-tree chunk merge percent"),
+    ] {
+        if percent == 0 || percent > 100 {
+            return Err(Error::InvalidFormat(format!(
+                "{context} must be in 1..=100"
+            )));
+        }
+    }
+
+    buf.push(4); // version 4
+    buf.push(2); // layout class = chunked
+    buf.push(0); // flags
+
+    let encoded_ndims = chunk_dims
+        .len()
+        .checked_add(1)
+        .ok_or_else(|| Error::InvalidFormat("chunked layout rank overflow".into()))?;
+    let ndims = u8::try_from(encoded_ndims)
+        .map_err(|_| Error::InvalidFormat("chunked layout rank exceeds u8".into()))?;
+    if ndims == 0 {
+        return Err(Error::InvalidFormat(
+            "chunked layout rank must be positive".into(),
+        ));
+    }
+    buf.push(ndims);
+
+    let max_dim = chunk_dims
+        .iter()
+        .copied()
+        .chain(std::iter::once(u64::from(element_size)))
+        .max()
+        .unwrap_or(0);
+    let enc_bytes_per_dim = (1usize..=8)
+        .find(|width| u128::from(max_dim) < (1u128 << (width * 8)))
+        .unwrap_or(8);
+    buf.push(u8::try_from(enc_bytes_per_dim).unwrap_or(8));
+    for &dim in chunk_dims {
+        if dim == 0 {
+            return Err(Error::InvalidFormat(
+                "chunk dimension must be positive".into(),
+            ));
+        }
+        buf.extend_from_slice(&dim.to_le_bytes()[..enc_bytes_per_dim]);
+    }
+    if element_size == 0 {
+        return Err(Error::InvalidFormat(
+            "chunk element size must be positive".into(),
+        ));
+    }
+    buf.extend_from_slice(&u64::from(element_size).to_le_bytes()[..enc_bytes_per_dim]);
+
+    buf.push(5); // chunk index type = v2 B-tree
+    buf.extend_from_slice(&node_size.to_le_bytes());
+    buf.push(split_percent);
+    buf.push(merge_percent);
+    append_encoded_addr(buf, btree_addr, sizeof_addr)?;
+
+    Ok(())
+}
+
 /// Append a filter pipeline message.
 fn encode_filter_pipeline_into(
     buf: &mut Vec<u8>,
@@ -1711,6 +1869,46 @@ fn dense_heap_id_len_for_payloads(
         .map_err(|_| Error::InvalidFormat("managed heap ID length exceeds u16".into()))
 }
 
+fn managed_heap_root_direct_block_size(payload_bytes: usize) -> Result<usize> {
+    let needed_block_size = 25usize
+        .checked_add(payload_bytes)
+        .ok_or_else(|| Error::Unsupported("managed fractal heap needs indirect blocks".into()))?;
+    match checked_next_power_of_two(needed_block_size, "managed heap root direct block") {
+        Ok(block_size) => Ok(block_size),
+        Err(err) => {
+            if let Error::InvalidFormat(message) = &err {
+                if message.contains("managed heap root direct block overflow") {
+                    return Err(Error::Unsupported(
+                        "managed fractal heap needs indirect blocks".into(),
+                    ));
+                }
+            }
+            Err(err)
+        }
+    }
+}
+
+fn managed_heap_offset_bytes(max_heap_size_bits: u16) -> Result<usize> {
+    let offset_bytes = usize::from(max_heap_size_bits).div_ceil(8);
+    if offset_bytes == 0 || offset_bytes > 8 {
+        return Err(Error::InvalidFormat(format!(
+            "managed heap offset width uses {offset_bytes} bytes"
+        )));
+    }
+    Ok(offset_bytes)
+}
+
+fn managed_heap_max_size_bits_for_block(block_size: usize) -> Result<u16> {
+    let block_size = u64_from_usize_writer(block_size, "managed heap block size")?;
+    let needed_bits = if block_size <= 1 {
+        1
+    } else {
+        u64::BITS - (block_size - 1).leading_zeros()
+    };
+    u16::try_from(needed_bits.max(u32::from(WRITER_MANAGED_HEAP_MIN_SIZE_BITS)))
+        .map_err(|_| Error::InvalidFormat("managed heap max size width exceeds u16".into()))
+}
+
 /// Verify a chunked dataset spec for consistency before writing.
 fn validate_chunked_dataset_spec(spec: &DatasetSpec<'_>, chunk_dims: &[u64]) -> Result<usize> {
     let ndims = spec.shape.len();
@@ -1773,6 +1971,304 @@ fn validate_chunked_dataset_spec(spec: &DatasetSpec<'_>, chunk_dims: &[u64]) -> 
     Ok(chunk_raw_bytes)
 }
 
+fn chunk_grid_is_sequential_row_major(shape: &[u64], chunk_dims: &[u64]) -> bool {
+    if shape.is_empty() || shape.len() != chunk_dims.len() || chunk_dims[0] == 0 {
+        return false;
+    }
+
+    shape
+        .iter()
+        .zip(chunk_dims)
+        .skip(1)
+        .all(|(&dim, &chunk_dim)| dim == chunk_dim)
+}
+
+fn full_chunk_row_major_payload_slice<'a>(
+    data: &'a [u8],
+    shape: &[u64],
+    chunk_start: &[u64],
+    chunk_dims: &[u64],
+    element_size: usize,
+    chunk_raw_bytes: usize,
+) -> Result<Option<&'a [u8]>> {
+    let Some(src_range) =
+        row_major_slab_payload_range(shape, chunk_start, chunk_dims, element_size)?
+    else {
+        return Ok(None);
+    };
+    if src_range.len() != chunk_raw_bytes {
+        return Ok(None);
+    }
+    let src = data
+        .get(src_range)
+        .ok_or_else(|| Error::InvalidFormat("chunk source range exceeds data".into()))?;
+    Ok(Some(src))
+}
+
+fn copy_row_major_slab_payload_into(
+    data: &[u8],
+    shape: &[u64],
+    chunk_start: &[u64],
+    chunk_dims: &[u64],
+    element_size: usize,
+    out: &mut [u8],
+) -> Result<bool> {
+    let Some(src_range) =
+        row_major_slab_payload_range(shape, chunk_start, chunk_dims, element_size)?
+    else {
+        return Ok(false);
+    };
+    let src = data
+        .get(src_range)
+        .ok_or_else(|| Error::InvalidFormat("chunk source range exceeds data".into()))?;
+    let dst = out
+        .get_mut(..src.len())
+        .ok_or_else(|| Error::InvalidFormat("chunk destination range exceeds output".into()))?;
+    dst.copy_from_slice(src);
+    Ok(true)
+}
+
+fn row_major_slab_payload_range(
+    shape: &[u64],
+    chunk_start: &[u64],
+    chunk_dims: &[u64],
+    element_size: usize,
+) -> Result<Option<std::ops::Range<usize>>> {
+    if shape.is_empty() || shape.len() != chunk_start.len() || shape.len() != chunk_dims.len() {
+        return Err(Error::InvalidFormat(
+            "chunk rank does not match dataset rank".into(),
+        ));
+    }
+    if element_size == 0 {
+        return Err(Error::InvalidFormat("chunk element size is zero".into()));
+    }
+    if chunk_dims.iter().any(|&dim| dim == 0) {
+        return Err(Error::InvalidFormat("chunk dimension is zero".into()));
+    }
+
+    let _leading_end = chunk_start[0]
+        .checked_add(chunk_dims[0])
+        .ok_or_else(|| Error::InvalidFormat("chunk coordinate overflow".into()))?;
+    if chunk_start[0] >= shape[0] {
+        return Ok(None);
+    }
+    for dim in 1..shape.len() {
+        if chunk_start[dim] != 0 || chunk_dims[dim] != shape[dim] {
+            return Ok(None);
+        }
+    }
+
+    let leading_start = usize_from_u64_writer(chunk_start[0], "chunk start")?;
+    let leading_copy = usize_from_u64_writer(
+        chunk_dims[0].min(shape[0].saturating_sub(chunk_start[0])),
+        "chunk leading copy",
+    )?;
+    let trailing_elements = shape.iter().skip(1).try_fold(1usize, |acc, &dim| {
+        let dim = usize_from_u64_writer(dim, "dataset dimension")?;
+        acc.checked_mul(dim)
+            .ok_or_else(|| Error::InvalidFormat("chunk source stride overflow".into()))
+    })?;
+    let src_start = leading_start
+        .checked_mul(trailing_elements)
+        .and_then(|value| value.checked_mul(element_size))
+        .ok_or_else(|| Error::InvalidFormat("chunk source byte offset overflow".into()))?;
+    let src_end = src_start
+        .checked_add(
+            leading_copy
+                .checked_mul(trailing_elements)
+                .and_then(|value| value.checked_mul(element_size))
+                .ok_or_else(|| Error::InvalidFormat("chunk copy byte count overflow".into()))?,
+        )
+        .ok_or_else(|| Error::InvalidFormat("chunk source byte offset overflow".into()))?;
+    Ok(Some(src_start..src_end))
+}
+
+struct ChunkExtractionPlan {
+    shape: Vec<usize>,
+    shape_strides: Vec<usize>,
+    chunk_dims: Vec<usize>,
+    chunk_elements: usize,
+    element_size: usize,
+}
+
+struct ChunkExtractionScratch {
+    chunk_start: Vec<usize>,
+    chunk_idx: Vec<usize>,
+}
+
+impl ChunkExtractionPlan {
+    fn new(shape: &[u64], chunk_dims: &[u64], element_size: usize) -> Result<Self> {
+        if shape.is_empty() || shape.len() != chunk_dims.len() {
+            return Err(Error::InvalidFormat(
+                "chunk rank does not match dataset rank".into(),
+            ));
+        }
+        if element_size == 0 {
+            return Err(Error::InvalidFormat("chunk element size is zero".into()));
+        }
+        let shape = shape
+            .iter()
+            .map(|&dim| usize_from_u64_writer(dim, "dataset dimension"))
+            .collect::<Result<Vec<_>>>()?;
+        let chunk_dims = chunk_dims
+            .iter()
+            .map(|&dim| {
+                if dim == 0 {
+                    return Err(Error::InvalidFormat("chunk dimension is zero".into()));
+                }
+                usize_from_u64_writer(dim, "chunk dimension")
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let chunk_elements = chunk_dims.iter().try_fold(1usize, |acc, &dim| {
+            acc.checked_mul(dim)
+                .ok_or_else(|| Error::InvalidFormat("chunk element count overflow".into()))
+        })?;
+        let mut shape_strides = vec![1usize; shape.len()];
+        for d in (0..shape.len().saturating_sub(1)).rev() {
+            shape_strides[d] = shape_strides[d + 1]
+                .checked_mul(shape[d + 1])
+                .ok_or_else(|| Error::InvalidFormat("chunk source stride overflow".into()))?;
+        }
+        Ok(Self {
+            shape,
+            shape_strides,
+            chunk_dims,
+            chunk_elements,
+            element_size,
+        })
+    }
+
+    fn scratch(&self) -> ChunkExtractionScratch {
+        ChunkExtractionScratch {
+            chunk_start: vec![0usize; self.shape.len()],
+            chunk_idx: vec![0usize; self.shape.len()],
+        }
+    }
+
+    fn copy_into(
+        &self,
+        data: &[u8],
+        chunk_start: &[u64],
+        out: &mut [u8],
+        scratch: &mut ChunkExtractionScratch,
+    ) -> Result<()> {
+        if chunk_start.len() != self.shape.len()
+            || scratch.chunk_start.len() != self.shape.len()
+            || scratch.chunk_idx.len() != self.shape.len()
+        {
+            return Err(Error::InvalidFormat(
+                "chunk rank does not match dataset rank".into(),
+            ));
+        }
+        let expected_len = self
+            .chunk_elements
+            .checked_mul(self.element_size)
+            .ok_or_else(|| Error::InvalidFormat("chunk byte size overflow".into()))?;
+        if out.len() < expected_len {
+            return Err(Error::InvalidFormat(
+                "chunk extraction output is smaller than chunk size".into(),
+            ));
+        }
+        for (dst, &coord) in scratch.chunk_start.iter_mut().zip(chunk_start) {
+            *dst = usize_from_u64_writer(coord, "chunk start")?;
+        }
+
+        for elem in 0..self.chunk_elements {
+            let mut rem = elem;
+            for d in (0..self.chunk_dims.len()).rev() {
+                scratch.chunk_idx[d] = rem % self.chunk_dims[d];
+                rem /= self.chunk_dims[d];
+            }
+
+            let mut in_bounds = true;
+            let mut src_linear = 0usize;
+            for d in (0..self.shape.len()).rev() {
+                let global = scratch.chunk_start[d]
+                    .checked_add(scratch.chunk_idx[d])
+                    .ok_or_else(|| {
+                        Error::InvalidFormat("chunk global coordinate overflow".into())
+                    })?;
+                if global >= self.shape[d] {
+                    in_bounds = false;
+                    break;
+                }
+                let contribution = global.checked_mul(self.shape_strides[d]).ok_or_else(|| {
+                    Error::InvalidFormat("chunk source linear offset overflow".into())
+                })?;
+                src_linear = src_linear.checked_add(contribution).ok_or_else(|| {
+                    Error::InvalidFormat("chunk source linear offset overflow".into())
+                })?;
+            }
+
+            if in_bounds {
+                let src_offset = src_linear.checked_mul(self.element_size).ok_or_else(|| {
+                    Error::InvalidFormat("chunk source byte offset overflow".into())
+                })?;
+                let dst_offset = elem.checked_mul(self.element_size).ok_or_else(|| {
+                    Error::InvalidFormat("chunk destination byte offset overflow".into())
+                })?;
+                let src_end = src_offset.checked_add(self.element_size).ok_or_else(|| {
+                    Error::InvalidFormat("chunk source byte offset overflow".into())
+                })?;
+                let dst_end = dst_offset.checked_add(self.element_size).ok_or_else(|| {
+                    Error::InvalidFormat("chunk destination byte offset overflow".into())
+                })?;
+                let src = data.get(src_offset..src_end).ok_or_else(|| {
+                    Error::InvalidFormat("chunk source range exceeds data".into())
+                })?;
+                let dst = out.get_mut(dst_offset..dst_end).ok_or_else(|| {
+                    Error::InvalidFormat("chunk destination range exceeds output".into())
+                })?;
+                dst.copy_from_slice(src);
+            }
+        }
+        Ok(())
+    }
+}
+
+fn max_shape_growable_dim_count(shape: &[u64], max_shape: Option<&[u64]>) -> Result<usize> {
+    let Some(max_shape) = max_shape else {
+        return Ok(0);
+    };
+    if max_shape.len() != shape.len() {
+        return Err(Error::InvalidFormat(
+            "max shape rank does not match dataset rank".into(),
+        ));
+    }
+    let mut growable = 0usize;
+    for (idx, (&dim, &max_dim)) in shape.iter().zip(max_shape).enumerate() {
+        if max_dim != u64::MAX && max_dim < dim {
+            return Err(Error::InvalidFormat(format!(
+                "dataset dimension {idx} size {dim} exceeds max dimension {max_dim}"
+            )));
+        }
+        if max_dim > dim {
+            growable += 1;
+        }
+    }
+    Ok(growable)
+}
+
+fn h5d_chunk_idx_type_for_writer(
+    shape: &[u64],
+    max_shape: Option<&[u64]>,
+    total_chunks: usize,
+) -> Result<WriterChunkIndexType> {
+    let growable_dims = max_shape_growable_dim_count(shape, max_shape)?;
+    if max_shape.is_none() || growable_dims == 0 {
+        return Ok(if total_chunks == 1 {
+            WriterChunkIndexType::SingleChunk
+        } else {
+            WriterChunkIndexType::FixedArray
+        });
+    }
+    if growable_dims <= 1 && total_chunks <= EXTENSIBLE_ARRAY_MAX_WRITER_ELEMENTS {
+        Ok(WriterChunkIndexType::ExtensibleArray)
+    } else {
+        Ok(WriterChunkIndexType::BTreeV2)
+    }
+}
+
 /// Reject invalid deflate compression levels.
 fn validate_deflate_level(compression_level: Option<u32>) -> Result<()> {
     if let Some(level) = compression_level {
@@ -1810,6 +2306,83 @@ fn validate_chunk_write_coords(shape: &[u64], chunk_dims: &[u64], coords: &[u64]
         }
     }
     Ok(())
+}
+
+fn chunk_grid_counts(shape: &[u64], chunk_dims: &[u64]) -> Result<(Vec<usize>, usize)> {
+    if shape.len() != chunk_dims.len() {
+        return Err(Error::InvalidFormat(
+            "chunk grid rank does not match dataset rank".into(),
+        ));
+    }
+    let mut n_chunks_per_dim = Vec::with_capacity(shape.len());
+    for (&dim, &chunk_dim) in shape.iter().zip(chunk_dims) {
+        let chunks = ceil_div_nonzero_u64(dim, chunk_dim, "chunk count")?;
+        n_chunks_per_dim.push(
+            usize::try_from(chunks)
+                .map_err(|_| Error::InvalidFormat("chunk count does not fit in usize".into()))?,
+        );
+    }
+    let total_chunks = n_chunks_per_dim.iter().try_fold(1usize, |acc, &count| {
+        acc.checked_mul(count)
+            .ok_or_else(|| Error::InvalidFormat("total chunk count overflow".into()))
+    })?;
+    Ok((n_chunks_per_dim, total_chunks))
+}
+
+fn chunk_linear_index_from_coords(
+    n_chunks_per_dim: &[usize],
+    chunk_dims: &[u64],
+    coords: &[u64],
+) -> Result<usize> {
+    if n_chunks_per_dim.len() != chunk_dims.len() || coords.len() != chunk_dims.len() {
+        return Err(Error::InvalidFormat(
+            "chunk coordinate rank does not match chunk grid rank".into(),
+        ));
+    }
+    let mut index = 0usize;
+    for ((&coord, &chunk_dim), &chunks) in coords.iter().zip(chunk_dims).zip(n_chunks_per_dim) {
+        if chunk_dim == 0 {
+            return Err(Error::InvalidFormat("chunk dimension is zero".into()));
+        }
+        let chunk_coord = coord / chunk_dim;
+        let chunk_coord = usize_from_u64_writer(chunk_coord, "chunk coordinate index")?;
+        if chunk_coord >= chunks {
+            return Err(Error::InvalidFormat(
+                "chunk coordinate index exceeds chunk grid".into(),
+            ));
+        }
+        index = index
+            .checked_mul(chunks)
+            .and_then(|value| value.checked_add(chunk_coord))
+            .ok_or_else(|| Error::InvalidFormat("chunk linear index overflow".into()))?;
+    }
+    Ok(index)
+}
+
+fn chunk_coords_from_linear_index(
+    n_chunks_per_dim: &[usize],
+    chunk_dims: &[u64],
+    mut index: usize,
+) -> Result<Vec<u64>> {
+    if n_chunks_per_dim.len() != chunk_dims.len() {
+        return Err(Error::InvalidFormat(
+            "chunk grid rank does not match chunk dimensions".into(),
+        ));
+    }
+    let mut coords = vec![0u64; chunk_dims.len()];
+    for d in (0..chunk_dims.len()).rev() {
+        let chunks = n_chunks_per_dim[d];
+        if chunks == 0 {
+            return Err(Error::InvalidFormat("chunk grid dimension is zero".into()));
+        }
+        let chunk_coord = u64::try_from(index % chunks)
+            .map_err(|_| Error::InvalidFormat("chunk coordinate index exceeds u64".into()))?;
+        coords[d] = chunk_coord
+            .checked_mul(chunk_dims[d])
+            .ok_or_else(|| Error::InvalidFormat("chunk coordinate offset overflow".into()))?;
+        index /= chunks;
+    }
+    Ok(coords)
 }
 
 fn encode_chunk_payload(
@@ -2996,136 +3569,258 @@ impl<W: Write + Seek> HdfFileWriter<W> {
                 .ok_or_else(|| Error::InvalidFormat("total chunk count overflow".into()))
         })?;
 
-        // Write each chunk and collect v1 B-tree entries.
-        let mut chunk_entries: Vec<ChunkBTreeEntry> = Vec::with_capacity(total_chunks);
         let has_filters = compression_level.is_some() || shuffle || fletcher32;
+        let element_size_usize = element_size;
+        let element_size = u32::try_from(element_size_usize)
+            .map_err(|_| Error::InvalidFormat("chunk element size exceeds u32".into()))?;
+        let chunk_index_type =
+            h5d_chunk_idx_type_for_writer(spec.shape, spec.max_shape, total_chunks)?;
 
-        for chunk_idx in 0..total_chunks {
-            // Calculate chunk coordinates
-            let mut coords = vec![0u64; ndims];
-            let mut rem = chunk_idx;
-            for d in (0..ndims).rev() {
-                let chunk_coord = u64::try_from(rem % n_chunks_per_dim[d]).map_err(|_| {
-                    Error::InvalidFormat("chunk coordinate index exceeds u64".into())
+        let can_write_sequential_chunk_run = !has_filters
+            && total_chunks > 0
+            && chunk_grid_is_sequential_row_major(spec.shape, chunk_dims);
+        let sequential_chunk_run = if can_write_sequential_chunk_run {
+            let allocated_bytes = total_chunks
+                .checked_mul(chunk_raw_bytes)
+                .ok_or_else(|| Error::InvalidFormat("chunk payload size overflow".into()))?;
+            let addr = self.allocator.allocate(
+                u64::try_from(allocated_bytes)
+                    .map_err(|_| Error::InvalidFormat("chunk payload size exceeds u64".into()))?,
+                1,
+            );
+            self.write_at(addr, spec.data)?;
+            let padding = allocated_bytes
+                .checked_sub(spec.data.len())
+                .ok_or_else(|| {
+                    Error::InvalidFormat("chunk payload is smaller than dataset data".into())
                 })?;
-                coords[d] = chunk_coord.checked_mul(chunk_dims[d]).ok_or_else(|| {
-                    Error::InvalidFormat("chunk coordinate offset overflow".into())
-                })?;
-                rem /= n_chunks_per_dim[d];
-            }
-
-            let (addr, compressed_size) = if !has_filters && ndims == 1 {
-                let start = usize_from_u64_writer(coords[0], "chunk start")?;
-                let chunk_len = usize_from_u64_writer(chunk_dims[0], "chunk dimension")?;
-                let data_len = usize_from_u64_writer(spec.shape[0], "dataset dimension")?;
-                let remaining = data_len.checked_sub(start).ok_or_else(|| {
-                    Error::InvalidFormat("chunk start exceeds dataset dimension".into())
-                })?;
-                let copy_len = chunk_len.min(remaining);
-                let copy_bytes = copy_len
-                    .checked_mul(element_size)
-                    .ok_or_else(|| Error::InvalidFormat("chunk copy byte count overflow".into()))?;
-                let src_start = start
-                    .checked_mul(element_size)
-                    .ok_or_else(|| Error::InvalidFormat("chunk source offset overflow".into()))?;
-                let src_end = src_start
-                    .checked_add(copy_bytes)
-                    .ok_or_else(|| Error::InvalidFormat("chunk source offset overflow".into()))?;
-                let src = spec.data.get(src_start..src_end).ok_or_else(|| {
-                    Error::InvalidFormat("chunk source range exceeds data".into())
-                })?;
-                if copy_bytes == chunk_raw_bytes {
-                    let addr = self.allocator.allocate(
-                        u64::try_from(src.len())
-                            .map_err(|_| Error::InvalidFormat("chunk size exceeds u64".into()))?,
-                        1,
-                    );
-                    self.write_at(addr, src)?;
-                    let compressed_size = u32::try_from(src.len())
-                        .map_err(|_| Error::InvalidFormat("chunk size exceeds u32".into()))?;
-                    (addr, compressed_size)
-                } else {
-                    let mut chunk_buf = vec![0u8; chunk_raw_bytes];
-                    let dst = chunk_buf.get_mut(..copy_bytes).ok_or_else(|| {
-                        Error::InvalidFormat("chunk destination range exceeds output".into())
-                    })?;
-                    dst.copy_from_slice(src);
-                    let addr = self.allocator.allocate(
-                        u64::try_from(chunk_buf.len())
-                            .map_err(|_| Error::InvalidFormat("chunk size exceeds u64".into()))?,
-                        1,
-                    );
-                    self.write_at(addr, &chunk_buf)?;
-                    let compressed_size = u32::try_from(chunk_buf.len())
-                        .map_err(|_| Error::InvalidFormat("chunk size exceeds u32".into()))?;
-                    (addr, compressed_size)
+            if padding > 0 {
+                let zeroes = vec![0u8; padding.min(8192)];
+                let mut written = 0usize;
+                let start = addr
+                    .checked_add(u64::try_from(spec.data.len()).map_err(|_| {
+                        Error::InvalidFormat("chunk payload offset exceeds u64".into())
+                    })?)
+                    .ok_or_else(|| Error::InvalidFormat("chunk payload offset overflow".into()))?;
+                while written < padding {
+                    let step = (padding - written).min(zeroes.len());
+                    let offset = start
+                        .checked_add(u64::try_from(written).map_err(|_| {
+                            Error::InvalidFormat("chunk padding offset exceeds u64".into())
+                        })?)
+                        .ok_or_else(|| {
+                            Error::InvalidFormat("chunk padding offset overflow".into())
+                        })?;
+                    self.write_at(offset, &zeroes[..step])?;
+                    written += step;
                 }
-            } else {
-                // Extract chunk data from the source array
-                let mut chunk_buf = vec![0u8; chunk_raw_bytes];
-                self.extract_chunk(
-                    spec.data,
-                    spec.shape,
-                    &coords,
-                    chunk_dims,
-                    element_size,
-                    &mut chunk_buf,
-                )?;
-
-                let filtered = encode_chunk_payload(
-                    &chunk_buf,
-                    element_size,
-                    compression_level,
-                    shuffle,
-                    fletcher32,
-                )?;
-
-                let compressed_size = u32::try_from(filtered.len()).map_err(|_| {
-                    Error::InvalidFormat("compressed chunk size exceeds u32".into())
-                })?;
-                let addr = self.allocator.allocate(
-                    u64::try_from(filtered.len()).map_err(|_| {
-                        Error::InvalidFormat("compressed chunk size exceeds u64".into())
-                    })?,
-                    1,
-                );
-                self.write_at(addr, &filtered)?;
-                (addr, compressed_size)
-            };
-
-            chunk_entries.push(ChunkBTreeEntry {
-                coords,
-                chunk_size: compressed_size,
+            }
+            Some(ChunkIndexEntries::Sequential {
+                first_addr: addr,
+                chunk_size: u32::try_from(chunk_raw_bytes)
+                    .map_err(|_| Error::InvalidFormat("chunk size exceeds u32".into()))?,
                 filter_mask: 0,
-                child_addr: addr,
-            });
+                count: total_chunks,
+            })
+        } else {
+            None
+        };
+
+        // Write each chunk and collect entries for paths that cannot be represented
+        // as one contiguous unfiltered chunk run.
+        let mut chunk_entries: Vec<ChunkBTreeEntry> = Vec::new();
+        let mut chunk_extract_buf: Option<Vec<u8>> = None;
+        let chunk_extract_plan = if sequential_chunk_run.is_none() && ndims > 1 {
+            Some(ChunkExtractionPlan::new(
+                spec.shape,
+                chunk_dims,
+                element_size_usize,
+            )?)
+        } else {
+            None
+        };
+        let mut chunk_extract_scratch = chunk_extract_plan
+            .as_ref()
+            .map(ChunkExtractionPlan::scratch);
+        if sequential_chunk_run.is_none() {
+            chunk_entries.reserve(total_chunks);
+            for chunk_idx in 0..total_chunks {
+                let coords =
+                    chunk_coords_from_linear_index(&n_chunks_per_dim, chunk_dims, chunk_idx)?;
+
+                let (addr, compressed_size) = if !has_filters && ndims == 1 {
+                    let start = usize_from_u64_writer(coords[0], "chunk start")?;
+                    let chunk_len = usize_from_u64_writer(chunk_dims[0], "chunk dimension")?;
+                    let data_len = usize_from_u64_writer(spec.shape[0], "dataset dimension")?;
+                    let remaining = data_len.checked_sub(start).ok_or_else(|| {
+                        Error::InvalidFormat("chunk start exceeds dataset dimension".into())
+                    })?;
+                    let copy_len = chunk_len.min(remaining);
+                    let copy_bytes = copy_len.checked_mul(element_size_usize).ok_or_else(|| {
+                        Error::InvalidFormat("chunk copy byte count overflow".into())
+                    })?;
+                    let src_start = start.checked_mul(element_size_usize).ok_or_else(|| {
+                        Error::InvalidFormat("chunk source offset overflow".into())
+                    })?;
+                    let src_end = src_start.checked_add(copy_bytes).ok_or_else(|| {
+                        Error::InvalidFormat("chunk source offset overflow".into())
+                    })?;
+                    let src = spec.data.get(src_start..src_end).ok_or_else(|| {
+                        Error::InvalidFormat("chunk source range exceeds data".into())
+                    })?;
+                    if copy_bytes == chunk_raw_bytes {
+                        let addr = self.allocator.allocate(
+                            u64::try_from(src.len()).map_err(|_| {
+                                Error::InvalidFormat("chunk size exceeds u64".into())
+                            })?,
+                            1,
+                        );
+                        self.write_at(addr, src)?;
+                        let compressed_size = u32::try_from(src.len())
+                            .map_err(|_| Error::InvalidFormat("chunk size exceeds u32".into()))?;
+                        (addr, compressed_size)
+                    } else {
+                        let mut chunk_buf = vec![0u8; chunk_raw_bytes];
+                        let dst = chunk_buf.get_mut(..copy_bytes).ok_or_else(|| {
+                            Error::InvalidFormat("chunk destination range exceeds output".into())
+                        })?;
+                        dst.copy_from_slice(src);
+                        let addr = self.allocator.allocate(
+                            u64::try_from(chunk_buf.len()).map_err(|_| {
+                                Error::InvalidFormat("chunk size exceeds u64".into())
+                            })?,
+                            1,
+                        );
+                        self.write_at(addr, &chunk_buf)?;
+                        let compressed_size = u32::try_from(chunk_buf.len())
+                            .map_err(|_| Error::InvalidFormat("chunk size exceeds u32".into()))?;
+                        (addr, compressed_size)
+                    }
+                } else {
+                    let direct_payload = full_chunk_row_major_payload_slice(
+                        spec.data,
+                        spec.shape,
+                        &coords,
+                        chunk_dims,
+                        element_size_usize,
+                        chunk_raw_bytes,
+                    )?;
+                    let filtered = if let Some(chunk_data) = direct_payload {
+                        encode_chunk_payload(
+                            chunk_data,
+                            element_size_usize,
+                            compression_level,
+                            shuffle,
+                            fletcher32,
+                        )?
+                    } else {
+                        let chunk_buf =
+                            chunk_extract_buf.get_or_insert_with(|| vec![0u8; chunk_raw_bytes]);
+                        chunk_buf.fill(0);
+                        if !copy_row_major_slab_payload_into(
+                            spec.data,
+                            spec.shape,
+                            &coords,
+                            chunk_dims,
+                            element_size_usize,
+                            chunk_buf,
+                        )? {
+                            let extraction_plan = chunk_extract_plan.as_ref().ok_or_else(|| {
+                                Error::InvalidFormat(
+                                    "chunk extraction plan is missing for multidimensional chunk"
+                                        .into(),
+                                )
+                            })?;
+                            let extraction_scratch =
+                                chunk_extract_scratch.as_mut().ok_or_else(|| {
+                                    Error::InvalidFormat(
+                                        "chunk extraction scratch is missing for multidimensional chunk"
+                                            .into(),
+                                    )
+                                })?;
+                            self.extract_chunk(
+                                spec.data,
+                                &coords,
+                                extraction_plan,
+                                extraction_scratch,
+                                chunk_buf,
+                            )?;
+                        }
+                        encode_chunk_payload(
+                            chunk_buf,
+                            element_size_usize,
+                            compression_level,
+                            shuffle,
+                            fletcher32,
+                        )?
+                    };
+
+                    let compressed_size = u32::try_from(filtered.len()).map_err(|_| {
+                        Error::InvalidFormat("compressed chunk size exceeds u32".into())
+                    })?;
+                    let addr = self.allocator.allocate(
+                        u64::try_from(filtered.len()).map_err(|_| {
+                            Error::InvalidFormat("compressed chunk size exceeds u64".into())
+                        })?,
+                        1,
+                    );
+                    self.write_at(addr, &filtered)?;
+                    (addr, compressed_size)
+                };
+
+                chunk_entries.push(ChunkBTreeEntry {
+                    coords,
+                    chunk_size: compressed_size,
+                    filter_mask: 0,
+                    child_addr: addr,
+                });
+            }
+        } else if chunk_index_type == WriterChunkIndexType::BTreeV2 {
+            let sequential_entries = sequential_chunk_run.as_ref().ok_or_else(|| {
+                Error::InvalidFormat("sequential chunk index entries are missing".into())
+            })?;
+            chunk_entries.reserve(total_chunks);
+            for chunk_idx in 0..total_chunks {
+                let coords =
+                    chunk_coords_from_linear_index(&n_chunks_per_dim, chunk_dims, chunk_idx)?;
+                let (child_addr, chunk_size, filter_mask) =
+                    sequential_entries.entry_at(chunk_idx)?;
+                chunk_entries.push(ChunkBTreeEntry {
+                    coords,
+                    chunk_size,
+                    filter_mask,
+                    child_addr,
+                });
+            }
         }
 
-        let element_size = u32::try_from(element_size)
-            .map_err(|_| Error::InvalidFormat("chunk element size exceeds u32".into()))?;
-        let use_single_chunk_index = total_chunks == 1 && spec.max_shape.is_none();
-        let use_fixed_array_index = !use_single_chunk_index && spec.max_shape.is_none();
-        let use_extensible_array_index =
-            spec.max_shape.is_some() && total_chunks <= EXTENSIBLE_ARRAY_INDEX_BLOCK_ELEMENTS_LIMIT;
+        let materialized_chunk_entries;
+        let chunk_index_entries = if let Some(entries) = sequential_chunk_run.as_ref() {
+            entries
+        } else {
+            materialized_chunk_entries = ChunkIndexEntries::Materialized(&chunk_entries);
+            &materialized_chunk_entries
+        };
 
         let mut layout_bytes = Vec::new();
-        if use_single_chunk_index {
-            let entry = chunk_entries.first().ok_or_else(|| {
-                Error::InvalidFormat("single-chunk dataset is missing chunk entry".into())
-            })?;
+        if chunk_index_type == WriterChunkIndexType::SingleChunk {
+            let (child_addr, chunk_size, filter_mask) =
+                chunk_index_entries.entry_at(0).map_err(|_| {
+                    Error::InvalidFormat("single-chunk dataset is missing chunk entry".into())
+                })?;
             encode_single_chunk_layout_v4_into(
                 &mut layout_bytes,
-                entry.child_addr,
+                child_addr,
                 chunk_dims,
                 element_size,
-                has_filters.then_some(u64::from(entry.chunk_size)),
-                entry.filter_mask,
+                has_filters.then_some(u64::from(chunk_size)),
+                filter_mask,
                 self.sizeof_addr,
                 self.sizeof_size,
             )?;
-        } else if use_fixed_array_index {
+        } else if chunk_index_type == WriterChunkIndexType::FixedArray {
             let fixed_array_addr = self.write_fixed_array_chunk_index(
-                &chunk_entries,
+                chunk_index_entries,
                 FIXED_ARRAY_CHUNK_PAGE_BITS,
                 has_filters,
                 chunk_raw_bytes,
@@ -3138,13 +3833,15 @@ impl<W: Write + Seek> HdfFileWriter<W> {
                 FIXED_ARRAY_CHUNK_PAGE_BITS,
                 self.sizeof_addr,
             )?;
-        } else if use_extensible_array_index {
-            let index_block_elements = u8::try_from(total_chunks).map_err(|_| {
-                Error::InvalidFormat("extensible-array inline chunk count exceeds u8".into())
-            })?;
+        } else if chunk_index_type == WriterChunkIndexType::ExtensibleArray {
+            let index_block_elements =
+                u8::try_from(total_chunks.min(EXTENSIBLE_ARRAY_INDEX_BLOCK_ELEMENTS_LIMIT))
+                    .map_err(|_| {
+                        Error::InvalidFormat("extensible-array chunk count exceeds u8".into())
+                    })?;
             let max_elements_bits = extensible_array_max_elements_bits(total_chunks)?;
-            let extensible_array_addr = self.write_inline_extensible_array_chunk_index(
-                &chunk_entries,
+            let extensible_array_addr = self.write_extensible_array_chunk_index(
+                chunk_index_entries,
                 index_block_elements,
                 has_filters,
                 chunk_raw_bytes,
@@ -3159,13 +3856,26 @@ impl<W: Write + Seek> HdfFileWriter<W> {
                 index_block_elements,
                 1,
                 1,
-                1,
+                max_elements_bits.max(1),
                 self.sizeof_addr,
             )?;
-        } else {
-            return Err(Error::Unsupported(format!(
-                "max-shape chunked writer currently supports at most {EXTENSIBLE_ARRAY_INDEX_BLOCK_ELEMENTS_LIMIT} chunks with inline extensible-array indexing; larger chunk grids need full extensible-array or v2 B-tree index creation"
-            )));
+        } else if chunk_index_type == WriterChunkIndexType::BTreeV2 {
+            let btree_addr = self.write_btree_v2_chunk_index(
+                &chunk_entries,
+                chunk_dims,
+                has_filters,
+                chunk_raw_bytes,
+            )?;
+            encode_btree_v2_chunk_layout_v4_into(
+                &mut layout_bytes,
+                btree_addr,
+                chunk_dims,
+                element_size,
+                BTREE_V2_CHUNK_NODE_SIZE,
+                BTREE_V2_CHUNK_SPLIT_PERCENT,
+                BTREE_V2_CHUNK_MERGE_PERCENT,
+                self.sizeof_addr,
+            )?;
         }
 
         // Encode filter pipeline message
@@ -3260,9 +3970,9 @@ impl<W: Write + Seek> HdfFileWriter<W> {
         encode_dataspace_for_spec_into(&mut ds_bytes, spec)?;
         let element_size = usize::try_from(spec.dtype.size())
             .map_err(|_| Error::InvalidFormat("dataset element size exceeds usize".into()))?;
-        let ndims = spec.shape.len();
         validate_deflate_level(compression_level)?;
         let chunk_raw_bytes = validate_chunked_dataset_spec(spec, chunk_dims)?;
+        let (n_chunks_per_dim, total_chunks) = chunk_grid_counts(spec.shape, chunk_dims)?;
 
         let mut seen = HashSet::with_capacity(chunks.len());
         let mut chunk_entries = Vec::with_capacity(chunks.len());
@@ -3310,17 +4020,107 @@ impl<W: Write + Seek> HdfFileWriter<W> {
 
         let element_size_u32 = u32::try_from(element_size)
             .map_err(|_| Error::InvalidFormat("chunk element size exceeds u32".into()))?;
-        let btree_addr =
-            self.write_chunk_btree_entries_v1(&chunk_entries, ndims, element_size_u32)?;
 
         let mut layout_bytes = Vec::new();
-        encode_chunked_layout_v3_into(
-            &mut layout_bytes,
-            btree_addr,
-            chunk_dims,
-            element_size_u32,
-            self.sizeof_addr,
-        )?;
+        let has_filters = compression_level.is_some() || shuffle || fletcher32;
+        let chunk_index_type =
+            h5d_chunk_idx_type_for_writer(spec.shape, spec.max_shape, total_chunks)?;
+
+        if chunk_index_type != WriterChunkIndexType::BTreeV2 {
+            let mut linear_slots = vec![None; total_chunks];
+            for entry in &chunk_entries {
+                let linear_index =
+                    chunk_linear_index_from_coords(&n_chunks_per_dim, chunk_dims, &entry.coords)?;
+                let slot = linear_slots.get_mut(linear_index).ok_or_else(|| {
+                    Error::InvalidFormat("chunk linear index exceeds chunk grid".into())
+                })?;
+                *slot = Some(entry.clone());
+            }
+            let linear_entries = ChunkIndexEntries::LinearSlots {
+                slots: &linear_slots,
+            };
+
+            if chunk_index_type == WriterChunkIndexType::SingleChunk {
+                let (child_addr, chunk_size, filter_mask) =
+                    linear_entries.entry_at(0).map_err(|_| {
+                        Error::InvalidFormat("single-chunk dataset is missing chunk entry".into())
+                    })?;
+                if child_addr == UNDEF_ADDR {
+                    return Err(Error::InvalidFormat(
+                        "single-chunk explicit dataset is missing its only chunk".into(),
+                    ));
+                }
+                encode_single_chunk_layout_v4_into(
+                    &mut layout_bytes,
+                    child_addr,
+                    chunk_dims,
+                    element_size_u32,
+                    has_filters.then_some(u64::from(chunk_size)),
+                    filter_mask,
+                    self.sizeof_addr,
+                    self.sizeof_size,
+                )?;
+            } else if chunk_index_type == WriterChunkIndexType::FixedArray {
+                let fixed_array_addr = self.write_fixed_array_chunk_index(
+                    &linear_entries,
+                    FIXED_ARRAY_CHUNK_PAGE_BITS,
+                    has_filters,
+                    chunk_raw_bytes,
+                )?;
+                encode_fixed_array_chunk_layout_v4_into(
+                    &mut layout_bytes,
+                    fixed_array_addr,
+                    chunk_dims,
+                    element_size_u32,
+                    FIXED_ARRAY_CHUNK_PAGE_BITS,
+                    self.sizeof_addr,
+                )?;
+            } else {
+                debug_assert_eq!(chunk_index_type, WriterChunkIndexType::ExtensibleArray);
+                let index_block_elements =
+                    u8::try_from(total_chunks.min(EXTENSIBLE_ARRAY_INDEX_BLOCK_ELEMENTS_LIMIT))
+                        .map_err(|_| {
+                            Error::InvalidFormat("extensible-array chunk count exceeds u8".into())
+                        })?;
+                let max_elements_bits = extensible_array_max_elements_bits(total_chunks)?;
+                let extensible_array_addr = self.write_extensible_array_chunk_index(
+                    &linear_entries,
+                    index_block_elements,
+                    has_filters,
+                    chunk_raw_bytes,
+                    max_elements_bits,
+                )?;
+                encode_extensible_array_chunk_layout_v4_into(
+                    &mut layout_bytes,
+                    extensible_array_addr,
+                    chunk_dims,
+                    element_size_u32,
+                    max_elements_bits,
+                    index_block_elements,
+                    1,
+                    1,
+                    max_elements_bits.max(1),
+                    self.sizeof_addr,
+                )?;
+            }
+        } else {
+            let btree_addr = self.write_btree_v2_chunk_index(
+                &chunk_entries,
+                chunk_dims,
+                has_filters,
+                chunk_raw_bytes,
+            )?;
+            encode_btree_v2_chunk_layout_v4_into(
+                &mut layout_bytes,
+                btree_addr,
+                chunk_dims,
+                element_size_u32,
+                BTREE_V2_CHUNK_NODE_SIZE,
+                BTREE_V2_CHUNK_SPLIT_PERCENT,
+                BTREE_V2_CHUNK_MERGE_PERCENT,
+                self.sizeof_addr,
+            )?;
+        }
 
         let mut pipeline_bytes = Vec::new();
         encode_filter_pipeline_into(&mut pipeline_bytes, compression_level, shuffle, fletcher32)?;
@@ -3402,17 +4202,70 @@ impl<W: Write + Seek> HdfFileWriter<W> {
             .map_err(|_| Error::InvalidFormat("dataset element size exceeds usize".into()))?;
         validate_deflate_level(compression_level)?;
         validate_chunked_dataset_spec(spec, chunk_dims)?;
+        let (_n_chunks_per_dim, total_chunks) = chunk_grid_counts(spec.shape, chunk_dims)?;
 
         let element_size_u32 = u32::try_from(element_size)
             .map_err(|_| Error::InvalidFormat("chunk element size exceeds u32".into()))?;
         let mut layout_bytes = Vec::new();
-        encode_chunked_layout_v3_into(
-            &mut layout_bytes,
-            UNDEF_ADDR,
-            chunk_dims,
-            element_size_u32,
-            self.sizeof_addr,
-        )?;
+        let chunk_index_type =
+            h5d_chunk_idx_type_for_writer(spec.shape, spec.max_shape, total_chunks)?;
+        match chunk_index_type {
+            WriterChunkIndexType::SingleChunk => {
+                encode_single_chunk_layout_v4_into(
+                    &mut layout_bytes,
+                    UNDEF_ADDR,
+                    chunk_dims,
+                    element_size_u32,
+                    None,
+                    0,
+                    self.sizeof_addr,
+                    self.sizeof_size,
+                )?;
+            }
+            WriterChunkIndexType::FixedArray => {
+                encode_fixed_array_chunk_layout_v4_into(
+                    &mut layout_bytes,
+                    UNDEF_ADDR,
+                    chunk_dims,
+                    element_size_u32,
+                    FIXED_ARRAY_CHUNK_PAGE_BITS,
+                    self.sizeof_addr,
+                )?;
+            }
+            WriterChunkIndexType::ExtensibleArray => {
+                let index_elements = total_chunks.max(1);
+                let index_block_elements =
+                    index_elements.min(EXTENSIBLE_ARRAY_INDEX_BLOCK_ELEMENTS_LIMIT);
+                let index_block_elements = u8::try_from(index_block_elements).map_err(|_| {
+                    Error::InvalidFormat("extensible-array chunk count exceeds u8".into())
+                })?;
+                let max_elements_bits = extensible_array_max_elements_bits(index_elements)?;
+                encode_extensible_array_chunk_layout_v4_into(
+                    &mut layout_bytes,
+                    UNDEF_ADDR,
+                    chunk_dims,
+                    element_size_u32,
+                    max_elements_bits,
+                    index_block_elements,
+                    1,
+                    1,
+                    max_elements_bits.max(1),
+                    self.sizeof_addr,
+                )?;
+            }
+            WriterChunkIndexType::BTreeV2 => {
+                encode_btree_v2_chunk_layout_v4_into(
+                    &mut layout_bytes,
+                    UNDEF_ADDR,
+                    chunk_dims,
+                    element_size_u32,
+                    BTREE_V2_CHUNK_NODE_SIZE,
+                    BTREE_V2_CHUNK_SPLIT_PERCENT,
+                    BTREE_V2_CHUNK_MERGE_PERCENT,
+                    self.sizeof_addr,
+                )?;
+            }
+        }
 
         let mut pipeline_bytes = Vec::new();
         encode_filter_pipeline_into(&mut pipeline_bytes, compression_level, shuffle, fletcher32)?;
@@ -3472,121 +4325,12 @@ impl<W: Write + Seek> HdfFileWriter<W> {
     fn extract_chunk(
         &self,
         data: &[u8],
-        shape: &[u64],
         chunk_start: &[u64],
-        chunk_dims: &[u64],
-        element_size: usize,
+        plan: &ChunkExtractionPlan,
+        scratch: &mut ChunkExtractionScratch,
         out: &mut [u8],
     ) -> Result<()> {
-        let ndims = shape.len();
-        if chunk_start.len() != ndims || chunk_dims.len() != ndims {
-            return Err(Error::InvalidFormat(
-                "chunk rank does not match dataset rank".into(),
-            ));
-        }
-        if element_size == 0 {
-            return Err(Error::InvalidFormat("chunk element size is zero".into()));
-        }
-        if ndims == 1 {
-            // Fast path for 1D
-            let start = usize_from_u64_writer(chunk_start[0], "chunk start")?;
-            let chunk_len = usize_from_u64_writer(chunk_dims[0], "chunk dimension")?;
-            let data_len = usize_from_u64_writer(shape[0], "dataset dimension")?;
-            let remaining = data_len.checked_sub(start).ok_or_else(|| {
-                Error::InvalidFormat("chunk start exceeds dataset dimension".into())
-            })?;
-            let copy_len = chunk_len.min(remaining);
-            let copy_bytes = copy_len
-                .checked_mul(element_size)
-                .ok_or_else(|| Error::InvalidFormat("chunk copy byte count overflow".into()))?;
-            let src_start = start
-                .checked_mul(element_size)
-                .ok_or_else(|| Error::InvalidFormat("chunk source offset overflow".into()))?;
-            let src_end = src_start
-                .checked_add(copy_bytes)
-                .ok_or_else(|| Error::InvalidFormat("chunk source offset overflow".into()))?;
-            let src = data
-                .get(src_start..src_end)
-                .ok_or_else(|| Error::InvalidFormat("chunk source range exceeds data".into()))?;
-            let dst = out.get_mut(..copy_bytes).ok_or_else(|| {
-                Error::InvalidFormat("chunk destination range exceeds output".into())
-            })?;
-            dst.copy_from_slice(src);
-        } else {
-            // General N-D: iterate over elements
-            let chunk_dim_usizes = chunk_dims
-                .iter()
-                .map(|&dim| usize_from_u64_writer(dim, "chunk dimension"))
-                .collect::<Result<Vec<_>>>()?;
-            let shape_usizes = shape
-                .iter()
-                .map(|&dim| usize_from_u64_writer(dim, "dataset dimension"))
-                .collect::<Result<Vec<_>>>()?;
-            let chunk_start_usizes = chunk_start
-                .iter()
-                .map(|&dim| usize_from_u64_writer(dim, "chunk start"))
-                .collect::<Result<Vec<_>>>()?;
-            let chunk_elements = chunk_dim_usizes.iter().try_fold(1usize, |acc, &dim| {
-                acc.checked_mul(dim)
-                    .ok_or_else(|| Error::InvalidFormat("chunk element count overflow".into()))
-            })?;
-            let mut idx = vec![0usize; ndims];
-
-            for elem in 0..chunk_elements {
-                // Convert linear index within chunk to N-D
-                let mut rem = elem;
-                for d in (0..ndims).rev() {
-                    idx[d] = rem % chunk_dim_usizes[d];
-                    rem /= chunk_dim_usizes[d];
-                }
-
-                // Global position
-                let mut in_bounds = true;
-                let mut src_linear = 0usize;
-                let mut stride = 1usize;
-                for d in (0..ndims).rev() {
-                    let global = chunk_start_usizes[d].checked_add(idx[d]).ok_or_else(|| {
-                        Error::InvalidFormat("chunk global coordinate overflow".into())
-                    })?;
-                    if global >= shape_usizes[d] {
-                        in_bounds = false;
-                        break;
-                    }
-                    let contribution = global.checked_mul(stride).ok_or_else(|| {
-                        Error::InvalidFormat("chunk source linear offset overflow".into())
-                    })?;
-                    src_linear = src_linear.checked_add(contribution).ok_or_else(|| {
-                        Error::InvalidFormat("chunk source linear offset overflow".into())
-                    })?;
-                    stride = stride.checked_mul(shape_usizes[d]).ok_or_else(|| {
-                        Error::InvalidFormat("chunk source stride overflow".into())
-                    })?;
-                }
-
-                if in_bounds {
-                    let src_offset = src_linear.checked_mul(element_size).ok_or_else(|| {
-                        Error::InvalidFormat("chunk source byte offset overflow".into())
-                    })?;
-                    let dst_offset = elem.checked_mul(element_size).ok_or_else(|| {
-                        Error::InvalidFormat("chunk destination byte offset overflow".into())
-                    })?;
-                    let src_end = src_offset.checked_add(element_size).ok_or_else(|| {
-                        Error::InvalidFormat("chunk source byte offset overflow".into())
-                    })?;
-                    let dst_end = dst_offset.checked_add(element_size).ok_or_else(|| {
-                        Error::InvalidFormat("chunk destination byte offset overflow".into())
-                    })?;
-                    let src = data.get(src_offset..src_end).ok_or_else(|| {
-                        Error::InvalidFormat("chunk source range exceeds data".into())
-                    })?;
-                    let dst = out.get_mut(dst_offset..dst_end).ok_or_else(|| {
-                        Error::InvalidFormat("chunk destination range exceeds output".into())
-                    })?;
-                    dst.copy_from_slice(src);
-                }
-            }
-        }
-        Ok(())
+        plan.copy_into(data, chunk_start, out, scratch)
     }
 
     /// Write the leaf entries of a v1 chunk B-tree.
@@ -3752,10 +4496,101 @@ impl<W: Write + Seek> HdfFileWriter<W> {
         Ok(buf)
     }
 
-    /// Write a v4 fixed-array chunk index for a fully materialized chunk grid.
-    fn write_fixed_array_chunk_index(
+    /// Write a v4 v2-B-tree chunk index for explicitly materialized chunks.
+    fn write_btree_v2_chunk_index(
         &mut self,
         entries: &[ChunkBTreeEntry],
+        chunk_dims: &[u64],
+        filtered: bool,
+        unfiltered_chunk_bytes: usize,
+    ) -> Result<u64> {
+        if entries.is_empty() {
+            return Err(Error::InvalidFormat(
+                "cannot write empty v2 B-tree chunk index".into(),
+            ));
+        }
+        let chunk_size_len = if filtered {
+            filtered_chunk_size_len_v4(unfiltered_chunk_bytes)
+        } else {
+            0
+        };
+        let sizeof_addr = usize::from(self.sizeof_addr);
+        let tree_type = if filtered { 11 } else { 10 };
+        let mut records = Vec::with_capacity(entries.len());
+        for entry in entries {
+            records.push(Self::encode_btree_v2_chunk_record(
+                entry,
+                chunk_dims,
+                filtered,
+                chunk_size_len,
+                sizeof_addr,
+            )?);
+        }
+        self.write_dense_name_btree(tree_type, &records)
+    }
+
+    fn encode_btree_v2_chunk_record(
+        entry: &ChunkBTreeEntry,
+        chunk_dims: &[u64],
+        filtered: bool,
+        chunk_size_len: usize,
+        sizeof_addr: usize,
+    ) -> Result<Vec<u8>> {
+        if entry.coords.len() != chunk_dims.len() {
+            return Err(Error::InvalidFormat(
+                "chunk coordinate rank does not match chunk dimensions".into(),
+            ));
+        }
+        let coord_bytes = chunk_dims
+            .len()
+            .checked_mul(8)
+            .ok_or_else(|| Error::InvalidFormat("v2 B-tree chunk record size overflow".into()))?;
+        let filtered_bytes = if filtered {
+            chunk_size_len.checked_add(4).ok_or_else(|| {
+                Error::InvalidFormat("v2 B-tree chunk record size overflow".into())
+            })?
+        } else {
+            0
+        };
+        let record_size = checked_usize_sum_writer(
+            &[sizeof_addr, filtered_bytes, coord_bytes],
+            "v2 B-tree chunk record size",
+        )?;
+        if u16::try_from(record_size).is_err() {
+            return Err(Error::InvalidFormat(
+                "v2 B-tree chunk record size exceeds u16".into(),
+            ));
+        }
+
+        let mut record = Vec::with_capacity(record_size);
+        append_encoded_addr(&mut record, entry.child_addr, sizeof_addr as u8)?;
+        if filtered {
+            append_encoded_uint(
+                &mut record,
+                u64::from(entry.chunk_size),
+                chunk_size_len,
+                "v2 B-tree filtered chunk size",
+            )?;
+            record.extend_from_slice(&entry.filter_mask.to_le_bytes());
+        }
+        for (&coord, &chunk_dim) in entry.coords.iter().zip(chunk_dims) {
+            if chunk_dim == 0 {
+                return Err(Error::InvalidFormat("chunk dimension is zero".into()));
+            }
+            if coord % chunk_dim != 0 {
+                return Err(Error::InvalidFormat(
+                    "chunk coordinate is not aligned to chunk dimension".into(),
+                ));
+            }
+            record.extend_from_slice(&(coord / chunk_dim).to_le_bytes());
+        }
+        Ok(record)
+    }
+
+    /// Write a v4 fixed-array chunk index for a full chunk grid.
+    fn write_fixed_array_chunk_index(
+        &mut self,
+        entries: &ChunkIndexEntries<'_>,
         page_bits: u8,
         filtered: bool,
         unfiltered_chunk_bytes: usize,
@@ -3796,9 +4631,10 @@ impl<W: Write + Seek> HdfFileWriter<W> {
             checked_usize_sum_writer(&[4, 1, 1, 1, 1, ss, sa, 4], "fixed-array chunk header size")?;
         let prefix_payload_len =
             checked_usize_sum_writer(&[4, 1, 1, sa], "fixed-array chunk data block prefix size")?;
-        let paginated = entries.len() > page_elements;
+        let entry_count = entries.len();
+        let paginated = entry_count > page_elements;
         let data_block_len = if paginated {
-            let page_count = entries.len().div_ceil(page_elements);
+            let page_count = entry_count.div_ceil(page_elements);
             let page_init_len = page_count.div_ceil(8);
             let page_payload_len =
                 page_elements.checked_mul(raw_element_size).ok_or_else(|| {
@@ -3814,7 +4650,7 @@ impl<W: Write + Seek> HdfFileWriter<W> {
                 "fixed-array chunk data block size",
             )?
         } else {
-            let payload_len = entries.len().checked_mul(raw_element_size).ok_or_else(|| {
+            let payload_len = entry_count.checked_mul(raw_element_size).ok_or_else(|| {
                 Error::InvalidFormat("fixed-array chunk payload size overflow".into())
             })?;
             checked_usize_sum_writer(
@@ -3838,7 +4674,7 @@ impl<W: Write + Seek> HdfFileWriter<W> {
         data_block.push(class_id);
         append_encoded_addr(&mut data_block, header_addr, self.sizeof_addr)?;
         if paginated {
-            let page_count = entries.len().div_ceil(page_elements);
+            let page_count = entry_count.div_ceil(page_elements);
             let page_init_len = page_count.div_ceil(8);
             let page_init_start = data_block.len();
             data_block.resize(page_init_start + page_init_len, 0);
@@ -3857,18 +4693,23 @@ impl<W: Write + Seek> HdfFileWriter<W> {
                 page_elements.checked_mul(raw_element_size).ok_or_else(|| {
                     Error::InvalidFormat("fixed-array chunk page payload size overflow".into())
                 })?;
-            for page_entries in entries.chunks(page_elements) {
+            for page_index in 0..page_count {
                 let page_start = data_block.len();
-                for entry in page_entries {
-                    append_encoded_addr(&mut data_block, entry.child_addr, self.sizeof_addr)?;
+                let entry_start = page_index.checked_mul(page_elements).ok_or_else(|| {
+                    Error::InvalidFormat("fixed-array page start overflow".into())
+                })?;
+                let entry_end = entry_start.saturating_add(page_elements).min(entry_count);
+                for entry_index in entry_start..entry_end {
+                    let (child_addr, chunk_size, filter_mask) = entries.entry_at(entry_index)?;
+                    append_encoded_addr(&mut data_block, child_addr, self.sizeof_addr)?;
                     if filtered {
                         append_encoded_uint(
                             &mut data_block,
-                            u64::from(entry.chunk_size),
+                            u64::from(chunk_size),
                             chunk_size_len,
                             "fixed-array filtered chunk size",
                         )?;
-                        data_block.extend_from_slice(&entry.filter_mask.to_le_bytes());
+                        data_block.extend_from_slice(&filter_mask.to_le_bytes());
                     }
                 }
                 data_block.resize(page_start + page_payload_len, 0);
@@ -3876,16 +4717,17 @@ impl<W: Write + Seek> HdfFileWriter<W> {
                 data_block.extend_from_slice(&page_checksum.to_le_bytes());
             }
         } else {
-            for entry in entries {
-                append_encoded_addr(&mut data_block, entry.child_addr, self.sizeof_addr)?;
+            for entry_index in 0..entry_count {
+                let (child_addr, chunk_size, filter_mask) = entries.entry_at(entry_index)?;
+                append_encoded_addr(&mut data_block, child_addr, self.sizeof_addr)?;
                 if filtered {
                     append_encoded_uint(
                         &mut data_block,
-                        u64::from(entry.chunk_size),
+                        u64::from(chunk_size),
                         chunk_size_len,
                         "fixed-array filtered chunk size",
                     )?;
-                    data_block.extend_from_slice(&entry.filter_mask.to_le_bytes());
+                    data_block.extend_from_slice(&filter_mask.to_le_bytes());
                 }
             }
             let data_checksum = checksum_metadata(&data_block);
@@ -3901,7 +4743,7 @@ impl<W: Write + Seek> HdfFileWriter<W> {
         header.push(page_bits);
         append_encoded_size(
             &mut header,
-            u64_from_usize_writer(entries.len(), "fixed-array chunk element count")?,
+            u64_from_usize_writer(entry_count, "fixed-array chunk element count")?,
             self.sizeof_size,
         )?;
         append_encoded_addr(&mut header, data_block_addr, self.sizeof_addr)?;
@@ -3912,10 +4754,33 @@ impl<W: Write + Seek> HdfFileWriter<W> {
         Ok(header_addr)
     }
 
-    /// Write a v4 extensible-array chunk index whose chunks fit in the index block.
-    fn write_inline_extensible_array_chunk_index(
+    /// Append one v4 extensible-array chunk-index element.
+    fn append_extensible_array_chunk_element(
+        out: &mut Vec<u8>,
+        entries: &ChunkIndexEntries<'_>,
+        entry_index: usize,
+        filtered: bool,
+        chunk_size_len: usize,
+        sizeof_addr: u8,
+    ) -> Result<()> {
+        let (child_addr, chunk_size, filter_mask) = entries.entry_at(entry_index)?;
+        append_encoded_addr(out, child_addr, sizeof_addr)?;
+        if filtered {
+            append_encoded_uint(
+                out,
+                u64::from(chunk_size),
+                chunk_size_len,
+                "extensible-array filtered chunk size",
+            )?;
+            out.extend_from_slice(&filter_mask.to_le_bytes());
+        }
+        Ok(())
+    }
+
+    /// Write a v4 extensible-array chunk index, including super/data block spillover.
+    fn write_extensible_array_chunk_index(
         &mut self,
-        entries: &[ChunkBTreeEntry],
+        entries: &ChunkIndexEntries<'_>,
         index_block_elements: u8,
         filtered: bool,
         unfiltered_chunk_bytes: usize,
@@ -3928,9 +4793,10 @@ impl<W: Write + Seek> HdfFileWriter<W> {
                 "cannot write empty extensible-array chunk index".into(),
             ));
         }
-        if usize::from(index_block_elements) != entries.len() {
+        let entry_count = entries.len();
+        if usize::from(index_block_elements) > entry_count {
             return Err(Error::InvalidFormat(
-                "inline extensible-array chunk count mismatch".into(),
+                "extensible-array index block has more elements than the chunk grid".into(),
             ));
         }
         let chunk_size_len = if filtered {
@@ -3950,16 +4816,56 @@ impl<W: Write + Seek> HdfFileWriter<W> {
             Error::InvalidFormat("extensible-array raw element size exceeds u8".into())
         })?;
         let class_id = if filtered { 1 } else { 0 };
+        let array_offset_size = usize::from(max_elements_bits.div_ceil(8));
         let super_block_addr_count =
             usize::from(max_elements_bits)
                 .checked_add(1)
                 .ok_or_else(|| {
                     Error::InvalidFormat("extensible-array super block count overflow".into())
                 })?;
+        let data_block_min_elements = 1usize;
+        let mut super_block_info = Vec::with_capacity(super_block_addr_count);
+        let mut start_index = 0usize;
+        for block_index in 0..super_block_addr_count {
+            let data_blocks = 1usize
+                .checked_shl(u32::try_from(block_index / 2).map_err(|_| {
+                    Error::InvalidFormat("extensible-array data block shift overflow".into())
+                })?)
+                .ok_or_else(|| {
+                    Error::InvalidFormat("extensible-array data block count overflow".into())
+                })?;
+            let data_block_elements = data_block_min_elements
+                .checked_mul(
+                    1usize
+                        .checked_shl(u32::try_from(block_index.div_ceil(2)).map_err(|_| {
+                            Error::InvalidFormat(
+                                "extensible-array data block element shift overflow".into(),
+                            )
+                        })?)
+                        .ok_or_else(|| {
+                            Error::InvalidFormat(
+                                "extensible-array data block element count overflow".into(),
+                            )
+                        })?,
+                )
+                .ok_or_else(|| {
+                    Error::InvalidFormat("extensible-array data block size overflow".into())
+                })?;
+            super_block_info.push((start_index, data_blocks, data_block_elements));
+            let span = data_blocks
+                .checked_mul(data_block_elements)
+                .ok_or_else(|| {
+                    Error::InvalidFormat("extensible-array super block span overflow".into())
+                })?;
+            start_index = start_index.checked_add(span).ok_or_else(|| {
+                Error::InvalidFormat("extensible-array super block start overflow".into())
+            })?;
+        }
 
         let header_len =
             checked_usize_sum_writer(&[4, 8, ss * 6, sa, 4], "extensible-array chunk header size")?;
-        let inline_bytes = entries.len().checked_mul(raw_element_size).ok_or_else(|| {
+        let inline_count = usize::from(index_block_elements);
+        let inline_bytes = inline_count.checked_mul(raw_element_size).ok_or_else(|| {
             Error::InvalidFormat("extensible-array inline element bytes overflow".into())
         })?;
         let super_block_addr_bytes = super_block_addr_count.checked_mul(sa).ok_or_else(|| {
@@ -3969,6 +4875,7 @@ impl<W: Write + Seek> HdfFileWriter<W> {
             &[4, 1, 1, sa, inline_bytes, super_block_addr_bytes, 4],
             "extensible-array chunk index block size",
         )?;
+        let max_data_block_page_elements_bits = max_elements_bits.max(1);
 
         let header_addr = self.allocator.allocate(
             u64_from_usize_writer(header_len, "extensible-array chunk header size")?,
@@ -3979,25 +4886,171 @@ impl<W: Write + Seek> HdfFileWriter<W> {
             8,
         );
 
+        let mut super_block_addrs = vec![UNDEF_ADDR; super_block_addr_count];
+        let mut super_block_count = 0usize;
+        let mut super_block_size_total = 0usize;
+        let mut data_block_count = 0usize;
+        let mut data_block_size_total = 0usize;
+        let spillover_base = inline_count;
+        for (super_index, &(super_start, data_blocks, data_block_elements)) in
+            super_block_info.iter().enumerate()
+        {
+            let super_global_start = spillover_base.checked_add(super_start).ok_or_else(|| {
+                Error::InvalidFormat("extensible-array super block start overflow".into())
+            })?;
+            if super_global_start >= entry_count {
+                break;
+            }
+            let data_block_payload = data_block_elements
+                .checked_mul(raw_element_size)
+                .ok_or_else(|| {
+                    Error::InvalidFormat("extensible-array data block payload overflow".into())
+                })?;
+            let data_block_len = checked_usize_sum_writer(
+                &[4, 1, 1, sa, array_offset_size, data_block_payload, 4],
+                "extensible-array data block size",
+            )?;
+            let mut data_block_addrs = Vec::with_capacity(data_blocks);
+            for local_data_block in 0..data_blocks {
+                let data_global_start = super_global_start
+                    .checked_add(
+                        local_data_block
+                            .checked_mul(data_block_elements)
+                            .ok_or_else(|| {
+                                Error::InvalidFormat(
+                                    "extensible-array data block start overflow".into(),
+                                )
+                            })?,
+                    )
+                    .ok_or_else(|| {
+                        Error::InvalidFormat("extensible-array data block start overflow".into())
+                    })?;
+                if data_global_start >= entry_count {
+                    data_block_addrs.push(UNDEF_ADDR);
+                    continue;
+                }
+                let data_block_addr = self.allocator.allocate(
+                    u64_from_usize_writer(data_block_len, "extensible-array data block size")?,
+                    8,
+                );
+                let mut data_block = Vec::with_capacity(data_block_len);
+                data_block.extend_from_slice(b"EADB");
+                data_block.push(0); // version
+                data_block.push(class_id);
+                append_encoded_addr(&mut data_block, header_addr, self.sizeof_addr)?;
+                append_encoded_uint(
+                    &mut data_block,
+                    u64_from_usize_writer(data_global_start, "extensible-array data block offset")?,
+                    array_offset_size,
+                    "extensible-array data block offset",
+                )?;
+                for element_index in 0..data_block_elements {
+                    let entry_index =
+                        data_global_start
+                            .checked_add(element_index)
+                            .ok_or_else(|| {
+                                Error::InvalidFormat(
+                                    "extensible-array element index overflow".into(),
+                                )
+                            })?;
+                    if entry_index < entry_count {
+                        Self::append_extensible_array_chunk_element(
+                            &mut data_block,
+                            entries,
+                            entry_index,
+                            filtered,
+                            chunk_size_len,
+                            self.sizeof_addr,
+                        )?;
+                    } else {
+                        append_encoded_addr(&mut data_block, UNDEF_ADDR, self.sizeof_addr)?;
+                        if filtered {
+                            data_block.resize(data_block.len() + chunk_size_len + 4, 0);
+                        }
+                    }
+                }
+                let data_checksum = checksum_metadata(&data_block);
+                data_block.extend_from_slice(&data_checksum.to_le_bytes());
+                self.write_at(data_block_addr, &data_block)?;
+                data_block_addrs.push(data_block_addr);
+                data_block_count += 1;
+                data_block_size_total = data_block_size_total
+                    .checked_add(data_block_len)
+                    .ok_or_else(|| {
+                        Error::InvalidFormat(
+                            "extensible-array data block total size overflow".into(),
+                        )
+                    })?;
+            }
+
+            let page_init_size = 0usize;
+            let page_init_len = data_blocks.checked_mul(page_init_size).ok_or_else(|| {
+                Error::InvalidFormat("extensible-array super block page-init overflow".into())
+            })?;
+            let super_block_addr_bytes = data_blocks.checked_mul(sa).ok_or_else(|| {
+                Error::InvalidFormat("extensible-array super block address bytes overflow".into())
+            })?;
+            let super_block_len = checked_usize_sum_writer(
+                &[
+                    4,
+                    1,
+                    1,
+                    sa,
+                    array_offset_size,
+                    page_init_len,
+                    super_block_addr_bytes,
+                    4,
+                ],
+                "extensible-array super block size",
+            )?;
+            let super_block_addr = self.allocator.allocate(
+                u64_from_usize_writer(super_block_len, "extensible-array super block size")?,
+                8,
+            );
+            let mut super_block = Vec::with_capacity(super_block_len);
+            super_block.extend_from_slice(b"EASB");
+            super_block.push(0); // version
+            super_block.push(class_id);
+            append_encoded_addr(&mut super_block, header_addr, self.sizeof_addr)?;
+            append_encoded_uint(
+                &mut super_block,
+                u64_from_usize_writer(super_global_start, "extensible-array super block offset")?,
+                array_offset_size,
+                "extensible-array super block offset",
+            )?;
+            super_block.resize(super_block.len() + page_init_len, 0);
+            for addr in data_block_addrs {
+                append_encoded_addr(&mut super_block, addr, self.sizeof_addr)?;
+            }
+            let super_checksum = checksum_metadata(&super_block);
+            super_block.extend_from_slice(&super_checksum.to_le_bytes());
+            self.write_at(super_block_addr, &super_block)?;
+            super_block_addrs[super_index] = super_block_addr;
+            super_block_count += 1;
+            super_block_size_total = super_block_size_total
+                .checked_add(super_block_len)
+                .ok_or_else(|| {
+                    Error::InvalidFormat("extensible-array super block total size overflow".into())
+                })?;
+        }
+
         let mut index = Vec::with_capacity(index_block_len);
         index.extend_from_slice(b"EAIB");
         index.push(0); // version
         index.push(class_id);
         append_encoded_addr(&mut index, header_addr, self.sizeof_addr)?;
-        for entry in entries {
-            append_encoded_addr(&mut index, entry.child_addr, self.sizeof_addr)?;
-            if filtered {
-                append_encoded_uint(
-                    &mut index,
-                    u64::from(entry.chunk_size),
-                    chunk_size_len,
-                    "extensible-array filtered chunk size",
-                )?;
-                index.extend_from_slice(&entry.filter_mask.to_le_bytes());
-            }
+        for entry_index in 0..inline_count {
+            Self::append_extensible_array_chunk_element(
+                &mut index,
+                entries,
+                entry_index,
+                filtered,
+                chunk_size_len,
+                self.sizeof_addr,
+            )?;
         }
-        for _ in 0..super_block_addr_count {
-            append_encoded_addr(&mut index, UNDEF_ADDR, self.sizeof_addr)?;
+        for addr in super_block_addrs {
+            append_encoded_addr(&mut index, addr, self.sizeof_addr)?;
         }
         let index_checksum = checksum_metadata(&index);
         index.extend_from_slice(&index_checksum.to_le_bytes());
@@ -4012,19 +5065,35 @@ impl<W: Write + Seek> HdfFileWriter<W> {
         header.push(index_block_elements);
         header.push(1); // data block min elements
         header.push(1); // super block min data pointers
-        header.push(1); // max data block page elements bits
-        append_encoded_size(&mut header, 0, self.sizeof_size)?; // super block count
-        append_encoded_size(&mut header, 0, self.sizeof_size)?; // super block size
-        append_encoded_size(&mut header, 0, self.sizeof_size)?; // data block count
-        append_encoded_size(&mut header, 0, self.sizeof_size)?; // data block size
+        header.push(max_data_block_page_elements_bits);
         append_encoded_size(
             &mut header,
-            u64_from_usize_writer(entries.len(), "extensible-array max index set")?,
+            u64_from_usize_writer(super_block_count, "extensible-array super block count")?,
             self.sizeof_size,
         )?;
         append_encoded_size(
             &mut header,
-            u64_from_usize_writer(entries.len(), "extensible-array realized elements")?,
+            u64_from_usize_writer(super_block_size_total, "extensible-array super block size")?,
+            self.sizeof_size,
+        )?;
+        append_encoded_size(
+            &mut header,
+            u64_from_usize_writer(data_block_count, "extensible-array data block count")?,
+            self.sizeof_size,
+        )?;
+        append_encoded_size(
+            &mut header,
+            u64_from_usize_writer(data_block_size_total, "extensible-array data block size")?,
+            self.sizeof_size,
+        )?;
+        append_encoded_size(
+            &mut header,
+            u64_from_usize_writer(entry_count, "extensible-array max index set")?,
+            self.sizeof_size,
+        )?;
+        append_encoded_size(
+            &mut header,
+            u64_from_usize_writer(entry_count, "extensible-array realized elements")?,
             self.sizeof_size,
         )?;
         append_encoded_addr(&mut header, index_block_addr, self.sizeof_addr)?;
@@ -4109,7 +5178,14 @@ impl<W: Write + Seek> HdfFileWriter<W> {
         payloads: &[Vec<u8>],
         min_heap_id_len: u16,
     ) -> Result<(u64, Vec<Vec<u8>>)> {
-        let offset_bytes = 4usize;
+        let payload_bytes = payloads.iter().try_fold(0usize, |acc, payload| {
+            acc.checked_add(payload.len())
+                .ok_or_else(|| Error::InvalidFormat("managed heap payload size overflow".into()))
+        })?;
+        let max_payload_len = payloads.iter().map(Vec::len).max().unwrap_or(0);
+        let block_size = managed_heap_root_direct_block_size(payload_bytes)?.max(512);
+        let max_heap_size_bits = managed_heap_max_size_bits_for_block(block_size)?;
+        let offset_bytes = managed_heap_offset_bytes(max_heap_size_bits)?;
         let heap_id_len = dense_heap_id_len_for_payloads(payloads, offset_bytes, min_heap_id_len)?;
         let offset_bytes_u16 = u16::try_from(offset_bytes)
             .map_err(|_| Error::InvalidFormat("managed heap ID offset width exceeds u16".into()))?;
@@ -4125,16 +5201,6 @@ impl<W: Write + Seek> HdfFileWriter<W> {
                 "managed heap ID length {heap_id_len} leaves unsupported length byte count {length_bytes}"
             )));
         }
-        let payload_bytes = payloads.iter().try_fold(0usize, |acc, payload| {
-            acc.checked_add(payload.len())
-                .ok_or_else(|| Error::InvalidFormat("managed heap payload size overflow".into()))
-        })?;
-        let max_payload_len = payloads.iter().map(Vec::len).max().unwrap_or(0);
-        let needed_block_size = 25usize
-            .checked_add(payload_bytes)
-            .ok_or_else(|| Error::InvalidFormat("managed heap block size overflow".into()))?;
-        let block_size =
-            checked_next_power_of_two(needed_block_size, "managed heap block size")?.max(512);
         let heap_header_len = self.minimal_fractal_heap_header_len()?;
         let heap_addr = self.allocator.allocate(
             u64_from_usize_writer(heap_header_len, "fractal heap header length")?,
@@ -4149,14 +5215,18 @@ impl<W: Write + Seek> HdfFileWriter<W> {
         direct.extend_from_slice(b"FHDB");
         direct.push(0);
         append_encoded_addr(&mut direct, heap_addr, self.sizeof_addr)?;
-        direct.extend_from_slice(&0u32.to_le_bytes());
+        direct.resize(
+            direct.len().checked_add(offset_bytes).ok_or_else(|| {
+                Error::InvalidFormat("fractal heap direct block header overflow".into())
+            })?,
+            0,
+        );
+        let checksum_pos = direct.len();
         direct.extend_from_slice(&0u32.to_le_bytes());
 
         let mut heap_ids = Vec::with_capacity(payloads.len());
         for payload in payloads {
-            let offset = u32::try_from(direct.len()).map_err(|_| {
-                Error::InvalidFormat("managed heap object offset exceeds u32".into())
-            })?;
+            let offset = u64_from_usize_writer(direct.len(), "managed heap object offset")?;
             direct.extend_from_slice(payload);
             let len = u64_from_usize_writer(payload.len(), "dense heap payload length")?;
             let max_len = if length_bytes == 8 {
@@ -4177,8 +5247,13 @@ impl<W: Write + Seek> HdfFileWriter<W> {
         }
         direct.resize(block_size, 0);
         let checksum = checksum_metadata(&direct);
-        checked_window_mut(&mut direct, 17, 4, "fractal heap direct block checksum")?
-            .copy_from_slice(&checksum.to_le_bytes());
+        checked_window_mut(
+            &mut direct,
+            checksum_pos,
+            4,
+            "fractal heap direct block checksum",
+        )?
+        .copy_from_slice(&checksum.to_le_bytes());
         self.write_at(direct_addr, &direct)?;
 
         let heap = self.encode_minimal_fractal_heap(
@@ -4186,6 +5261,7 @@ impl<W: Write + Seek> HdfFileWriter<W> {
             payloads.len(),
             u64_from_usize_writer(max_payload_len, "managed heap max payload length")?,
             u64_from_usize_writer(block_size, "fractal heap direct block size")?,
+            max_heap_size_bits,
             direct_addr,
         )?;
         debug_assert_eq!(heap.len(), heap_header_len);
@@ -4217,6 +5293,7 @@ impl<W: Write + Seek> HdfFileWriter<W> {
         managed_nobjs: usize,
         max_managed_obj_size: u64,
         managed_alloc_size: u64,
+        max_heap_size_bits: u16,
         root_block_addr: u64,
     ) -> Result<Vec<u8>> {
         let mut buf = Vec::new();
@@ -4247,7 +5324,7 @@ impl<W: Write + Seek> HdfFileWriter<W> {
         buf.extend_from_slice(&4u16.to_le_bytes());
         append_encoded_size(&mut buf, managed_alloc_size, self.sizeof_size)?;
         append_encoded_size(&mut buf, managed_alloc_size.max(65536), self.sizeof_size)?;
-        buf.extend_from_slice(&32u16.to_le_bytes());
+        buf.extend_from_slice(&max_heap_size_bits.to_le_bytes());
         buf.extend_from_slice(&1u16.to_le_bytes());
         append_encoded_addr(&mut buf, root_block_addr, self.sizeof_addr)?;
         buf.extend_from_slice(&0u16.to_le_bytes());
@@ -4256,7 +5333,7 @@ impl<W: Write + Seek> HdfFileWriter<W> {
         Ok(buf)
     }
 
-    /// Write a v2 B-tree indexed by name hash, for dense links or attributes.
+    /// Write a v2 B-tree for dense links/attributes or chunk-index records.
     fn write_dense_name_btree(&mut self, tree_type: u8, records: &[Vec<u8>]) -> Result<u64> {
         const DENSE_BTREE_NODE_SIZE: usize = 512;
 
@@ -4269,11 +5346,6 @@ impl<W: Write + Seek> HdfFileWriter<W> {
                 "dense name B-tree records have inconsistent sizes".into(),
             ));
         }
-        if u16::try_from(records.len()).is_err() {
-            return Err(Error::Unsupported(
-                "dense name B-tree writer supports at most 65535 records".into(),
-            ));
-        }
 
         let level_info = dense_btree_level_info(
             DENSE_BTREE_NODE_SIZE,
@@ -4282,18 +5354,7 @@ impl<W: Write + Seek> HdfFileWriter<W> {
             self.sizeof_addr,
         )?;
         let leaf_max_records = level_info[0].max_nrecords;
-        let (root_addr, root_nrecords, depth, node_size) = if tree_type != 5 {
-            let record_bytes = records
-                .len()
-                .checked_mul(record_size)
-                .ok_or_else(|| Error::InvalidFormat("dense B-tree record bytes overflow".into()))?;
-            let node_payload_size = 10usize
-                .checked_add(record_bytes)
-                .ok_or_else(|| Error::InvalidFormat("dense B-tree node size overflow".into()))?;
-            let node_size = DENSE_BTREE_NODE_SIZE.max(node_payload_size);
-            let root_addr = self.write_dense_btree_leaf_node(tree_type, records, node_size)?;
-            (root_addr, records.len(), 0u16, node_size)
-        } else if records.len() <= leaf_max_records {
+        let (root_addr, root_nrecords, depth, node_size) = if records.len() <= leaf_max_records {
             (
                 self.write_dense_btree_leaf_node(tree_type, records, DENSE_BTREE_NODE_SIZE)?,
                 records.len(),
@@ -4849,8 +5910,11 @@ fn child_path(parent: &str, name: &str) -> String {
 mod tests {
     use super::{
         ceil_div_nonzero_u64, checked_next_power_of_two, checked_usize_sum_writer,
-        dense_record_hash, encode_global_heap_collection, read_encoded_size_le_at, read_u64_le_at,
-        CompoundFieldSpec, DtypeSpec, FillValueSpec, HdfFileWriter,
+        chunk_grid_is_sequential_row_major, copy_row_major_slab_payload_into, dense_record_hash,
+        encode_global_heap_collection, full_chunk_row_major_payload_slice,
+        managed_heap_max_size_bits_for_block, managed_heap_offset_bytes,
+        managed_heap_root_direct_block_size, read_encoded_size_le_at, read_u64_le_at,
+        ChunkExtractionPlan, CompoundFieldSpec, DtypeSpec, FillValueSpec, HdfFileWriter,
     };
     use crate::format::btree_v2::{collect_all_records_into, BTreeV2Header};
     use crate::io::reader::HdfReader;
@@ -4887,6 +5951,130 @@ mod tests {
         assert!(HdfFileWriter::<Cursor<Vec<u8>>>::chunk_btree_node_size(usize::MAX, 8).is_err());
         assert!(checked_next_power_of_two(usize::MAX, "test power").is_err());
         assert!(checked_usize_sum_writer(&[usize::MAX, 1], "test sum").is_err());
+    }
+
+    #[test]
+    fn sequential_chunk_index_entries_derive_addresses_without_materialized_chunks() {
+        let entries = super::ChunkIndexEntries::Sequential {
+            first_addr: 128,
+            chunk_size: 32,
+            filter_mask: 0,
+            count: 3,
+        };
+
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries.entry_at(0).unwrap(), (128, 32, 0));
+        assert_eq!(entries.entry_at(1).unwrap(), (160, 32, 0));
+        assert_eq!(entries.entry_at(2).unwrap(), (192, 32, 0));
+        assert!(entries.entry_at(3).is_err());
+    }
+
+    #[test]
+    fn sequential_chunk_run_accepts_only_row_major_slabs() {
+        assert!(chunk_grid_is_sequential_row_major(&[6], &[2]));
+        assert!(chunk_grid_is_sequential_row_major(&[5], &[2]));
+        assert!(chunk_grid_is_sequential_row_major(&[6, 4], &[2, 4]));
+        assert!(chunk_grid_is_sequential_row_major(&[5, 4], &[2, 4]));
+        assert!(chunk_grid_is_sequential_row_major(&[6, 4, 5], &[2, 4, 5]));
+        assert!(!chunk_grid_is_sequential_row_major(&[5], &[0]));
+        assert!(!chunk_grid_is_sequential_row_major(&[6, 4], &[2, 2]));
+        assert!(!chunk_grid_is_sequential_row_major(&[6, 4], &[6, 2]));
+    }
+
+    #[test]
+    fn full_chunk_row_major_payload_slice_borrows_only_complete_slabs() {
+        let data: Vec<u8> = (0..96).collect();
+
+        let middle = full_chunk_row_major_payload_slice(&data, &[6, 4], &[2, 0], &[2, 4], 4, 32)
+            .unwrap()
+            .expect("middle row slab is contiguous");
+        assert_eq!(middle, &data[32..64]);
+
+        assert!(
+            full_chunk_row_major_payload_slice(&data[..80], &[5, 4], &[4, 0], &[2, 4], 4, 32)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            full_chunk_row_major_payload_slice(&data, &[6, 4], &[0, 2], &[2, 2], 4, 16)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn row_major_slab_payload_copy_handles_partial_edge_without_nd_iteration() {
+        let data: Vec<u8> = (0..80).collect();
+        let mut out = vec![0u8; 32];
+
+        assert!(
+            copy_row_major_slab_payload_into(&data, &[5, 4], &[4, 0], &[2, 4], 4, &mut out)
+                .unwrap()
+        );
+        assert_eq!(&out[..16], &data[64..80]);
+        assert_eq!(&out[16..], &[0u8; 16]);
+
+        assert!(
+            !copy_row_major_slab_payload_into(&data, &[5, 4], &[0, 2], &[2, 2], 4, &mut out)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn chunk_extraction_plan_reuses_scratch_for_non_slab_multidim_chunks() {
+        let data: Vec<u8> = (0..25).collect();
+        let plan = ChunkExtractionPlan::new(&[5, 5], &[2, 3], 1).unwrap();
+        let mut scratch = plan.scratch();
+        let mut out = vec![0u8; 6];
+
+        plan.copy_into(&data, &[0, 0], &mut out, &mut scratch)
+            .unwrap();
+        assert_eq!(out, vec![0, 1, 2, 5, 6, 7]);
+
+        out.fill(0);
+        plan.copy_into(&data, &[2, 3], &mut out, &mut scratch)
+            .unwrap();
+        assert_eq!(out, vec![13, 14, 0, 18, 19, 0]);
+    }
+
+    #[test]
+    fn managed_heap_offset_width_tracks_declared_heap_size() {
+        assert_eq!(managed_heap_offset_bytes(1).unwrap(), 1);
+        assert_eq!(managed_heap_offset_bytes(32).unwrap(), 4);
+        assert_eq!(managed_heap_offset_bytes(64).unwrap(), 8);
+        assert!(managed_heap_offset_bytes(0).is_err());
+        assert!(managed_heap_offset_bytes(65).is_err());
+        assert_eq!(managed_heap_max_size_bits_for_block(512).unwrap(), 32);
+        assert_eq!(
+            managed_heap_max_size_bits_for_block((u32::MAX as usize) + 1).unwrap(),
+            32
+        );
+        assert_eq!(
+            managed_heap_max_size_bits_for_block((u32::MAX as usize) + 2).unwrap(),
+            33
+        );
+    }
+
+    #[test]
+    fn managed_heap_root_direct_block_boundary_is_explicit() {
+        assert_eq!(managed_heap_root_direct_block_size(0).unwrap(), 32);
+        assert_eq!(
+            managed_heap_root_direct_block_size(512usize.saturating_sub(25)).unwrap(),
+            512
+        );
+
+        let boundary_payload = (usize::MAX / 2).saturating_sub(24);
+        assert_eq!(
+            managed_heap_root_direct_block_size(boundary_payload).unwrap(),
+            usize::MAX / 2 + 1
+        );
+
+        let err = managed_heap_root_direct_block_size(boundary_payload + 1).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("managed fractal heap needs indirect blocks"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -5124,6 +6312,26 @@ mod tests {
         assert_eq!(
             decoded.chunk_index_type,
             Some(crate::format::messages::data_layout::ChunkIndexType::ExtensibleArray)
+        );
+
+        let mut btree2 = Vec::new();
+        super::encode_btree_v2_chunk_layout_v4_into(
+            &mut btree2,
+            0x1020_3040_5060_7080,
+            &[10],
+            4,
+            512,
+            100,
+            40,
+            8,
+        )
+        .unwrap();
+        let decoded =
+            crate::format::messages::data_layout::DataLayoutMessage::decode(&btree2, 8, 8).unwrap();
+        assert_eq!(decoded.chunk_encoded_dims, Some(vec![10, 4]));
+        assert_eq!(
+            decoded.chunk_index_type,
+            Some(crate::format::messages::data_layout::ChunkIndexType::BTreeV2)
         );
     }
 

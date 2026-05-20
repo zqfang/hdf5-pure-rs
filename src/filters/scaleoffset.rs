@@ -170,7 +170,9 @@ pub fn can_apply_scaleoffset(client_data: &[u32]) -> Result<()> {
             "invalid scaleoffset byte order {order}"
         )));
     }
-    validate_scaleoffset_datatype(class, sign, size, scale_type)
+    validate_scaleoffset_datatype(class, sign, size, scale_type)?;
+    validate_scaleoffset_fill_value(client_data, size)?;
+    Ok(())
 }
 
 pub fn scaleoffset_convert(
@@ -606,6 +608,25 @@ fn validate_scaleoffset_parameters(
         return Err(Error::InvalidFormat(format!(
             "invalid scaleoffset integer sign {sign}"
         )));
+    }
+    Ok(())
+}
+
+fn validate_scaleoffset_fill_value(client_data: &[u32], size: usize) -> Result<()> {
+    if client_data.get(PARM_FILAVAIL).copied().unwrap_or(0) == 0 {
+        return Ok(());
+    }
+    let fill_words = size
+        .checked_add(3)
+        .ok_or_else(|| Error::InvalidFormat("scaleoffset fill value size overflow".into()))?
+        / 4;
+    let required = PARM_FILVAL
+        .checked_add(fill_words)
+        .ok_or_else(|| Error::InvalidFormat("scaleoffset fill value size overflow".into()))?;
+    if client_data.len() < required {
+        return Err(Error::InvalidFormat(
+            "scaleoffset fill value parameters are truncated".into(),
+        ));
     }
     Ok(())
 }
@@ -1215,6 +1236,28 @@ mod tests {
         let err = decompress_err(&[], &params);
         assert!(
             err.to_string().contains("scaleoffset float scale type 1"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_truncated_fill_value_parameters_before_chunk_header() {
+        let params = vec![2, 0, 0, CLS_INTEGER, 1, SIGN_UNSIGNED, ORDER_LE, 1];
+        let err = decompress_err(&[], &params);
+        assert!(
+            err.to_string()
+                .contains("scaleoffset fill value parameters are truncated"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_partial_multibyte_fill_value_parameters_before_chunk_header() {
+        let params = vec![2, 0, 0, CLS_INTEGER, 8, SIGN_UNSIGNED, ORDER_LE, 1, 0];
+        let err = decompress_err(&[], &params);
+        assert!(
+            err.to_string()
+                .contains("scaleoffset fill value parameters are truncated"),
             "unexpected error: {err}"
         );
     }
