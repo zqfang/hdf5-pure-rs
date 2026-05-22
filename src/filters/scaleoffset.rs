@@ -1401,6 +1401,26 @@ mod tests {
     }
 
     #[test]
+    fn scaleoffset_u128_compress_roundtrips_wide_deltas() {
+        let params = vec![2, 0, 3, CLS_INTEGER, 16, SIGN_UNSIGNED, ORDER_LE];
+        let base = (1u128 << 80) + 5;
+        let input = [base, base + 1, base + (1u128 << 65) + 3]
+            .into_iter()
+            .flat_map(u128::to_le_bytes)
+            .collect::<Vec<_>>();
+
+        let mut compressed = Vec::new();
+        scaleoffset_compress_into(&input, &params, &mut compressed).unwrap();
+
+        assert_eq!(&compressed[..4], &66u32.to_le_bytes());
+        assert_eq!(&compressed[5..21], &base.to_le_bytes());
+
+        let mut decoded = Vec::new();
+        decompress_into(&compressed, &params, &mut decoded).unwrap();
+        assert_eq!(decoded, input);
+    }
+
+    #[test]
     fn scaleoffset_integer_full_precision_payload_stores_deltas() {
         let params = vec![2, 0, 2, CLS_INTEGER, 1, SIGN_UNSIGNED, ORDER_LE];
 
@@ -1552,6 +1572,79 @@ mod tests {
             .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
             .collect::<Vec<_>>();
         assert_eq!(values, [1.0, fill, 1.2, 1.3]);
+    }
+
+    #[test]
+    fn scaleoffset_big_endian_float_compress_reserves_fill_marker() {
+        let fill = -999.0f32;
+        let fill_client_word = u32::from_le_bytes(fill.to_be_bytes());
+        let params = vec![
+            0,
+            1,
+            4,
+            CLS_FLOAT,
+            4,
+            SIGN_UNSIGNED,
+            ORDER_BE,
+            1,
+            fill_client_word,
+        ];
+        let input = [1.0f32, fill, 1.2, 1.3]
+            .into_iter()
+            .flat_map(f32::to_be_bytes)
+            .collect::<Vec<_>>();
+
+        let mut compressed = Vec::new();
+        scaleoffset_compress_into(&input, &params, &mut compressed).unwrap();
+
+        assert_eq!(&compressed[..4], &3u32.to_le_bytes());
+        assert_eq!(&compressed[5..9], &1.0f32.to_le_bytes());
+
+        let mut decoded = Vec::new();
+        decompress_into(&compressed, &params, &mut decoded).unwrap();
+        let values = decoded
+            .chunks_exact(4)
+            .map(|chunk| f32::from_be_bytes(chunk.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(values, [1.0, fill, 1.2, 1.3]);
+    }
+
+    #[test]
+    fn scaleoffset_big_endian_f64_compress_reserves_fill_marker() {
+        let fill = -999.0f64;
+        let fill_bytes = fill.to_be_bytes();
+        let fill_low = u32::from_le_bytes(fill_bytes[..4].try_into().unwrap());
+        let fill_high = u32::from_le_bytes(fill_bytes[4..].try_into().unwrap());
+        let params = vec![
+            0,
+            2,
+            4,
+            CLS_FLOAT,
+            8,
+            SIGN_UNSIGNED,
+            ORDER_BE,
+            1,
+            fill_low,
+            fill_high,
+        ];
+        let input = [1.0f64, fill, 1.25, 1.5]
+            .into_iter()
+            .flat_map(f64::to_be_bytes)
+            .collect::<Vec<_>>();
+
+        let mut compressed = Vec::new();
+        scaleoffset_compress_into(&input, &params, &mut compressed).unwrap();
+
+        assert_eq!(&compressed[..4], &6u32.to_le_bytes());
+        assert_eq!(&compressed[5..13], &1.0f64.to_le_bytes());
+
+        let mut decoded = Vec::new();
+        decompress_into(&compressed, &params, &mut decoded).unwrap();
+        let values = decoded
+            .chunks_exact(8)
+            .map(|chunk| f64::from_be_bytes(chunk.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(values, [1.0, fill, 1.25, 1.5]);
     }
 
     #[test]

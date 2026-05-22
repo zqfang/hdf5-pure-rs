@@ -9,7 +9,7 @@ use hdf5_pure_rust::format::global_heap::{
     GlobalHeapRef,
 };
 use hdf5_pure_rust::io::reader::HdfReader;
-use hdf5_pure_rust::{Dataset, File, H5Type, Result};
+use hdf5_pure_rust::{Dataset, File, H5Type, IntoSelection, Result};
 
 fn file_member_summary<const N: usize>(
     file: &File,
@@ -58,6 +58,16 @@ where
 {
     let mut values = vec![T::default(); ds.size()? as usize];
     ds.read_into(&mut values)?;
+    Ok(values)
+}
+
+fn dataset_slice_values<T, S>(ds: &Dataset, sel: S, len: usize) -> Result<Vec<T>>
+where
+    T: H5Type + Default + Clone,
+    S: IntoSelection,
+{
+    let mut values = vec![T::default(); len];
+    ds.read_slice_into(sel, &mut values)?;
     Ok(values)
 }
 
@@ -476,6 +486,28 @@ fn t9ef_btree_v1_chunk_index_3d_coordinates() {
     assert_eq!(vals[6], 6);
     assert_eq!(vals[37], 37);
     assert_eq!(vals[119], 119);
+}
+
+#[test]
+fn t9ef_btree_v1_deflate_parallel_threshold_tail() {
+    const CHUNK: usize = 2048;
+    const LEN: usize = CHUNK * 8 + 17;
+
+    let f = File::open("tests/data/hdf5_ref/v1_btree_deflate_parallel_threshold_tail.h5").unwrap();
+    let ds = f
+        .dataset("btree_v1_deflate_parallel_threshold_tail")
+        .unwrap();
+    assert_dataset_shape(&ds, &[LEN as u64]);
+
+    let expected: Vec<i32> = (0..LEN).map(|value| value as i32 * 3 - 7).collect();
+    let vals: Vec<i32> = dataset_values(&ds).unwrap();
+    assert_eq!(vals, expected);
+
+    let boundary: Vec<i32> = dataset_slice_values(&ds, CHUNK - 3..CHUNK + 4, 7).unwrap();
+    assert_eq!(boundary, expected[CHUNK - 3..CHUNK + 4]);
+
+    let tail: Vec<i32> = dataset_slice_values(&ds, LEN - 20..LEN, 20).unwrap();
+    assert_eq!(tail, expected[LEN - 20..LEN]);
 }
 
 #[test]

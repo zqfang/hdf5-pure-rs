@@ -1058,6 +1058,20 @@ mod tests {
         }
     }
 
+    fn bitfield_type(size: u32, order: ByteOrder) -> DatatypeMessage {
+        let mut class_bits = [0u8; 3];
+        if matches!(order, ByteOrder::BigEndian) {
+            class_bits[0] |= 0x01;
+        }
+        DatatypeMessage {
+            version: 1,
+            class: DatatypeClass::BitField,
+            class_bits,
+            size,
+            properties: vec![0, 0, (size * 8) as u8, 0],
+        }
+    }
+
     #[test]
     fn reads_big_endian_u128_same_size() {
         let datatype = fixed_type(16, false, ByteOrder::BigEndian);
@@ -1144,6 +1158,36 @@ mod tests {
             .map(|chunk| f64::from_be_bytes(chunk.try_into().unwrap()))
             .collect::<Vec<_>>();
         assert_eq!(values, vec![0.0, 1_700_000_000.0]);
+    }
+
+    #[test]
+    fn converts_enum_and_bitfield_integer_like_payloads() {
+        let enum_source =
+            DatatypeMessage::enum_create(fixed_type(2, false, ByteOrder::LittleEndian)).unwrap();
+        let unsigned_enum_dest = fixed_type(4, false, ByteOrder::LittleEndian);
+        let mut enum_raw = Vec::new();
+        enum_raw.extend_from_slice(&2u16.to_le_bytes());
+        enum_raw.extend_from_slice(&300u16.to_le_bytes());
+
+        let enum_converted =
+            convert_between_datatypes(&enum_raw, &enum_source, &unsigned_enum_dest)
+                .expect("enum base integers should use the integer conversion path");
+        let enum_values = enum_converted
+            .chunks_exact(4)
+            .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(enum_values, vec![2, 300]);
+
+        let bitfield_source = bitfield_type(2, ByteOrder::BigEndian);
+        let unsigned_dest = fixed_type(1, false, ByteOrder::LittleEndian);
+        let mut bitfield_raw = Vec::new();
+        bitfield_raw.extend_from_slice(&0x00abu16.to_be_bytes());
+        bitfield_raw.extend_from_slice(&0x01ffu16.to_be_bytes());
+
+        let bitfield_converted =
+            convert_between_datatypes(&bitfield_raw, &bitfield_source, &unsigned_dest)
+                .expect("bitfield payloads should convert as unsigned integer-like data");
+        assert_eq!(bitfield_converted, vec![0xab, 0xff]);
     }
 
     #[test]

@@ -463,6 +463,51 @@ fn test_group_compat_relink_compact_soft_link_same_size() {
 }
 
 #[test]
+fn test_group_compat_relink_dense_link_name_growth_reopens() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("relink_dense_name_growth.h5");
+    {
+        let mut writable = WritableFile::create(&path).unwrap();
+        let mut parent = writable.create_group("parent").unwrap();
+        for idx in 0..9 {
+            parent
+                .new_dataset_builder(&format!("data_{idx:02}"))
+                .write::<i32>(&[idx])
+                .unwrap();
+        }
+        writable.close().unwrap();
+    }
+
+    let file = File::open_rw(&path).unwrap();
+    let parent = file.group("parent").unwrap();
+    parent.relink("data_08", "longer_data_name_08").unwrap();
+
+    let parent = file.group("parent").unwrap();
+    assert!(parent.link_exists("data_00").unwrap());
+    assert!(!parent.link_exists("data_08").unwrap());
+    assert!(parent.link_exists("longer_data_name_08").unwrap());
+    let mut values = vec![0; 1];
+    file.dataset("parent/longer_data_name_08")
+        .unwrap()
+        .read_into(&mut values)
+        .unwrap();
+    assert_eq!(values, [8]);
+
+    let reopened = File::open(&path).unwrap();
+    let parent = reopened.group("parent").unwrap();
+    assert!(parent.link_exists("data_00").unwrap());
+    assert!(!parent.link_exists("data_08").unwrap());
+    assert!(parent.link_exists("longer_data_name_08").unwrap());
+    let mut values = vec![0; 1];
+    reopened
+        .dataset("parent/longer_data_name_08")
+        .unwrap()
+        .read_into(&mut values)
+        .unwrap();
+    assert_eq!(values, [8]);
+}
+
+#[test]
 fn test_group_compat_relink_cross_group_nested_compact_hard_link_reopens() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("relink_cross_group_nested.h5");
@@ -514,6 +559,115 @@ fn test_group_compat_relink_cross_group_nested_compact_hard_link_reopens() {
         .read_into(&mut values)
         .unwrap();
     assert_eq!(values, [144, 233]);
+}
+
+#[test]
+fn test_group_compat_relink_cross_group_into_dense_destination_reopens() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("relink_cross_group_into_dense_dest.h5");
+    {
+        let mut writable = WritableFile::create(&path).unwrap();
+        let mut source = writable.create_group("source").unwrap();
+        source
+            .new_dataset_builder("old")
+            .write::<i32>(&[1597, 2584])
+            .unwrap();
+        let mut dest = writable.create_group("dest").unwrap();
+        for idx in 0..9 {
+            dest.create_group(&format!("existing_{idx:02}")).unwrap();
+        }
+        writable.close().unwrap();
+    }
+
+    let file = File::open_rw(&path).unwrap();
+    let source = file.group("source").unwrap();
+    source.relink("old", "/dest/moved").unwrap();
+
+    let source = file.group("source").unwrap();
+    let dest = file.group("dest").unwrap();
+    assert!(!source.link_exists("old").unwrap());
+    assert!(dest.link_exists("existing_00").unwrap());
+    assert!(dest.link_exists("existing_08").unwrap());
+    assert!(dest.link_exists("moved").unwrap());
+    let mut values = vec![0; 2];
+    file.dataset("dest/moved")
+        .unwrap()
+        .read_into(&mut values)
+        .unwrap();
+    assert_eq!(values, [1597, 2584]);
+
+    let reopened = File::open(&path).unwrap();
+    assert!(!reopened
+        .group("source")
+        .unwrap()
+        .link_exists("old")
+        .unwrap());
+    let dest = reopened.group("dest").unwrap();
+    assert!(dest.link_exists("existing_00").unwrap());
+    assert!(dest.link_exists("existing_08").unwrap());
+    assert!(dest.link_exists("moved").unwrap());
+    let mut values = vec![0; 2];
+    reopened
+        .dataset("dest/moved")
+        .unwrap()
+        .read_into(&mut values)
+        .unwrap();
+    assert_eq!(values, [1597, 2584]);
+}
+
+#[test]
+fn test_group_compat_relink_cross_group_dense_source_into_dense_destination_reopens() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("relink_dense_source_into_dense_dest.h5");
+    {
+        let mut writable = WritableFile::create(&path).unwrap();
+        let mut source = writable.create_group("source").unwrap();
+        for idx in 0..9 {
+            source
+                .new_dataset_builder(&format!("data_{idx:02}"))
+                .write::<i32>(&[idx])
+                .unwrap();
+        }
+        let mut dest = writable.create_group("dest").unwrap();
+        for idx in 0..9 {
+            dest.create_group(&format!("existing_{idx:02}")).unwrap();
+        }
+        writable.close().unwrap();
+    }
+
+    let file = File::open_rw(&path).unwrap();
+    let source = file.group("source").unwrap();
+    source.relink("data_08", "/dest/moved").unwrap();
+
+    let source = file.group("source").unwrap();
+    let dest = file.group("dest").unwrap();
+    assert!(!source.link_exists("data_08").unwrap());
+    assert!(source.link_exists("data_00").unwrap());
+    assert!(dest.link_exists("existing_00").unwrap());
+    assert!(dest.link_exists("existing_08").unwrap());
+    assert!(dest.link_exists("moved").unwrap());
+    let mut values = vec![0; 1];
+    file.dataset("dest/moved")
+        .unwrap()
+        .read_into(&mut values)
+        .unwrap();
+    assert_eq!(values, [8]);
+
+    let reopened = File::open(&path).unwrap();
+    let source = reopened.group("source").unwrap();
+    let dest = reopened.group("dest").unwrap();
+    assert!(!source.link_exists("data_08").unwrap());
+    assert!(source.link_exists("data_00").unwrap());
+    assert!(dest.link_exists("existing_00").unwrap());
+    assert!(dest.link_exists("existing_08").unwrap());
+    assert!(dest.link_exists("moved").unwrap());
+    let mut values = vec![0; 1];
+    reopened
+        .dataset("dest/moved")
+        .unwrap()
+        .read_into(&mut values)
+        .unwrap();
+    assert_eq!(values, [8]);
 }
 
 #[test]
@@ -596,6 +750,42 @@ fn test_group_compat_create_root_child_open_rw() {
     assert!(root.link_exists("existing").unwrap());
     assert!(root.link_exists("created").unwrap());
     assert!(reopened.group("created").unwrap().is_empty().unwrap());
+}
+
+#[test]
+fn test_group_compat_stale_handles_use_rewritten_metadata_addresses() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("stale_group_handles_after_rewrite.h5");
+    {
+        let mut writable = WritableFile::create(&path).unwrap();
+        writable.add_attr("root_attr", 7i32).unwrap();
+        let mut parent = writable.create_group("parent").unwrap();
+        parent.add_attr("parent_attr", 11i32).unwrap();
+        writable.close().unwrap();
+    }
+
+    let file = File::open_rw(&path).unwrap();
+    let root = file.root_group().unwrap();
+    let parent = file.group("parent").unwrap();
+
+    root.create_group("created_with_a_long_name_to_force_root_rewrite")
+        .unwrap();
+    parent.create_group("child").unwrap();
+
+    let fresh_root = file.root_group().unwrap();
+    let fresh_parent = file.group("parent").unwrap();
+    assert_eq!(
+        root.native_info().unwrap().addr,
+        fresh_root.native_info().unwrap().addr
+    );
+    assert_eq!(
+        parent.native_info().unwrap().addr,
+        fresh_parent.native_info().unwrap().addr
+    );
+    assert!(parent.link_exists("child").unwrap());
+    assert!(parent.open_group("child").unwrap().is_empty().unwrap());
+    assert!(root.attr_exists("root_attr").unwrap());
+    assert!(parent.attr_exists("parent_attr").unwrap());
 }
 
 #[test]
@@ -836,6 +1026,212 @@ fn test_group_compat_create_child_under_dense_root_parent_open_rw() {
 }
 
 #[test]
+fn test_group_compat_create_child_inside_dense_group_open_rw() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("create_child_inside_dense_group.h5");
+    {
+        let mut writable = WritableFile::create(&path).unwrap();
+        let mut parent = writable.create_group("parent").unwrap();
+        for idx in 0..9 {
+            parent.create_group(&format!("existing_{idx:02}")).unwrap();
+        }
+        writable.close().unwrap();
+    }
+
+    let file = File::open_rw(&path).unwrap();
+    let parent = file.group("parent").unwrap();
+    parent.create_group("new_child").unwrap();
+
+    let parent = file.group("parent").unwrap();
+    assert!(parent.link_exists("existing_00").unwrap());
+    assert!(parent.link_exists("existing_08").unwrap());
+    assert!(parent.link_exists("new_child").unwrap());
+    assert!(file.group("parent/new_child").unwrap().is_empty().unwrap());
+
+    let reopened = File::open(&path).unwrap();
+    let parent = reopened.group("parent").unwrap();
+    assert!(parent.link_exists("existing_00").unwrap());
+    assert!(parent.link_exists("existing_08").unwrap());
+    assert!(parent.link_exists("new_child").unwrap());
+    assert!(reopened
+        .group("parent/new_child")
+        .unwrap()
+        .is_empty()
+        .unwrap());
+}
+
+#[test]
+fn test_group_compat_create_dataset_inside_dense_group_open_rw() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("create_dataset_inside_dense_group.h5");
+    {
+        let mut writable = WritableFile::create(&path).unwrap();
+        let mut parent = writable.create_group("parent").unwrap();
+        for idx in 0..9 {
+            parent.create_group(&format!("existing_{idx:02}")).unwrap();
+        }
+        writable.close().unwrap();
+    }
+
+    let file = File::open_rw(&path).unwrap();
+    let parent = file.group("parent").unwrap();
+    parent
+        .new_dataset_builder()
+        .with_data::<i32>(&[233, 377])
+        .create(Some("values"))
+        .unwrap();
+
+    let reopened = File::open(&path).unwrap();
+    let parent = reopened.group("parent").unwrap();
+    assert!(parent.link_exists("existing_00").unwrap());
+    assert!(parent.link_exists("existing_08").unwrap());
+    assert!(parent.link_exists("values").unwrap());
+    let mut values = vec![0; 2];
+    reopened
+        .dataset("parent/values")
+        .unwrap()
+        .read_into(&mut values)
+        .unwrap();
+    assert_eq!(values, [233, 377]);
+}
+
+#[test]
+fn test_group_compat_create_soft_and_external_links_inside_dense_group_open_rw() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("create_links_inside_dense_group.h5");
+    {
+        let mut writable = WritableFile::create(&path).unwrap();
+        let mut parent = writable.create_group("parent").unwrap();
+        for idx in 0..9 {
+            parent.create_group(&format!("existing_{idx:02}")).unwrap();
+        }
+        writable.close().unwrap();
+    }
+
+    let file = File::open_rw(&path).unwrap();
+    let parent = file.group("parent").unwrap();
+    parent.link_soft("/missing", "soft_child").unwrap();
+    parent
+        .link_external("external.h5", "/external_target", "external_child")
+        .unwrap();
+
+    let reopened = File::open(&path).unwrap();
+    let parent = reopened.group("parent").unwrap();
+    assert!(parent.link_exists("existing_00").unwrap());
+    assert!(parent.link_exists("existing_08").unwrap());
+    assert_eq!(parent.soft_link_target("soft_child").unwrap(), "/missing");
+    assert_eq!(
+        parent.external_link_target("external_child").unwrap(),
+        ("external.h5".to_string(), "/external_target".to_string())
+    );
+}
+
+#[test]
+fn test_group_compat_create_hard_link_inside_dense_group_open_rw() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("create_hard_link_inside_dense_group.h5");
+    {
+        let mut writable = WritableFile::create(&path).unwrap();
+        writable
+            .new_dataset_builder("target")
+            .write::<i32>(&[610, 987])
+            .unwrap();
+        let mut parent = writable.create_group("parent").unwrap();
+        for idx in 0..9 {
+            parent.create_group(&format!("existing_{idx:02}")).unwrap();
+        }
+        writable.close().unwrap();
+    }
+
+    let file = File::open_rw(&path).unwrap();
+    let parent = file.group("parent").unwrap();
+    parent.link_hard("/target", "alias").unwrap();
+
+    let reopened = File::open(&path).unwrap();
+    let parent = reopened.group("parent").unwrap();
+    assert!(parent.link_exists("existing_00").unwrap());
+    assert!(parent.link_exists("existing_08").unwrap());
+    assert!(parent.link_exists("alias").unwrap());
+    let mut values = vec![0; 2];
+    reopened
+        .dataset("parent/alias")
+        .unwrap()
+        .read_into(&mut values)
+        .unwrap();
+    assert_eq!(values, [610, 987]);
+}
+
+#[test]
+fn test_group_compat_create_dataset_under_dense_root_parent_open_rw() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("create_dataset_under_dense_root_parent.h5");
+    {
+        let mut writable = WritableFile::create(&path).unwrap();
+        for idx in 0..9 {
+            writable.create_group(&format!("parent_{idx:02}")).unwrap();
+        }
+        writable.close().unwrap();
+    }
+
+    let file = File::open_rw(&path).unwrap();
+    let parent = file.group("parent_05").unwrap();
+    parent
+        .new_dataset_builder()
+        .with_data::<i32>(&[55, 89, 144])
+        .create(Some("values"))
+        .unwrap();
+
+    let mut values = vec![0; 3];
+    file.dataset("parent_05/values")
+        .unwrap()
+        .read_into(&mut values)
+        .unwrap();
+    assert_eq!(values, [55, 89, 144]);
+
+    let reopened = File::open(&path).unwrap();
+    assert!(reopened
+        .group("parent_05")
+        .unwrap()
+        .link_exists("values")
+        .unwrap());
+    let mut reopened_values = vec![0; 3];
+    reopened
+        .dataset("parent_05/values")
+        .unwrap()
+        .read_into(&mut reopened_values)
+        .unwrap();
+    assert_eq!(reopened_values, [55, 89, 144]);
+}
+
+#[test]
+fn test_group_compat_create_soft_and_external_links_under_dense_root_parent_open_rw() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("create_links_under_dense_root_parent.h5");
+    {
+        let mut writable = WritableFile::create(&path).unwrap();
+        for idx in 0..9 {
+            writable.create_group(&format!("parent_{idx:02}")).unwrap();
+        }
+        writable.close().unwrap();
+    }
+
+    let file = File::open_rw(&path).unwrap();
+    let parent = file.group("parent_05").unwrap();
+    parent.link_soft("/missing", "soft_child").unwrap();
+    parent
+        .link_external("external.h5", "/external_target", "external_child")
+        .unwrap();
+
+    let reopened = File::open(&path).unwrap();
+    let parent = reopened.group("parent_05").unwrap();
+    assert_eq!(parent.soft_link_target("soft_child").unwrap(), "/missing");
+    assert_eq!(
+        parent.external_link_target("external_child").unwrap(),
+        ("external.h5".to_string(), "/external_target".to_string())
+    );
+}
+
+#[test]
 fn test_group_compat_create_same_group_hard_link_under_dense_root_parent_open_rw() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir
@@ -887,6 +1283,86 @@ fn test_group_compat_create_same_group_hard_link_under_dense_root_parent_open_rw
         .read_into(&mut values)
         .unwrap();
     assert_eq!(values, [21, 34]);
+}
+
+#[test]
+fn test_group_compat_open_rw_relative_hard_link_target_in_same_group() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("open_rw_relative_hard_link_target.h5");
+    {
+        let mut writable = WritableFile::create(&path).unwrap();
+        let mut parent = writable.create_group("parent").unwrap();
+        parent
+            .new_dataset_builder("real_data")
+            .write::<i32>(&[13, 21])
+            .unwrap();
+        writable.close().unwrap();
+    }
+
+    let file = File::open_rw(&path).unwrap();
+    let parent = file.group("parent").unwrap();
+    parent.link_hard("real_data", "alias_data").unwrap();
+
+    let parent = file.group("parent").unwrap();
+    let real_addr = parent
+        .link_info("real_data")
+        .unwrap()
+        .hard_link_addr
+        .unwrap();
+    let alias_addr = parent
+        .link_info("alias_data")
+        .unwrap()
+        .hard_link_addr
+        .unwrap();
+    assert_eq!(real_addr, alias_addr);
+    assert_eq!(object_refcount_at(&path, &file, real_addr), 2);
+
+    let mut values = vec![0; 2];
+    File::open(&path)
+        .unwrap()
+        .dataset("parent/alias_data")
+        .unwrap()
+        .read_into(&mut values)
+        .unwrap();
+    assert_eq!(values, [13, 21]);
+}
+
+#[test]
+fn test_group_compat_open_rw_relative_hard_link_target_group_in_same_group() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir
+        .path()
+        .join("open_rw_relative_hard_link_group_target.h5");
+    {
+        let mut writable = WritableFile::create(&path).unwrap();
+        let mut parent = writable.create_group("parent").unwrap();
+        parent.create_group("child").unwrap();
+        writable.close().unwrap();
+    }
+
+    let file = File::open_rw(&path).unwrap();
+    let parent = file.group("parent").unwrap();
+    parent.link_hard("child", "child_alias").unwrap();
+
+    let parent = file.group("parent").unwrap();
+    let child_addr = parent.link_info("child").unwrap().hard_link_addr.unwrap();
+    let alias_addr = parent
+        .link_info("child_alias")
+        .unwrap()
+        .hard_link_addr
+        .unwrap();
+    assert_eq!(child_addr, alias_addr);
+    assert_eq!(object_refcount_at(&path, &file, child_addr), 2);
+    assert_eq!(
+        parent.member_type("child_alias").unwrap(),
+        hdf5_pure_rust::hl::file::ObjectType::Group
+    );
+    assert!(File::open(&path)
+        .unwrap()
+        .group("parent/child_alias")
+        .unwrap()
+        .is_empty()
+        .unwrap());
 }
 
 #[test]

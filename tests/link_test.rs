@@ -156,6 +156,9 @@ fn test_soft_link_resolution_normalizes_relative_targets() {
             .link_soft("relative_data", "../real/./data")
             .unwrap();
         aliases.link_soft("relative_group", "../real").unwrap();
+        aliases
+            .link_soft("relative_group_dotted", "./../real/.")
+            .unwrap();
         wf.link_soft("through_alias", "/aliases/relative_data")
             .unwrap();
         wf.flush().unwrap();
@@ -174,6 +177,42 @@ fn test_soft_link_resolution_normalizes_relative_targets() {
         aliases.open_group("relative_group").unwrap().name(),
         "/real"
     );
+    assert_i32_dataset_values(
+        &f.dataset("aliases/relative_group_dotted/data").unwrap(),
+        &[11, 22],
+    )
+    .unwrap();
+}
+
+#[test]
+fn test_soft_link_cycle_detected_after_relative_target_normalization() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("soft_link_normalized_cycle.h5");
+
+    {
+        let mut wf = WritableFile::create(&path).unwrap();
+        let mut aliases = wf.create_group("aliases").unwrap();
+        aliases
+            .link_soft("self_cycle", "./../aliases/./self_cycle")
+            .unwrap();
+        wf.flush().unwrap();
+    }
+
+    let f = File::open(&path).unwrap();
+    let root = f.root_group().unwrap();
+    assert!(group_has_link(
+        &root.open_group("aliases").unwrap(),
+        "self_cycle",
+        LinkType::Soft
+    )
+    .unwrap());
+
+    let err = match f.dataset("aliases/self_cycle") {
+        Ok(_) => panic!("normalized relative soft link should resolve back to itself"),
+        Err(err) => err,
+    };
+    assert!(matches!(err, Error::InvalidFormat(_)));
+    assert!(err.to_string().contains("soft link cycle"));
 }
 
 #[test]
@@ -640,6 +679,36 @@ fn test_group_compat_relink_changed_size_dense_root_link_shrinks() {
     assert!(!file_has_member(&reopened, "data_08").unwrap());
     assert!(file_has_member(&reopened, "d8").unwrap());
     assert_i32_dataset_values(&reopened.dataset("d8").unwrap(), &[8]).unwrap();
+}
+
+#[test]
+fn test_group_compat_relink_changed_size_dense_root_link_grows() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir
+        .path()
+        .join("open_rw_root_dense_relink_changed_size_growth.h5");
+    {
+        let mut wf = WritableFile::create(&path).unwrap();
+        for idx in 0..9 {
+            wf.new_dataset_builder(&format!("data_{idx:02}"))
+                .write::<i32>(&[idx])
+                .unwrap();
+        }
+        wf.flush().unwrap();
+    }
+
+    let file = File::open_rw(&path).unwrap();
+    let root = file.root_group().unwrap();
+    root.relink("data_08", "longer_data_name_08").unwrap();
+
+    assert!(!root.link_exists("data_08").unwrap());
+    assert!(root.link_exists("longer_data_name_08").unwrap());
+    assert_i32_dataset_values(&file.dataset("longer_data_name_08").unwrap(), &[8]).unwrap();
+
+    let reopened = File::open(&path).unwrap();
+    assert!(!file_has_member(&reopened, "data_08").unwrap());
+    assert!(file_has_member(&reopened, "longer_data_name_08").unwrap());
+    assert_i32_dataset_values(&reopened.dataset("longer_data_name_08").unwrap(), &[8]).unwrap();
 }
 
 #[test]

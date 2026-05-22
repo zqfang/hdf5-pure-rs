@@ -108,6 +108,7 @@ impl Dataset {
         filter_mask: u32,
         output: &mut [u8],
         compressed_scratch: &mut Vec<u8>,
+        shuffle_scratch: &mut Vec<u8>,
     ) -> Result<bool> {
         let Some(dst_range) = Self::full_chunk_1d_output_range(coords, chunk_ctx, output.len())?
         else {
@@ -141,14 +142,16 @@ impl Dataset {
             }
             Some(pipeline) if Self::is_shuffle_deflate_pipeline(pipeline) && filter_mask == 0 => {
                 Self::read_chunk_into_scratch(reader, addr, read_size, compressed_scratch)?;
-                let mut shuffled = vec![0u8; dst_range.len()];
-                crate::filters::deflate::decompress_exact_into(compressed_scratch, &mut shuffled)?;
+                shuffle_scratch.resize(dst_range.len(), 0);
+                crate::filters::deflate::decompress_exact_into(
+                    compressed_scratch,
+                    shuffle_scratch,
+                )?;
                 crate::filters::shuffle::unshuffle_into(
-                    &shuffled,
+                    shuffle_scratch,
                     chunk_ctx.element_size,
                     &mut output[dst_range],
                 )?;
-                shuffled.clear();
                 Ok(true)
             }
             _ => Ok(false),

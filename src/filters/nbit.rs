@@ -1096,6 +1096,31 @@ mod tests {
     }
 
     #[test]
+    fn nbit_atomic_single_byte_offset_masks_discarded_bits() {
+        let params = vec![8, 0, 1, NBIT_ATOMIC, 1, NBIT_ORDER_LE, 4, 2];
+        let input = [0b1011_1101];
+        let mut compressed = Vec::new();
+        nbit_compress_into(&input, &params, &mut compressed).unwrap();
+        assert_eq!(compressed, [0b1111_0000]);
+
+        let mut decoded = Vec::new();
+        decompress_into(&compressed, &params, &mut decoded).unwrap();
+        assert_eq!(decoded, [0b0011_1100]);
+    }
+
+    #[test]
+    fn nbit_big_endian_atomic_compress_roundtrips() {
+        let params = vec![8, 0, 2, NBIT_ATOMIC, 2, NBIT_ORDER_BE, 12, 2];
+        let input = [0b0011_1100, 0b1100_0000, 0b0001_0100, 0b1010_1000];
+        let mut compressed = Vec::new();
+        nbit_compress_into(&input, &params, &mut compressed).unwrap();
+
+        let mut decoded = Vec::new();
+        decompress_into(&compressed, &params, &mut decoded).unwrap();
+        assert_eq!(decoded, input);
+    }
+
+    #[test]
     fn nbit_top_level_nooptype_roundtrips() {
         let params = vec![5, 0, 3, NBIT_NOOPTYPE, 2];
         let input = [0x12, 0x34, 0xab, 0xcd, 0xfe, 0xdc];
@@ -1141,6 +1166,32 @@ mod tests {
     }
 
     #[test]
+    fn nbit_nested_array_of_atomic_roundtrips() {
+        let params = vec![
+            12,
+            0,
+            1,
+            NBIT_ARRAY,
+            4,
+            NBIT_ARRAY,
+            2,
+            NBIT_ATOMIC,
+            1,
+            NBIT_ORDER_LE,
+            5,
+            1,
+        ];
+        let input = [0b0000_0010, 0b0011_1110, 0b0001_0100, 0b0010_1010];
+        let mut compressed = Vec::new();
+        nbit_compress_into(&input, &params, &mut compressed).unwrap();
+        assert_eq!(compressed.len(), 3);
+
+        let mut decoded = Vec::new();
+        decompress_into(&compressed, &params, &mut decoded).unwrap();
+        assert_eq!(decoded, input);
+    }
+
+    #[test]
     fn nbit_compound_with_padding_roundtrips() {
         let params = vec![
             15,
@@ -1160,6 +1211,36 @@ mod tests {
             1,
         ];
         let input = [0b0001_0100, 0, 0, 0xab, 0b0011_1000, 0, 0, 0xcd];
+        let mut compressed = Vec::new();
+        nbit_compress_into(&input, &params, &mut compressed).unwrap();
+
+        let mut decoded = Vec::new();
+        decompress_into(&compressed, &params, &mut decoded).unwrap();
+        assert_eq!(decoded, input);
+    }
+
+    #[test]
+    fn nbit_array_of_compound_roundtrips() {
+        let params = vec![
+            17,
+            0,
+            1,
+            NBIT_ARRAY,
+            8,
+            NBIT_COMPOUND,
+            4,
+            2,
+            0,
+            NBIT_ATOMIC,
+            1,
+            NBIT_ORDER_LE,
+            4,
+            2,
+            2,
+            NBIT_NOOPTYPE,
+            1,
+        ];
+        let input = [0b0001_0100, 0, 0xab, 0, 0b0011_1000, 0, 0xcd, 0];
         let mut compressed = Vec::new();
         nbit_compress_into(&input, &params, &mut compressed).unwrap();
 

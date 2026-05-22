@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::ops::ControlFlow;
 
 use crate::error::{Error, Result};
 
@@ -30,6 +31,22 @@ impl H5Map {
         } else {
             Err(Error::InvalidFormat("map handle is closed".into()))
         }
+    }
+}
+
+pub trait H5MIterCallbackResult {
+    fn should_stop(self) -> bool;
+}
+
+impl H5MIterCallbackResult for () {
+    fn should_stop(self) -> bool {
+        false
+    }
+}
+
+impl H5MIterCallbackResult for ControlFlow<()> {
+    fn should_stop(self) -> bool {
+        matches!(self, ControlFlow::Break(()))
     }
 }
 
@@ -256,21 +273,25 @@ pub fn H5M_iter_entries(map: &H5Map) -> Result<impl Iterator<Item = (&[u8], &[u8
 }
 
 #[allow(non_snake_case)]
-pub fn H5M_iterate_with<F>(map: &H5Map, mut callback: F) -> Result<()>
+pub fn H5M_iterate_with<F, R>(map: &H5Map, mut callback: F) -> Result<()>
 where
-    F: FnMut(&[u8], &[u8]) -> Result<()>,
+    F: FnMut(&[u8], &[u8]) -> Result<R>,
+    R: H5MIterCallbackResult,
 {
     map.ensure_open()?;
     for (key, value) in &map.entries {
-        callback(key, value)?;
+        if callback(key, value)?.should_stop() {
+            break;
+        }
     }
     Ok(())
 }
 
 #[allow(non_snake_case)]
-pub fn H5Miterate_with<F>(map: &H5Map, callback: F) -> Result<()>
+pub fn H5Miterate_with<F, R>(map: &H5Map, callback: F) -> Result<()>
 where
-    F: FnMut(&[u8], &[u8]) -> Result<()>,
+    F: FnMut(&[u8], &[u8]) -> Result<R>,
+    R: H5MIterCallbackResult,
 {
     H5M_iterate_with(map, callback)
 }
@@ -326,6 +347,11 @@ pub fn H5Mdelete(map: &mut H5Map, key: &[u8]) -> Result<Option<Vec<u8>>> {
     Ok(map.entries.remove(key))
 }
 
+#[allow(non_snake_case)]
+pub fn H5Mdelete_async(map: &mut H5Map, key: &[u8]) -> Result<Option<Vec<u8>>> {
+    H5Mdelete(map, key)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -363,7 +389,22 @@ mod tests {
         H5M_iterate_into(&map, &mut copied).unwrap();
         assert_eq!(copied, vec![(b"k".to_vec(), b"v".to_vec())]);
 
+        H5Mput(&mut map, b"k2".to_vec(), b"v2".to_vec()).unwrap();
+        let mut stopped = Vec::new();
+        H5Miterate_with(&map, |key, value| {
+            stopped.push((key.to_vec(), value.to_vec()));
+            Ok(ControlFlow::Break(()))
+        })
+        .unwrap();
+        assert_eq!(stopped, vec![(b"k".to_vec(), b"v".to_vec())]);
+        assert_eq!(H5Mdelete(&mut map, b"k2").unwrap(), Some(b"v2".to_vec()));
+
         assert_eq!(H5Mdelete(&mut map, b"k").unwrap(), Some(b"v".to_vec()));
+        H5Mput_async(&mut map, b"k2".to_vec(), b"v2".to_vec()).unwrap();
+        assert_eq!(
+            H5Mdelete_async(&mut map, b"k2").unwrap(),
+            Some(b"v2".to_vec())
+        );
         H5Mclose_async(&mut map);
         assert!(H5Mget_count(&map).is_err());
 

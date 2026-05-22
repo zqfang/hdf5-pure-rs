@@ -71,6 +71,24 @@ fn assert_dataset_raw(ds: &Dataset, expected: &[u8]) -> Result<()> {
     Ok(())
 }
 
+fn assert_h5dump_dataset_read(path: &std::path::Path, dataset: &str, context: &str) {
+    let out = std::process::Command::new("timeout")
+        .arg("10")
+        .arg("h5dump")
+        .arg("-d")
+        .arg(dataset)
+        .arg(path)
+        .output();
+    if let Ok(out) = out {
+        assert!(
+            out.status.success(),
+            "h5dump -d failed or timed out on {context}: status={:?}, stderr={}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
 fn dataset_scalar<T>(ds: &Dataset) -> Result<T>
 where
     T: H5Type + Default,
@@ -986,7 +1004,7 @@ fn test_writable_file_chunked_row_slab_streams_multidimensional_run() {
         let resizable_info = resizable.info().unwrap();
         assert_eq!(
             resizable_info.layout.chunk_index_type,
-            Some(ChunkIndexType::ExtensibleArray)
+            Some(ChunkIndexType::BTreeV2)
         );
         assert_dataset_values::<i32>(&resizable, &data).unwrap();
     }
@@ -1077,7 +1095,7 @@ fn test_writable_file_chunked_row_slab_streams_partial_edge_run() {
         let resizable_info = resizable.info().unwrap();
         assert_eq!(
             resizable_info.layout.chunk_index_type,
-            Some(ChunkIndexType::ExtensibleArray)
+            Some(ChunkIndexType::BTreeV2)
         );
         assert_dataset_values::<i32>(&resizable, &data).unwrap();
     }
@@ -1124,11 +1142,89 @@ fn test_writable_file_chunked_filtered_row_slab_partial_edge_run() {
         let resizable_info = resizable.info().unwrap();
         assert_eq!(
             resizable_info.layout.chunk_index_type,
-            Some(ChunkIndexType::ExtensibleArray)
+            Some(ChunkIndexType::BTreeV2)
         );
         assert!(dataset_has_filter_id(&resizable, 1).unwrap());
         assert!(dataset_has_filter_id(&resizable, 2).unwrap());
         assert_dataset_values::<i32>(&resizable, &data).unwrap();
+    }
+}
+
+#[test]
+fn test_writable_file_fixed_array_deflate_parallel_threshold_tail_round_trip() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir
+        .path()
+        .join("api_write_fixed_array_deflate_parallel_tail.h5");
+    const CHUNK: usize = 2048;
+    const LEN: usize = CHUNK * 8 + 17;
+
+    {
+        let mut wf = WritableFile::create(&path).unwrap();
+        let data: Vec<i32> = (0..LEN).map(|value| value as i32 * 3 - 11).collect();
+        wf.new_dataset_builder("data")
+            .shape(&[LEN as u64])
+            .chunk(&[CHUNK as u64])
+            .deflate(4)
+            .write::<i32>(&data)
+            .unwrap();
+        let f = wf.close().unwrap();
+
+        let ds = f.dataset("data").unwrap();
+        let info = ds.info().unwrap();
+        assert_eq!(
+            info.layout.chunk_index_type,
+            Some(ChunkIndexType::FixedArray)
+        );
+        assert!(dataset_has_filter_id(&ds, 1).unwrap());
+        assert_dataset_values::<i32>(&ds, &data).unwrap();
+
+        let mut boundary = vec![0i32; 7];
+        ds.read_slice_into(CHUNK - 3..CHUNK + 4, &mut boundary)
+            .unwrap();
+        assert_eq!(boundary, data[CHUNK - 3..CHUNK + 4]);
+
+        let mut tail = vec![0i32; 20];
+        ds.read_slice_into(LEN - 20..LEN, &mut tail).unwrap();
+        assert_eq!(tail, data[LEN - 20..LEN]);
+    }
+}
+
+#[test]
+fn test_writable_file_extensible_array_deflate_parallel_threshold_tail_round_trip() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir
+        .path()
+        .join("api_write_extensible_array_deflate_parallel_tail.h5");
+    const CHUNK: usize = 2048;
+    const LEN: usize = CHUNK * 8 + 17;
+
+    {
+        let mut wf = WritableFile::create(&path).unwrap();
+        let data: Vec<i32> = (0..LEN).map(|value| 7000 - value as i32 * 5).collect();
+        wf.new_dataset_builder("data")
+            .shape(&[LEN as u64])
+            .max_shape(&[(LEN * 2) as u64])
+            .chunk(&[CHUNK as u64])
+            .deflate(4)
+            .write::<i32>(&data)
+            .unwrap();
+        let f = wf.close().unwrap();
+
+        let ds = f.dataset("data").unwrap();
+        let info = ds.info().unwrap();
+        assert_eq!(info.layout.chunk_index_type, Some(ChunkIndexType::BTreeV2));
+        assert!(dataset_has_filter_id(&ds, 1).unwrap());
+        assert_dataset_values::<i32>(&ds, &data).unwrap();
+
+        let mut boundary = vec![0i32; 7];
+        ds.read_slice_into(CHUNK - 3..CHUNK + 4, &mut boundary)
+            .unwrap();
+        assert_eq!(boundary, data[CHUNK - 3..CHUNK + 4]);
+
+        let mut tail = vec![0i32; 20];
+        ds.read_slice_into(LEN - 20..LEN, &mut tail).unwrap();
+        assert_eq!(tail, data[LEN - 20..LEN]);
     }
 }
 
@@ -1185,9 +1281,9 @@ fn test_writable_file_chunked_filtered_non_slab_multidim_round_trip() {
 }
 
 #[test]
-fn test_writable_file_chunked_v1_btree_beyond_two_levels() {
+fn test_writable_file_chunked_fixed_array_beyond_one_page() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("api_write_chunked_deep_btree.h5");
+    let path = dir.path().join("api_write_chunked_fixed_array_deep.h5");
 
     {
         let mut wf = WritableFile::create(&path).unwrap();
@@ -1201,6 +1297,10 @@ fn test_writable_file_chunked_v1_btree_beyond_two_levels() {
 
         let ds = f.dataset("data").unwrap();
         assert!(ds.is_chunked().unwrap());
+        assert_eq!(
+            ds.info().unwrap().layout.chunk_index_type,
+            Some(ChunkIndexType::FixedArray)
+        );
         assert_dataset_values::<i32>(&ds, &data).unwrap();
     }
 }
@@ -1257,7 +1357,7 @@ fn test_dataset_builder_writes_max_shape_dataspace() {
         assert_eq!(finite_info.layout.version, 4);
         assert_eq!(
             finite_info.layout.chunk_index_type,
-            Some(ChunkIndexType::ExtensibleArray)
+            Some(ChunkIndexType::BTreeV2)
         );
         assert_dataset_values::<i32>(&finite, &[1, 2, 3, 4]).unwrap();
 
@@ -1378,9 +1478,11 @@ fn test_dataset_builder_fixed_max_shape_uses_fixed_chunk_indexes() {
 }
 
 #[test]
-fn test_dataset_builder_max_shape_extensible_array_spillover() {
+fn test_dataset_builder_finite_max_shape_full_write_uses_btree_v2() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("api_write_max_shape_ea_spillover.h5");
+    let path = dir
+        .path()
+        .join("api_write_finite_max_shape_full_btree_v2.h5");
 
     {
         let mut wf = WritableFile::create(&path).unwrap();
@@ -1396,12 +1498,11 @@ fn test_dataset_builder_max_shape_extensible_array_spillover() {
         let ds = f.dataset("data").unwrap();
         let info = ds.info().unwrap();
         assert_eq!(info.layout.version, 4);
-        assert_eq!(
-            info.layout.chunk_index_type,
-            Some(ChunkIndexType::ExtensibleArray)
-        );
+        assert_eq!(info.layout.chunk_index_type, Some(ChunkIndexType::BTreeV2));
         assert_dataset_values::<i32>(&ds, &data).unwrap();
     }
+
+    assert_h5dump_dataset_read(&path, "data", "finite max-shape full B-tree v2 fixture");
 }
 
 #[test]
@@ -1597,7 +1698,7 @@ fn test_dataset_builder_sparse_max_shape_fill_only_uses_modern_indexes() {
         assert_eq!(single_info.layout.version, 4);
         assert_eq!(
             single_info.layout.chunk_index_type,
-            Some(ChunkIndexType::ExtensibleArray)
+            Some(ChunkIndexType::BTreeV2)
         );
         let single_values: Vec<i16> = single.read().unwrap();
         assert_eq!(single_values, vec![-3; 12]);
@@ -1612,6 +1713,17 @@ fn test_dataset_builder_sparse_max_shape_fill_only_uses_modern_indexes() {
         let multi_values: Vec<i32> = multi.read().unwrap();
         assert_eq!(multi_values, vec![-8; 16]);
     }
+
+    assert_h5dump_dataset_read(
+        &path,
+        "single_grow",
+        "single grow fill-only B-tree v2 fixture",
+    );
+    assert_h5dump_dataset_read(
+        &path,
+        "multi_grow",
+        "multi grow fill-only B-tree v2 fixture",
+    );
 }
 
 #[test]
@@ -1717,11 +1829,11 @@ fn test_dataset_builder_sparse_filtered_explicit_chunks_use_fixed_array() {
 }
 
 #[test]
-fn test_dataset_builder_sparse_chunked_explicit_chunks_with_max_shape_uses_ea() {
+fn test_dataset_builder_sparse_chunked_explicit_chunks_with_max_shape_uses_btree_v2() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir
         .path()
-        .join("api_write_sparse_chunked_explicit_chunks_ea.h5");
+        .join("api_write_sparse_chunked_explicit_chunks_btree_v2.h5");
     let first = [3i16; 4];
     let last = [9i16; 4];
 
@@ -1739,24 +1851,27 @@ fn test_dataset_builder_sparse_chunked_explicit_chunks_with_max_shape_uses_ea() 
         let ds = f.dataset("data").unwrap();
         assert!(ds.is_chunked().unwrap());
         let info = ds.info().unwrap();
-        assert_eq!(
-            info.layout.chunk_index_type,
-            Some(ChunkIndexType::ExtensibleArray)
-        );
+        assert_eq!(info.layout.chunk_index_type, Some(ChunkIndexType::BTreeV2));
         let values: Vec<i16> = ds.read().unwrap();
         assert_eq!(values.len(), 16);
         assert_eq!(&values[..4], &first);
         assert!(values[4..12].iter().all(|&value| value == -2));
         assert_eq!(&values[12..], &last);
     }
+
+    assert_h5dump_dataset_read(
+        &path,
+        "data",
+        "sparse unfiltered B-tree v2 explicit-chunk fixture",
+    );
 }
 
 #[test]
-fn test_dataset_builder_sparse_filtered_explicit_chunks_with_max_shape_uses_ea() {
+fn test_dataset_builder_sparse_filtered_explicit_chunks_with_max_shape_uses_btree_v2() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir
         .path()
-        .join("api_write_sparse_filtered_explicit_chunks_ea.h5");
+        .join("api_write_sparse_filtered_explicit_chunks_btree_v2.h5");
     let first = [6i16; 4];
     let last = [12i16; 4];
 
@@ -1775,10 +1890,7 @@ fn test_dataset_builder_sparse_filtered_explicit_chunks_with_max_shape_uses_ea()
         let ds = f.dataset("data").unwrap();
         assert!(ds.is_chunked().unwrap());
         let info = ds.info().unwrap();
-        assert_eq!(
-            info.layout.chunk_index_type,
-            Some(ChunkIndexType::ExtensibleArray)
-        );
+        assert_eq!(info.layout.chunk_index_type, Some(ChunkIndexType::BTreeV2));
         assert!(dataset_has_filter_id(&ds, 1).unwrap());
         let values: Vec<i16> = ds.read().unwrap();
         assert_eq!(values.len(), 16);
@@ -1786,6 +1898,12 @@ fn test_dataset_builder_sparse_filtered_explicit_chunks_with_max_shape_uses_ea()
         assert!(values[4..12].iter().all(|&value| value == -2));
         assert_eq!(&values[12..], &last);
     }
+
+    assert_h5dump_dataset_read(
+        &path,
+        "data",
+        "sparse filtered B-tree v2 explicit-chunk fixture",
+    );
 }
 
 #[test]
@@ -1818,6 +1936,12 @@ fn test_dataset_builder_sparse_multidim_growable_chunks_use_btree_v2() {
             vec![10, 11, -5, -5, 12, 13, -5, -5, -5, -5, 30, 31, -5, -5, 32, 33,]
         );
     }
+
+    assert_h5dump_dataset_read(
+        &path,
+        "data",
+        "sparse multidimensional growable B-tree v2 fixture",
+    );
 }
 
 #[test]

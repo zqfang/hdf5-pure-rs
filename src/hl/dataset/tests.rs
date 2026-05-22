@@ -50,6 +50,115 @@ fn build_global_heap_collection(
     bytes
 }
 
+fn assert_parallel_deflate_fixture(
+    path: &str,
+    dataset_name: &str,
+    len: usize,
+    expected: impl Fn(usize) -> i32,
+) {
+    support::set_parallel_deflate_worker_override(2);
+    support::reset_parallel_deflate_chunks_handled();
+
+    let file = crate::File::open(path).unwrap();
+    let ds = file.dataset(dataset_name).unwrap();
+    let mut values = vec![0i32; len];
+    ds.read_into(&mut values).unwrap();
+
+    let expected_values: Vec<i32> = (0..len).map(expected).collect();
+    assert_eq!(values, expected_values);
+    assert_eq!(support::parallel_deflate_chunks_handled(), 8);
+
+    support::set_parallel_deflate_worker_override(0);
+}
+
+#[test]
+fn parallel_deflate_probe_records_v1_btree_full_prefix() {
+    const CHUNK: usize = 2048;
+    const LEN: usize = CHUNK * 8 + 17;
+
+    assert_parallel_deflate_fixture(
+        "tests/data/hdf5_ref/v1_btree_deflate_parallel_threshold_tail.h5",
+        "btree_v1_deflate_parallel_threshold_tail",
+        LEN,
+        |value| value as i32 * 3 - 7,
+    );
+}
+
+#[test]
+fn parallel_deflate_probe_records_fixed_array_full_prefix() {
+    const CHUNK: usize = 2048;
+    const LEN: usize = CHUNK * 8 + 17;
+
+    assert_parallel_deflate_fixture(
+        "tests/data/hdf5_ref/v4_fixed_array_deflate_parallel_threshold_tail.h5",
+        "fixed_array_deflate_parallel_threshold_tail",
+        LEN,
+        |value| value as i32 * 5 - 11,
+    );
+}
+
+#[test]
+fn parallel_deflate_probe_skips_masked_fixed_array_full_prefix() {
+    const CHUNK: usize = 2048;
+    const LEN: usize = CHUNK * 8;
+
+    support::set_parallel_deflate_worker_override(2);
+    support::reset_parallel_deflate_chunks_handled();
+
+    let file =
+        crate::File::open("tests/data/hdf5_ref/v4_fixed_array_deflate_mask_parallel_fallback.h5")
+            .unwrap();
+    let ds = file
+        .dataset("fixed_array_deflate_mask_parallel_fallback")
+        .unwrap();
+    let mut values = vec![0i32; LEN];
+    ds.read_into(&mut values).unwrap();
+
+    let expected: Vec<i32> = (0..LEN).map(|value| value as i32 * 2 - 31).collect();
+    assert_eq!(values, expected);
+    assert_eq!(support::parallel_deflate_chunks_handled(), 0);
+
+    support::set_parallel_deflate_worker_override(0);
+}
+
+#[test]
+fn parallel_deflate_probe_skips_masked_extensible_array_full_prefix() {
+    const CHUNK: usize = 2048;
+    const LEN: usize = CHUNK * 8;
+
+    support::set_parallel_deflate_worker_override(2);
+    support::reset_parallel_deflate_chunks_handled();
+
+    let file = crate::File::open(
+        "tests/data/hdf5_ref/v4_extensible_array_deflate_mask_parallel_fallback.h5",
+    )
+    .unwrap();
+    let ds = file
+        .dataset("extensible_array_deflate_mask_parallel_fallback")
+        .unwrap();
+    let mut values = vec![0i32; LEN];
+    ds.read_into(&mut values).unwrap();
+
+    let expected: Vec<i32> = (0..LEN).map(|value| value as i32 * 11 - 19).collect();
+    assert_eq!(values, expected);
+    assert_eq!(support::parallel_deflate_chunks_handled(), 0);
+
+    support::set_parallel_deflate_worker_override(0);
+}
+
+#[test]
+fn parallel_deflate_probe_records_extensible_array_full_prefix() {
+    const CHUNK: usize = 2048;
+    const LEN: usize = CHUNK * 8 + 17;
+
+    assert_parallel_deflate_fixture(
+        "tests/data/hdf5_ref/v4_extensible_array_deflate_parallel_threshold_tail.h5",
+        "extensible_array_deflate_parallel_threshold_tail",
+        LEN,
+        |value| value as i32 * 7 - 13,
+    );
+}
+
 #[test]
 fn virtual_point_selection_decodes_and_materializes() {
     let mut encoded = Vec::new();

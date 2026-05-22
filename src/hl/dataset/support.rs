@@ -1,4 +1,50 @@
+#[cfg(test)]
+use std::cell::Cell;
+
 use crate::error::{Error, Result};
+
+#[cfg(test)]
+thread_local! {
+    static PARALLEL_DEFLATE_WORKER_OVERRIDE: Cell<usize> = const { Cell::new(0) };
+    static PARALLEL_DEFLATE_CHUNKS_HANDLED: Cell<usize> = const { Cell::new(0) };
+}
+
+pub(super) fn parallel_deflate_worker_count(full_chunk_count: usize) -> usize {
+    #[cfg(test)]
+    {
+        let override_count = PARALLEL_DEFLATE_WORKER_OVERRIDE.with(Cell::get);
+        if override_count != 0 {
+            return override_count.min(full_chunk_count);
+        }
+    }
+    std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .min(full_chunk_count)
+}
+
+pub(super) fn record_parallel_deflate_chunks_handled(count: usize) {
+    #[cfg(test)]
+    PARALLEL_DEFLATE_CHUNKS_HANDLED
+        .with(|handled| handled.set(handled.get().saturating_add(count)));
+    #[cfg(not(test))]
+    let _ = count;
+}
+
+#[cfg(test)]
+pub(super) fn set_parallel_deflate_worker_override(worker_count: usize) {
+    PARALLEL_DEFLATE_WORKER_OVERRIDE.with(|override_count| override_count.set(worker_count));
+}
+
+#[cfg(test)]
+pub(super) fn reset_parallel_deflate_chunks_handled() {
+    PARALLEL_DEFLATE_CHUNKS_HANDLED.with(|handled| handled.set(0));
+}
+
+#[cfg(test)]
+pub(super) fn parallel_deflate_chunks_handled() -> usize {
+    PARALLEL_DEFLATE_CHUNKS_HANDLED.with(Cell::get)
+}
 
 pub(super) fn read_le_uint(bytes: &[u8], size: usize) -> Result<u64> {
     if size == 0 || size > 8 || bytes.len() < size {

@@ -1314,6 +1314,14 @@ pub(crate) fn object_type_from_messages(messages: &[RawMessage]) -> ObjectType {
     let has_link_info = messages
         .iter()
         .any(|m| m.msg_type == object_header::MSG_LINK_INFO);
+    let has_semantic_messages = messages.iter().any(|m| {
+        !matches!(
+            m.msg_type,
+            object_header::MSG_OBJ_REF_COUNT
+                | object_header::MSG_HEADER_CONTINUATION
+                | object_header::MSG_NIL
+        )
+    });
 
     if has_layout || (has_dataspace && has_datatype && !has_stab && !has_link && !has_link_info) {
         ObjectType::Dataset
@@ -1321,8 +1329,9 @@ pub(crate) fn object_type_from_messages(messages: &[RawMessage]) -> ObjectType {
         ObjectType::Group
     } else if has_datatype && !has_dataspace {
         ObjectType::NamedDatatype
-    } else if messages.is_empty() {
-        // Empty object header -- likely an empty group (v2 format)
+    } else if !has_semantic_messages {
+        // Empty object header, possibly with metadata-only messages such as a
+        // persistent reference count, represents an empty v2-format group.
         ObjectType::Group
     } else {
         ObjectType::Unknown

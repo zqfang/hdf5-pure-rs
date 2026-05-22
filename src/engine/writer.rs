@@ -751,7 +751,7 @@ fn filtered_chunk_size_len_v4(unfiltered_chunk_bytes: usize) -> usize {
     } else {
         usize::try_from(usize::BITS - unfiltered_chunk_bytes.leading_zeros()).unwrap_or(usize::MAX)
     };
-    (1 + ((bits + 8) / 8)).min(8)
+    ((bits + 15) / 8).clamp(2, 8)
 }
 
 fn extensible_array_max_elements_bits(elements: usize) -> Result<u8> {
@@ -961,45 +961,6 @@ fn encode_contiguous_layout_into(
     append_encoded_addr(buf, data_addr, sizeof_addr)?;
 
     append_encoded_size(buf, data_size, sizeof_size)?;
-
-    Ok(())
-}
-
-/// Append a data layout message (v3, chunked).
-fn encode_chunked_layout_v3_into(
-    buf: &mut Vec<u8>,
-    btree_addr: u64,
-    chunk_dims: &[u64],
-    element_size: u32,
-    sizeof_addr: u8,
-) -> Result<()> {
-    buf.push(3); // version 3
-    buf.push(2); // layout class = chunked
-
-    // ndims = chunk_dims.len() + 1 (extra dim for element size)
-    let ndims = chunk_dims
-        .len()
-        .checked_add(1)
-        .ok_or_else(|| Error::InvalidFormat("chunked layout rank overflow".into()))?;
-    let ndims = u8::try_from(ndims)
-        .map_err(|_| Error::InvalidFormat("chunked layout rank exceeds u8".into()))?;
-    buf.push(ndims);
-
-    // B-tree address
-    append_encoded_addr(buf, btree_addr, sizeof_addr)?;
-
-    // Chunk dimensions (each 4 bytes) + element size as last dim
-    for &d in chunk_dims {
-        let dim = u32::try_from(d)
-            .map_err(|_| Error::InvalidFormat("chunk dimension exceeds u32".into()))?;
-        if dim == 0 {
-            return Err(Error::InvalidFormat(
-                "chunk dimension must be positive".into(),
-            ));
-        }
-        buf.extend_from_slice(&dim.to_le_bytes());
-    }
-    buf.extend_from_slice(&element_size.to_le_bytes());
 
     Ok(())
 }
@@ -1310,6 +1271,7 @@ fn encode_filter_pipeline_into(
     compression_level: Option<u32>,
     shuffle: bool,
     fletcher32: bool,
+    element_size: usize,
 ) -> Result<()> {
     let filter_count =
         u8::from(shuffle) + u8::from(compression_level.is_some()) + u8::from(fletcher32);
@@ -1321,7 +1283,9 @@ fn encode_filter_pipeline_into(
     buf.push(filter_count); // number of filters
 
     if shuffle {
-        encode_filter_pipeline_entry_into(buf, 2, &[])?;
+        let element_size = u32::try_from(element_size)
+            .map_err(|_| Error::InvalidFormat("shuffle element size exceeds u32".into()))?;
+        encode_filter_pipeline_entry_into(buf, 2, &[element_size])?;
     }
     if let Some(level) = compression_level {
         encode_filter_pipeline_entry_into(buf, 1, &[level])?;
@@ -2255,6 +2219,9 @@ fn h5d_chunk_idx_type_for_writer(
     total_chunks: usize,
 ) -> Result<WriterChunkIndexType> {
     let growable_dims = max_shape_growable_dim_count(shape, max_shape)?;
+    let unlimited_dims = max_shape
+        .map(|max_shape| max_shape.iter().filter(|&&dim| dim == u64::MAX).count())
+        .unwrap_or(0);
     if max_shape.is_none() || growable_dims == 0 {
         return Ok(if total_chunks == 1 {
             WriterChunkIndexType::SingleChunk
@@ -2262,7 +2229,10 @@ fn h5d_chunk_idx_type_for_writer(
             WriterChunkIndexType::FixedArray
         });
     }
-    if growable_dims <= 1 && total_chunks <= EXTENSIBLE_ARRAY_MAX_WRITER_ELEMENTS {
+    if unlimited_dims == 1
+        && growable_dims == 1
+        && total_chunks <= EXTENSIBLE_ARRAY_MAX_WRITER_ELEMENTS
+    {
         Ok(WriterChunkIndexType::ExtensibleArray)
     } else {
         Ok(WriterChunkIndexType::BTreeV2)
@@ -3880,7 +3850,13 @@ impl<W: Write + Seek> HdfFileWriter<W> {
 
         // Encode filter pipeline message
         let mut pipeline_bytes = Vec::new();
-        encode_filter_pipeline_into(&mut pipeline_bytes, compression_level, shuffle, fletcher32)?;
+        encode_filter_pipeline_into(
+            &mut pipeline_bytes,
+            compression_level,
+            shuffle,
+            fletcher32,
+            element_size_usize,
+        )?;
 
         let mut fill_value_bytes = Vec::new();
         encode_fill_value_message_into(&mut fill_value_bytes, fill)?;
@@ -4123,7 +4099,13 @@ impl<W: Write + Seek> HdfFileWriter<W> {
         }
 
         let mut pipeline_bytes = Vec::new();
-        encode_filter_pipeline_into(&mut pipeline_bytes, compression_level, shuffle, fletcher32)?;
+        encode_filter_pipeline_into(
+            &mut pipeline_bytes,
+            compression_level,
+            shuffle,
+            fletcher32,
+            element_size,
+        )?;
 
         let mut fill_value_bytes = Vec::new();
         encode_fill_value_message_into(&mut fill_value_bytes, fill)?;
@@ -4268,7 +4250,13 @@ impl<W: Write + Seek> HdfFileWriter<W> {
         }
 
         let mut pipeline_bytes = Vec::new();
-        encode_filter_pipeline_into(&mut pipeline_bytes, compression_level, shuffle, fletcher32)?;
+        encode_filter_pipeline_into(
+            &mut pipeline_bytes,
+            compression_level,
+            shuffle,
+            fletcher32,
+            element_size,
+        )?;
 
         let mut fill_value_bytes = Vec::new();
         encode_fill_value_message_into(&mut fill_value_bytes, fill)?;
@@ -4331,169 +4319,6 @@ impl<W: Write + Seek> HdfFileWriter<W> {
         out: &mut [u8],
     ) -> Result<()> {
         plan.copy_into(data, chunk_start, out, scratch)
-    }
-
-    /// Write the leaf entries of a v1 chunk B-tree.
-    fn write_chunk_btree_entries_v1(
-        &mut self,
-        entries: &[ChunkBTreeEntry],
-        ndims: usize,
-        element_size: u32,
-    ) -> Result<u64> {
-        let node_size = Self::chunk_btree_node_size(ndims, usize::from(self.sizeof_addr))?;
-        let root_addr = self.allocator.allocate(
-            u64_from_usize_writer(node_size, "chunk B-tree node size")?,
-            8,
-        );
-        let final_coords = entries[entries.len() - 1].coords.as_slice();
-
-        if entries.len() <= 64 {
-            let leaf =
-                self.encode_chunk_btree_node_v1(0, entries, final_coords, ndims, element_size)?;
-            self.write_at(root_addr, &leaf)?;
-            return Ok(root_addr);
-        }
-
-        let (root_level, root_entries) =
-            self.write_chunk_btree_v1_child_level(entries, 0, ndims, element_size, node_size)?;
-        let root = self.encode_chunk_btree_node_v1(
-            root_level,
-            &root_entries,
-            final_coords,
-            ndims,
-            element_size,
-        )?;
-        self.write_at(root_addr, &root)?;
-        Ok(root_addr)
-    }
-
-    fn write_chunk_btree_v1_child_level(
-        &mut self,
-        entries: &[ChunkBTreeEntry],
-        child_level: u8,
-        ndims: usize,
-        element_size: u32,
-        node_size: usize,
-    ) -> Result<(u8, Vec<ChunkBTreeEntry>)> {
-        let parent_level = child_level
-            .checked_add(1)
-            .ok_or_else(|| Error::InvalidFormat("chunk B-tree level overflow".into()))?;
-        let child_count = entries.len().div_ceil(64);
-        let mut parent_entries = Vec::with_capacity(child_count);
-
-        for child_entries in entries.chunks(64) {
-            let child_addr = self.allocator.allocate(
-                u64_from_usize_writer(node_size, "chunk B-tree node size")?,
-                8,
-            );
-            let child_final_coords = child_entries[child_entries.len() - 1].coords.as_slice();
-            let child = self.encode_chunk_btree_node_v1(
-                child_level,
-                child_entries,
-                child_final_coords,
-                ndims,
-                element_size,
-            )?;
-            self.write_at(child_addr, &child)?;
-            parent_entries.push(ChunkBTreeEntry {
-                coords: child_entries[0].coords.clone(),
-                chunk_size: child_entries[0].chunk_size,
-                filter_mask: child_entries[0].filter_mask,
-                child_addr,
-            });
-        }
-
-        if parent_entries.len() <= 64 {
-            Ok((parent_level, parent_entries))
-        } else {
-            self.write_chunk_btree_v1_child_level(
-                &parent_entries,
-                parent_level,
-                ndims,
-                element_size,
-                node_size,
-            )
-        }
-    }
-
-    /// Compute the encoded size of one v1 chunk B-tree node.
-    fn chunk_btree_node_size(ndims: usize, sizeof_addr: usize) -> Result<usize> {
-        let key_size = ndims
-            .checked_add(1)
-            .and_then(|value| value.checked_mul(8))
-            .and_then(|value| value.checked_add(8))
-            .ok_or_else(|| Error::InvalidFormat("chunk B-tree key size overflow".into()))?;
-        let max_entries = 64usize;
-        let header_size = sizeof_addr
-            .checked_mul(2)
-            .and_then(|value| value.checked_add(8))
-            .ok_or_else(|| Error::InvalidFormat("chunk B-tree node size overflow".into()))?;
-        let key_bytes = max_entries
-            .checked_add(1)
-            .and_then(|value| value.checked_mul(key_size))
-            .ok_or_else(|| Error::InvalidFormat("chunk B-tree node size overflow".into()))?;
-        let child_bytes = max_entries
-            .checked_mul(sizeof_addr)
-            .ok_or_else(|| Error::InvalidFormat("chunk B-tree node size overflow".into()))?;
-        header_size
-            .checked_add(key_bytes)
-            .and_then(|value| value.checked_add(child_bytes))
-            .ok_or_else(|| Error::InvalidFormat("chunk B-tree node size overflow".into()))
-    }
-
-    /// Encode a v1 chunk B-tree node payload.
-    fn encode_chunk_btree_node_v1(
-        &self,
-        level: u8,
-        entries: &[ChunkBTreeEntry],
-        final_coords: &[u64],
-        ndims: usize,
-        element_size: u32,
-    ) -> Result<Vec<u8>> {
-        if entries.is_empty() {
-            return Err(Error::InvalidFormat(
-                "cannot write empty chunk B-tree node".into(),
-            ));
-        }
-        if entries.len() > 64 {
-            return Err(Error::InvalidFormat(
-                "chunk B-tree node entry count exceeds v1 node capacity".into(),
-            ));
-        }
-
-        let sa = usize::from(self.sizeof_addr);
-        let node_size = Self::chunk_btree_node_size(ndims, sa)?;
-        let mut buf = Vec::with_capacity(node_size);
-
-        buf.extend_from_slice(b"TREE");
-        buf.push(1);
-        buf.push(level);
-        buf.extend_from_slice(
-            &u16::try_from(entries.len())
-                .map_err(|_| Error::InvalidFormat("chunk B-tree entry count exceeds u16".into()))?
-                .to_le_bytes(),
-        );
-        append_encoded_addr(&mut buf, UNDEF_ADDR, self.sizeof_addr)?;
-        append_encoded_addr(&mut buf, UNDEF_ADDR, self.sizeof_addr)?;
-
-        for entry in entries {
-            buf.extend_from_slice(&entry.chunk_size.to_le_bytes());
-            buf.extend_from_slice(&entry.filter_mask.to_le_bytes());
-            for &coord in &entry.coords {
-                buf.extend_from_slice(&coord.to_le_bytes());
-            }
-            buf.extend_from_slice(&0u64.to_le_bytes());
-            append_encoded_addr(&mut buf, entry.child_addr, self.sizeof_addr)?;
-        }
-
-        buf.extend_from_slice(&0u32.to_le_bytes());
-        buf.extend_from_slice(&0u32.to_le_bytes());
-        for &coord in final_coords {
-            buf.extend_from_slice(&coord.to_le_bytes());
-        }
-        buf.extend_from_slice(&u64::from(element_size).to_le_bytes());
-        buf.resize(node_size, 0);
-        Ok(buf)
     }
 
     /// Write a v4 v2-B-tree chunk index for explicitly materialized chunks.
@@ -5534,6 +5359,7 @@ impl<W: Write + Seek> HdfFileWriter<W> {
         }
         let leaf_checksum = checksum_metadata(&leaf);
         leaf.extend_from_slice(&leaf_checksum.to_le_bytes());
+        leaf.resize(node_size, 0);
         let leaf_addr = self.allocator.allocate(
             u64_from_usize_writer(leaf.len(), "dense B-tree leaf size")?,
             8,
@@ -5596,7 +5422,7 @@ impl<W: Write + Seek> HdfFileWriter<W> {
             ));
         }
 
-        let mut node = Vec::with_capacity(node_capacity);
+        let mut node = Vec::with_capacity(node_size);
         node.extend_from_slice(b"BTIN");
         node.push(0);
         node.push(tree_type);
@@ -5620,6 +5446,7 @@ impl<W: Write + Seek> HdfFileWriter<W> {
         }
         let checksum = checksum_metadata(&node);
         node.extend_from_slice(&checksum.to_le_bytes());
+        node.resize(node_size, 0);
         let node_addr = self.allocator.allocate(
             u64_from_usize_writer(node.len(), "dense B-tree internal size")?,
             8,
@@ -5948,9 +5775,42 @@ mod tests {
 
     #[test]
     fn checked_writer_metadata_sizing_rejects_overflow() {
-        assert!(HdfFileWriter::<Cursor<Vec<u8>>>::chunk_btree_node_size(usize::MAX, 8).is_err());
         assert!(checked_next_power_of_two(usize::MAX, "test power").is_err());
         assert!(checked_usize_sum_writer(&[usize::MAX, 1], "test sum").is_err());
+    }
+
+    #[test]
+    fn filter_pipeline_encoder_writes_shuffle_element_size() {
+        let mut image = Vec::new();
+        super::encode_filter_pipeline_into(&mut image, Some(4), true, false, 8).unwrap();
+        let pipeline =
+            crate::format::messages::filter_pipeline::FilterPipelineMessage::decode(&image)
+                .unwrap();
+
+        assert_eq!(pipeline.filters.len(), 2);
+        assert_eq!(
+            pipeline.filters[0].id,
+            crate::format::messages::filter_pipeline::FILTER_SHUFFLE
+        );
+        assert_eq!(pipeline.filters[0].client_data, vec![8]);
+        assert_eq!(
+            pipeline.filters[1].id,
+            crate::format::messages::filter_pipeline::FILTER_DEFLATE
+        );
+        assert_eq!(pipeline.filters[1].client_data, vec![4]);
+    }
+
+    #[test]
+    fn filtered_chunk_size_len_matches_libhdf5_widths() {
+        assert_eq!(super::filtered_chunk_size_len_v4(1), 2);
+        assert_eq!(super::filtered_chunk_size_len_v4(64), 2);
+        assert_eq!(super::filtered_chunk_size_len_v4(127), 2);
+        assert_eq!(super::filtered_chunk_size_len_v4(128), 2);
+        assert_eq!(super::filtered_chunk_size_len_v4(200), 2);
+        assert_eq!(super::filtered_chunk_size_len_v4(255), 2);
+        assert_eq!(super::filtered_chunk_size_len_v4(256), 3);
+        assert_eq!(super::filtered_chunk_size_len_v4(65_535), 3);
+        assert_eq!(super::filtered_chunk_size_len_v4(8192), 3);
     }
 
     #[test]
@@ -6232,15 +6092,6 @@ mod tests {
         assert!(super::encode_link_name_len(&mut Vec::new(), 1, 4).is_err());
         assert!(super::encode_contiguous_layout_into(&mut Vec::new(), 0, 0, 8, 0).is_err());
         assert!(super::encode_contiguous_layout_into(&mut Vec::new(), 0, 0, 8, 9).is_err());
-        assert!(super::encode_chunked_layout_v3_into(
-            &mut Vec::new(),
-            0,
-            &[u64::from(u32::MAX) + 1],
-            1,
-            8
-        )
-        .is_err());
-        assert!(super::encode_chunked_layout_v3_into(&mut Vec::new(), 0, &[0], 1, 8).is_err());
         assert!(super::encode_fill_value_message_into(
             &mut Vec::new(),
             Some(FillValueSpec {

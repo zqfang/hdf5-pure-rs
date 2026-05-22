@@ -433,11 +433,110 @@ impl Group {
         self.addr
     }
 
-    fn current_metadata_addr_locked(&self, inner: &FileInner<BufReader<fs::File>>) -> u64 {
+    fn current_metadata_addr_locked(
+        &self,
+        inner: &mut FileInner<BufReader<fs::File>>,
+    ) -> Result<u64> {
         if self.name == "/" {
-            inner.superblock.root_addr
+            return Ok(inner.superblock.root_addr);
+        }
+
+        let mut addr = inner.superblock.root_addr;
+        let parts: Vec<&str> = self
+            .name
+            .trim_start_matches('/')
+            .split('/')
+            .filter(|part| !part.is_empty())
+            .collect();
+        for part in parts {
+            let oh = ObjectHeader::read_at(&mut inner.reader, addr)?;
+            addr = Self::hard_link_addr_in_group_header(
+                &mut inner.reader,
+                &oh,
+                inner.superblock.sizeof_addr,
+                part,
+            )?;
+            let child_oh = ObjectHeader::read_at(&mut inner.reader, addr)?;
+            if object_type_from_messages(&child_oh.messages) != ObjectType::Group {
+                return Err(Error::InvalidFormat(format!(
+                    "'{}' is not a group",
+                    group_child_path("/", part)
+                )));
+            }
+        }
+        Ok(addr)
+    }
+
+    fn hard_link_addr_in_group_header<R>(
+        reader: &mut HdfReader<R>,
+        oh: &ObjectHeader,
+        sizeof_addr: u8,
+        name: &str,
+    ) -> Result<u64>
+    where
+        R: std::io::Read + std::io::Seek,
+    {
+        for msg in &oh.messages {
+            if msg.msg_type == object_header::MSG_SYMBOL_TABLE {
+                let stab = SymbolTableMessage::decode(&msg.data, sizeof_addr)?;
+                let mut found = None;
+                Self::visit_v1_group_members(
+                    reader,
+                    stab.btree_addr,
+                    stab.name_heap_addr,
+                    |member_name, addr| {
+                        if member_name == name {
+                            found = Some(addr);
+                        }
+                        Ok(())
+                    },
+                )?;
+                if let Some(addr) = found {
+                    return Ok(addr);
+                }
+            }
+        }
+
+        for msg in &oh.messages {
+            if msg.msg_type == object_header::MSG_LINK {
+                let link = LinkMessage::decode(&msg.data, sizeof_addr)?;
+                if link.name == name {
+                    return link.hard_link_addr.ok_or_else(|| {
+                        Error::InvalidFormat(format!(
+                            "link '{name}' does not reference an object header"
+                        ))
+                    });
+                }
+            }
+        }
+
+        for msg in &oh.messages {
+            if msg.msg_type == object_header::MSG_LINK_INFO {
+                let link_info = LinkInfoMessage::decode(&msg.data, sizeof_addr)?;
+                if link_info.has_dense_storage() {
+                    if let Some(link) =
+                        Self::find_dense_link_by_name(reader, &link_info, sizeof_addr, name)?
+                    {
+                        return link.hard_link_addr.ok_or_else(|| {
+                            Error::InvalidFormat(format!(
+                                "link '{name}' does not reference an object header"
+                            ))
+                        });
+                    }
+                }
+            }
+        }
+
+        Err(Error::InvalidFormat(format!("link '{name}' not found")))
+    }
+
+    fn current_metadata_addr(&self) -> Result<u64> {
+        if self.name == "/" {
+            return Ok(self.inner.lock().superblock.root_addr);
         } else {
-            self.addr
+            File::from_inner(self.inner.clone())
+                .group(&self.name)
+                .map(|group| group.addr())
         }
     }
 
@@ -543,7 +642,7 @@ impl Group {
     {
         let mut guard = self.inner.lock();
         let sizeof_addr = guard.superblock.sizeof_addr;
-        let group_addr = self.current_metadata_addr_locked(&guard);
+        let group_addr = self.current_metadata_addr_locked(&mut guard)?;
         let oh = ObjectHeader::read_at(&mut guard.reader, group_addr)?;
 
         for msg in &oh.messages {
@@ -593,7 +692,7 @@ impl Group {
     {
         let mut guard = self.inner.lock();
         let sizeof_addr = guard.superblock.sizeof_addr;
-        let group_addr = self.current_metadata_addr_locked(&guard);
+        let group_addr = self.current_metadata_addr_locked(&mut guard)?;
         let oh = ObjectHeader::read_at(&mut guard.reader, group_addr)?;
 
         for msg in &oh.messages {
@@ -704,7 +803,7 @@ impl Group {
     {
         let mut guard = self.inner.lock();
         let sizeof_addr = guard.superblock.sizeof_addr;
-        let group_addr = self.current_metadata_addr_locked(&guard);
+        let group_addr = self.current_metadata_addr_locked(&mut guard)?;
         let oh = ObjectHeader::read_at(&mut guard.reader, group_addr)?;
 
         // Check for v1 symbol table message
@@ -968,7 +1067,7 @@ impl Group {
         let mut visitor = Some(visitor);
         let mut guard = self.inner.lock();
         let sizeof_addr = guard.superblock.sizeof_addr;
-        let group_addr = self.current_metadata_addr_locked(&guard);
+        let group_addr = self.current_metadata_addr_locked(&mut guard)?;
         let oh = ObjectHeader::read_at(&mut guard.reader, group_addr)?;
 
         // Check v1 symbol table messages
@@ -1264,7 +1363,7 @@ impl Group {
     where
         F: FnMut(&str) -> Result<()>,
     {
-        visit_attr_names_at(&self.inner, self.addr, &mut f)
+        visit_attr_names_at(&self.inner, self.current_metadata_addr()?, &mut f)
     }
 
     /// Append attribute names in storage order into caller-provided storage.
@@ -1288,13 +1387,17 @@ impl Group {
     where
         F: FnMut(&crate::hl::attribute::Attribute) -> Result<()>,
     {
-        visit_attrs_at(&self.inner, self.addr, &mut f)
+        visit_attrs_at(&self.inner, self.current_metadata_addr()?, &mut f)
     }
 
     /// Store attributes in caller-provided storage.
     pub fn attrs_into(&self, out: &mut Vec<crate::hl::attribute::Attribute>) -> Result<()> {
         out.clear();
-        crate::hl::attribute::collect_attributes_into(&self.inner, self.addr, out)
+        crate::hl::attribute::collect_attributes_into(
+            &self.inner,
+            self.current_metadata_addr()?,
+            out,
+        )
     }
 
     /// List attributes sorted by tracked creation order.
@@ -1309,8 +1412,10 @@ impl Group {
     where
         F: FnMut(&crate::hl::attribute::Attribute) -> Result<()>,
     {
-        let attrs =
-            crate::hl::attribute::collect_attributes_by_creation_order(&self.inner, self.addr)?;
+        let attrs = crate::hl::attribute::collect_attributes_by_creation_order(
+            &self.inner,
+            self.current_metadata_addr()?,
+        )?;
         for attr in &attrs {
             f(attr)?;
         }
@@ -1325,7 +1430,7 @@ impl Group {
         out.clear();
         crate::hl::attribute::collect_attributes_by_creation_order_into(
             &self.inner,
-            self.addr,
+            self.current_metadata_addr()?,
             out,
         )?;
         Ok(())
@@ -1333,12 +1438,12 @@ impl Group {
 
     /// Get an attribute by name.
     pub fn attr(&self, name: &str) -> Result<crate::hl::attribute::Attribute> {
-        crate::hl::attribute::get_attr(&self.inner, self.addr, name)
+        crate::hl::attribute::get_attr(&self.inner, self.current_metadata_addr()?, name)
     }
 
     /// Check whether an attribute exists on this group.
     pub fn attr_exists(&self, name: &str) -> Result<bool> {
-        crate::hl::attribute::attr_exists(&self.inner, self.addr, name)
+        crate::hl::attribute::attr_exists(&self.inner, self.current_metadata_addr()?, name)
     }
 
     /// Get the link type of a member by name.
@@ -1358,7 +1463,7 @@ impl Group {
         let mut visitor = Some(visitor);
         let mut guard = self.inner.lock();
         let sizeof_addr = guard.superblock.sizeof_addr;
-        let group_addr = self.current_metadata_addr_locked(&guard);
+        let group_addr = self.current_metadata_addr_locked(&mut guard)?;
         let oh = ObjectHeader::read_at(&mut guard.reader, group_addr)?;
 
         for msg in &oh.messages {
@@ -1537,7 +1642,7 @@ impl Group {
 
     /// Get this group's object comment, if present.
     pub fn object_comment(&self) -> Result<Option<String>> {
-        self.object_comment_at(self.addr)
+        self.object_comment_at(self.current_metadata_addr()?)
     }
 
     /// Get a child object's comment by link name, if present.
@@ -1548,7 +1653,7 @@ impl Group {
 
     /// Get native object-header metadata for this group.
     pub fn native_info(&self) -> Result<ObjectInfo> {
-        self.object_info_at(self.addr)
+        self.object_info_at(self.current_metadata_addr()?)
     }
 
     /// Get v3-style child object metadata by zero-based link index.
@@ -1590,7 +1695,15 @@ impl Group {
     pub fn link_hard(&self, target: &str, link_name: &str) -> Result<()> {
         let target_addr = self.object_addr_for_hard_link_target(target)?;
         let mut file = self.mutable_file_for_group()?;
-        if let Some(target_name) = same_group_direct_target_name(&self.name, target) {
+        if relative_same_group_direct_target_name(target).is_some() {
+            let target_path = group_child_path(&self.name, target);
+            file.create_compact_hard_link_to_target_path(
+                &self.name,
+                link_name,
+                &target_path,
+                target_addr,
+            )?;
+        } else if let Some(target_name) = same_group_direct_target_name(&self.name, target) {
             file.create_compact_same_group_hard_link(
                 &self.name,
                 link_name,
@@ -1678,6 +1791,15 @@ impl Group {
         }
 
         let file = File::from_inner(self.inner.clone());
+        if !target.starts_with('/') {
+            let relative_target = group_child_path(&self.name, target);
+            if let Ok(dataset) = file.dataset(&relative_target) {
+                return Ok(dataset.addr());
+            }
+            if let Ok(group) = file.group(&relative_target) {
+                return Ok(group.addr());
+            }
+        }
         if let Ok(dataset) = file.dataset(target) {
             return Ok(dataset.addr());
         }
@@ -1773,6 +1895,15 @@ fn same_group_direct_target_name<'a>(group_name: &str, target: &'a str) -> Optio
     let group = group_name.strip_prefix('/')?;
     let child = target.strip_prefix(group)?.strip_prefix('/')?;
     (!child.is_empty() && !child.contains('/')).then_some(child)
+}
+
+fn relative_same_group_direct_target_name(target: &str) -> Option<&str> {
+    (!target.is_empty()
+        && !target.starts_with('/')
+        && !target.contains('/')
+        && target != "."
+        && target != "..")
+        .then_some(target)
 }
 
 fn normalized_absolute_child_path(path: &str) -> Option<(&str, &str)> {

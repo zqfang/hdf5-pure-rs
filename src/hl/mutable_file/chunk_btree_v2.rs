@@ -1,10 +1,23 @@
-use std::io::{Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 
 use crate::error::{Error, Result};
 use crate::format::btree_v2::BTreeV2Header;
 use crate::format::checksum::checksum_metadata;
+use crate::io::reader::HdfReader;
 
 use super::MutableFile;
+
+struct BTreeV2RecordLocation {
+    node_addr: u64,
+    record_offset: usize,
+    checksum_len: usize,
+}
+
+struct BTreeV2MutableNodeInfo {
+    max_nrec: usize,
+    cum_max_nrec: u64,
+    cum_max_nrec_size: usize,
+}
 
 impl MutableFile {
     pub(super) fn rewrite_btree_v2_chunk(
@@ -64,15 +77,31 @@ impl MutableFile {
             chunk_size_len,
             sa,
         )? {
-            Ok(index) => Self::encode_btree_v2_chunk_record_into(
-                chunk_addr,
-                chunk_size,
-                &scaled_coords,
-                filtered,
-                chunk_size_len,
-                sa,
-                &mut records[index],
-            )?,
+            Ok(_) => {
+                let record = Self::encode_btree_v2_chunk_record(
+                    chunk_addr,
+                    chunk_size,
+                    &scaled_coords,
+                    filtered,
+                    chunk_size_len,
+                    sa,
+                )?;
+                let location = Self::find_btree_v2_chunk_record_location(
+                    reader,
+                    &header,
+                    &scaled_coords,
+                    filtered,
+                    chunk_size_len,
+                    sa,
+                )?
+                .ok_or_else(|| {
+                    Error::InvalidFormat(
+                        "existing v2 B-tree chunk record was not found on disk".into(),
+                    )
+                })?;
+                drop(guard);
+                return self.rewrite_btree_v2_record_at(&location, &record);
+            }
             Err(index) => {
                 let new_record = Self::encode_btree_v2_chunk_record(
                     chunk_addr,
@@ -88,6 +117,149 @@ impl MutableFile {
         drop(guard);
 
         self.rebuild_btree_v2_chunk_tree(index_addr, &header, &records)
+    }
+
+    fn rewrite_btree_v2_record_at(
+        &mut self,
+        location: &BTreeV2RecordLocation,
+        record: &[u8],
+    ) -> Result<()> {
+        let record_end = location
+            .record_offset
+            .checked_add(record.len())
+            .ok_or_else(|| Error::InvalidFormat("v2 B-tree record offset overflow".into()))?;
+        if record_end > location.checksum_len {
+            return Err(Error::InvalidFormat(
+                "v2 B-tree record extends past checksum span".into(),
+            ));
+        }
+
+        let node_pos = self.physical_addr(location.node_addr, "v2 B-tree node")?;
+        let mut node = vec![0; location.checksum_len];
+        self.read_fresh_bytes_into(node_pos, &mut node)?;
+        node[location.record_offset..record_end].copy_from_slice(record);
+        let checksum = checksum_metadata(&node);
+
+        let record_pos = node_pos
+            .checked_add(Self::usize_to_u64(
+                location.record_offset,
+                "v2 B-tree record offset",
+            )?)
+            .ok_or_else(|| Error::InvalidFormat("v2 B-tree record position overflow".into()))?;
+        self.write_handle.seek(SeekFrom::Start(record_pos))?;
+        self.write_handle.write_all(record)?;
+
+        let checksum_pos = node_pos
+            .checked_add(Self::usize_to_u64(
+                location.checksum_len,
+                "v2 B-tree checksum offset",
+            )?)
+            .ok_or_else(|| Error::InvalidFormat("v2 B-tree checksum position overflow".into()))?;
+        self.write_handle.seek(SeekFrom::Start(checksum_pos))?;
+        self.write_handle.write_all(&checksum.to_le_bytes())?;
+        Ok(())
+    }
+
+    pub(super) fn prune_btree_v2_chunks_outside_extent(
+        &mut self,
+        index_addr: u64,
+        info: &crate::hl::dataset::DatasetInfo,
+        new_dims: &[u64],
+        chunk_dims: &[u64],
+    ) -> Result<()> {
+        let filtered = info
+            .filter_pipeline
+            .as_ref()
+            .map(|pipeline| !pipeline.filters.is_empty())
+            .unwrap_or(false);
+        let unfiltered_chunk_bytes = Self::chunk_unfiltered_byte_len(info, chunk_dims)?;
+        let chunk_size_len = if filtered {
+            Self::filtered_chunk_size_len(
+                info.layout.version,
+                unfiltered_chunk_bytes,
+                self.superblock.sizeof_size,
+            )
+        } else {
+            0
+        };
+        let sa = usize::from(self.superblock.sizeof_addr);
+        let expected_record_size =
+            Self::btree_v2_chunk_record_size(sa, filtered, chunk_size_len, chunk_dims.len())?;
+
+        let mut guard = self.inner.lock();
+        let reader = &mut guard.reader;
+        let header = BTreeV2Header::read_at(reader, index_addr)?;
+        if usize::from(header.record_size) != expected_record_size {
+            return Err(Error::InvalidFormat(format!(
+                "v2 B-tree chunk record size {} does not match expected {expected_record_size}",
+                header.record_size
+            )));
+        }
+        if header.tree_type != 10 && header.tree_type != 11 {
+            return Err(Error::Unsupported(format!(
+                "resize cannot prune v2 B-tree type {} chunk indexes",
+                header.tree_type
+            )));
+        }
+
+        let mut records = Vec::new();
+        crate::format::btree_v2::collect_all_records_into(reader, index_addr, &mut records)?;
+        let original_len = records.len();
+        records.retain(|record| {
+            Self::btree_v2_record_starts_inside_extent(
+                record,
+                new_dims,
+                chunk_dims,
+                filtered,
+                chunk_size_len,
+                sa,
+            )
+            .unwrap_or(false)
+        });
+        drop(guard);
+
+        if records.len() == original_len {
+            return Ok(());
+        }
+        self.rebuild_btree_v2_chunk_tree(index_addr, &header, &records)
+    }
+
+    fn btree_v2_record_starts_inside_extent(
+        record: &[u8],
+        dims: &[u64],
+        chunk_dims: &[u64],
+        filtered: bool,
+        chunk_size_len: usize,
+        sizeof_addr: usize,
+    ) -> Result<bool> {
+        let scaled_coords = Self::decode_btree_v2_scaled_coords(
+            record,
+            filtered,
+            chunk_size_len,
+            sizeof_addr,
+            chunk_dims.len(),
+        )?;
+        for ((&scaled, &chunk), &dim) in scaled_coords.iter().zip(chunk_dims).zip(dims) {
+            let start = scaled
+                .checked_mul(chunk)
+                .ok_or_else(|| Error::InvalidFormat("chunk start coordinate overflow".into()))?;
+            if start >= dim {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn chunk_unfiltered_byte_len(
+        info: &crate::hl::dataset::DatasetInfo,
+        chunk_dims: &[u64],
+    ) -> Result<usize> {
+        let element_size = Self::u64_to_usize(u64::from(info.datatype.size), "datatype size")?;
+        chunk_dims.iter().try_fold(element_size, |acc, &dim| {
+            let dim = Self::u64_to_usize(dim, "chunk dimension")?;
+            acc.checked_mul(dim)
+                .ok_or_else(|| Error::InvalidFormat("chunk byte size overflow".into()))
+        })
     }
 
     fn find_btree_v2_chunk_record_index(
@@ -215,7 +387,7 @@ impl MutableFile {
     }
 
     /// Pure encoder for a v2 B-tree leaf node (BTLF magic + records +
-    /// checksum). Mirrors the serialize half of libhdf5's
+    /// checksum + zero padding). Mirrors the serialize half of libhdf5's
     /// `H5B2__cache_leaf_serialize`.
     fn encode_btree_v2_leaf(header: &BTreeV2Header, records: &[Vec<u8>]) -> Result<Vec<u8>> {
         if records.len() > usize::from(u16::MAX) {
@@ -228,11 +400,17 @@ impl MutableFile {
             .len()
             .checked_mul(record_size)
             .ok_or_else(|| Error::InvalidFormat("v2 B-tree leaf size overflow".into()))?;
-        let leaf_capacity = 6usize
+        let node_size = Self::btree_v2_node_size(header)?;
+        let compact_len = 6usize
             .checked_add(records_bytes)
             .and_then(|value| value.checked_add(4))
             .ok_or_else(|| Error::InvalidFormat("v2 B-tree leaf size overflow".into()))?;
-        let mut leaf = Vec::with_capacity(leaf_capacity);
+        if compact_len > node_size {
+            return Err(Error::InvalidFormat(
+                "v2 B-tree leaf records exceed node size".into(),
+            ));
+        }
+        let mut leaf = Vec::with_capacity(node_size);
         leaf.extend_from_slice(b"BTLF");
         leaf.push(0);
         leaf.push(header.tree_type);
@@ -246,6 +424,7 @@ impl MutableFile {
         }
         let checksum = checksum_metadata(&leaf);
         leaf.extend_from_slice(&checksum.to_le_bytes());
+        leaf.resize(node_size, 0);
         Ok(leaf)
     }
 
@@ -259,7 +438,7 @@ impl MutableFile {
     }
 
     /// Pure encoder for a v2 B-tree depth-1 internal node (BTIN magic +
-    /// separators + child pointers + checksum). Mirrors the serialize
+    /// separators + child pointers + checksum + zero padding). Mirrors the serialize
     /// half of libhdf5's `H5B2__cache_int_serialize`.
     fn encode_btree_v2_depth1_internal(
         &self,
@@ -288,7 +467,8 @@ impl MutableFile {
             .checked_add(child_nrecords_size)
             .ok_or_else(|| Error::InvalidFormat("v2 B-tree pointer size overflow".into()))?;
 
-        let node_capacity =
+        let node_size = Self::btree_v2_node_size(header)?;
+        let compact_len =
             6usize
                 .checked_add(separators.len().checked_mul(record_size).ok_or_else(|| {
                     Error::InvalidFormat("v2 B-tree internal size overflow".into())
@@ -301,7 +481,12 @@ impl MutableFile {
                 })
                 .and_then(|value| value.checked_add(4))
                 .ok_or_else(|| Error::InvalidFormat("v2 B-tree internal size overflow".into()))?;
-        let mut node = Vec::with_capacity(node_capacity);
+        if compact_len > node_size {
+            return Err(Error::InvalidFormat(
+                "v2 B-tree internal records exceed node size".into(),
+            ));
+        }
+        let mut node = Vec::with_capacity(node_size);
         node.extend_from_slice(b"BTIN");
         node.push(0);
         node.push(header.tree_type);
@@ -330,6 +515,7 @@ impl MutableFile {
         }
         let checksum = checksum_metadata(&node);
         node.extend_from_slice(&checksum.to_le_bytes());
+        node.resize(node_size, 0);
         Ok(node)
     }
 
@@ -348,8 +534,7 @@ impl MutableFile {
     }
 
     fn btree_v2_depth1_internal_capacity(&self, header: &BTreeV2Header) -> Result<usize> {
-        let node_size = usize::try_from(header.node_size)
-            .map_err(|_| Error::InvalidFormat("v2 B-tree node size is too large".into()))?;
+        let node_size = Self::btree_v2_node_size(header)?;
         let record_size = usize::from(header.record_size);
         let leaf_capacity = Self::btree_v2_leaf_capacity(header)?;
         let max_nrec_size = Self::bytes_needed(Self::usize_to_u64(
@@ -466,8 +651,7 @@ impl MutableFile {
     }
 
     fn btree_v2_leaf_capacity(header: &BTreeV2Header) -> Result<usize> {
-        let node_size = usize::try_from(header.node_size)
-            .map_err(|_| Error::InvalidFormat("v2 B-tree node size is too large".into()))?;
+        let node_size = Self::btree_v2_node_size(header)?;
         let record_size = usize::from(header.record_size);
         if node_size <= 10 || record_size == 0 {
             return Err(Error::InvalidFormat("invalid v2 B-tree node sizing".into()));
@@ -479,6 +663,327 @@ impl MutableFile {
             ));
         }
         Ok(capacity)
+    }
+
+    fn btree_v2_node_size(header: &BTreeV2Header) -> Result<usize> {
+        usize::try_from(header.node_size)
+            .map_err(|_| Error::InvalidFormat("v2 B-tree node size is too large".into()))
+    }
+
+    fn find_btree_v2_chunk_record_location<R: Read + Seek>(
+        reader: &mut HdfReader<R>,
+        header: &BTreeV2Header,
+        scaled_coords: &[u64],
+        filtered: bool,
+        chunk_size_len: usize,
+        sizeof_addr: usize,
+    ) -> Result<Option<BTreeV2RecordLocation>> {
+        if header.total_records == 0 {
+            return Ok(None);
+        }
+        let node_info = Self::btree_v2_mutable_node_info(header, sizeof_addr)?;
+        Self::find_btree_v2_chunk_record_location_in_node(
+            reader,
+            header,
+            &node_info,
+            header.root_addr,
+            header.root_nrecords,
+            header.depth,
+            scaled_coords,
+            filtered,
+            chunk_size_len,
+            sizeof_addr,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn find_btree_v2_chunk_record_location_in_node<R: Read + Seek>(
+        reader: &mut HdfReader<R>,
+        header: &BTreeV2Header,
+        node_info: &[BTreeV2MutableNodeInfo],
+        node_addr: u64,
+        nrecords: u16,
+        depth: u16,
+        scaled_coords: &[u64],
+        filtered: bool,
+        chunk_size_len: usize,
+        sizeof_addr: usize,
+    ) -> Result<Option<BTreeV2RecordLocation>> {
+        if depth == 0 {
+            return Self::find_btree_v2_chunk_record_location_in_leaf(
+                reader,
+                header,
+                node_addr,
+                nrecords,
+                scaled_coords,
+                filtered,
+                chunk_size_len,
+                sizeof_addr,
+            );
+        }
+
+        let depth_index = usize::from(depth);
+        let Some(info) = node_info.get(depth_index) else {
+            return Err(Error::InvalidFormat(
+                "v2 B-tree internal node depth is invalid".into(),
+            ));
+        };
+        if usize::from(nrecords) > info.max_nrec {
+            return Err(Error::InvalidFormat(
+                "v2 B-tree internal node has too many records".into(),
+            ));
+        }
+
+        let record_size = usize::from(header.record_size);
+        let nrecords_usize = usize::from(nrecords);
+        let record_bytes = nrecords_usize.checked_mul(record_size).ok_or_else(|| {
+            Error::InvalidFormat("v2 B-tree internal record bytes overflow".into())
+        })?;
+        let leaf_capacity = node_info
+            .first()
+            .map(|info| info.max_nrec)
+            .ok_or_else(|| Error::InvalidFormat("v2 B-tree node info is empty".into()))?;
+        let child_nrec_size = Self::bytes_needed(Self::usize_to_u64(
+            leaf_capacity,
+            "v2 B-tree leaf record capacity",
+        )?);
+        let child_all_nrec_size = if depth > 1 {
+            node_info[depth_index - 1].cum_max_nrec_size
+        } else {
+            0
+        };
+        let child_entry_size = sizeof_addr
+            .checked_add(child_nrec_size)
+            .and_then(|value| value.checked_add(child_all_nrec_size))
+            .ok_or_else(|| Error::InvalidFormat("v2 B-tree child entry size overflow".into()))?;
+        let child_count = nrecords_usize
+            .checked_add(1)
+            .ok_or_else(|| Error::InvalidFormat("v2 B-tree child count overflow".into()))?;
+        let child_bytes = child_count
+            .checked_mul(child_entry_size)
+            .ok_or_else(|| Error::InvalidFormat("v2 B-tree child bytes overflow".into()))?;
+        let checksum_len = 6usize
+            .checked_add(record_bytes)
+            .and_then(|value| value.checked_add(child_bytes))
+            .ok_or_else(|| {
+                Error::InvalidFormat("v2 B-tree internal checksum span overflow".into())
+            })?;
+
+        let mut node = vec![0; checksum_len + 4];
+        reader.seek(node_addr)?;
+        reader.read_bytes_into(&mut node)?;
+        if node.get(..4) != Some(b"BTIN") {
+            return Err(Error::InvalidFormat(
+                "invalid v2 B-tree internal magic".into(),
+            ));
+        }
+        if node.get(4) != Some(&0) || node.get(5) != Some(&header.tree_type) {
+            return Err(Error::InvalidFormat(
+                "invalid v2 B-tree internal node prefix".into(),
+            ));
+        }
+
+        let records_start = 6usize;
+        let mut left = 0usize;
+        let mut right = nrecords_usize;
+        while left < right {
+            let mid = left + (right - left) / 2;
+            let record_offset = records_start
+                .checked_add(mid.checked_mul(record_size).ok_or_else(|| {
+                    Error::InvalidFormat("v2 B-tree record offset overflow".into())
+                })?)
+                .ok_or_else(|| Error::InvalidFormat("v2 B-tree record offset overflow".into()))?;
+            let record = node
+                .get(record_offset..record_offset + record_size)
+                .ok_or_else(|| {
+                    Error::InvalidFormat("v2 B-tree internal record is truncated".into())
+                })?;
+            match Self::cmp_btree_v2_scaled_coords(
+                record,
+                scaled_coords,
+                filtered,
+                chunk_size_len,
+                sizeof_addr,
+            )? {
+                std::cmp::Ordering::Less => left = mid + 1,
+                std::cmp::Ordering::Equal => {
+                    return Ok(Some(BTreeV2RecordLocation {
+                        node_addr,
+                        record_offset,
+                        checksum_len,
+                    }));
+                }
+                std::cmp::Ordering::Greater => right = mid,
+            }
+        }
+
+        let child_table_start = records_start
+            .checked_add(record_bytes)
+            .ok_or_else(|| Error::InvalidFormat("v2 B-tree child table offset overflow".into()))?;
+        let child_offset = child_table_start
+            .checked_add(left.checked_mul(child_entry_size).ok_or_else(|| {
+                Error::InvalidFormat("v2 B-tree child entry offset overflow".into())
+            })?)
+            .ok_or_else(|| Error::InvalidFormat("v2 B-tree child entry offset overflow".into()))?;
+        let child_addr = Self::read_le_uint(
+            node.get(child_offset..child_offset + sizeof_addr)
+                .ok_or_else(|| {
+                    Error::InvalidFormat("v2 B-tree child address is truncated".into())
+                })?,
+        )?;
+        let child_nrecords_start = child_offset
+            .checked_add(sizeof_addr)
+            .ok_or_else(|| Error::InvalidFormat("v2 B-tree child entry offset overflow".into()))?;
+        let child_nrecords = Self::read_le_uint(
+            node.get(child_nrecords_start..child_nrecords_start + child_nrec_size)
+                .ok_or_else(|| {
+                    Error::InvalidFormat("v2 B-tree child record count is truncated".into())
+                })?,
+        )?;
+        let child_nrecords = u16::try_from(child_nrecords)
+            .map_err(|_| Error::InvalidFormat("v2 B-tree child record count exceeds u16".into()))?;
+
+        Self::find_btree_v2_chunk_record_location_in_node(
+            reader,
+            header,
+            node_info,
+            child_addr,
+            child_nrecords,
+            depth - 1,
+            scaled_coords,
+            filtered,
+            chunk_size_len,
+            sizeof_addr,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn find_btree_v2_chunk_record_location_in_leaf<R: Read + Seek>(
+        reader: &mut HdfReader<R>,
+        header: &BTreeV2Header,
+        node_addr: u64,
+        nrecords: u16,
+        scaled_coords: &[u64],
+        filtered: bool,
+        chunk_size_len: usize,
+        sizeof_addr: usize,
+    ) -> Result<Option<BTreeV2RecordLocation>> {
+        let record_size = usize::from(header.record_size);
+        let nrecords_usize = usize::from(nrecords);
+        let record_bytes = nrecords_usize
+            .checked_mul(record_size)
+            .ok_or_else(|| Error::InvalidFormat("v2 B-tree leaf record bytes overflow".into()))?;
+        let checksum_len = 6usize
+            .checked_add(record_bytes)
+            .ok_or_else(|| Error::InvalidFormat("v2 B-tree leaf checksum span overflow".into()))?;
+        let mut node = vec![0; checksum_len + 4];
+        reader.seek(node_addr)?;
+        reader.read_bytes_into(&mut node)?;
+        if node.get(..4) != Some(b"BTLF") {
+            return Err(Error::InvalidFormat("invalid v2 B-tree leaf magic".into()));
+        }
+        if node.get(4) != Some(&0) || node.get(5) != Some(&header.tree_type) {
+            return Err(Error::InvalidFormat(
+                "invalid v2 B-tree leaf node prefix".into(),
+            ));
+        }
+
+        let records_start = 6usize;
+        let mut left = 0usize;
+        let mut right = nrecords_usize;
+        while left < right {
+            let mid = left + (right - left) / 2;
+            let record_offset = records_start
+                .checked_add(mid.checked_mul(record_size).ok_or_else(|| {
+                    Error::InvalidFormat("v2 B-tree record offset overflow".into())
+                })?)
+                .ok_or_else(|| Error::InvalidFormat("v2 B-tree record offset overflow".into()))?;
+            let record = node
+                .get(record_offset..record_offset + record_size)
+                .ok_or_else(|| Error::InvalidFormat("v2 B-tree leaf record is truncated".into()))?;
+            match Self::cmp_btree_v2_scaled_coords(
+                record,
+                scaled_coords,
+                filtered,
+                chunk_size_len,
+                sizeof_addr,
+            )? {
+                std::cmp::Ordering::Less => left = mid + 1,
+                std::cmp::Ordering::Equal => {
+                    return Ok(Some(BTreeV2RecordLocation {
+                        node_addr,
+                        record_offset,
+                        checksum_len,
+                    }));
+                }
+                std::cmp::Ordering::Greater => right = mid,
+            }
+        }
+        Ok(None)
+    }
+
+    fn btree_v2_mutable_node_info(
+        header: &BTreeV2Header,
+        sizeof_addr: usize,
+    ) -> Result<Vec<BTreeV2MutableNodeInfo>> {
+        let node_size = Self::btree_v2_node_size(header)?;
+        let record_size = usize::from(header.record_size);
+        if node_size <= 10 || record_size == 0 {
+            return Err(Error::InvalidFormat("invalid v2 B-tree node sizing".into()));
+        }
+        let leaf_max = (node_size - 10) / record_size;
+        if leaf_max == 0 {
+            return Err(Error::InvalidFormat(
+                "v2 B-tree leaf cannot hold any records".into(),
+            ));
+        }
+
+        let leaf_max_u64 = Self::usize_to_u64(leaf_max, "v2 B-tree leaf record capacity")?;
+        let max_nrec_size = Self::bytes_needed(leaf_max_u64);
+        let depth = usize::from(header.depth);
+        let mut infos = Vec::with_capacity(depth + 1);
+        infos.push(BTreeV2MutableNodeInfo {
+            max_nrec: leaf_max,
+            cum_max_nrec: leaf_max_u64,
+            cum_max_nrec_size: 0,
+        });
+        for level in 1..=depth {
+            let pointer_size = sizeof_addr
+                .checked_add(max_nrec_size)
+                .and_then(|value| value.checked_add(infos[level - 1].cum_max_nrec_size))
+                .ok_or_else(|| Error::InvalidFormat("v2 B-tree pointer size overflow".into()))?;
+            let prefix_and_pointer = 6usize.checked_add(pointer_size).ok_or_else(|| {
+                Error::InvalidFormat("v2 B-tree internal node prefix overflow".into())
+            })?;
+            if node_size <= prefix_and_pointer {
+                return Err(Error::InvalidFormat(
+                    "v2 B-tree internal node cannot hold records".into(),
+                ));
+            }
+            let record_slot = record_size.checked_add(pointer_size).ok_or_else(|| {
+                Error::InvalidFormat("v2 B-tree internal record slot size overflow".into())
+            })?;
+            let max_nrec = (node_size - prefix_and_pointer) / record_slot;
+            if max_nrec == 0 {
+                return Err(Error::InvalidFormat(
+                    "v2 B-tree internal node cannot hold records".into(),
+                ));
+            }
+            let max_nrec_u64 = Self::usize_to_u64(max_nrec, "v2 B-tree internal record capacity")?;
+            let cum_max_nrec = max_nrec_u64
+                .checked_add(1)
+                .and_then(|value| value.checked_mul(infos[level - 1].cum_max_nrec))
+                .and_then(|value| value.checked_add(max_nrec_u64))
+                .ok_or_else(|| {
+                    Error::InvalidFormat("v2 B-tree cumulative record count overflow".into())
+                })?;
+            infos.push(BTreeV2MutableNodeInfo {
+                max_nrec,
+                cum_max_nrec,
+                cum_max_nrec_size: Self::bytes_needed(cum_max_nrec),
+            });
+        }
+        Ok(infos)
     }
 
     fn btree_v2_chunk_record_size(
@@ -571,7 +1076,6 @@ impl MutableFile {
         Ok(())
     }
 
-    #[cfg(test)]
     fn decode_btree_v2_scaled_coords(
         record: &[u8],
         filtered: bool,
@@ -756,6 +1260,15 @@ mod tests {
         let header = test_header(8);
         let result = MutableFile::encode_btree_v2_leaf(&header, &[vec![0; 7]]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn encode_btree_v2_leaf_pads_to_declared_node_size() {
+        let header = test_header(8);
+        let leaf = MutableFile::encode_btree_v2_leaf(&header, &[vec![1; 8], vec![2; 8]]).unwrap();
+
+        assert_eq!(leaf.len(), header.node_size as usize);
+        assert!(leaf[6 + 2 * 8 + 4..].iter().all(|byte| *byte == 0));
     }
 
     #[test]

@@ -1,4 +1,10 @@
+use hdf5_pure_rust::format::checksum::checksum_metadata;
+use hdf5_pure_rust::format::messages::data_layout::ChunkIndexType;
 use hdf5_pure_rust::{Dataset, File, H5Type, MutableFile, Result, WritableFile};
+
+const V0_BASE_ADDR_OFFSET: usize = 24;
+const V2_BASE_ADDR_OFFSET: usize = 12;
+const USERBLOCK_SIZE: usize = 512;
 
 fn dataset_shape_into(ds: &Dataset, shape: &mut Vec<u64>) -> Result<()> {
     ds.shape_into(shape)
@@ -9,6 +15,77 @@ where
     T: H5Type,
 {
     ds.read_into(values)
+}
+
+fn assert_h5dump_dataset_read(path: &std::path::Path, dataset: &str, context: &str) {
+    let out = std::process::Command::new("h5dump")
+        .arg("-d")
+        .arg(dataset)
+        .arg(path)
+        .output();
+    if let Ok(out) = out {
+        assert!(
+            out.status.success(),
+            "h5dump data read failed on {context}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+fn assert_h5py_script(path: &std::path::Path, script: &str, context: &str) {
+    let code = format!(
+        "import sys, h5py\n\
+         f = h5py.File(sys.argv[1], 'r')\n\
+         {script}\n\
+         f.close()\n\
+         print('OK')"
+    );
+    let out = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(code)
+        .arg(path)
+        .output();
+    if let Ok(out) = out {
+        assert!(
+            out.status.success() && String::from_utf8_lossy(&out.stdout).contains("OK"),
+            "h5py verification failed on {context}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+fn assert_logical_eoa_matches_file_len(path: &std::path::Path) {
+    let f = File::open(path).unwrap();
+    let physical_len = std::fs::metadata(path).unwrap().len();
+    assert_eq!(f.eoa(), physical_len - f.userblock());
+}
+
+fn copy_v0_fixture_with_userblock(src: &str, dst: &std::path::Path) {
+    let mut original = std::fs::read(src).unwrap();
+    original[V0_BASE_ADDR_OFFSET..V0_BASE_ADDR_OFFSET + 8]
+        .copy_from_slice(&(USERBLOCK_SIZE as u64).to_le_bytes());
+    let mut with_userblock = vec![0u8; USERBLOCK_SIZE];
+    with_userblock[..b"resize test userblock\0".len()].copy_from_slice(b"resize test userblock\0");
+    with_userblock.extend_from_slice(&original);
+    std::fs::write(dst, with_userblock).unwrap();
+}
+
+fn copy_v2_v3_fixture_with_userblock(src: &str, dst: &std::path::Path) {
+    let mut original = std::fs::read(src).unwrap();
+    assert!(original[8] >= 2, "expected a v2/v3 superblock fixture");
+    let sizeof_addr = usize::from(original[9]);
+    let checksum_offset = V2_BASE_ADDR_OFFSET + 4 * sizeof_addr;
+    let encoded_base = (USERBLOCK_SIZE as u64).to_le_bytes();
+    original[V2_BASE_ADDR_OFFSET..V2_BASE_ADDR_OFFSET + sizeof_addr]
+        .copy_from_slice(&encoded_base[..sizeof_addr]);
+    let checksum = checksum_metadata(&original[..checksum_offset]);
+    original[checksum_offset..checksum_offset + 4].copy_from_slice(&checksum.to_le_bytes());
+
+    let mut with_userblock = vec![0u8; USERBLOCK_SIZE];
+    with_userblock[..b"resize test modern userblock\0".len()]
+        .copy_from_slice(b"resize test modern userblock\0");
+    with_userblock.extend_from_slice(&original);
+    std::fs::write(dst, with_userblock).unwrap();
 }
 
 #[test]
@@ -385,6 +462,7 @@ fn test_resize_shrink_hides_removed_chunks() {
         let mut wf = WritableFile::create(&path).unwrap();
         wf.new_dataset_builder("data")
             .shape(&[15])
+            .max_shape(&[20])
             .chunk(&[5])
             .resizable()
             .write::<i32>(&(0..15).collect::<Vec<_>>())
@@ -404,6 +482,319 @@ fn test_resize_shrink_hides_removed_chunks() {
         dataset_read_into(&ds, &mut vals).unwrap();
         assert_eq!(vals, vec![0, 1, 2, 3, 4, 5]);
     }
+}
+
+#[test]
+fn test_resize_btree_v2_shrink_then_grow_does_not_reexpose_pruned_chunks() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("resize_btree_v2_shrink_grow.h5");
+
+    {
+        let mut wf = WritableFile::create(&path).unwrap();
+        wf.new_dataset_builder("data")
+            .shape(&[15])
+            .max_shape(&[20])
+            .chunk(&[5])
+            .fill_value::<i32>(-7)
+            .write::<i32>(&(0..15).collect::<Vec<_>>())
+            .unwrap();
+        wf.flush().unwrap();
+    }
+
+    {
+        let mut mf = MutableFile::open_rw(&path).unwrap();
+        mf.resize_dataset("data", &[5]).unwrap();
+        mf.resize_dataset("data", &[15]).unwrap();
+    }
+
+    {
+        let f = File::open(&path).unwrap();
+        let ds = f.dataset("data").unwrap();
+        let info = ds.info().unwrap();
+        assert_eq!(info.layout.chunk_index_type, Some(ChunkIndexType::BTreeV2));
+        let mut vals = vec![0; ds.size().unwrap() as usize];
+        dataset_read_into(&ds, &mut vals).unwrap();
+        assert_eq!(
+            vals,
+            vec![0, 1, 2, 3, 4, -7, -7, -7, -7, -7, -7, -7, -7, -7, -7]
+        );
+    }
+
+    assert_logical_eoa_matches_file_len(&path);
+    assert_h5dump_dataset_read(&path, "data", "B-tree v2 shrink-grow pruned file");
+}
+
+#[test]
+fn test_resize_btree_v2_partial_shrink_then_grow_scrubs_boundary_chunk_tail() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("resize_btree_v2_partial_shrink_grow.h5");
+
+    {
+        let mut wf = WritableFile::create(&path).unwrap();
+        wf.new_dataset_builder("data")
+            .shape(&[15])
+            .max_shape(&[20])
+            .chunk(&[5])
+            .fill_value::<i32>(-7)
+            .write::<i32>(&(0..15).collect::<Vec<_>>())
+            .unwrap();
+        wf.flush().unwrap();
+    }
+
+    {
+        let mut mf = MutableFile::open_rw(&path).unwrap();
+        mf.resize_dataset("data", &[7]).unwrap();
+        mf.resize_dataset("data", &[15]).unwrap();
+    }
+
+    {
+        let f = File::open(&path).unwrap();
+        let ds = f.dataset("data").unwrap();
+        assert_eq!(
+            ds.info().unwrap().layout.chunk_index_type,
+            Some(ChunkIndexType::BTreeV2)
+        );
+        let mut vals = vec![0; ds.size().unwrap() as usize];
+        dataset_read_into(&ds, &mut vals).unwrap();
+        assert_eq!(
+            vals,
+            vec![0, 1, 2, 3, 4, 5, 6, -7, -7, -7, -7, -7, -7, -7, -7]
+        );
+    }
+
+    assert_logical_eoa_matches_file_len(&path);
+    assert_h5dump_dataset_read(&path, "data", "B-tree v2 partial shrink-grow scrubbed file");
+}
+
+#[test]
+fn test_resize_2d_btree_v2_partial_shrink_then_grow_scrubs_boundary_chunk_tail() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("resize_2d_btree_v2_partial_shrink_grow.h5");
+    std::fs::copy("tests/data/hdf5_ref/v4_btree2_chunks.h5", &path).unwrap();
+
+    {
+        let mut mf = MutableFile::open_rw(&path).unwrap();
+        mf.resize_dataset("btree_v2", &[6, 8]).unwrap();
+        mf.resize_dataset("btree_v2", &[8, 8]).unwrap();
+    }
+
+    {
+        let f = File::open(&path).unwrap();
+        let ds = f.dataset("btree_v2").unwrap();
+        assert_eq!(
+            ds.info().unwrap().layout.chunk_index_type,
+            Some(ChunkIndexType::BTreeV2)
+        );
+        let mut vals = vec![0; ds.size().unwrap() as usize];
+        dataset_read_into(&ds, &mut vals).unwrap();
+        let mut expected: Vec<i32> = (0..64).collect();
+        expected[48..64].fill(0);
+        assert_eq!(vals, expected);
+    }
+
+    assert_logical_eoa_matches_file_len(&path);
+    assert_h5dump_dataset_read(
+        &path,
+        "btree_v2",
+        "2D B-tree v2 partial shrink-grow scrubbed file",
+    );
+}
+
+#[test]
+fn test_resize_fixed_array_partial_shrink_then_grow_scrubs_boundary_chunk_tail() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("resize_fixed_array_partial_shrink_grow.h5");
+
+    {
+        let mut wf = WritableFile::create(&path).unwrap();
+        wf.new_dataset_builder("data")
+            .shape(&[15])
+            .chunk(&[5])
+            .fill_value::<i32>(-7)
+            .write::<i32>(&(0..15).collect::<Vec<_>>())
+            .unwrap();
+        wf.flush().unwrap();
+    }
+
+    {
+        let mut mf = MutableFile::open_rw(&path).unwrap();
+        mf.resize_dataset("data", &[7]).unwrap();
+        mf.resize_dataset("data", &[10]).unwrap();
+    }
+
+    {
+        let f = File::open(&path).unwrap();
+        let ds = f.dataset("data").unwrap();
+        assert_eq!(
+            ds.info().unwrap().layout.chunk_index_type,
+            Some(ChunkIndexType::FixedArray)
+        );
+        let mut vals = vec![0; ds.size().unwrap() as usize];
+        dataset_read_into(&ds, &mut vals).unwrap();
+        assert_eq!(vals, vec![0, 1, 2, 3, 4, 5, 6, -7, -7, -7]);
+    }
+
+    assert_logical_eoa_matches_file_len(&path);
+    assert_h5dump_dataset_read(
+        &path,
+        "data",
+        "fixed-array partial shrink-grow scrubbed file",
+    );
+}
+
+#[test]
+fn test_resize_extensible_array_partial_shrink_then_grow_scrubs_boundary_chunk_tail() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir
+        .path()
+        .join("resize_extensible_array_partial_shrink_grow.h5");
+
+    {
+        let mut wf = WritableFile::create(&path).unwrap();
+        wf.new_dataset_builder("data")
+            .shape(&[9])
+            .chunk(&[5])
+            .fill_value::<i32>(-7)
+            .resizable()
+            .write::<i32>(&(0..9).collect::<Vec<_>>())
+            .unwrap();
+        wf.flush().unwrap();
+    }
+
+    {
+        let mut mf = MutableFile::open_rw(&path).unwrap();
+        mf.resize_dataset("data", &[7]).unwrap();
+        mf.resize_dataset("data", &[9]).unwrap();
+    }
+
+    {
+        let f = File::open(&path).unwrap();
+        let ds = f.dataset("data").unwrap();
+        assert_eq!(
+            ds.info().unwrap().layout.chunk_index_type,
+            Some(ChunkIndexType::ExtensibleArray)
+        );
+        let mut vals = vec![0; ds.size().unwrap() as usize];
+        dataset_read_into(&ds, &mut vals).unwrap();
+        assert_eq!(vals, vec![0, 1, 2, 3, 4, 5, 6, -7, -7]);
+    }
+
+    assert_logical_eoa_matches_file_len(&path);
+    assert_h5dump_dataset_read(
+        &path,
+        "data",
+        "extensible-array partial shrink-grow scrubbed file",
+    );
+}
+
+#[test]
+fn test_resize_v1_btree_partial_shrink_then_grow_scrubs_boundary_chunk_tail() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("resize_v1_btree_partial_shrink_grow.h5");
+    std::fs::copy("tests/data/hdf5_ref/v1_btree_full_leaf_gap.h5", &path).unwrap();
+
+    {
+        let mut mf = MutableFile::open_rw(&path).unwrap();
+        let chunk: Vec<i32> = (320..325).collect();
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                chunk.as_ptr() as *const u8,
+                chunk.len() * std::mem::size_of::<i32>(),
+            )
+        };
+        mf.write_chunk("btree_v1_full_leaf_gap", &[320], bytes)
+            .unwrap();
+        mf.resize_dataset("btree_v1_full_leaf_gap", &[322]).unwrap();
+        mf.resize_dataset("btree_v1_full_leaf_gap", &[325]).unwrap();
+    }
+
+    {
+        let f = File::open(&path).unwrap();
+        let ds = f.dataset("btree_v1_full_leaf_gap").unwrap();
+        assert_eq!(ds.info().unwrap().layout.chunk_index_type, None);
+        let mut vals = vec![0; ds.size().unwrap() as usize];
+        dataset_read_into(&ds, &mut vals).unwrap();
+        assert_eq!(&vals[..320], &(0..320).collect::<Vec<_>>());
+        assert_eq!(&vals[320..325], &[320, 321, -1, -1, -1]);
+    }
+
+    assert_logical_eoa_matches_file_len(&path);
+    assert_h5dump_dataset_read(
+        &path,
+        "btree_v1_full_leaf_gap",
+        "v1 B-tree partial shrink-grow scrubbed file",
+    );
+    assert_h5py_script(
+        &path,
+        "x = f['btree_v1_full_leaf_gap'][:]\n\
+         assert len(x) == 325\n\
+         assert list(x[:3]) == [0, 1, 2]\n\
+         assert list(x[319:325]) == [319, 320, 321, -1, -1, -1]",
+        "v1 B-tree partial shrink-grow scrubbed file",
+    );
+}
+
+#[test]
+fn test_resize_v1_btree_userblock_partial_shrink_scrubs_without_corrupting_prefix() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("resize_v1_btree_userblock_partial.h5");
+    copy_v0_fixture_with_userblock("tests/data/hdf5_ref/v1_btree_full_leaf_gap.h5", &path);
+    let before = std::fs::read(&path).unwrap();
+    let prefix = before[..USERBLOCK_SIZE].to_vec();
+
+    {
+        let mut mf = MutableFile::open_rw(&path).unwrap();
+        let chunk: Vec<i32> = (320..325).collect();
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                chunk.as_ptr() as *const u8,
+                chunk.len() * std::mem::size_of::<i32>(),
+            )
+        };
+        mf.write_chunk("btree_v1_full_leaf_gap", &[320], bytes)
+            .unwrap();
+        mf.resize_dataset("btree_v1_full_leaf_gap", &[322]).unwrap();
+        mf.resize_dataset("btree_v1_full_leaf_gap", &[325]).unwrap();
+    }
+
+    let after = std::fs::read(&path).unwrap();
+    assert_eq!(&after[..USERBLOCK_SIZE], prefix.as_slice());
+    let f = File::open(&path).unwrap();
+    assert_eq!(f.userblock(), USERBLOCK_SIZE as u64);
+    let ds = f.dataset("btree_v1_full_leaf_gap").unwrap();
+    let mut vals = vec![0; ds.size().unwrap() as usize];
+    dataset_read_into(&ds, &mut vals).unwrap();
+    assert_eq!(&vals[..320], &(0..320).collect::<Vec<_>>());
+    assert_eq!(&vals[320..325], &[320, 321, -1, -1, -1]);
+    assert_logical_eoa_matches_file_len(&path);
+}
+
+#[test]
+fn test_resize_v1_btree_userblock_chunk_boundary_updates_dataspace_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("resize_v1_btree_userblock_boundary.h5");
+    copy_v0_fixture_with_userblock("tests/data/hdf5_ref/v1_btree_full_leaf_gap.h5", &path);
+    let before = std::fs::read(&path).unwrap();
+    let prefix = before[..USERBLOCK_SIZE].to_vec();
+
+    {
+        let mut mf = MutableFile::open_rw(&path).unwrap();
+        mf.resize_dataset("btree_v1_full_leaf_gap", &[320]).unwrap();
+    }
+
+    let after = std::fs::read(&path).unwrap();
+    assert_eq!(&after[..USERBLOCK_SIZE], prefix.as_slice());
+    let f = File::open(&path).unwrap();
+    assert_eq!(f.userblock(), USERBLOCK_SIZE as u64);
+    let ds = f.dataset("btree_v1_full_leaf_gap").unwrap();
+    let mut vals = vec![0; ds.size().unwrap() as usize];
+    dataset_read_into(&ds, &mut vals).unwrap();
+    assert_eq!(vals, (0..320).collect::<Vec<_>>());
+
+    assert_logical_eoa_matches_file_len(&path);
+    // This synthetic userblock fixture is made by shifting the v0 superblock
+    // only. libhdf5 can inspect its headers but cannot read its raw chunk data,
+    // so this test verifies the in-place dataspace rewrite with the pure reader.
 }
 
 #[test]
@@ -478,7 +869,127 @@ fn test_write_chunk_replaces_existing_chunk() {
 #[test]
 fn test_write_chunk_splits_full_v1_btree_leaf() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("split_full_chunk_btree.h5");
+    let path = dir.path().join("split_full_v1_btree_leaf.h5");
+    std::fs::copy("tests/data/hdf5_ref/v1_btree_full_leaf_gap.h5", &path).unwrap();
+
+    {
+        let f = File::open(&path).unwrap();
+        let ds = f.dataset("btree_v1_full_leaf_gap").unwrap();
+        assert_eq!(ds.info().unwrap().layout.chunk_index_type, None);
+        let mut vals = vec![0; ds.size().unwrap() as usize];
+        dataset_read_into(&ds, &mut vals).unwrap();
+        assert_eq!(&vals[..320], &(0..320).collect::<Vec<_>>());
+        assert_eq!(&vals[320..325], &[-1; 5]);
+    }
+
+    {
+        let mut mf = MutableFile::open_rw(&path).unwrap();
+        let chunk: Vec<i32> = (320..325).collect();
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                chunk.as_ptr() as *const u8,
+                chunk.len() * std::mem::size_of::<i32>(),
+            )
+        };
+        mf.write_chunk("btree_v1_full_leaf_gap", &[320], bytes)
+            .unwrap();
+    }
+
+    {
+        let f = File::open(&path).unwrap();
+        let ds = f.dataset("btree_v1_full_leaf_gap").unwrap();
+        let mut vals = vec![0; ds.size().unwrap() as usize];
+        dataset_read_into(&ds, &mut vals).unwrap();
+        assert_eq!(vals, (0..325).collect::<Vec<_>>());
+    }
+
+    assert_logical_eoa_matches_file_len(&path);
+    assert_h5dump_dataset_read(&path, "btree_v1_full_leaf_gap", "split v1 B-tree file");
+}
+
+#[test]
+fn test_write_chunk_updates_v0_userblock_v1_btree_without_corrupting_prefix() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("userblock_split_full_v1_btree_leaf.h5");
+    copy_v0_fixture_with_userblock("tests/data/hdf5_ref/v1_btree_full_leaf_gap.h5", &path);
+    let before = std::fs::read(&path).unwrap();
+    let prefix = before[..USERBLOCK_SIZE].to_vec();
+
+    {
+        let f = File::open(&path).unwrap();
+        assert_eq!(f.userblock(), 512);
+        let ds = f.dataset("btree_v1_full_leaf_gap").unwrap();
+        let mut vals = vec![0; ds.size().unwrap() as usize];
+        dataset_read_into(&ds, &mut vals).unwrap();
+        assert_eq!(&vals[..320], &(0..320).collect::<Vec<_>>());
+        assert_eq!(&vals[320..325], &[-1; 5]);
+    }
+
+    {
+        let mut mf = MutableFile::open_rw(&path).unwrap();
+        let chunk: Vec<i32> = (320..325).collect();
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                chunk.as_ptr() as *const u8,
+                chunk.len() * std::mem::size_of::<i32>(),
+            )
+        };
+        mf.write_chunk("btree_v1_full_leaf_gap", &[320], bytes)
+            .unwrap();
+    }
+
+    let after = std::fs::read(&path).unwrap();
+    assert_eq!(&after[..USERBLOCK_SIZE], prefix.as_slice());
+    {
+        let f = File::open(&path).unwrap();
+        assert_eq!(f.userblock(), 512);
+        let ds = f.dataset("btree_v1_full_leaf_gap").unwrap();
+        let mut vals = vec![0; ds.size().unwrap() as usize];
+        dataset_read_into(&ds, &mut vals).unwrap();
+        assert_eq!(vals, (0..325).collect::<Vec<_>>());
+    }
+    assert_logical_eoa_matches_file_len(&path);
+}
+
+#[test]
+fn test_write_chunk_rejects_modern_userblock_file_without_corrupting_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("userblock_v4_fixed_array.h5");
+    copy_v2_v3_fixture_with_userblock("tests/data/hdf5_ref/v4_fixed_array_chunks.h5", &path);
+    let before = std::fs::read(&path).unwrap();
+
+    {
+        let f = File::open(&path).unwrap();
+        assert_eq!(f.userblock(), USERBLOCK_SIZE as u64);
+        assert_logical_eoa_matches_file_len(&path);
+        let ds = f.dataset("fixed_array").unwrap();
+        let mut vals = vec![0; ds.size().unwrap() as usize];
+        dataset_read_into(&ds, &mut vals).unwrap();
+        assert_eq!(vals, (0..100).collect::<Vec<_>>());
+    }
+
+    {
+        let mut mf = MutableFile::open_rw(&path).unwrap();
+        let chunk: Vec<i32> = (1000..1010).collect();
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                chunk.as_ptr() as *const u8,
+                chunk.len() * std::mem::size_of::<i32>(),
+            )
+        };
+        let err = mf
+            .write_chunk("fixed_array", &[0], bytes)
+            .expect_err("write_chunk should reject modern userblock files before appending data");
+        assert!(err.to_string().contains("userblock"));
+    }
+
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+}
+
+#[test]
+fn test_resize_then_write_appended_extensible_array_chunk() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("append_extensible_array_chunks.h5");
 
     {
         let mut wf = WritableFile::create(&path).unwrap();
@@ -520,10 +1031,17 @@ fn test_write_chunk_splits_full_v1_btree_leaf() {
     {
         let f = File::open(&path).unwrap();
         let ds = f.dataset("data").unwrap();
+        assert_eq!(
+            ds.info().unwrap().layout.chunk_index_type,
+            Some(ChunkIndexType::ExtensibleArray)
+        );
         let mut vals = vec![0; ds.size().unwrap() as usize];
         dataset_read_into(&ds, &mut vals).unwrap();
         assert_eq!(vals, (0..330).collect::<Vec<_>>());
     }
+
+    assert_logical_eoa_matches_file_len(&path);
+    assert_h5dump_dataset_read(&path, "data", "writer-created extensible-array append file");
 }
 
 #[test]
@@ -553,6 +1071,198 @@ fn test_write_chunk_replaces_existing_v4_fixed_array_chunk() {
         expected[..10].copy_from_slice(&(1000..1010).collect::<Vec<_>>());
         assert_eq!(vals, expected);
     }
+    assert_logical_eoa_matches_file_len(&path);
+    assert_h5dump_dataset_read(&path, "fixed_array", "replaced fixed-array file");
+    assert_h5py_script(
+        &path,
+        "x = f['fixed_array'][:]\n\
+         assert len(x) == 100\n\
+         assert list(x[:10]) == list(range(1000, 1010))\n\
+         assert list(x[10:13]) == [10, 11, 12]\n\
+         assert int(x[-1]) == 99",
+        "replaced fixed-array file",
+    );
+}
+
+#[test]
+fn test_write_chunk_replaces_paged_v4_fixed_array_chunk() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("replace_paged_v4_fixed_array.h5");
+    std::fs::copy("tests/data/hdf5_ref/v4_fixed_array_paged_chunks.h5", &path).unwrap();
+
+    {
+        let mut mf = MutableFile::open_rw(&path).unwrap();
+        let chunk = [900_123i32];
+        let bytes = unsafe {
+            std::slice::from_raw_parts(chunk.as_ptr() as *const u8, std::mem::size_of_val(&chunk))
+        };
+        mf.write_chunk("fixed_array_paged", &[2048], bytes).unwrap();
+    }
+
+    {
+        let f = File::open(&path).unwrap();
+        let ds = f.dataset("fixed_array_paged").unwrap();
+        let mut vals = vec![0; ds.size().unwrap() as usize];
+        dataset_read_into(&ds, &mut vals).unwrap();
+        assert_eq!(vals[2047], 2047);
+        assert_eq!(vals[2048], 900_123);
+        assert_eq!(vals[2049], 2049);
+    }
+
+    assert_logical_eoa_matches_file_len(&path);
+    assert_h5dump_dataset_read(
+        &path,
+        "fixed_array_paged",
+        "replaced paged fixed-array file",
+    );
+    assert_h5py_script(
+        &path,
+        "x = f['fixed_array_paged']\n\
+         assert int(x[2047]) == 2047\n\
+         assert int(x[2048]) == 900123\n\
+         assert int(x[2049]) == 2049",
+        "replaced paged fixed-array file",
+    );
+}
+
+#[test]
+fn test_write_chunk_replaces_existing_v4_extensible_array_chunk() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("replace_v4_extensible_array.h5");
+    std::fs::copy("tests/data/hdf5_ref/v4_extensible_array_chunks.h5", &path).unwrap();
+
+    {
+        let mut mf = MutableFile::open_rw(&path).unwrap();
+        let chunk: Vec<f64> = (1000..1020).map(|value| value as f64).collect();
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                chunk.as_ptr() as *const u8,
+                chunk.len() * std::mem::size_of::<f64>(),
+            )
+        };
+        mf.write_chunk("extensible_array", &[20], bytes).unwrap();
+    }
+
+    {
+        let f = File::open(&path).unwrap();
+        let ds = f.dataset("extensible_array").unwrap();
+        let mut vals = vec![0.0; ds.size().unwrap() as usize];
+        dataset_read_into(&ds, &mut vals).unwrap();
+        let mut expected: Vec<f64> = (0..80).map(|value| value as f64).collect();
+        expected[20..40]
+            .copy_from_slice(&(1000..1020).map(|value| value as f64).collect::<Vec<_>>());
+        assert_eq!(vals, expected);
+    }
+
+    assert_logical_eoa_matches_file_len(&path);
+    assert_h5dump_dataset_read(&path, "extensible_array", "replaced extensible-array file");
+    assert_h5py_script(
+        &path,
+        "x = f['extensible_array']\n\
+         assert x.shape == (80,)\n\
+         assert abs(float(x[19]) - 19.0) < 1e-12\n\
+         assert abs(float(x[20]) - 1000.0) < 1e-12\n\
+         assert abs(float(x[39]) - 1019.0) < 1e-12\n\
+         assert abs(float(x[40]) - 40.0) < 1e-12",
+        "replaced extensible-array file",
+    );
+}
+
+#[test]
+fn test_write_chunk_replaces_existing_v4_btree2_chunk() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("replace_v4_btree2.h5");
+    std::fs::copy("tests/data/hdf5_ref/v4_btree2_chunks.h5", &path).unwrap();
+
+    {
+        let mut mf = MutableFile::open_rw(&path).unwrap();
+        let chunk: Vec<i32> = (1000..1016).collect();
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                chunk.as_ptr() as *const u8,
+                chunk.len() * std::mem::size_of::<i32>(),
+            )
+        };
+        mf.write_chunk("btree_v2", &[4, 0], bytes).unwrap();
+    }
+
+    {
+        let f = File::open(&path).unwrap();
+        let ds = f.dataset("btree_v2").unwrap();
+        let mut vals = vec![0; ds.size().unwrap() as usize];
+        dataset_read_into(&ds, &mut vals).unwrap();
+        let mut expected: Vec<i32> = (0..64).collect();
+        for row in 0..4 {
+            let src = row * 4;
+            let dst = (4 + row) * 8;
+            expected[dst..dst + 4]
+                .copy_from_slice(&(1000 + src as i32..1004 + src as i32).collect::<Vec<_>>());
+        }
+        assert_eq!(vals, expected);
+    }
+
+    assert_logical_eoa_matches_file_len(&path);
+    assert_h5dump_dataset_read(&path, "btree_v2", "replaced v2 B-tree file");
+    assert_h5py_script(
+        &path,
+        "x = f['btree_v2']\n\
+         assert x.shape == (8, 8)\n\
+         assert list(x[4, 0:4]) == [1000, 1001, 1002, 1003]\n\
+         assert list(x[7, 0:4]) == [1012, 1013, 1014, 1015]\n\
+         assert int(x[7, 7]) == 63",
+        "replaced v2 B-tree file",
+    );
+}
+
+#[test]
+fn test_write_chunk_replaces_existing_deep_v4_btree2_chunk() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("replace_deep_v4_btree2.h5");
+    std::fs::copy(
+        "tests/data/hdf5_ref/v4_btree2_deep_internal_chunks.h5",
+        &path,
+    )
+    .unwrap();
+
+    {
+        let mut mf = MutableFile::open_rw(&path).unwrap();
+        let chunk = [900_123i32];
+        let bytes = unsafe {
+            std::slice::from_raw_parts(chunk.as_ptr() as *const u8, std::mem::size_of_val(&chunk))
+        };
+        mf.write_chunk("btree_v2_deep_internal", &[0, 0], bytes)
+            .unwrap();
+    }
+
+    {
+        let f = File::open(&path).unwrap();
+        let ds = f.dataset("btree_v2_deep_internal").unwrap();
+        let mut vals = vec![0; ds.size().unwrap() as usize];
+        dataset_read_into(&ds, &mut vals).unwrap();
+        assert_eq!(vals.len(), 160 * 160);
+        assert_eq!(vals[0], 900_123);
+        assert_eq!(vals[1], 1);
+        assert_eq!(vals[159], 159);
+        assert_eq!(vals[160], 160);
+        assert_eq!(vals[25_599], 25_599);
+    }
+
+    assert_logical_eoa_matches_file_len(&path);
+    assert_h5dump_dataset_read(
+        &path,
+        "btree_v2_deep_internal",
+        "replaced deep v2 B-tree file",
+    );
+    assert_h5py_script(
+        &path,
+        "x = f['btree_v2_deep_internal']\n\
+         assert x.shape == (160, 160)\n\
+         assert int(x[0, 0]) == 900123\n\
+         assert int(x[0, 1]) == 1\n\
+         assert int(x[1, 0]) == 160\n\
+         assert int(x[159, 159]) == 25599",
+        "replaced deep v2 B-tree file",
+    );
 }
 
 #[test]
@@ -590,17 +1300,8 @@ fn test_resize_then_write_appended_v4_btree2_chunk() {
         }
     }
 
-    let out = std::process::Command::new("h5dump")
-        .arg("-H")
-        .arg(&path)
-        .output();
-    if let Ok(out) = out {
-        assert!(
-            out.status.success(),
-            "h5dump -H failed on appended v2 B-tree file: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
+    assert_logical_eoa_matches_file_len(&path);
+    assert_h5dump_dataset_read(&path, "btree_v2", "appended v2 B-tree file");
 }
 
 #[test]
@@ -631,17 +1332,167 @@ fn test_resize_then_write_appended_v4_extensible_array_chunk() {
         assert_eq!(vals, expected);
     }
 
-    let out = std::process::Command::new("h5dump")
-        .arg("-H")
-        .arg(&path)
-        .output();
-    if let Ok(out) = out {
-        assert!(
-            out.status.success(),
-            "h5dump -H failed on appended extensible-array file: {}",
-            String::from_utf8_lossy(&out.stderr)
+    assert_logical_eoa_matches_file_len(&path);
+    assert_h5dump_dataset_read(&path, "extensible_array", "appended extensible-array file");
+}
+
+#[test]
+fn test_resize_then_write_non_next_v4_extensible_array_data_block_chunk() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir
+        .path()
+        .join("non_next_v4_extensible_array_data_block.h5");
+    std::fs::copy("tests/data/hdf5_ref/v4_extensible_array_chunks.h5", &path).unwrap();
+
+    {
+        let mut mf = MutableFile::open_rw(&path).unwrap();
+        mf.resize_dataset("extensible_array", &[120]).unwrap();
+        let chunk: Vec<f64> = (1000..1020).map(|value| value as f64).collect();
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                chunk.as_ptr() as *const u8,
+                chunk.len() * std::mem::size_of::<f64>(),
+            )
+        };
+        mf.write_chunk("extensible_array", &[100], bytes).unwrap();
+    }
+
+    {
+        let f = File::open(&path).unwrap();
+        let ds = f.dataset("extensible_array").unwrap();
+        let mut vals = vec![0.0; ds.size().unwrap() as usize];
+        dataset_read_into(&ds, &mut vals).unwrap();
+        assert_eq!(
+            &vals[..80],
+            &(0..80).map(|value| value as f64).collect::<Vec<_>>()
+        );
+        assert_eq!(&vals[80..100], &[0.0; 20]);
+        assert_eq!(
+            &vals[100..120],
+            &(1000..1020).map(|value| value as f64).collect::<Vec<_>>()
         );
     }
+
+    assert_logical_eoa_matches_file_len(&path);
+    assert_h5dump_dataset_read(
+        &path,
+        "extensible_array",
+        "non-next extensible-array data-block file",
+    );
+}
+
+#[test]
+fn test_write_chunk_replaces_appended_v4_extensible_array_data_block_chunk() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir
+        .path()
+        .join("replace_appended_v4_extensible_array_data_block.h5");
+    std::fs::copy("tests/data/hdf5_ref/v4_extensible_array_chunks.h5", &path).unwrap();
+
+    {
+        let mut mf = MutableFile::open_rw(&path).unwrap();
+        mf.resize_dataset("extensible_array", &[120]).unwrap();
+        for chunk_start in [80, 100] {
+            let chunk: Vec<f64> = (chunk_start..chunk_start + 20)
+                .map(|value| value as f64)
+                .collect();
+            let bytes = unsafe {
+                std::slice::from_raw_parts(
+                    chunk.as_ptr() as *const u8,
+                    chunk.len() * std::mem::size_of::<f64>(),
+                )
+            };
+            mf.write_chunk("extensible_array", &[chunk_start as u64], bytes)
+                .unwrap();
+        }
+    }
+
+    {
+        let mut mf = MutableFile::open_rw(&path).unwrap();
+        let chunk: Vec<f64> = (2000..2020).map(|value| value as f64).collect();
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                chunk.as_ptr() as *const u8,
+                chunk.len() * std::mem::size_of::<f64>(),
+            )
+        };
+        mf.write_chunk("extensible_array", &[100], bytes).unwrap();
+    }
+
+    {
+        let f = File::open(&path).unwrap();
+        let ds = f.dataset("extensible_array").unwrap();
+        let mut vals = vec![0.0; ds.size().unwrap() as usize];
+        dataset_read_into(&ds, &mut vals).unwrap();
+        let mut expected: Vec<f64> = (0..120).map(|value| value as f64).collect();
+        expected[100..120]
+            .copy_from_slice(&(2000..2020).map(|value| value as f64).collect::<Vec<_>>());
+        assert_eq!(vals, expected);
+    }
+
+    assert_logical_eoa_matches_file_len(&path);
+    assert_h5dump_dataset_read(
+        &path,
+        "extensible_array",
+        "replaced appended extensible-array file",
+    );
+}
+
+#[test]
+fn test_write_chunk_replaces_later_v4_extensible_array_index_data_block_chunk() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir
+        .path()
+        .join("replace_later_v4_extensible_array_data_block.h5");
+    std::fs::copy("tests/data/hdf5_ref/v4_extensible_array_chunks.h5", &path).unwrap();
+
+    {
+        let mut mf = MutableFile::open_rw(&path).unwrap();
+        mf.resize_dataset("extensible_array", &[220]).unwrap();
+        for chunk_start in (80..220).step_by(20) {
+            let chunk: Vec<f64> = (chunk_start..chunk_start + 20)
+                .map(|value| value as f64)
+                .collect();
+            let bytes = unsafe {
+                std::slice::from_raw_parts(
+                    chunk.as_ptr() as *const u8,
+                    chunk.len() * std::mem::size_of::<f64>(),
+                )
+            };
+            mf.write_chunk("extensible_array", &[chunk_start as u64], bytes)
+                .unwrap();
+        }
+    }
+
+    {
+        let mut mf = MutableFile::open_rw(&path).unwrap();
+        let chunk: Vec<f64> = (3000..3020).map(|value| value as f64).collect();
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                chunk.as_ptr() as *const u8,
+                chunk.len() * std::mem::size_of::<f64>(),
+            )
+        };
+        mf.write_chunk("extensible_array", &[180], bytes).unwrap();
+    }
+
+    {
+        let f = File::open(&path).unwrap();
+        let ds = f.dataset("extensible_array").unwrap();
+        let mut vals = vec![0.0; ds.size().unwrap() as usize];
+        dataset_read_into(&ds, &mut vals).unwrap();
+        let mut expected: Vec<f64> = (0..220).map(|value| value as f64).collect();
+        expected[180..200]
+            .copy_from_slice(&(3000..3020).map(|value| value as f64).collect::<Vec<_>>());
+        assert_eq!(vals, expected);
+    }
+
+    assert_logical_eoa_matches_file_len(&path);
+    assert_h5dump_dataset_read(
+        &path,
+        "extensible_array",
+        "replaced later extensible-array data-block file",
+    );
 }
 
 #[test]
@@ -677,17 +1528,129 @@ fn test_resize_then_write_v4_extensible_array_into_super_block() {
         assert_eq!(vals, expected);
     }
 
-    let out = std::process::Command::new("h5dump")
-        .arg("-H")
-        .arg(&path)
-        .output();
-    if let Ok(out) = out {
-        assert!(
-            out.status.success(),
-            "h5dump -H failed on super-block extensible-array append file: {}",
-            String::from_utf8_lossy(&out.stderr)
+    assert_logical_eoa_matches_file_len(&path);
+    assert_h5dump_dataset_read(
+        &path,
+        "extensible_array",
+        "super-block extensible-array append file",
+    );
+}
+
+#[test]
+fn test_resize_then_write_sparse_v4_extensible_array_super_block_chunk() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("sparse_v4_extensible_array_super_block.h5");
+    std::fs::copy("tests/data/hdf5_ref/v4_extensible_array_chunks.h5", &path).unwrap();
+
+    {
+        let mut mf = MutableFile::open_rw(&path).unwrap();
+        mf.resize_dataset("extensible_array", &[4_920]).unwrap();
+        let chunk: Vec<f64> = (9_000..9_020).map(|value| value as f64).collect();
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                chunk.as_ptr() as *const u8,
+                chunk.len() * std::mem::size_of::<f64>(),
+            )
+        };
+        mf.write_chunk("extensible_array", &[4_900], bytes).unwrap();
+    }
+
+    {
+        let f = File::open(&path).unwrap();
+        let ds = f.dataset("extensible_array").unwrap();
+        let mut vals = vec![0.0; ds.size().unwrap() as usize];
+        dataset_read_into(&ds, &mut vals).unwrap();
+        assert_eq!(
+            &vals[..80],
+            &(0..80).map(|value| value as f64).collect::<Vec<_>>()
+        );
+        assert!(vals[80..4_900].iter().all(|&value| value == 0.0));
+        assert_eq!(
+            &vals[4_900..4_920],
+            &(9_000..9_020).map(|value| value as f64).collect::<Vec<_>>()
         );
     }
+
+    assert_logical_eoa_matches_file_len(&path);
+    assert_h5dump_dataset_read(
+        &path,
+        "extensible_array",
+        "sparse super-block extensible-array file",
+    );
+    assert_h5py_script(
+        &path,
+        "x = f['extensible_array'][:]\n\
+         assert len(x) == 4920\n\
+         assert list(x[:3]) == [0.0, 1.0, 2.0]\n\
+         assert (x[80:4900] == 0.0).all()\n\
+         assert list(x[4900:4920]) == [float(v) for v in range(9000, 9020)]",
+        "sparse super-block extensible-array file",
+    );
+}
+
+#[test]
+fn test_write_chunk_replaces_paged_v4_extensible_array_super_block_chunk() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir
+        .path()
+        .join("replace_paged_v4_extensible_array_super_block.h5");
+    std::fs::copy("tests/data/hdf5_ref/v4_extensible_array_chunks.h5", &path).unwrap();
+
+    {
+        let mut mf = MutableFile::open_rw(&path).unwrap();
+        mf.resize_dataset("extensible_array", &[4_900]).unwrap();
+        for chunk_start in (80..4_900).step_by(20) {
+            let chunk: Vec<f64> = (chunk_start..chunk_start + 20)
+                .map(|value| value as f64)
+                .collect();
+            let bytes = unsafe {
+                std::slice::from_raw_parts(
+                    chunk.as_ptr() as *const u8,
+                    chunk.len() * std::mem::size_of::<f64>(),
+                )
+            };
+            mf.write_chunk("extensible_array", &[chunk_start as u64], bytes)
+                .unwrap();
+        }
+    }
+
+    {
+        let mut mf = MutableFile::open_rw(&path).unwrap();
+        let chunk: Vec<f64> = (9_000..9_020).map(|value| value as f64).collect();
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                chunk.as_ptr() as *const u8,
+                chunk.len() * std::mem::size_of::<f64>(),
+            )
+        };
+        mf.write_chunk("extensible_array", &[4_880], bytes).unwrap();
+    }
+
+    {
+        let f = File::open(&path).unwrap();
+        let ds = f.dataset("extensible_array").unwrap();
+        let mut vals = vec![0.0; ds.size().unwrap() as usize];
+        dataset_read_into(&ds, &mut vals).unwrap();
+        let mut expected: Vec<f64> = (0..4_900).map(|value| value as f64).collect();
+        expected[4_880..4_900]
+            .copy_from_slice(&(9_000..9_020).map(|value| value as f64).collect::<Vec<_>>());
+        assert_eq!(vals, expected);
+    }
+
+    assert_logical_eoa_matches_file_len(&path);
+    assert_h5dump_dataset_read(
+        &path,
+        "extensible_array",
+        "replaced paged extensible-array super-block file",
+    );
+    assert_h5py_script(
+        &path,
+        "x = f['extensible_array']\n\
+         assert x.shape == (4900,)\n\
+         assert abs(float(x[4879]) - 4879.0) < 1e-9\n\
+         assert list(x[4880:4900]) == [float(v) for v in range(9000, 9020)]",
+        "replaced paged extensible-array super-block file",
+    );
 }
 
 #[test]
@@ -728,6 +1691,9 @@ fn test_write_chunk_replaces_filtered_chunk() {
         expected[5..10].copy_from_slice(&(1000..1005).collect::<Vec<_>>());
         assert_eq!(vals, expected);
     }
+
+    assert_logical_eoa_matches_file_len(&path);
+    assert_h5dump_dataset_read(&path, "data", "replaced shuffle-deflate chunk file");
 }
 
 #[test]
@@ -758,6 +1724,9 @@ fn test_write_chunk_replaces_fletcher32_chunk() {
             .copy_from_slice(&(1000..1025).map(|value| value as f32).collect::<Vec<_>>());
         assert_eq!(vals, expected);
     }
+
+    assert_logical_eoa_matches_file_len(&path);
+    assert_h5dump_dataset_read(&path, "chunked_fletcher", "replaced fletcher32 chunk file");
 }
 
 #[test]

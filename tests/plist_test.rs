@@ -4,6 +4,21 @@ use hdf5_pure_rust::{
     MetadataCacheLogOptions, ObjectCopy, ObjectCreate, VdsView,
 };
 
+const V0_BASE_ADDR_OFFSET: usize = 24;
+
+fn userblock_v0_fixture() -> (tempfile::TempDir, std::path::PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("plist_userblock_v0.h5");
+    let mut original = std::fs::read("tests/data/simple_v0.h5").unwrap();
+    original[V0_BASE_ADDR_OFFSET..V0_BASE_ADDR_OFFSET + 8].copy_from_slice(&512u64.to_le_bytes());
+
+    let mut with_userblock = vec![0u8; 512];
+    with_userblock[..b"plist test userblock\0".len()].copy_from_slice(b"plist test userblock\0");
+    with_userblock.extend_from_slice(&original);
+    std::fs::write(&path, with_userblock).unwrap();
+    (dir, path)
+}
+
 #[test]
 fn test_dataset_create_plist_contiguous() {
     let f = File::open("tests/data/datasets_v0.h5").unwrap();
@@ -127,6 +142,16 @@ fn test_file_create_plist() {
     assert_eq!(plist.shared_mesg_index(0).unwrap().minimum_message_size, 32);
     plist.set_shared_mesg_phase_change(60, 30);
     assert_eq!(plist.shared_mesg_phase_change(), (60, 30));
+}
+
+#[test]
+fn test_file_access_plist_reports_opened_file_userblock() {
+    let (_dir, path) = userblock_v0_fixture();
+    let f = File::open(&path).unwrap();
+
+    assert_eq!(f.userblock(), 512);
+    assert_eq!(f.access_plist().userblock(), 512);
+    assert_eq!(f.fapl().userblock(), 512);
 }
 
 #[test]

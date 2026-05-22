@@ -144,7 +144,9 @@ impl Default for FileAccess {
 
 impl FileAccess {
     pub(crate) fn from_file(file: &crate::hl::file::File) -> Self {
-        file.access_plist_snapshot()
+        let mut plist = file.access_plist_snapshot();
+        plist.userblock = file.userblock();
+        plist
     }
 
     /// File-driver name. This crate reads regular files directly.

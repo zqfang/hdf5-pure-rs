@@ -20,6 +20,38 @@ def write_fixed_array(path: Path) -> None:
         f.create_dataset("fixed_array", data=data, chunks=(10,))
 
 
+def write_fixed_array_deflate_parallel_threshold_tail(path: Path) -> None:
+    chunk = 2048
+    length = chunk * 8 + 17
+    data = (np.arange(length, dtype=np.int32) * 5) - 11
+    with h5py.File(path, "w", libver="latest") as f:
+        f.create_dataset(
+            "fixed_array_deflate_parallel_threshold_tail",
+            data=data,
+            chunks=(chunk,),
+            compression="gzip",
+            compression_opts=4,
+        )
+
+
+def write_fixed_array_deflate_mask_parallel_fallback(path: Path) -> None:
+    chunk = 2048
+    length = chunk * 8
+    data = (np.arange(length, dtype=np.int32) * 2) - 31
+    with h5py.File(path, "w", libver="latest") as f:
+        ds = f.create_dataset(
+            "fixed_array_deflate_mask_parallel_fallback",
+            shape=(length,),
+            dtype=np.int32,
+            chunks=(chunk,),
+            compression="gzip",
+            compression_opts=4,
+        )
+        first = np.asarray(data[:chunk], dtype="<i4")
+        ds.id.write_direct_chunk((0,), first.tobytes(), filter_mask=0b1)
+        ds[chunk:] = data[chunk:]
+
+
 def write_fixed_array_3d_edges(path: Path) -> None:
     data = np.arange(5 * 7 * 4, dtype=np.int32).reshape(5, 7, 4)
     with h5py.File(path, "w", libver="latest") as f:
@@ -58,6 +90,44 @@ def write_extensible_array(path: Path) -> None:
         )
         ds.resize((data.shape[0],))
         ds[...] = data
+
+
+def write_extensible_array_deflate_parallel_threshold_tail(path: Path) -> None:
+    chunk = 2048
+    length = chunk * 8 + 17
+    data = (np.arange(length, dtype=np.int32) * 7) - 13
+    with h5py.File(path, "w", libver="latest") as f:
+        ds = f.create_dataset(
+            "extensible_array_deflate_parallel_threshold_tail",
+            shape=(0,),
+            maxshape=(None,),
+            chunks=(chunk,),
+            dtype=np.int32,
+            compression="gzip",
+            compression_opts=4,
+        )
+        ds.resize((data.shape[0],))
+        ds[...] = data
+
+
+def write_extensible_array_deflate_mask_parallel_fallback(path: Path) -> None:
+    chunk = 2048
+    length = chunk * 8
+    data = (np.arange(length, dtype=np.int32) * 11) - 19
+    with h5py.File(path, "w", libver="latest") as f:
+        ds = f.create_dataset(
+            "extensible_array_deflate_mask_parallel_fallback",
+            shape=(0,),
+            maxshape=(None,),
+            chunks=(chunk,),
+            dtype=np.int32,
+            compression="gzip",
+            compression_opts=4,
+        )
+        ds.resize((length,))
+        first = np.asarray(data[:chunk], dtype="<i4")
+        ds.id.write_direct_chunk((0,), first.tobytes(), filter_mask=0b1)
+        ds[chunk:] = data[chunk:]
 
 
 def write_extensible_array_2d_unlimited_edges(path: Path) -> None:
@@ -773,6 +843,20 @@ def write_v1_btree_3d_chunks(path: Path) -> None:
         f.create_dataset("btree_v1_3d", data=data, chunks=(2, 2, 3))
 
 
+def write_v1_btree_deflate_parallel_threshold_tail(path: Path) -> None:
+    chunk = 2048
+    length = chunk * 8 + 17
+    data = (np.arange(length, dtype=np.int32) * 3) - 7
+    with h5py.File(path, "w", libver="earliest") as f:
+        f.create_dataset(
+            "btree_v1_deflate_parallel_threshold_tail",
+            data=data,
+            chunks=(chunk,),
+            compression="gzip",
+            compression_opts=4,
+        )
+
+
 def write_v1_btree_sparse_nonmonotonic(path: Path) -> None:
     with h5py.File(path, "w", libver="earliest") as f:
         ds = f.create_dataset(
@@ -785,6 +869,19 @@ def write_v1_btree_sparse_nonmonotonic(path: Path) -> None:
         ds[4:6, 4:6] = np.array([[44, 45], [54, 55]], dtype=np.int32)
         ds[0:2, 0:2] = np.array([[0, 1], [10, 11]], dtype=np.int32)
         ds[2:4, 2:4] = np.array([[22, 23], [32, 33]], dtype=np.int32)
+
+
+def write_v1_btree_full_leaf_gap(path: Path) -> None:
+    chunk = 5
+    with h5py.File(path, "w", libver="earliest") as f:
+        ds = f.create_dataset(
+            "btree_v1_full_leaf_gap",
+            shape=(chunk * 65,),
+            dtype=np.int32,
+            chunks=(chunk,),
+            fillvalue=-1,
+        )
+        ds[: chunk * 64] = np.arange(chunk * 64, dtype=np.int32)
 
 
 def write_virtual_all(vds_path: Path, source_path: Path) -> None:
@@ -1137,10 +1234,22 @@ def main() -> None:
         return path
 
     write_fixed_array(record(OUT / "v4_fixed_array_chunks.h5"))
+    write_fixed_array_deflate_parallel_threshold_tail(
+        record(OUT / "v4_fixed_array_deflate_parallel_threshold_tail.h5")
+    )
+    write_fixed_array_deflate_mask_parallel_fallback(
+        record(OUT / "v4_fixed_array_deflate_mask_parallel_fallback.h5")
+    )
     write_fixed_array_3d_edges(record(OUT / "v4_fixed_array_3d_edges.h5"))
     write_paged_fixed_array(record(OUT / "v4_fixed_array_paged_chunks.h5"))
     write_paged_fixed_array_sparse(record(OUT / "v4_fixed_array_paged_sparse.h5"))
     write_extensible_array(record(OUT / "v4_extensible_array_chunks.h5"))
+    write_extensible_array_deflate_parallel_threshold_tail(
+        record(OUT / "v4_extensible_array_deflate_parallel_threshold_tail.h5")
+    )
+    write_extensible_array_deflate_mask_parallel_fallback(
+        record(OUT / "v4_extensible_array_deflate_mask_parallel_fallback.h5")
+    )
     write_extensible_array_2d_unlimited_edges(
         record(OUT / "v4_extensible_array_2d_unlimited_edges.h5")
     )
@@ -1189,7 +1298,11 @@ def main() -> None:
     write_undefined_storage_address(record(OUT / "undefined_storage_address.h5"))
     write_late_fill_time_never(record(OUT / "late_fill_time_never.h5"))
     write_v1_btree_3d_chunks(record(OUT / "v1_btree_3d_chunks.h5"))
+    write_v1_btree_deflate_parallel_threshold_tail(
+        record(OUT / "v1_btree_deflate_parallel_threshold_tail.h5")
+    )
     write_v1_btree_sparse_nonmonotonic(record(OUT / "v1_btree_sparse_nonmonotonic.h5"))
+    write_v1_btree_full_leaf_gap(record(OUT / "v1_btree_full_leaf_gap.h5"))
     write_virtual_all(
         record(OUT / "vds_all.h5"),
         record(OUT / "vds_all_source.h5"),

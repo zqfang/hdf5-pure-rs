@@ -325,6 +325,7 @@ impl Dataset {
         }
         let chunk_bytes_u64 = u64_from_usize(chunk_ctx.chunk_bytes, "implicit chunk byte size")?;
         let mut compressed_scratch = Vec::new();
+        let mut shuffle_scratch = Vec::new();
         let mut raw_scratch = Vec::new();
         let mut coords = Vec::with_capacity(ndims);
         let handled = if Self::implicit_index_uses_unfiltered_coalescing(info, chunk_ctx) {
@@ -362,6 +363,7 @@ impl Dataset {
                 0,
                 output,
                 &mut compressed_scratch,
+                &mut shuffle_scratch,
             )? {
                 continue;
             }
@@ -875,7 +877,7 @@ impl Dataset {
             usize::try_from(usize::BITS - chunk_bytes.leading_zeros())
                 .map_err(|_| Error::InvalidFormat("chunk size bit count overflow".into()))?
         };
-        Ok((1 + ((bits + 8) / 8)).min(8))
+        Ok(((bits + 15) / 8).clamp(2, 8))
     }
 
     pub(super) fn chunks_per_dim(data_dims: &[u64], chunk_dims: &[u64]) -> Result<Vec<usize>> {

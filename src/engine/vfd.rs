@@ -854,13 +854,36 @@ pub fn H5FDquery(driver: &LocalFileDriver) -> u64 {
 /// Public API: allocate `size` bytes in the file.
 #[allow(non_snake_case)]
 pub fn H5FDalloc(driver: &mut LocalFileDriver, size: u64) -> Result<u64> {
+    H5FD_alloc(driver, size)
+}
+
+/// Internal VFD API: allocate `size` bytes in the file.
+#[allow(non_snake_case)]
+pub fn H5FD_alloc(driver: &mut LocalFileDriver, size: u64) -> Result<u64> {
     driver.alloc(size)
 }
 
 /// Public API: free a region previously allocated in the file.
 #[allow(non_snake_case)]
 pub fn H5FDfree(driver: &mut LocalFileDriver, addr: u64, size: u64) {
+    H5FD_free(driver, addr, size);
+}
+
+/// Internal VFD API: free a region previously allocated in the file.
+#[allow(non_snake_case)]
+pub fn H5FD_free(driver: &mut LocalFileDriver, addr: u64, size: u64) {
     driver.free(addr, size);
+}
+
+/// Internal VFD API: attempt to extend an existing allocation.
+#[allow(non_snake_case)]
+pub fn H5FD_try_extend(
+    driver: &mut LocalFileDriver,
+    addr: u64,
+    old_size: u64,
+    extra: u64,
+) -> Result<bool> {
+    driver.try_extend(addr, old_size, extra)
 }
 
 /// Public API: return the current EOA.
@@ -891,6 +914,23 @@ pub fn H5FD_get_maxaddr() -> u64 {
 #[allow(non_snake_case)]
 pub fn H5FD_get_feature_flags(driver: &LocalFileDriver) -> u64 {
     driver.driver_query()
+}
+
+/// Public API: query feature flags for a registered driver id before opening a file.
+#[allow(non_snake_case)]
+pub fn H5FDdriver_query(registry: &VfdRegistry, driver_id: u64) -> Result<u64> {
+    if !registry.by_value.contains_key(&driver_id) {
+        return Err(Error::InvalidFormat(format!(
+            "VFD driver id {driver_id} is not registered"
+        )));
+    }
+    match driver_id {
+        id if id == file_driver_kind_id(FileDriverKind::Sec2) => Ok(0x01),
+        id if id == file_driver_kind_id(FileDriverKind::Stdio) => Ok(0x01),
+        id if id == file_driver_kind_id(FileDriverKind::Direct) => Ok(0x01),
+        id if id == file_driver_kind_id(FileDriverKind::Core) => Ok(0x03),
+        _ => Err(unsupported_vfd_driver("custom registered")),
+    }
 }
 
 /// Setting feature flags is a no-op in the pure-Rust backend.
@@ -942,6 +982,26 @@ pub fn H5FDwrite_selection(driver: &mut LocalFileDriver, requests: &[VfdIoReques
 #[allow(non_snake_case)]
 pub fn H5FDflush(driver: &mut LocalFileDriver) -> Result<()> {
     driver.driver_flush()
+}
+
+/// Public API: truncate the file to the current end-of-allocation address.
+#[allow(non_snake_case)]
+pub fn H5FDtruncate(driver: &mut LocalFileDriver) -> Result<()> {
+    driver.driver_truncate()
+}
+
+/// Public API: acquire a VFD lock.
+#[allow(non_snake_case)]
+pub fn H5FDlock(driver: &mut LocalFileDriver, _read_write: bool) -> Result<()> {
+    driver.locked = true;
+    Ok(())
+}
+
+/// Public API: release a VFD lock.
+#[allow(non_snake_case)]
+pub fn H5FDunlock(driver: &mut LocalFileDriver) -> Result<()> {
+    driver.locked = false;
+    Ok(())
 }
 
 /// Return the file path of the underlying file, if any.
@@ -4789,6 +4849,55 @@ mod tests {
         driver.core_read(0, &mut out).unwrap();
         assert_eq!(&out, b"abcd");
         assert_eq!(driver.core_get_eof_checked().unwrap(), 4);
+    }
+
+    #[test]
+    fn public_h5fd_runtime_wrappers_and_driver_query_are_explicit() {
+        let mut registry = super::H5FD_init();
+        assert_eq!(
+            super::H5FDdriver_query(&registry, super::file_driver_kind_id(FileDriverKind::Sec2))
+                .unwrap(),
+            0x01
+        );
+        assert_eq!(
+            super::H5FDdriver_query(&registry, super::file_driver_kind_id(FileDriverKind::Core))
+                .unwrap(),
+            0x03
+        );
+        assert!(matches!(
+            super::H5FDdriver_query(&registry, 99).unwrap_err(),
+            Error::InvalidFormat(_)
+        ));
+        super::H5FDregister(&mut registry, "custom", 99);
+        assert!(matches!(
+            super::H5FDdriver_query(&registry, 99).unwrap_err(),
+            Error::Unsupported(_)
+        ));
+
+        let mut driver = LocalFileDriver {
+            kind: super::FileDriverKind::Core,
+            path: None,
+            file: None,
+            core_image: Vec::new(),
+            eoa: 0,
+            locked: false,
+        };
+        assert_eq!(super::H5FD_alloc(&mut driver, 2).unwrap(), 0);
+        assert_eq!(super::H5FDget_eoa(&driver), 2);
+        assert!(super::H5FD_try_extend(&mut driver, 0, 2, 4).unwrap());
+        assert_eq!(super::H5FDget_eoa(&driver), 6);
+        super::H5FD_free(&mut driver, 0, 6);
+        assert_eq!(super::H5FDget_eoa(&driver), 6);
+
+        driver.core_write(0, b"abcdef").unwrap();
+        super::H5FDset_eoa(&mut driver, 3);
+        super::H5FDtruncate(&mut driver).unwrap();
+        assert_eq!(driver.core_get_handle().unwrap(), b"abc");
+
+        super::H5FDlock(&mut driver, true).unwrap();
+        assert!(driver.locked);
+        super::H5FDunlock(&mut driver).unwrap();
+        assert!(!driver.locked);
     }
 
     #[test]

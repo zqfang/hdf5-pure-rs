@@ -2,7 +2,7 @@
 //! Opens each .h5 reference file from the HDF5 C test suite and verifies
 //! we can parse the superblock and navigate the structure without panicking.
 
-use hdf5_pure_rust::File;
+use hdf5_pure_rust::{Error, File};
 
 const REF_DIR: &str = "tests/data/hdf5_ref";
 
@@ -172,6 +172,22 @@ fn t1e_test_filters_le() {
 #[test]
 fn t1e_noencoder() {
     assert!(try_open("noencoder.h5").is_ok());
+}
+
+#[test]
+fn t1e_noencoder_szip_read_fails_explicitly() {
+    let f = File::open(format!("{REF_DIR}/noencoder.h5")).unwrap();
+    let ds = f.dataset("noencoder_szip_dset.h5").unwrap();
+    let err = ds
+        .read_raw()
+        .expect_err("SZip-compressed dataset read should be unsupported");
+    match err {
+        Error::Unsupported(msg) => assert!(
+            msg.contains("SZip"),
+            "unsupported SZip error should name SZip, got: {msg}"
+        ),
+        other => panic!("expected unsupported SZip error, got: {other}"),
+    }
 }
 
 #[test]

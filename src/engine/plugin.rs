@@ -18,17 +18,31 @@ pub struct PluginRegistry {
     cache: PluginCache,
     paths: PluginPathTable,
     control_mask: u64,
-    loading_enabled: bool,
     open_plugins: BTreeMap<String, usize>,
 }
+
+#[repr(i32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum H5PLPluginType {
+    Error = -1,
+    Filter = 0,
+    Vol = 1,
+    Vfd = 2,
+    None = 3,
+}
+
+pub const H5PL_FILTER_PLUGIN: u64 = 0x0001;
+pub const H5PL_VOL_PLUGIN: u64 = 0x0002;
+pub const H5PL_VFD_PLUGIN: u64 = 0x0004;
+pub const H5PL_ALL_PLUGIN: u64 = 0xffff;
+pub const H5PL_NO_PLUGIN: &str = "::";
 
 impl Default for PluginRegistry {
     fn default() -> Self {
         Self {
             cache: PluginCache::default(),
             paths: PluginPathTable::default(),
-            control_mask: u64::MAX,
-            loading_enabled: true,
+            control_mask: H5PL_ALL_PLUGIN,
             open_plugins: BTreeMap::new(),
         }
     }
@@ -102,7 +116,7 @@ pub fn H5PL_term_package(registry: &mut PluginRegistry) {
 
 #[allow(non_snake_case)]
 pub fn H5PL_load(registry: &mut PluginRegistry, name: &str) -> Result<()> {
-    if !registry.loading_enabled {
+    if registry.control_mask == 0 {
         return Err(Error::Unsupported("plugin loading is disabled".into()));
     }
     if registry.cache.plugins.iter().any(|plugin| plugin == name) {
@@ -121,7 +135,7 @@ pub fn H5PL_load(registry: &mut PluginRegistry, name: &str) -> Result<()> {
 
 #[allow(non_snake_case)]
 pub fn H5PL_load_owned(registry: &mut PluginRegistry, name: String) -> Result<()> {
-    if !registry.loading_enabled {
+    if registry.control_mask == 0 {
         return Err(Error::Unsupported("plugin loading is disabled".into()));
     }
     if registry.cache.plugins.iter().any(|plugin| plugin == &name) {
@@ -136,6 +150,26 @@ pub fn H5PL_load_owned(registry: &mut PluginRegistry, name: String) -> Result<()
             "dynamic plugin loading is not supported for '{name}'"
         )))
     }
+}
+
+/// `H5PLget_plugin_type`: external dynamic-plugin entry point, not a
+/// host-library query in this pure-Rust backend.
+#[allow(non_snake_case)]
+pub fn H5PLget_plugin_type() -> Result<H5PLPluginType> {
+    Err(Error::Unsupported(
+        "external HDF5 plugin entry point H5PLget_plugin_type is unsupported in pure-Rust mode"
+            .into(),
+    ))
+}
+
+/// `H5PLget_plugin_info`: external dynamic-plugin entry point, not a
+/// host-library query in this pure-Rust backend.
+#[allow(non_snake_case)]
+pub fn H5PLget_plugin_info() -> Result<()> {
+    Err(Error::Unsupported(
+        "external HDF5 plugin entry point H5PLget_plugin_info is unsupported in pure-Rust mode"
+            .into(),
+    ))
 }
 
 #[allow(non_snake_case)]
@@ -334,13 +368,13 @@ pub fn H5PL__find_plugin_in_path_into(path: &Path, name: &str, candidate: &mut P
 }
 
 #[allow(non_snake_case)]
-pub fn H5PLset_loading_state(registry: &mut PluginRegistry, enabled: bool) {
-    registry.loading_enabled = enabled;
+pub fn H5PLset_loading_state(registry: &mut PluginRegistry, plugin_control_mask: u64) {
+    H5PL__set_plugin_control_mask(registry, plugin_control_mask);
 }
 
 #[allow(non_snake_case)]
-pub fn H5PLget_loading_state(registry: &PluginRegistry) -> bool {
-    registry.loading_enabled
+pub fn H5PLget_loading_state(registry: &PluginRegistry) -> u64 {
+    H5PL__get_plugin_control_mask(registry)
 }
 
 #[allow(non_snake_case)]
@@ -431,9 +465,9 @@ mod tests {
         H5PLappend(&mut registry, "/b");
         H5PLprepend(&mut registry, "/a");
         H5PLinsert(&mut registry, 1, "/mid").unwrap();
-        assert!(H5PLget_loading_state(&registry));
-        H5PLset_loading_state(&mut registry, false);
-        assert!(!H5PLget_loading_state(&registry));
+        assert_eq!(H5PLget_loading_state(&registry), H5PL_ALL_PLUGIN);
+        H5PLset_loading_state(&mut registry, H5PL_FILTER_PLUGIN);
+        assert_eq!(H5PLget_loading_state(&registry), H5PL_FILTER_PLUGIN);
         assert_eq!(H5PLsize(&registry), 3);
         assert_eq!(H5PLget(&registry, 1).unwrap(), Path::new("/mid"));
         let mut path = PathBuf::new();
@@ -454,13 +488,50 @@ mod tests {
     #[test]
     fn plugin_load_is_explicitly_unsupported_without_cached_plugin() {
         let mut registry = H5PL__init_package();
-        assert!(H5PL_load(&mut registry, "missing").is_err());
+        let err = H5PL_load(&mut registry, "missing").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Unsupported: dynamic plugin loading is not supported for 'missing'"
+        );
+
         H5PL__add_plugin_ref(&mut registry.cache, "known");
         H5PL_load(&mut registry, "known").unwrap();
         H5PL_load_owned(&mut registry, "known".to_owned()).unwrap();
         assert_eq!(registry.open_plugins.get("known"), Some(&2));
         H5PL__close(&mut registry, "known").unwrap();
         H5PL__close(&mut registry, "known").unwrap();
+
+        H5PLset_loading_state(&mut registry, 0);
+        let err = H5PL_load(&mut registry, "known").unwrap_err();
+        assert_eq!(err.to_string(), "Unsupported: plugin loading is disabled");
+        let err = H5PL_load_owned(&mut registry, "known".to_owned()).unwrap_err();
+        assert_eq!(err.to_string(), "Unsupported: plugin loading is disabled");
+    }
+
+    #[test]
+    fn external_plugin_entry_points_are_explicitly_unsupported() {
+        assert_eq!(H5PL_FILTER_PLUGIN, 0x0001);
+        assert_eq!(H5PL_VOL_PLUGIN, 0x0002);
+        assert_eq!(H5PL_VFD_PLUGIN, 0x0004);
+        assert_eq!(H5PL_ALL_PLUGIN, 0xffff);
+        assert_eq!(H5PL_NO_PLUGIN, "::");
+        assert_eq!(H5PLPluginType::Error as isize, -1);
+        assert_eq!(H5PLPluginType::Filter as isize, 0);
+        assert_eq!(H5PLPluginType::Vol as isize, 1);
+        assert_eq!(H5PLPluginType::Vfd as isize, 2);
+        assert_eq!(H5PLPluginType::None as isize, 3);
+
+        let err = H5PLget_plugin_type().unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Unsupported: external HDF5 plugin entry point H5PLget_plugin_type is unsupported in pure-Rust mode"
+        );
+
+        let err = H5PLget_plugin_info().unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Unsupported: external HDF5 plugin entry point H5PLget_plugin_info is unsupported in pure-Rust mode"
+        );
     }
 
     #[test]

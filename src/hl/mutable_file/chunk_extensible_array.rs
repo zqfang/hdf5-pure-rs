@@ -51,6 +51,13 @@ pub(super) struct ExtensibleArrayChunkWrite {
     pub(super) chunk_size_len: usize,
 }
 
+struct ExtensibleArrayDataBlockElement {
+    data_block_addr: u64,
+    data_block_elements: usize,
+    element_in_block: usize,
+    page_index: Option<usize>,
+}
+
 impl MutableFile {
     pub(super) fn rewrite_extensible_array_chunk(
         &mut self,
@@ -81,26 +88,55 @@ impl MutableFile {
         })?;
         let direct_count = usize::from(header.index_block_elements);
         if write.element_index < element_count {
-            let element_pos = Self::locate_extensible_array_element(
+            let direct_count = usize::from(header.index_block_elements);
+            if write.element_index < direct_count {
+                let element_pos = Self::locate_extensible_array_element(
+                    &mut guard.reader,
+                    index_addr,
+                    &header,
+                    write.element_index,
+                )?;
+                drop(guard);
+                self.rewrite_existing_extensible_array_index_element(
+                    &header,
+                    element_pos,
+                    chunk_addr,
+                    chunk_size,
+                    write.filtered,
+                    write.chunk_size_len,
+                )?;
+                return Ok(());
+            }
+
+            Self::ensure_mutable_extensible_array_super_block_info(&mut header)?;
+            let element = Self::locate_existing_extensible_array_data_block_element(
                 &mut guard.reader,
                 index_addr,
                 &header,
                 write.element_index,
             )?;
             drop(guard);
-            self.rewrite_existing_extensible_array_element(
-                element_pos,
+            self.rewrite_existing_extensible_array_data_block_element(
+                &header,
+                element.data_block_addr,
+                element.data_block_elements,
+                element.element_in_block,
                 chunk_addr,
                 chunk_size,
                 write.filtered,
                 write.chunk_size_len,
+                element.page_index,
             )?;
             return Ok(());
         }
-        if write.element_index != element_count {
-            return Err(Error::Unsupported(
-                "write_chunk can append only the next extensible-array chunk index".into(),
-            ));
+        if write.element_index > element_count {
+            if write.element_index < direct_count {
+                return Err(Error::Unsupported(
+                    "write_chunk cannot allocate sparse extensible-array direct elements".into(),
+                ));
+            }
+            Self::ensure_mutable_extensible_array_super_block_info(&mut header)?;
+            Self::ensure_extensible_array_index_data_block_geometry(&header, write.element_index)?;
         }
         if write.element_index < direct_count {
             let element_pos = Self::locate_extensible_array_element(
@@ -134,8 +170,41 @@ impl MutableFile {
         }
     }
 
-    fn rewrite_existing_extensible_array_element(
+    fn ensure_extensible_array_index_data_block_geometry(
+        header: &MutableExtensibleArrayHeader,
+        element_index: usize,
+    ) -> Result<()> {
+        let direct_count = usize::from(header.index_block_elements);
+        let spillover_index = element_index.checked_sub(direct_count).ok_or_else(|| {
+            Error::InvalidFormat("extensible array spillover index underflow".into())
+        })?;
+        if header.super_block_info.iter().any(|info| {
+            let Ok(start) = usize::try_from(info.start_index).map_err(|_| ()) else {
+                return false;
+            };
+            let Ok(span) = info
+                .data_blocks
+                .checked_mul(info.data_block_elements)
+                .ok_or(())
+            else {
+                return false;
+            };
+            let Ok(end) = start.checked_add(span).ok_or(()) else {
+                return false;
+            };
+            spillover_index >= start && spillover_index < end
+        }) {
+            Ok(())
+        } else {
+            Err(Error::Unsupported(
+                "write_chunk can allocate sparse extensible-array chunks only inside existing index-block data-block geometry".into(),
+            ))
+        }
+    }
+
+    fn rewrite_existing_extensible_array_index_element(
         &mut self,
+        header: &MutableExtensibleArrayHeader,
         element_pos: u64,
         chunk_addr: u64,
         chunk_size: u64,
@@ -148,6 +217,33 @@ impl MutableFile {
             chunk_size,
             filtered,
             chunk_size_len,
+        )?;
+        self.rewrite_extensible_array_index_block_checksum(header, None, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn rewrite_existing_extensible_array_data_block_element(
+        &mut self,
+        header: &MutableExtensibleArrayHeader,
+        data_block_addr: u64,
+        data_block_elements: usize,
+        element_in_block: usize,
+        chunk_addr: u64,
+        chunk_size: u64,
+        filtered: bool,
+        chunk_size_len: usize,
+        page_index: Option<usize>,
+    ) -> Result<()> {
+        self.write_extensible_array_data_block_element(
+            data_block_addr,
+            header,
+            data_block_elements,
+            element_in_block,
+            chunk_addr,
+            chunk_size,
+            filtered,
+            chunk_size_len,
+            page_index,
         )
     }
 
@@ -304,6 +400,15 @@ impl MutableFile {
         filtered: bool,
         chunk_size_len: usize,
     ) -> Result<()> {
+        let next_element_count = Self::checked_u64_add(
+            block_offset,
+            Self::checked_u64_add(
+                Self::u64_from_usize(element_in_block, "extensible array element in block")?,
+                1,
+                "extensible array max index count",
+            )?,
+            "extensible array max index count",
+        )?;
         let global_data_block_index = usize::try_from(super_info.start_data_block)
             .map_err(|_| {
                 Error::InvalidFormat(
@@ -339,11 +444,6 @@ impl MutableFile {
         let data_block_size =
             self.extensible_array_data_block_size(header, super_info.data_block_elements)?;
         if crate::io::reader::is_undef_addr(data_block_addr) {
-            if element_in_block != 0 {
-                return Err(Error::Unsupported(
-                    "write_chunk cannot allocate a sparse extensible-array data block".into(),
-                ));
-            }
             let new_addr = self.create_extensible_array_data_block(
                 header_addr,
                 header,
@@ -376,7 +476,7 @@ impl MutableFile {
             self.rewrite_extensible_array_header_counts(
                 header_addr,
                 header,
-                Self::checked_u64_add(header.max_index_set, 1, "extensible array max index count")?,
+                next_element_count,
                 header.realized_elements.max(Self::checked_u64_add(
                     block_offset,
                     Self::u64_from_usize(
@@ -419,7 +519,7 @@ impl MutableFile {
         self.rewrite_extensible_array_header_counts(
             header_addr,
             header,
-            Self::checked_u64_add(header.max_index_set, 1, "extensible array max index count")?,
+            next_element_count,
             header.realized_elements,
             None,
             None,
@@ -441,6 +541,15 @@ impl MutableFile {
         filtered: bool,
         chunk_size_len: usize,
     ) -> Result<()> {
+        let next_element_count = Self::checked_u64_add(
+            block_offset,
+            Self::checked_u64_add(
+                Self::u64_from_usize(element_in_block, "extensible array element in block")?,
+                1,
+                "extensible array max index count",
+            )?,
+            "extensible array max index count",
+        )?;
         let super_block_addr_index = super_block_index - header.index_block_super_blocks;
         if super_block_addr_index >= header.index_block_super_block_addrs {
             return Err(Error::InvalidFormat(
@@ -466,11 +575,6 @@ impl MutableFile {
         let data_block_size =
             self.extensible_array_data_block_size(header, super_info.data_block_elements)?;
         if crate::io::reader::is_undef_addr(super_block_addr) {
-            if local_data_block_index != 0 || element_in_block != 0 {
-                return Err(Error::Unsupported(
-                    "write_chunk cannot allocate a sparse extensible-array super block".into(),
-                ));
-            }
             let (new_super_addr, new_data_addr) = self.create_extensible_array_super_block(
                 header_addr,
                 header,
@@ -503,7 +607,7 @@ impl MutableFile {
             self.rewrite_extensible_array_header_counts(
                 header_addr,
                 header,
-                Self::checked_u64_add(header.max_index_set, 1, "extensible array max index count")?,
+                next_element_count,
                 header.realized_elements.max(Self::checked_u64_add(
                     block_offset,
                     Self::u64_from_usize(
@@ -645,7 +749,7 @@ impl MutableFile {
         self.rewrite_extensible_array_header_counts(
             header_addr,
             header,
-            Self::checked_u64_add(header.max_index_set, 1, "extensible array max index count")?,
+            next_element_count,
             header.realized_elements,
             None,
             None,
@@ -860,11 +964,31 @@ impl MutableFile {
         super_info: &MutableExtensibleArraySuperBlockInfo,
         local_data_block_index: usize,
     ) -> Result<u64> {
+        let sizeof_addr = usize::from(self.superblock.sizeof_addr);
+        let mut guard = self.inner.lock();
+        Self::read_extensible_array_super_block_data_addr_from(
+            &mut guard.reader,
+            sizeof_addr,
+            super_block_addr,
+            header,
+            super_info,
+            local_data_block_index,
+        )
+    }
+
+    fn read_extensible_array_super_block_data_addr_from<R: Read + Seek>(
+        reader: &mut HdfReader<R>,
+        sizeof_addr: usize,
+        super_block_addr: u64,
+        header: &MutableExtensibleArrayHeader,
+        super_info: &MutableExtensibleArraySuperBlockInfo,
+        local_data_block_index: usize,
+    ) -> Result<u64> {
         let page_init_size =
             Self::extensible_array_page_init_size(header, super_info.data_block_elements);
         let prefix_size = Self::checked_usize_add(
             4 + 1 + 1,
-            usize::from(self.superblock.sizeof_addr),
+            sizeof_addr,
             "extensible array super block address offset",
         )
         .and_then(|value| {
@@ -881,7 +1005,7 @@ impl MutableFile {
         )?;
         let addr_index_bytes = Self::checked_usize_mul(
             local_data_block_index,
-            usize::from(self.superblock.sizeof_addr),
+            sizeof_addr,
             "extensible array super block address offset",
         )?;
         let addr_offset = Self::checked_usize_add(
@@ -901,9 +1025,8 @@ impl MutableFile {
             Self::u64_from_usize(addr_offset, "extensible array super block address offset")?,
             "extensible array super block address",
         )?;
-        let mut guard = self.inner.lock();
-        guard.reader.seek(addr_pos)?;
-        guard.reader.read_addr()
+        reader.seek(addr_pos)?;
+        reader.read_addr()
     }
 
     fn rewrite_extensible_array_super_block(
@@ -1670,6 +1793,7 @@ impl MutableFile {
                 header_addr,
                 header,
                 data_block_addr,
+                header.data_block_min_elements,
                 Self::u64_from_usize(direct_count, "extensible array direct element count")?,
                 data_block_index,
             );
@@ -1680,38 +1804,204 @@ impl MutableFile {
         ))
     }
 
+    fn locate_existing_extensible_array_data_block_element<R: Read + Seek>(
+        reader: &mut HdfReader<R>,
+        header_addr: u64,
+        header: &MutableExtensibleArrayHeader,
+        element_index: usize,
+    ) -> Result<ExtensibleArrayDataBlockElement> {
+        if crate::io::reader::is_undef_addr(header.index_block_addr) {
+            return Err(Error::Unsupported(
+                "cannot update extensible-array chunk entry without an index block".into(),
+            ));
+        }
+        Self::verify_extensible_array_index_block(reader, header_addr, header)?;
+        let direct_count = usize::from(header.index_block_elements);
+        if element_index < direct_count {
+            return Err(Error::InvalidFormat(
+                "extensible-array data-block update called for index-block element".into(),
+            ));
+        }
+
+        let spillover_index = element_index - direct_count;
+        let Some((super_block_index, super_info)) = header
+            .super_block_info
+            .iter()
+            .enumerate()
+            .find(|(_, info)| {
+                let Ok(start) = usize::try_from(info.start_index).map_err(|_| ()) else {
+                    return false;
+                };
+                let Ok(span) = info
+                    .data_blocks
+                    .checked_mul(info.data_block_elements)
+                    .ok_or(())
+                else {
+                    return false;
+                };
+                let Ok(end) = start.checked_add(span).ok_or(()) else {
+                    return false;
+                };
+                spillover_index >= start && spillover_index < end
+            })
+        else {
+            return Err(Error::Unsupported(
+                "extensible-array update index exceeds supported array geometry".into(),
+            ));
+        };
+
+        let super_start = usize::try_from(super_info.start_index).map_err(|_| {
+            Error::InvalidFormat(
+                "extensible array super block start index does not fit usize".into(),
+            )
+        })?;
+        let index_in_super = spillover_index.checked_sub(super_start).ok_or_else(|| {
+            Error::InvalidFormat("extensible array super block index underflow".into())
+        })?;
+        let local_data_block_index = index_in_super / super_info.data_block_elements;
+        let element_in_block = index_in_super % super_info.data_block_elements;
+        let block_offset = Self::checked_u64_add(
+            Self::u64_from_usize(direct_count, "extensible array direct element count")?,
+            super_info.start_index,
+            "extensible array block offset",
+        )
+        .and_then(|value| {
+            Self::checked_u64_add(
+                value,
+                Self::u64_from_usize(
+                    local_data_block_index
+                        .checked_mul(super_info.data_block_elements)
+                        .ok_or_else(|| {
+                            Error::InvalidFormat(
+                                "extensible array local data block offset overflow".into(),
+                            )
+                        })?,
+                    "extensible array local data block offset",
+                )?,
+                "extensible array block offset",
+            )
+        })?;
+
+        let sizeof_addr = usize::from(reader.sizeof_addr());
+        let data_block_addr = if super_block_index < header.index_block_super_blocks {
+            let global_data_block_index = usize::try_from(super_info.start_data_block)
+                .map_err(|_| {
+                    Error::InvalidFormat(
+                        "extensible-array data-block start index does not fit usize".into(),
+                    )
+                })
+                .and_then(|start| {
+                    Self::checked_usize_add(
+                        start,
+                        local_data_block_index,
+                        "extensible-array index data-block address index",
+                    )
+                })?;
+            if global_data_block_index >= header.index_block_data_block_addrs {
+                return Err(Error::InvalidFormat(
+                    "extensible-array index data-block address is out of bounds".into(),
+                ));
+            }
+            let data_block_addr_pos = Self::extensible_array_index_data_block_addr_pos(
+                header.index_block_addr,
+                direct_count,
+                header.raw_element_size,
+                sizeof_addr,
+                global_data_block_index,
+            )?;
+            reader.seek(data_block_addr_pos)?;
+            reader.read_addr()?
+        } else {
+            let super_block_addr_index = super_block_index - header.index_block_super_blocks;
+            if super_block_addr_index >= header.index_block_super_block_addrs {
+                return Err(Error::InvalidFormat(
+                    "extensible-array super-block address is out of bounds".into(),
+                ));
+            }
+            let super_block_addr_pos = Self::extensible_array_index_super_block_addr_pos(
+                header.index_block_addr,
+                direct_count,
+                header.raw_element_size,
+                header.index_block_data_block_addrs,
+                sizeof_addr,
+                super_block_addr_index,
+            )?;
+            reader.seek(super_block_addr_pos)?;
+            let super_block_addr = reader.read_addr()?;
+            if crate::io::reader::is_undef_addr(super_block_addr) {
+                return Err(Error::Unsupported(
+                    "cannot update unallocated extensible-array super block".into(),
+                ));
+            }
+            Self::read_extensible_array_super_block_data_addr_from(
+                reader,
+                sizeof_addr,
+                super_block_addr,
+                header,
+                super_info,
+                local_data_block_index,
+            )?
+        };
+        if crate::io::reader::is_undef_addr(data_block_addr) {
+            return Err(Error::Unsupported(
+                "cannot update unallocated extensible-array data block".into(),
+            ));
+        }
+
+        let page_index = if super_info.data_block_elements > header.max_data_block_page_elements {
+            Self::verify_extensible_array_data_block_header(
+                reader,
+                header_addr,
+                header,
+                data_block_addr,
+                block_offset,
+            )?;
+            if header.max_data_block_page_elements == 0 {
+                return Err(Error::InvalidFormat(
+                    "extensible array paged data block has zero page elements".into(),
+                ));
+            }
+            Some(element_in_block / header.max_data_block_page_elements)
+        } else {
+            let _element_pos = Self::locate_extensible_array_data_block_element(
+                reader,
+                header_addr,
+                header,
+                data_block_addr,
+                super_info.data_block_elements,
+                block_offset,
+                element_in_block,
+            )?;
+            None
+        };
+        Ok(ExtensibleArrayDataBlockElement {
+            data_block_addr,
+            data_block_elements: super_info.data_block_elements,
+            element_in_block,
+            page_index,
+        })
+    }
+
     fn locate_extensible_array_data_block_element<R: Read + Seek>(
         reader: &mut HdfReader<R>,
         header_addr: u64,
         header: &MutableExtensibleArrayHeader,
         data_block_addr: u64,
+        data_block_elements: usize,
         block_offset: u64,
         element_index: usize,
     ) -> Result<u64> {
-        reader.seek(data_block_addr)?;
-        let mut magic = [0u8; 4];
-        reader.read_bytes_into(&mut magic)?;
-        if magic != *b"EADB" {
-            return Err(Error::InvalidFormat(
-                "invalid extensible array data block magic".into(),
-            ));
-        }
-        let version = reader.read_u8()?;
-        let class_id = reader.read_u8()?;
-        let owner = reader.read_addr()?;
-        let stored_offset = reader.read_uint(header.array_offset_size)?;
-        if version != 0
-            || class_id != header.class_id
-            || owner != header_addr
-            || stored_offset != block_offset
-        {
-            return Err(Error::InvalidFormat(
-                "extensible array data block header does not match index".into(),
-            ));
-        }
-        if header.data_block_min_elements > header.max_data_block_page_elements {
+        Self::verify_extensible_array_data_block_header(
+            reader,
+            header_addr,
+            header,
+            data_block_addr,
+            block_offset,
+        )?;
+        if data_block_elements > header.max_data_block_page_elements {
             return Err(Error::Unsupported(
-                "write_chunk cannot update paged extensible-array data blocks yet".into(),
+                "write_chunk cannot update paged extensible-array data blocks without page context"
+                    .into(),
             ));
         }
         let prefix_size = Self::checked_usize_add(
@@ -1740,6 +2030,37 @@ impl MutableFile {
             Self::u64_from_usize(element_offset, "extensible array data block element offset")?,
             "extensible array data block element address",
         )
+    }
+
+    fn verify_extensible_array_data_block_header<R: Read + Seek>(
+        reader: &mut HdfReader<R>,
+        header_addr: u64,
+        header: &MutableExtensibleArrayHeader,
+        data_block_addr: u64,
+        block_offset: u64,
+    ) -> Result<()> {
+        reader.seek(data_block_addr)?;
+        let mut magic = [0u8; 4];
+        reader.read_bytes_into(&mut magic)?;
+        if magic != *b"EADB" {
+            return Err(Error::InvalidFormat(
+                "invalid extensible array data block magic".into(),
+            ));
+        }
+        let version = reader.read_u8()?;
+        let class_id = reader.read_u8()?;
+        let owner = reader.read_addr()?;
+        let stored_offset = reader.read_uint(header.array_offset_size)?;
+        if version != 0
+            || class_id != header.class_id
+            || owner != header_addr
+            || stored_offset != block_offset
+        {
+            return Err(Error::InvalidFormat(
+                "extensible array data block header does not match index".into(),
+            ));
+        }
+        Ok(())
     }
 
     fn verify_extensible_array_index_block<R: Read + Seek>(

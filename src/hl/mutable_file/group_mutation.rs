@@ -201,7 +201,7 @@ impl MutableFile {
         })?;
 
         let (dest_flags, mut dest_messages) =
-            self.compact_messages_for_append(dest_addr, name, operation)?;
+            self.messages_for_append(dest_addr, name, operation)?;
         if target_is_destination_ancestor
             && self.find_object_refcount_location(target_addr)?.is_none()
         {
@@ -365,7 +365,7 @@ impl MutableFile {
         let root_addr = self.superblock.root_addr;
         if parent_path == "/" {
             let (root_flags, root_messages) =
-                self.compact_messages_for_append(root_addr, name, operation)?;
+                self.messages_for_append(root_addr, name, operation)?;
             return self.append_rebuilt_root_link_message(root_messages, root_flags, link);
         }
 
@@ -377,7 +377,7 @@ impl MutableFile {
                 Error::InvalidFormat(format!("parent group '{parent_path}' not found"))
             })?;
         let (parent_flags, mut parent_messages) =
-            self.compact_messages_for_append(old_parent_addr, name, operation)?;
+            self.messages_for_append(old_parent_addr, name, operation)?;
         parent_messages.push(OwnedObjectHeaderMessage {
             msg_type: object_header::MSG_LINK,
             flags: 0,
@@ -694,7 +694,7 @@ impl MutableFile {
             Err(Error::Unsupported(msg))
                 if msg.contains("dense or creation-order indexed links") =>
             {
-                return self.rename_dense_link(group.addr(), old_name, new_name);
+                return self.rename_dense_link(group_path, group.addr(), old_name, new_name);
             }
             Err(err) => return Err(err),
         };
@@ -702,7 +702,7 @@ impl MutableFile {
             if group_path == "/" {
                 return self.rename_root_compact_link_by_rebuild(old_name, new_name);
             }
-            return self.rename_nested_compact_link_by_rebuild(group_path, old_name, new_name);
+            return self.rename_nested_link_by_rebuild(group_path, old_name, new_name);
         }
 
         let name_offset_u64 = Self::usize_to_u64(location.name_offset, "link name offset")?;
@@ -753,9 +753,9 @@ impl MutableFile {
         })?;
 
         let (source_flags, source_messages, moved_link) =
-            self.compact_messages_removing_link(source_addr, old_name, new_name, operation)?;
+            self.messages_removing_link(source_addr, old_name, new_name, operation)?;
         let (dest_flags, mut dest_messages) =
-            self.compact_messages_for_append(dest_addr, new_name, operation)?;
+            self.messages_for_append(dest_addr, new_name, operation)?;
         dest_messages.push(OwnedObjectHeaderMessage {
             msg_type: object_header::MSG_LINK,
             flags: 0,
@@ -847,7 +847,7 @@ impl MutableFile {
         self.append_rebuilt_root_link_message(messages, oh.flags, renamed_link)
     }
 
-    fn rename_nested_compact_link_by_rebuild(
+    fn rename_nested_link_by_rebuild(
         &mut self,
         group_path: &str,
         old_name: &str,
@@ -863,32 +863,55 @@ impl MutableFile {
 
         let operation = "nested compact relink";
         let root_addr = self.superblock.root_addr;
-        let parent_chain = self.compact_hard_link_parent_chain(group_path, operation)?;
+        let parent_chain = self.compact_or_dense_hard_link_parent_chain(group_path, operation)?;
         let old_group_addr = parent_chain
             .last()
-            .map(|(_, _, child_addr)| *child_addr)
+            .map(|link| link.child_addr)
             .ok_or_else(|| {
                 Error::InvalidFormat(format!("group '{group_path}' is not linked from the root"))
             })?;
         let (group_flags, group_messages) =
-            self.compact_messages_renaming_link(old_group_addr, old_name, new_name, operation)?;
+            self.messages_renaming_link(old_group_addr, old_name, new_name, operation)?;
 
         let mut new_child_addr =
             self.append_owned_v2_object_header(&group_messages, group_flags)?;
         let mut root_update = None;
-        for (ancestor_addr, link_name, _) in parent_chain.iter().rev() {
-            let (ancestor_flags, ancestor_messages) = self.compact_messages_replacing_hard_link(
-                *ancestor_addr,
-                link_name,
-                new_child_addr,
-                operation,
-            )?;
-            if *ancestor_addr == root_addr {
-                root_update = Some((ancestor_flags, ancestor_messages));
-                break;
+        let mut dense_update = false;
+        for link in parent_chain.iter().rev() {
+            match link.storage {
+                ParentChainLinkStorage::Compact => {
+                    let (ancestor_flags, ancestor_messages) = self
+                        .compact_messages_replacing_hard_link(
+                            link.ancestor_addr,
+                            &link.link_name,
+                            new_child_addr,
+                            operation,
+                        )?;
+                    if link.ancestor_addr == root_addr {
+                        root_update = Some((ancestor_flags, ancestor_messages));
+                        break;
+                    }
+                    new_child_addr =
+                        self.append_owned_v2_object_header(&ancestor_messages, ancestor_flags)?;
+                }
+                ParentChainLinkStorage::Dense => {
+                    self.rewrite_dense_hard_link_addr(
+                        link.ancestor_addr,
+                        &link.link_name,
+                        new_child_addr,
+                        operation,
+                    )?;
+                    dense_update = true;
+                    break;
+                }
             }
-            new_child_addr =
-                self.append_owned_v2_object_header(&ancestor_messages, ancestor_flags)?;
+        }
+        if dense_update {
+            let eof_addr = self.write_handle.seek(SeekFrom::End(0))?;
+            self.rewrite_v2_v3_superblock(self.superblock.root_addr, eof_addr)?;
+            self.write_handle.flush()?;
+            self.reopen_reader()?;
+            return Ok(());
         }
         let (root_flags, root_messages) = root_update.ok_or_else(|| {
             Error::InvalidFormat(format!(
@@ -971,6 +994,156 @@ impl MutableFile {
         Ok((oh.flags, messages))
     }
 
+    fn messages_renaming_link(
+        &self,
+        group_addr: u64,
+        old_name: &str,
+        new_name: &str,
+        operation: &str,
+    ) -> Result<(u8, Vec<OwnedObjectHeaderMessage>)> {
+        match self.compact_messages_renaming_link(group_addr, old_name, new_name, operation) {
+            Err(Error::Unsupported(msg))
+                if msg.contains("dense or creation-order indexed links") =>
+            {
+                self.compact_messages_from_dense_links_renaming_link(
+                    group_addr, old_name, new_name, operation,
+                )
+            }
+            other => other,
+        }
+    }
+
+    fn compact_messages_from_dense_links_renaming_link(
+        &self,
+        group_addr: u64,
+        old_name: &str,
+        new_name: &str,
+        operation: &str,
+    ) -> Result<(u8, Vec<OwnedObjectHeaderMessage>)> {
+        let mut guard = self.inner.lock();
+        let sizeof_addr = guard.superblock.sizeof_addr;
+        let oh = ObjectHeader::read_at(&mut guard.reader, group_addr)?;
+        if oh.version != 2 {
+            return Err(Error::Unsupported(format!(
+                "{operation} currently supports only v2 object headers"
+            )));
+        }
+        if oh.flags & HDR_ATTR_CRT_ORDER_TRACKED != 0 {
+            return Err(Error::Unsupported(format!(
+                "{operation} with object-header creation-order tracking is not implemented"
+            )));
+        }
+
+        let mut renamed = false;
+        let mut messages = Vec::new();
+        for msg in &oh.messages {
+            match msg.msg_type {
+                object_header::MSG_LINK => {
+                    let link = LinkMessage::decode(&msg.data, sizeof_addr)?;
+                    if link.name == new_name {
+                        return Err(Error::InvalidFormat(format!(
+                            "link '{new_name}' already exists"
+                        )));
+                    }
+                    if link.name == old_name {
+                        if renamed {
+                            return Err(Error::InvalidFormat(format!(
+                                "link '{old_name}' appears more than once"
+                            )));
+                        }
+                        messages.push(OwnedObjectHeaderMessage {
+                            msg_type: object_header::MSG_LINK,
+                            flags: msg.flags,
+                            creation_index: msg.creation_index,
+                            data: encode_renamed_link_message(&link, new_name, sizeof_addr)?,
+                        });
+                        renamed = true;
+                    } else {
+                        messages.push(OwnedObjectHeaderMessage::from_raw(msg));
+                    }
+                }
+                object_header::MSG_LINK_INFO => {
+                    let link_info = LinkInfoMessage::decode(&msg.data, sizeof_addr)?;
+                    if link_info.corder_btree_addr.is_some() {
+                        return Err(Error::Unsupported(format!(
+                            "{operation} for creation-order indexed links is not implemented"
+                        )));
+                    }
+                    if !link_info.has_dense_storage() {
+                        messages.push(OwnedObjectHeaderMessage::from_raw(msg));
+                        continue;
+                    }
+
+                    let heap =
+                        FractalHeapHeader::read_at(&mut guard.reader, link_info.fractal_heap_addr)?;
+                    if heap.io_filter_len != 0 || heap.current_root_rows != 0 {
+                        return Err(Error::Unsupported(
+                            "mutating filtered or indirect dense link heaps is not implemented"
+                                .into(),
+                        ));
+                    }
+                    let btree =
+                        BTreeV2Header::read_at(&mut guard.reader, link_info.name_btree_addr)?;
+                    if btree.depth != 0 {
+                        return Err(Error::Unsupported(
+                            "mutating non-leaf dense link name indexes is not implemented".into(),
+                        ));
+                    }
+                    let mut leaf_records = Vec::new();
+                    Self::read_dense_link_leaf_records_into(
+                        &mut guard.reader,
+                        &btree,
+                        &mut leaf_records,
+                    )?;
+                    let heap_id_len = usize::from(heap.heap_id_len);
+                    let record_size = usize::from(btree.record_size);
+                    for record in leaf_records.chunks_exact(record_size) {
+                        let heap_id = checked_window(record, 4, heap_id_len, "dense link heap ID")?;
+                        let raw_data = heap.read_managed_object(&mut guard.reader, heap_id)?;
+                        let link = LinkMessage::decode(&raw_data, sizeof_addr)?;
+                        if link.name == new_name {
+                            return Err(Error::InvalidFormat(format!(
+                                "link '{new_name}' already exists"
+                            )));
+                        }
+                        if link.name == old_name {
+                            if renamed {
+                                return Err(Error::InvalidFormat(format!(
+                                    "link '{old_name}' appears more than once"
+                                )));
+                            }
+                            messages.push(OwnedObjectHeaderMessage {
+                                msg_type: object_header::MSG_LINK,
+                                flags: 0,
+                                creation_index: None,
+                                data: encode_renamed_link_message(&link, new_name, sizeof_addr)?,
+                            });
+                            renamed = true;
+                        } else {
+                            messages.push(OwnedObjectHeaderMessage {
+                                msg_type: object_header::MSG_LINK,
+                                flags: 0,
+                                creation_index: None,
+                                data: raw_data,
+                            });
+                        }
+                    }
+                }
+                object_header::MSG_SYMBOL_TABLE => {
+                    return Err(Error::Unsupported(format!(
+                        "{operation} for v1 symbol-table groups is not implemented"
+                    )));
+                }
+                object_header::MSG_HEADER_CONTINUATION | object_header::MSG_NIL => {}
+                _ => messages.push(OwnedObjectHeaderMessage::from_raw(msg)),
+            }
+        }
+        if !renamed {
+            return Err(Error::InvalidFormat(format!("link '{old_name}' not found")));
+        }
+        Ok((oh.flags, messages))
+    }
+
     fn compact_messages_removing_link(
         &self,
         group_addr: u64,
@@ -1018,6 +1191,136 @@ impl MutableFile {
                         )));
                     }
                     messages.push(OwnedObjectHeaderMessage::from_raw(msg));
+                }
+                object_header::MSG_SYMBOL_TABLE => {
+                    return Err(Error::Unsupported(format!(
+                        "{operation} for v1 symbol-table groups is not implemented"
+                    )));
+                }
+                object_header::MSG_HEADER_CONTINUATION | object_header::MSG_NIL => {}
+                _ => messages.push(OwnedObjectHeaderMessage::from_raw(msg)),
+            }
+        }
+
+        let removed_link = removed_link
+            .ok_or_else(|| Error::InvalidFormat(format!("link '{old_name}' not found")))?;
+        Ok((oh.flags, messages, removed_link))
+    }
+
+    fn messages_removing_link(
+        &self,
+        group_addr: u64,
+        old_name: &str,
+        new_name: &str,
+        operation: &str,
+    ) -> Result<(u8, Vec<OwnedObjectHeaderMessage>, Vec<u8>)> {
+        match self.compact_messages_removing_link(group_addr, old_name, new_name, operation) {
+            Err(Error::Unsupported(msg))
+                if msg.contains("dense or creation-order indexed links") =>
+            {
+                self.compact_messages_from_dense_links_removing_link(
+                    group_addr, old_name, new_name, operation,
+                )
+            }
+            other => other,
+        }
+    }
+
+    fn compact_messages_from_dense_links_removing_link(
+        &self,
+        group_addr: u64,
+        old_name: &str,
+        new_name: &str,
+        operation: &str,
+    ) -> Result<(u8, Vec<OwnedObjectHeaderMessage>, Vec<u8>)> {
+        let mut guard = self.inner.lock();
+        let sizeof_addr = guard.superblock.sizeof_addr;
+        let oh = ObjectHeader::read_at(&mut guard.reader, group_addr)?;
+        if oh.version != 2 {
+            return Err(Error::Unsupported(format!(
+                "{operation} currently supports only v2 object headers"
+            )));
+        }
+        if oh.flags & HDR_ATTR_CRT_ORDER_TRACKED != 0 {
+            return Err(Error::Unsupported(format!(
+                "{operation} with object-header creation-order tracking is not implemented"
+            )));
+        }
+
+        let mut removed_link = None;
+        let mut messages = Vec::new();
+        for msg in &oh.messages {
+            match msg.msg_type {
+                object_header::MSG_LINK => {
+                    let link = LinkMessage::decode(&msg.data, sizeof_addr)?;
+                    if link.name == old_name {
+                        if removed_link.is_some() {
+                            return Err(Error::InvalidFormat(format!(
+                                "link '{old_name}' appears more than once"
+                            )));
+                        }
+                        removed_link =
+                            Some(encode_renamed_link_message(&link, new_name, sizeof_addr)?);
+                    } else {
+                        messages.push(OwnedObjectHeaderMessage::from_raw(msg));
+                    }
+                }
+                object_header::MSG_LINK_INFO => {
+                    let link_info = LinkInfoMessage::decode(&msg.data, sizeof_addr)?;
+                    if link_info.corder_btree_addr.is_some() {
+                        return Err(Error::Unsupported(format!(
+                            "{operation} for creation-order indexed links is not implemented"
+                        )));
+                    }
+                    if !link_info.has_dense_storage() {
+                        messages.push(OwnedObjectHeaderMessage::from_raw(msg));
+                        continue;
+                    }
+
+                    let heap =
+                        FractalHeapHeader::read_at(&mut guard.reader, link_info.fractal_heap_addr)?;
+                    if heap.io_filter_len != 0 || heap.current_root_rows != 0 {
+                        return Err(Error::Unsupported(
+                            "mutating filtered or indirect dense link heaps is not implemented"
+                                .into(),
+                        ));
+                    }
+                    let btree =
+                        BTreeV2Header::read_at(&mut guard.reader, link_info.name_btree_addr)?;
+                    if btree.depth != 0 {
+                        return Err(Error::Unsupported(
+                            "mutating non-leaf dense link name indexes is not implemented".into(),
+                        ));
+                    }
+                    let mut leaf_records = Vec::new();
+                    Self::read_dense_link_leaf_records_into(
+                        &mut guard.reader,
+                        &btree,
+                        &mut leaf_records,
+                    )?;
+                    let heap_id_len = usize::from(heap.heap_id_len);
+                    let record_size = usize::from(btree.record_size);
+                    for record in leaf_records.chunks_exact(record_size) {
+                        let heap_id = checked_window(record, 4, heap_id_len, "dense link heap ID")?;
+                        let raw_data = heap.read_managed_object(&mut guard.reader, heap_id)?;
+                        let link = LinkMessage::decode(&raw_data, sizeof_addr)?;
+                        if link.name == old_name {
+                            if removed_link.is_some() {
+                                return Err(Error::InvalidFormat(format!(
+                                    "link '{old_name}' appears more than once"
+                                )));
+                            }
+                            removed_link =
+                                Some(encode_renamed_link_message(&link, new_name, sizeof_addr)?);
+                        } else {
+                            messages.push(OwnedObjectHeaderMessage {
+                                msg_type: object_header::MSG_LINK,
+                                flags: 0,
+                                creation_index: None,
+                                data: raw_data,
+                            });
+                        }
+                    }
                 }
                 object_header::MSG_SYMBOL_TABLE => {
                     return Err(Error::Unsupported(format!(
@@ -1117,7 +1420,13 @@ impl MutableFile {
         self.append_rebuilt_root_link_message(root_messages, root_flags, Vec::new())
     }
 
-    fn rename_dense_link(&mut self, group_addr: u64, old_name: &str, new_name: &str) -> Result<()> {
+    fn rename_dense_link(
+        &mut self,
+        group_path: &str,
+        group_addr: u64,
+        old_name: &str,
+        new_name: &str,
+    ) -> Result<()> {
         let mut location = self.find_dense_link_location(group_addr, old_name, Some(new_name))?;
         let link = compact_link_view(&location.raw_data, self.superblock.sizeof_addr)?;
         let name_offset = link.name_offset;
@@ -1127,9 +1436,17 @@ impl MutableFile {
             let mut renamed =
                 encode_renamed_link_message(&link, new_name, self.superblock.sizeof_addr)?;
             if renamed.len() > location.raw_data.len() {
-                return Err(Error::Unsupported(
-                    "in-place dense link rename cannot grow the encoded heap object yet".into(),
-                ));
+                if group_path == "/" {
+                    let operation = "root dense relink";
+                    let (root_flags, root_messages) =
+                        self.messages_renaming_link(group_addr, old_name, new_name, operation)?;
+                    return self.append_rebuilt_root_link_message(
+                        root_messages,
+                        root_flags,
+                        Vec::new(),
+                    );
+                }
+                return self.rename_nested_link_by_rebuild(group_path, old_name, new_name);
             }
             renamed.resize(location.raw_data.len(), 0);
 
@@ -2073,20 +2390,117 @@ impl MutableFile {
         Ok((oh.flags, messages))
     }
 
-    fn compact_hard_link_parent_chain(
+    fn messages_for_append(
         &self,
-        parent_path: &str,
+        group_addr: u64,
+        new_name: &str,
         operation: &str,
-    ) -> Result<Vec<(u64, String, u64)>> {
-        let names = compact_absolute_path_components(parent_path, operation)?;
-        let mut ancestor_addr = self.superblock.root_addr;
-        let mut chain = Vec::with_capacity(names.len());
-        for name in names {
-            let child_addr = self.compact_hard_link_addr(ancestor_addr, name, operation)?;
-            chain.push((ancestor_addr, name.to_string(), child_addr));
-            ancestor_addr = child_addr;
+    ) -> Result<(u8, Vec<OwnedObjectHeaderMessage>)> {
+        match self.compact_messages_for_append(group_addr, new_name, operation) {
+            Err(Error::Unsupported(msg))
+                if msg.contains("dense or creation-order indexed links") =>
+            {
+                self.compact_messages_from_dense_links_for_append(group_addr, new_name, operation)
+            }
+            other => other,
         }
-        Ok(chain)
+    }
+
+    fn compact_messages_from_dense_links_for_append(
+        &self,
+        group_addr: u64,
+        new_name: &str,
+        operation: &str,
+    ) -> Result<(u8, Vec<OwnedObjectHeaderMessage>)> {
+        let mut guard = self.inner.lock();
+        let sizeof_addr = guard.superblock.sizeof_addr;
+        let oh = ObjectHeader::read_at(&mut guard.reader, group_addr)?;
+        if oh.version != 2 {
+            return Err(Error::Unsupported(format!(
+                "{operation} currently supports only v2 object headers"
+            )));
+        }
+        if oh.flags & HDR_ATTR_CRT_ORDER_TRACKED != 0 {
+            return Err(Error::Unsupported(format!(
+                "{operation} with object-header creation-order tracking is not implemented"
+            )));
+        }
+
+        let mut messages = Vec::new();
+        for msg in &oh.messages {
+            match msg.msg_type {
+                object_header::MSG_LINK => {
+                    let link = LinkMessage::decode(&msg.data, sizeof_addr)?;
+                    if link.name == new_name {
+                        return Err(Error::InvalidFormat(format!(
+                            "link '{new_name}' already exists"
+                        )));
+                    }
+                    messages.push(OwnedObjectHeaderMessage::from_raw(msg));
+                }
+                object_header::MSG_LINK_INFO => {
+                    let link_info = LinkInfoMessage::decode(&msg.data, sizeof_addr)?;
+                    if link_info.corder_btree_addr.is_some() {
+                        return Err(Error::Unsupported(format!(
+                            "{operation} for creation-order indexed links is not implemented"
+                        )));
+                    }
+                    if !link_info.has_dense_storage() {
+                        messages.push(OwnedObjectHeaderMessage::from_raw(msg));
+                        continue;
+                    }
+
+                    let heap =
+                        FractalHeapHeader::read_at(&mut guard.reader, link_info.fractal_heap_addr)?;
+                    if heap.io_filter_len != 0 || heap.current_root_rows != 0 {
+                        return Err(Error::Unsupported(
+                            "mutating filtered or indirect dense link heaps is not implemented"
+                                .into(),
+                        ));
+                    }
+                    let btree =
+                        BTreeV2Header::read_at(&mut guard.reader, link_info.name_btree_addr)?;
+                    if btree.depth != 0 {
+                        return Err(Error::Unsupported(
+                            "mutating non-leaf dense link name indexes is not implemented".into(),
+                        ));
+                    }
+                    let mut leaf_records = Vec::new();
+                    Self::read_dense_link_leaf_records_into(
+                        &mut guard.reader,
+                        &btree,
+                        &mut leaf_records,
+                    )?;
+                    let heap_id_len = usize::from(heap.heap_id_len);
+                    let record_size = usize::from(btree.record_size);
+                    for record in leaf_records.chunks_exact(record_size) {
+                        let heap_id = checked_window(record, 4, heap_id_len, "dense link heap ID")?;
+                        let raw_data = heap.read_managed_object(&mut guard.reader, heap_id)?;
+                        let link = LinkMessage::decode(&raw_data, sizeof_addr)?;
+                        if link.name == new_name {
+                            return Err(Error::InvalidFormat(format!(
+                                "link '{new_name}' already exists"
+                            )));
+                        }
+                        messages.push(OwnedObjectHeaderMessage {
+                            msg_type: object_header::MSG_LINK,
+                            flags: 0,
+                            creation_index: None,
+                            data: raw_data,
+                        });
+                    }
+                }
+                object_header::MSG_SYMBOL_TABLE => {
+                    return Err(Error::Unsupported(format!(
+                        "{operation} for v1 symbol-table groups is not implemented"
+                    )));
+                }
+                object_header::MSG_HEADER_CONTINUATION | object_header::MSG_NIL => {}
+                _ => messages.push(OwnedObjectHeaderMessage::from_raw(msg)),
+            }
+        }
+
+        Ok((oh.flags, messages))
     }
 
     fn compact_or_dense_hard_link_parent_chain(

@@ -1,4 +1,60 @@
-use crate::error::{ErrorEvent, ErrorEventSet, Result};
+use std::ffi::c_void;
+
+use crate::error::{Error, ErrorEvent, ErrorEventSet, Result};
+
+pub const H5ES_NONE: u64 = 0;
+pub const H5ES_WAIT_FOREVER: u64 = u64::MAX;
+pub const H5ES_WAIT_NONE: u64 = 0;
+
+#[allow(non_camel_case_types)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum H5ES_status_t {
+    H5ES_STATUS_IN_PROGRESS,
+    H5ES_STATUS_SUCCEED,
+    H5ES_STATUS_CANCELED,
+    H5ES_STATUS_FAIL,
+}
+
+#[allow(non_camel_case_types)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct H5ES_op_info_t {
+    pub api_name: String,
+    pub api_args: String,
+    pub app_file_name: String,
+    pub app_func_name: String,
+    pub app_line_num: u32,
+    pub op_ins_count: u64,
+    pub op_ins_ts: u64,
+    pub op_exec_ts: u64,
+    pub op_exec_time: u64,
+}
+
+#[allow(non_camel_case_types)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct H5ES_err_info_t {
+    pub api_name: String,
+    pub api_args: String,
+    pub app_file_name: String,
+    pub app_func_name: String,
+    pub app_line_num: u32,
+    pub op_ins_count: u64,
+    pub op_ins_ts: u64,
+    pub op_exec_ts: u64,
+    pub op_exec_time: u64,
+    pub err_stack_id: u64,
+}
+
+#[allow(non_camel_case_types)]
+pub type H5ES_event_insert_func_t = fn(&H5ES_op_info_t, *mut c_void) -> i32;
+
+#[allow(non_camel_case_types)]
+pub type H5ES_event_complete_func_t = fn(&H5ES_op_info_t, H5ES_status_t, u64, *mut c_void) -> i32;
+
+fn unsupported_event_set(name: &str) -> Error {
+    Error::Unsupported(format!(
+        "{name} requires libhdf5 asynchronous VOL event-set behavior not implemented in pure-Rust mode"
+    ))
+}
 
 #[allow(non_snake_case)]
 pub fn H5ES__init_package() -> ErrorEventSet {
@@ -61,13 +117,26 @@ pub fn H5ESget_op_counter(event_set: &ErrorEventSet) -> u64 {
 }
 
 #[allow(non_snake_case)]
-pub fn H5ESwait(event_set: &mut ErrorEventSet) -> usize {
-    event_set.wait()
+pub fn H5ESwait(
+    event_set: &mut ErrorEventSet,
+    _timeout: u64,
+    num_in_progress: &mut usize,
+    err_occurred: &mut bool,
+) -> Result<()> {
+    *num_in_progress = event_set.wait();
+    *err_occurred = event_set.get_err_status();
+    Ok(())
 }
 
 #[allow(non_snake_case)]
-pub fn H5EScancel(event_set: &mut ErrorEventSet) -> usize {
-    event_set.cancel()
+pub fn H5EScancel(
+    event_set: &mut ErrorEventSet,
+    num_not_canceled: &mut usize,
+    err_occurred: &mut bool,
+) -> Result<()> {
+    *num_not_canceled = event_set.cancel();
+    *err_occurred = event_set.get_err_status();
+    Ok(())
 }
 
 #[allow(non_snake_case)]
@@ -117,16 +186,38 @@ pub fn H5ESget_err_info_into(event_set: &ErrorEventSet, out: &mut Vec<String>) {
 }
 
 #[allow(non_snake_case)]
-pub fn H5ESfree_err_info(out: &mut Vec<String>) {
-    out.clear();
+pub fn H5ESfree_err_info(out: &mut [H5ES_err_info_t]) -> Result<()> {
+    for info in out {
+        info.api_name.clear();
+        info.api_args.clear();
+        info.app_file_name.clear();
+        info.app_func_name.clear();
+        info.app_line_num = 0;
+        info.op_ins_count = 0;
+        info.op_ins_ts = 0;
+        info.op_exec_ts = 0;
+        info.op_exec_time = 0;
+        info.err_stack_id = 0;
+    }
+    Ok(())
 }
 
-#[deprecated(note = "use H5ESget_err_info_with or H5ESget_err_info_into")]
 #[allow(non_snake_case)]
-pub fn H5ESget_err_info(event_set: &ErrorEventSet) -> Vec<String> {
-    let mut out = Vec::new();
-    H5ESget_err_info_into(event_set, &mut out);
-    out
+pub fn H5ESget_err_info(
+    _event_set: &mut ErrorEventSet,
+    _num_err_info: usize,
+    _err_info: &mut [H5ES_err_info_t],
+) -> Result<usize> {
+    Err(unsupported_event_set("H5ESget_err_info"))
+}
+
+#[allow(non_snake_case)]
+pub fn H5ES__get_err_info(
+    _event_set: &mut ErrorEventSet,
+    _num_err_info: usize,
+    _err_info: &mut [H5ES_err_info_t],
+) -> Result<usize> {
+    Err(unsupported_event_set("H5ES__get_err_info"))
 }
 
 #[allow(non_snake_case)]
@@ -213,19 +304,100 @@ mod tests {
         let mut errors = Vec::new();
         H5ESget_err_info_into(&set, &mut errors);
         assert_eq!(errors, ["failed"]);
-        H5ESfree_err_info(&mut errors);
-        assert!(errors.is_empty());
+        errors.clear();
 
         H5ESregister_insert_func(&mut set, true).unwrap();
         H5ESregister_complete_func(&mut set, true).unwrap();
         assert!(H5EShas_insert_func(&set));
         assert!(H5EShas_complete_func(&set));
 
-        assert_eq!(H5ESwait(&mut set), 2);
-        assert_eq!(H5EScancel(&mut set), 0);
+        let mut num_in_progress = usize::MAX;
+        let mut err_occurred = false;
+        H5ESwait(
+            &mut set,
+            H5ES_WAIT_FOREVER,
+            &mut num_in_progress,
+            &mut err_occurred,
+        )
+        .unwrap();
+        assert_eq!(num_in_progress, 2);
+        assert!(err_occurred);
+
+        let mut num_not_canceled = usize::MAX;
+        err_occurred = false;
+        H5EScancel(&mut set, &mut num_not_canceled, &mut err_occurred).unwrap();
+        assert_eq!(num_not_canceled, 0);
+        assert!(err_occurred);
         H5ES__close_failed_cb(&mut set);
         assert_eq!(H5ESget_err_count(&set), 0);
         H5ESclear(&mut set);
         assert_eq!(H5ESget_count(&set), 0);
+    }
+
+    #[test]
+    fn h5es_wait_and_cancel_use_public_output_parameters() {
+        let mut set = H5EScreate();
+        H5ESinsert_request(&mut set, "read");
+        H5ESfail_request(&mut set, "write", "failed");
+
+        let mut num_in_progress = 99;
+        let mut err_occurred = false;
+        H5ESwait(
+            &mut set,
+            H5ES_WAIT_NONE,
+            &mut num_in_progress,
+            &mut err_occurred,
+        )
+        .unwrap();
+        assert_eq!(num_in_progress, 1);
+        assert!(err_occurred);
+
+        let mut num_not_canceled = 99;
+        err_occurred = false;
+        H5EScancel(&mut set, &mut num_not_canceled, &mut err_occurred).unwrap();
+        assert_eq!(num_not_canceled, 0);
+        assert!(err_occurred);
+    }
+
+    #[test]
+    fn h5es_public_constants_and_statuses_match_libhdf5_names() {
+        assert_eq!(H5ES_NONE, 0);
+        assert_eq!(H5ES_WAIT_NONE, 0);
+        assert_eq!(H5ES_WAIT_FOREVER, u64::MAX);
+
+        assert_eq!(
+            H5ES_status_t::H5ES_STATUS_IN_PROGRESS,
+            H5ES_status_t::H5ES_STATUS_IN_PROGRESS
+        );
+        assert_ne!(
+            H5ES_status_t::H5ES_STATUS_SUCCEED,
+            H5ES_status_t::H5ES_STATUS_FAIL
+        );
+        assert_ne!(
+            H5ES_status_t::H5ES_STATUS_CANCELED,
+            H5ES_status_t::H5ES_STATUS_FAIL
+        );
+    }
+
+    #[test]
+    fn h5es_error_info_records_are_explicit_unsupported_boundary() {
+        let mut set = H5EScreate();
+        H5ESfail_request(&mut set, "close", "failed");
+        let mut records = vec![H5ES_err_info_t::default()];
+
+        assert!(matches!(
+            H5ESget_err_info(&mut set, records.len(), &mut records),
+            Err(Error::Unsupported(_))
+        ));
+        assert!(matches!(
+            H5ES__get_err_info(&mut set, records.len(), &mut records),
+            Err(Error::Unsupported(_))
+        ));
+
+        records[0].api_name = "H5Dwrite_async".into();
+        records[0].err_stack_id = 42;
+        H5ESfree_err_info(&mut records).unwrap();
+
+        assert_eq!(records, [H5ES_err_info_t::default()]);
     }
 }

@@ -124,6 +124,21 @@ pub fn H5VL_register(registry: &mut VolRegistry, name: &str, value: u64) -> u64 
 }
 
 #[allow(non_snake_case)]
+pub fn H5VLregister_connector_by_name(registry: &mut VolRegistry, name: &str, value: u64) -> u64 {
+    H5VL__register_connector_by_name(registry, name, value)
+}
+
+#[allow(non_snake_case)]
+pub fn H5VLregister_connector_by_value(
+    registry: &mut VolRegistry,
+    id: u64,
+    name: &str,
+    value: u64,
+) -> u64 {
+    H5VL__register_connector_by_value(registry, id, name, value)
+}
+
+#[allow(non_snake_case)]
 pub fn H5VL_register_using_existing_id(
     registry: &mut VolRegistry,
     id: u64,
@@ -176,6 +191,11 @@ pub fn H5VL__conn_free(registry: &mut VolRegistry, id: u64) {
 
 #[allow(non_snake_case)]
 pub fn H5VL__conn_free_id(registry: &mut VolRegistry, id: u64) {
+    H5VL__conn_free(registry, id);
+}
+
+#[allow(non_snake_case)]
+pub fn H5VLunregister_connector(registry: &mut VolRegistry, id: u64) {
     H5VL__conn_free(registry, id);
 }
 
@@ -248,6 +268,56 @@ pub fn H5VL__get_connector_by_id<'a>(
     id: u64,
 ) -> Option<&'a VolConnector> {
     registry.connectors.get(&id)
+}
+
+#[allow(non_snake_case)]
+pub fn H5VLget_connector_by_name<'a>(
+    registry: &'a VolRegistry,
+    name: &str,
+) -> Option<&'a VolConnector> {
+    H5VL__get_connector_by_name(registry, name)
+}
+
+#[allow(non_snake_case)]
+pub fn H5VLget_connector_by_value(registry: &VolRegistry, value: u64) -> Option<&VolConnector> {
+    H5VL__get_connector_by_value(registry, value)
+}
+
+#[allow(non_snake_case)]
+pub fn H5VLget_connector_id(object: &VolObject) -> u64 {
+    object.connector_id
+}
+
+#[allow(non_snake_case)]
+pub fn H5VLget_connector_name_ref<'a>(
+    registry: &'a VolRegistry,
+    object: &VolObject,
+) -> Result<&'a str> {
+    H5VL__get_connector_by_id(registry, object.connector_id)
+        .map(|connector| connector.name.as_str())
+        .ok_or_else(|| Error::InvalidFormat("VOL connector id is not registered".into()))
+}
+
+#[allow(non_snake_case)]
+pub fn H5VLget_connector_name(
+    registry: &VolRegistry,
+    object: &VolObject,
+    dst: &mut String,
+) -> Result<usize> {
+    let name = H5VLget_connector_name_ref(registry, object)?;
+    dst.clear();
+    dst.push_str(name);
+    Ok(name.len())
+}
+
+#[allow(non_snake_case)]
+pub fn H5VLis_connector_registered_by_name(registry: &VolRegistry, name: &str) -> bool {
+    H5VL__get_connector_by_name(registry, name).is_some()
+}
+
+#[allow(non_snake_case)]
+pub fn H5VLis_connector_registered_by_value(registry: &VolRegistry, value: u64) -> bool {
+    H5VL__get_connector_by_value(registry, value).is_some()
 }
 
 #[allow(non_snake_case)]
@@ -684,6 +754,30 @@ mod tests {
         assert_eq!(H5VL_connector_get_id(connector), id);
         assert_eq!(H5VL_connector_get_name(connector), "audit_vol");
         assert_eq!(H5VL_connector_get_value(connector), 42);
+        assert!(std::ptr::eq(
+            H5VLget_connector_by_name(&registry, "audit_vol").unwrap(),
+            connector
+        ));
+        assert!(std::ptr::eq(
+            H5VLget_connector_by_value(&registry, 42).unwrap(),
+            connector
+        ));
+        assert!(H5VLis_connector_registered_by_name(&registry, "audit_vol"));
+        assert!(H5VLis_connector_registered_by_value(&registry, 42));
+
+        let object = H5VL_new_vol_obj(id, "dataset");
+        assert_eq!(H5VLget_connector_id(&object), id);
+        assert_eq!(
+            H5VLget_connector_name_ref(&registry, &object).unwrap(),
+            "audit_vol"
+        );
+        let mut connector_name = String::from("stale");
+        assert_eq!(
+            H5VLget_connector_name(&registry, &object, &mut connector_name).unwrap(),
+            "audit_vol".len()
+        );
+        assert_eq!(connector_name, "audit_vol");
+
         assert!(H5VL__connector_names_iter(&registry).any(|name| name == "audit_vol"));
         let mut saw_audit_vol = false;
         H5VL__connector_names_visit(&registry, |name| {
@@ -704,6 +798,17 @@ mod tests {
         rendered.clear();
         H5VL_pass_through_info_fmt(connector, &mut rendered).unwrap();
         assert_eq!(rendered, "audit_vol");
+
+        let extra_id = H5VLregister_connector_by_name(&mut registry, "extra_vol", 77);
+        assert!(H5VLis_connector_registered_by_value(&registry, 77));
+        H5VLunregister_connector(&mut registry, extra_id);
+        assert!(!H5VLis_connector_registered_by_name(&registry, "extra_vol"));
+
+        let value_id = H5VLregister_connector_by_value(&mut registry, 99, "value_vol", 88);
+        assert_eq!(value_id, 99);
+        assert!(H5VLis_connector_registered_by_name(&registry, "value_vol"));
+        H5VLunregister_connector(&mut registry, value_id);
+        assert!(!H5VLis_connector_registered_by_value(&registry, 88));
     }
 
     #[test]
@@ -796,6 +901,17 @@ mod tests {
 
         assert!(H5VL__native_blob_read_into(&object, &mut [0; 3]).is_err());
         assert!(H5VL__native_blob_visit_chunks(&object, 0, |_| Ok(())).is_err());
+    }
+
+    #[test]
+    fn connector_name_lookup_rejects_unregistered_object_connector() {
+        let registry = H5VL__init_package();
+        let object = H5VL_new_vol_obj(12345, "missing");
+        let mut name = String::from("unchanged");
+
+        assert!(H5VLget_connector_name_ref(&registry, &object).is_err());
+        assert!(H5VLget_connector_name(&registry, &object, &mut name).is_err());
+        assert_eq!(name, "unchanged");
     }
 }
 

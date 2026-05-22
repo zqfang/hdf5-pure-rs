@@ -2112,20 +2112,37 @@ fn test_enum_rejects_empty_member_name() {
 
 #[test]
 fn test_unsupported_filters_fail_explicitly() {
-    for id in [FILTER_SZIP, 65535] {
-        let pipeline = FilterPipelineMessage {
-            version: 2,
-            filters: vec![FilterDesc {
-                id,
-                name: None,
-                flags: 0,
-                client_data: Vec::new(),
-            }],
-        };
-        let err = hdf5_pure_rust::filters::apply_pipeline_reverse(&[1, 2, 3, 4], &pipeline, 4)
-            .expect_err("unsupported filter should return an error");
-        assert!(matches!(err, hdf5_pure_rust::Error::Unsupported(_)));
-    }
+    let szip_pipeline = FilterPipelineMessage {
+        version: 2,
+        filters: vec![FilterDesc {
+            id: FILTER_SZIP,
+            name: None,
+            flags: 0,
+            client_data: Vec::new(),
+        }],
+    };
+    let err = hdf5_pure_rust::filters::apply_pipeline_reverse(&[1, 2, 3, 4], &szip_pipeline, 4)
+        .expect_err("SZip should return an unsupported error");
+    assert_eq!(
+        err.to_string(),
+        "Unsupported: SZip decompression not available in pure-Rust mode. Re-save the dataset with deflate compression, or use the C HDF5 library."
+    );
+
+    let unknown_pipeline = FilterPipelineMessage {
+        version: 2,
+        filters: vec![FilterDesc {
+            id: 65535,
+            name: None,
+            flags: 0,
+            client_data: Vec::new(),
+        }],
+    };
+    let err = hdf5_pure_rust::filters::apply_pipeline_reverse(&[1, 2, 3, 4], &unknown_pipeline, 4)
+        .expect_err("unknown filter should return an unsupported error");
+    assert!(
+        err.to_string().contains("filter 65535 not implemented"),
+        "unexpected error: {err}"
+    );
 }
 
 #[cfg(not(feature = "blosc"))]

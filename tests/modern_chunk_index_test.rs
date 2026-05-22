@@ -126,6 +126,50 @@ fn test_v4_fixed_array_chunks_read() {
 }
 
 #[test]
+fn test_v4_fixed_array_deflate_parallel_threshold_tail_read() {
+    const CHUNK: usize = 2048;
+    const LEN: usize = CHUNK * 8 + 17;
+
+    let f = File::open("tests/data/hdf5_ref/v4_fixed_array_deflate_parallel_threshold_tail.h5")
+        .unwrap();
+    let ds = f
+        .dataset("fixed_array_deflate_parallel_threshold_tail")
+        .unwrap();
+    assert_shape(&ds, &[LEN as u64]);
+
+    let expected: Vec<i32> = (0..LEN).map(|value| value as i32 * 5 - 11).collect();
+    assert_dataset_values::<i32>(&ds, &expected).unwrap();
+
+    let mut boundary = vec![0i32; 7];
+    read_dataset_slice_into(&ds, CHUNK - 3..CHUNK + 4, &mut boundary).unwrap();
+    assert_eq!(boundary, expected[CHUNK - 3..CHUNK + 4]);
+
+    let mut tail = vec![0i32; 20];
+    read_dataset_slice_into(&ds, LEN - 20..LEN, &mut tail).unwrap();
+    assert_eq!(tail, expected[LEN - 20..LEN]);
+}
+
+#[test]
+fn test_v4_fixed_array_deflate_mask_parallel_fallback_read() {
+    const CHUNK: usize = 2048;
+    const LEN: usize = CHUNK * 8;
+
+    let f =
+        File::open("tests/data/hdf5_ref/v4_fixed_array_deflate_mask_parallel_fallback.h5").unwrap();
+    let ds = f
+        .dataset("fixed_array_deflate_mask_parallel_fallback")
+        .unwrap();
+    assert_shape(&ds, &[LEN as u64]);
+
+    let expected: Vec<i32> = (0..LEN).map(|value| value as i32 * 2 - 31).collect();
+    assert_dataset_values::<i32>(&ds, &expected).unwrap();
+
+    let mut boundary = vec![0i32; 7];
+    read_dataset_slice_into(&ds, CHUNK - 3..CHUNK + 4, &mut boundary).unwrap();
+    assert_eq!(boundary, expected[CHUNK - 3..CHUNK + 4]);
+}
+
+#[test]
 fn test_v4_fixed_array_3d_edge_chunks_read() {
     let f = File::open("tests/data/hdf5_ref/v4_fixed_array_3d_edges.h5").unwrap();
     let ds = f.dataset("fixed_array_3d_edges").unwrap();
@@ -196,6 +240,22 @@ fn test_filtered_implicit_chunk_index_fixture_is_rejected() {
     let mut values = vec![0i16; dataset_len(&ds).unwrap()];
     let err = read_dataset_into(&ds, &mut values)
         .expect_err("filtered implicit chunk index should be rejected");
+    assert!(
+        err.to_string()
+            .contains("v4 implicit chunk index with filters"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn test_filtered_implicit_chunk_index_slice_read_is_rejected() {
+    let (_dir, path) =
+        patch_filtered_fixed_array_to_implicit("tests/data/hdf5_ref/v4_filtered_chunked.h5");
+    let f = File::open(&path).unwrap();
+    let ds = f.dataset("filtered_chunked").unwrap();
+    let mut values = vec![0i16; 4];
+    let err = read_dataset_slice_into(&ds, 0..4, &mut values)
+        .expect_err("filtered implicit chunk index slice read should be rejected");
     assert!(
         err.to_string()
             .contains("v4 implicit chunk index with filters"),
@@ -354,6 +414,53 @@ fn test_v4_extensible_array_chunks_read() {
         &(0..80).map(|v| v as f64).collect::<Vec<_>>(),
     )
     .unwrap();
+}
+
+#[test]
+fn test_v4_extensible_array_deflate_parallel_threshold_tail_read() {
+    const CHUNK: usize = 2048;
+    const LEN: usize = CHUNK * 8 + 17;
+
+    let f =
+        File::open("tests/data/hdf5_ref/v4_extensible_array_deflate_parallel_threshold_tail.h5")
+            .unwrap();
+    let ds = f
+        .dataset("extensible_array_deflate_parallel_threshold_tail")
+        .unwrap();
+    assert_shape(&ds, &[LEN as u64]);
+    assert!(ds.space().unwrap().is_resizable());
+
+    let expected: Vec<i32> = (0..LEN).map(|value| value as i32 * 7 - 13).collect();
+    assert_dataset_values::<i32>(&ds, &expected).unwrap();
+
+    let mut boundary = vec![0i32; 7];
+    read_dataset_slice_into(&ds, CHUNK - 3..CHUNK + 4, &mut boundary).unwrap();
+    assert_eq!(boundary, expected[CHUNK - 3..CHUNK + 4]);
+
+    let mut tail = vec![0i32; 20];
+    read_dataset_slice_into(&ds, LEN - 20..LEN, &mut tail).unwrap();
+    assert_eq!(tail, expected[LEN - 20..LEN]);
+}
+
+#[test]
+fn test_v4_extensible_array_deflate_mask_parallel_fallback_read() {
+    const CHUNK: usize = 2048;
+    const LEN: usize = CHUNK * 8;
+
+    let f = File::open("tests/data/hdf5_ref/v4_extensible_array_deflate_mask_parallel_fallback.h5")
+        .unwrap();
+    let ds = f
+        .dataset("extensible_array_deflate_mask_parallel_fallback")
+        .unwrap();
+    assert_shape(&ds, &[LEN as u64]);
+    assert!(ds.space().unwrap().is_resizable());
+
+    let expected: Vec<i32> = (0..LEN).map(|value| value as i32 * 11 - 19).collect();
+    assert_dataset_values::<i32>(&ds, &expected).unwrap();
+
+    let mut boundary = vec![0i32; 7];
+    read_dataset_slice_into(&ds, CHUNK - 3..CHUNK + 4, &mut boundary).unwrap();
+    assert_eq!(boundary, expected[CHUNK - 3..CHUNK + 4]);
 }
 
 #[test]

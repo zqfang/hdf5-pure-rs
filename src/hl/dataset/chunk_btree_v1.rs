@@ -1,9 +1,8 @@
-use std::io::{Read, Seek};
-use std::thread;
-
 use crate::error::{Error, Result};
 use crate::filters;
 use crate::io::reader::HdfReader;
+use std::io::{Read, Seek};
+use std::thread;
 
 use super::chunk_read::{BorrowedChunkPayloadRead, ChunkBTreeRecord, ChunkReadContext};
 use super::{usize_from_u64, Dataset, DatasetInfo};
@@ -62,6 +61,7 @@ impl Dataset {
             )?;
         }
         let mut compressed_scratch = Vec::new();
+        let mut shuffle_scratch = Vec::new();
         let mut raw_scratch = Vec::new();
         let mut scaled_scratch = Vec::new();
         let mut handled = if Self::btree_v1_uses_unfiltered_coalescing(info) {
@@ -109,6 +109,7 @@ impl Dataset {
                 chunk_record.filter_mask,
                 output,
                 &mut compressed_scratch,
+                &mut shuffle_scratch,
             )? {
                 continue;
             }
@@ -182,10 +183,7 @@ impl Dataset {
             return Ok(());
         }
 
-        let worker_count = thread::available_parallelism()
-            .map(usize::from)
-            .unwrap_or(1)
-            .min(full_chunk_count);
+        let worker_count = super::support::parallel_deflate_worker_count(full_chunk_count);
         if worker_count <= 1 {
             return Ok(());
         }
@@ -210,8 +208,18 @@ impl Dataset {
 
             let read_size = usize_from_u64(record.chunk_size, "v1 B-tree chunk size")?;
             let mut payload = vec![0u8; read_size];
-            reader.seek(record.chunk_addr)?;
-            reader.read_bytes_into(&mut payload)?;
+            reader.seek(record.chunk_addr).map_err(|err| {
+                Error::InvalidFormat(format!(
+                    "failed to seek to v1 B-tree chunk {chunk_index} at address {}: {err}",
+                    record.chunk_addr
+                ))
+            })?;
+            reader.read_bytes_into(&mut payload).map_err(|err| {
+                Error::InvalidFormat(format!(
+                    "failed to read v1 B-tree chunk {chunk_index} at address {} with size {}: {err}",
+                    record.chunk_addr, record.chunk_size
+                ))
+            })?;
             payloads.push(payload);
         }
 
@@ -249,6 +257,7 @@ impl Dataset {
             Ok(())
         });
         parallel_result?;
+        super::support::record_parallel_deflate_chunks_handled(full_chunk_count);
 
         for flag in handled.iter_mut().take(full_chunk_count) {
             *flag = true;

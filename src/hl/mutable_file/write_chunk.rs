@@ -28,6 +28,12 @@ impl MutableFile {
     ) -> Result<()> {
         let ds = self.dataset(dataset_path)?;
         let info = ds.info()?;
+        let index_kind = Self::writable_chunk_index_kind(&info);
+        if self.superblock.base_addr != 0 && index_kind != WritableChunkIndexKind::BTreeV1 {
+            return Err(Error::Unsupported(
+                "write_chunk supports userblock files only for v1 B-tree chunk indexes".into(),
+            ));
+        }
 
         if info.layout.layout_class != LayoutClass::Chunked {
             return Err(Error::InvalidFormat(
@@ -61,9 +67,12 @@ impl MutableFile {
             .chunk_index_addr
             .ok_or_else(|| Error::InvalidFormat("chunked dataset missing B-tree address".into()))?;
 
-        let chunk_addr = self.write_handle.seek(SeekFrom::End(0))?;
+        let chunk_physical_addr = self.write_handle.seek(SeekFrom::End(0))?;
+        let chunk_addr =
+            self.logical_addr_from_physical(chunk_physical_addr, "appended chunk address")?;
         self.write_handle.write_all(&filtered)?;
         self.rewrite_chunk_index(
+            index_kind,
             index_addr,
             &info,
             chunk_coords,
@@ -73,13 +82,18 @@ impl MutableFile {
             expected_len,
             element_size,
         )?;
+        let physical_eof = self.write_handle.seek(SeekFrom::End(0))?;
+        let logical_eof = physical_eof
+            .checked_sub(self.superblock.base_addr)
+            .ok_or_else(|| Error::InvalidFormat("file EOF is before HDF5 base address".into()))?;
+        self.rewrite_superblock_eof(logical_eof)?;
         self.write_handle.flush()?;
         self.reopen_reader()?;
 
         Ok(())
     }
 
-    fn chunk_data_dims(info: &crate::hl::dataset::DatasetInfo) -> Result<&[u64]> {
+    pub(super) fn chunk_data_dims(info: &crate::hl::dataset::DatasetInfo) -> Result<&[u64]> {
         let chunk_dims = info
             .layout
             .chunk_dims
@@ -190,6 +204,7 @@ impl MutableFile {
 
     fn rewrite_chunk_index(
         &mut self,
+        index_kind: WritableChunkIndexKind,
         index_addr: u64,
         info: &crate::hl::dataset::DatasetInfo,
         chunk_coords: &[u64],
@@ -199,7 +214,7 @@ impl MutableFile {
         expected_len: usize,
         element_size: usize,
     ) -> Result<()> {
-        match Self::writable_chunk_index_kind(info) {
+        match index_kind {
             WritableChunkIndexKind::FixedArray => self.rewrite_fixed_array_chunk(
                 index_addr,
                 &info,
@@ -230,6 +245,7 @@ impl MutableFile {
             WritableChunkIndexKind::BTreeV1 => self.rewrite_leaf_chunk_btree(
                 index_addr,
                 chunk_coords,
+                chunk_data_dims,
                 Self::u64_to_u32(filtered_len, "filtered chunk size")?,
                 chunk_addr,
                 Self::usize_to_u32(element_size, "datatype size")?,
