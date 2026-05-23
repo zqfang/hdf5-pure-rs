@@ -37,6 +37,24 @@ pub struct VolLibState {
     pub wrapper_depth: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i32)]
+pub enum VolSubclass {
+    None = -1,
+    Info = 0,
+    WrapCtx = 1,
+    Attribute = 2,
+    Dataset = 3,
+    Datatype = 4,
+    File = 5,
+    Group = 6,
+    Link = 7,
+    Object = 8,
+    Request = 9,
+    Blob = 10,
+    Token = 11,
+}
+
 #[allow(non_snake_case)]
 pub fn H5VL_init_phase1() -> VolRegistry {
     H5VL__init_package()
@@ -200,6 +218,15 @@ pub fn H5VLunregister_connector(registry: &mut VolRegistry, id: u64) {
 }
 
 #[allow(non_snake_case)]
+pub fn H5VLclose(registry: &mut VolRegistry, id: u64) -> Result<usize> {
+    let remaining = H5VL_conn_dec_rc(registry, id)?;
+    if remaining == 0 {
+        H5VL__conn_free(registry, id);
+    }
+    Ok(remaining)
+}
+
+#[allow(non_snake_case)]
 pub fn H5VL_file_is_same(left: &VolObject, right: &VolObject) -> bool {
     left.connector_id == right.connector_id && left.name == right.name
 }
@@ -281,6 +308,73 @@ pub fn H5VLget_connector_by_name<'a>(
 #[allow(non_snake_case)]
 pub fn H5VLget_connector_by_value(registry: &VolRegistry, value: u64) -> Option<&VolConnector> {
     H5VL__get_connector_by_value(registry, value)
+}
+
+#[allow(non_snake_case)]
+pub fn H5VLget_connector_id_by_name(registry: &VolRegistry, name: &str) -> Result<u64> {
+    H5VL__get_connector_by_name(registry, name)
+        .map(|connector| connector.id)
+        .ok_or_else(|| Error::InvalidFormat("VOL connector name is not registered".into()))
+}
+
+#[allow(non_snake_case)]
+pub fn H5VLget_connector_id_by_name_into(
+    registry: &VolRegistry,
+    name: &str,
+    connector_id: &mut u64,
+) -> Result<()> {
+    *connector_id = H5VLget_connector_id_by_name(registry, name)?;
+    Ok(())
+}
+
+#[allow(non_snake_case)]
+pub fn H5VLget_connector_id_by_value(registry: &VolRegistry, value: u64) -> Result<u64> {
+    H5VL__get_connector_by_value(registry, value)
+        .map(|connector| connector.id)
+        .ok_or_else(|| Error::InvalidFormat("VOL connector value is not registered".into()))
+}
+
+#[allow(non_snake_case)]
+pub fn H5VLget_connector_id_by_value_into(
+    registry: &VolRegistry,
+    value: u64,
+    connector_id: &mut u64,
+) -> Result<()> {
+    *connector_id = H5VLget_connector_id_by_value(registry, value)?;
+    Ok(())
+}
+
+#[allow(non_snake_case)]
+pub fn H5VLget_value(registry: &VolRegistry, id: u64) -> Result<u64> {
+    H5VL__get_connector_by_id(registry, id)
+        .map(|connector| connector.value)
+        .ok_or_else(|| Error::InvalidFormat("VOL connector id is not registered".into()))
+}
+
+#[allow(non_snake_case)]
+pub fn H5VLget_cap_flags(registry: &VolRegistry, id: u64) -> Result<u64> {
+    H5VL__get_connector_by_id(registry, id)
+        .map(|connector| connector.cap_flags)
+        .ok_or_else(|| Error::InvalidFormat("VOL connector id is not registered".into()))
+}
+
+#[allow(non_snake_case)]
+pub fn H5VLcmp_connector_cls(
+    registry: &VolRegistry,
+    cmp: &mut i32,
+    connector_id1: u64,
+    connector_id2: u64,
+) -> Result<()> {
+    let left = H5VL__get_connector_by_id(registry, connector_id1)
+        .ok_or_else(|| Error::InvalidFormat("VOL connector id is not registered".into()))?;
+    let right = H5VL__get_connector_by_id(registry, connector_id2)
+        .ok_or_else(|| Error::InvalidFormat("VOL connector id is not registered".into()))?;
+    *cmp = match left.value.cmp(&right.value) {
+        std::cmp::Ordering::Less => -1,
+        std::cmp::Ordering::Equal => 0,
+        std::cmp::Ordering::Greater => 1,
+    };
+    Ok(())
 }
 
 #[allow(non_snake_case)]
@@ -428,10 +522,28 @@ pub fn H5VL_wrap_register(object: &mut VolObject) {
 }
 
 #[allow(non_snake_case)]
+pub fn H5VLget_wrap_ctx(object: &VolObject, wrap_ctx: &mut bool) -> Result<()> {
+    *wrap_ctx = object.wrapped;
+    Ok(())
+}
+
+#[allow(non_snake_case)]
 pub fn H5VL_check_plugin_load(_name: &str) -> Result<()> {
     Err(Error::Unsupported(
         "dynamic VOL plugin loading is unsupported in pure-Rust mode".into(),
     ))
+}
+
+#[allow(non_snake_case)]
+pub fn H5VLquery_optional(
+    _connector_id: u64,
+    subclass: VolSubclass,
+    op_type: i32,
+    _flags: &mut u64,
+) -> Result<()> {
+    Err(Error::Unsupported(format!(
+        "VOL optional operation query is unsupported in pure-Rust mode (subclass {subclass:?}, op {op_type})"
+    )))
 }
 
 #[allow(non_snake_case)]
@@ -762,6 +874,36 @@ mod tests {
             H5VLget_connector_by_value(&registry, 42).unwrap(),
             connector
         ));
+        assert_eq!(
+            H5VLget_connector_id_by_name(&registry, "audit_vol").unwrap(),
+            id
+        );
+        assert_eq!(H5VLget_connector_id_by_value(&registry, 42).unwrap(), id);
+        let mut connector_id = u64::MAX;
+        H5VLget_connector_id_by_name_into(&registry, "audit_vol", &mut connector_id).unwrap();
+        assert_eq!(connector_id, id);
+        connector_id = 0;
+        H5VLget_connector_id_by_value_into(&registry, 42, &mut connector_id).unwrap();
+        assert_eq!(connector_id, id);
+        assert!(matches!(
+            H5VLget_connector_id_by_name(&registry, "missing"),
+            Err(Error::InvalidFormat(_))
+        ));
+        assert!(matches!(
+            H5VLget_connector_id_by_value(&registry, u64::MAX),
+            Err(Error::InvalidFormat(_))
+        ));
+        connector_id = 1234;
+        assert!(matches!(
+            H5VLget_connector_id_by_name_into(&registry, "missing", &mut connector_id),
+            Err(Error::InvalidFormat(_))
+        ));
+        assert_eq!(connector_id, 1234);
+        assert!(matches!(
+            H5VLget_connector_id_by_value_into(&registry, u64::MAX, &mut connector_id),
+            Err(Error::InvalidFormat(_))
+        ));
+        assert_eq!(connector_id, 1234);
         assert!(H5VLis_connector_registered_by_name(&registry, "audit_vol"));
         assert!(H5VLis_connector_registered_by_value(&registry, 42));
 
@@ -786,11 +928,24 @@ mod tests {
         assert!(saw_audit_vol);
         assert!(H5VL__is_default_conn(&registry, id));
 
-        let connector = registry.connectors.get_mut(&id).unwrap();
-        H5VL_connector_set_cap_flags(connector, 0x1234);
-        assert_eq!(H5VL_conn_prop_get_cap_flags(connector), 0x1234);
-        assert!(std::ptr::eq(H5VL_conn_prop_ref(connector), connector));
+        {
+            let connector = registry.connectors.get_mut(&id).unwrap();
+            H5VL_connector_set_cap_flags(connector, 0x1234);
+            assert_eq!(H5VL_conn_prop_get_cap_flags(connector), 0x1234);
+            assert!(std::ptr::eq(H5VL_conn_prop_ref(connector), connector));
+        }
+        assert_eq!(H5VLget_value(&registry, id).unwrap(), 42);
+        assert_eq!(H5VLget_cap_flags(&registry, id).unwrap(), 0x1234);
+        assert!(matches!(
+            H5VLget_value(&registry, u64::MAX),
+            Err(Error::InvalidFormat(_))
+        ));
+        assert!(matches!(
+            H5VLget_cap_flags(&registry, u64::MAX),
+            Err(Error::InvalidFormat(_))
+        ));
 
+        let connector = registry.connectors.get(&id).unwrap();
         let mut rendered = String::from("connector=");
         H5VL_pass_through_info_to_str_into(connector, &mut rendered);
         assert_eq!(rendered, "connector=audit_vol");
@@ -801,6 +956,18 @@ mod tests {
 
         let extra_id = H5VLregister_connector_by_name(&mut registry, "extra_vol", 77);
         assert!(H5VLis_connector_registered_by_value(&registry, 77));
+        let mut cmp = i32::MAX;
+        H5VLcmp_connector_cls(&registry, &mut cmp, id, id).unwrap();
+        assert_eq!(cmp, 0);
+        H5VLcmp_connector_cls(&registry, &mut cmp, id, extra_id).unwrap();
+        assert_eq!(cmp, -1);
+        H5VLcmp_connector_cls(&registry, &mut cmp, extra_id, id).unwrap();
+        assert_eq!(cmp, 1);
+        assert!(matches!(
+            H5VLcmp_connector_cls(&registry, &mut cmp, id, u64::MAX),
+            Err(Error::InvalidFormat(_))
+        ));
+        assert_eq!(cmp, 1);
         H5VLunregister_connector(&mut registry, extra_id);
         assert!(!H5VLis_connector_registered_by_name(&registry, "extra_vol"));
 
@@ -830,6 +997,46 @@ mod tests {
         assert_eq!(H5VL__find_opt_operation(&registry, "flush_async"), None);
         H5VL__term_opt_operation(&mut registry);
         assert_eq!(H5VL__num_opt_operation(&registry), 0);
+    }
+
+    #[test]
+    fn vol_close_decrements_connector_refcount_and_frees_at_zero() {
+        let mut registry = H5VL__init_package();
+        let id = H5VLregister_connector_by_name(&mut registry, "close_me", 200);
+
+        assert_eq!(H5VL_conn_inc_rc(&mut registry, id).unwrap(), 2);
+        assert_eq!(H5VLclose(&mut registry, id).unwrap(), 1);
+        assert!(H5VLis_connector_registered_by_name(&registry, "close_me"));
+
+        assert_eq!(H5VLclose(&mut registry, id).unwrap(), 0);
+        assert!(!H5VLis_connector_registered_by_name(&registry, "close_me"));
+        assert!(matches!(
+            H5VLclose(&mut registry, id),
+            Err(Error::InvalidFormat(_))
+        ));
+    }
+
+    #[test]
+    fn vol_optional_query_is_explicit_unsupported_boundary() {
+        let mut flags = 0x55;
+        let err = H5VLquery_optional(0, VolSubclass::Dataset, 17, &mut flags).unwrap_err();
+        assert_eq!(flags, 0x55);
+        assert_eq!(
+            err.to_string(),
+            "Unsupported: VOL optional operation query is unsupported in pure-Rust mode (subclass Dataset, op 17)"
+        );
+    }
+
+    #[test]
+    fn vol_wrap_context_is_written_to_output_parameter() {
+        let object = H5VL_new_vol_obj(0, "plain");
+        let mut wrap_ctx = true;
+        H5VLget_wrap_ctx(&object, &mut wrap_ctx).unwrap();
+        assert!(!wrap_ctx);
+
+        let wrapped = H5VL__wrap_obj(object);
+        H5VLget_wrap_ctx(&wrapped, &mut wrap_ctx).unwrap();
+        assert!(wrap_ctx);
     }
 
     #[test]

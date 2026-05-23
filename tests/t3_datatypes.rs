@@ -261,6 +261,15 @@ fn t3a_float_to_integer_conversions() {
 
     let unsigned: [u8; 10] = read_array(&ds).unwrap();
     assert_eq!(unsigned, [0, 0, 0, 0, 0, 1, 127, 128, 255, 0]);
+
+    let signed16: [i16; 10] = read_array(&ds).unwrap();
+    assert_eq!(
+        signed16,
+        [i16::MIN, -129, -1, 0, 0, 1, 127, 128, i16::MAX, 0]
+    );
+
+    let unsigned16: [u16; 10] = read_array(&ds).unwrap();
+    assert_eq!(unsigned16, [0, 0, 0, 0, 0, 1, 127, 128, u16::MAX, 0]);
 }
 
 // T3a: Big-endian variants
@@ -387,6 +396,18 @@ fn t3c_enum_u16_big_endian_members_and_values() {
 
     let vals: [u16; 3] = read_array(&ds).unwrap();
     assert_eq!(vals, [1, 258, 4095]);
+}
+
+#[test]
+fn t3c_enum_u16_big_endian_typed_conversions() {
+    let f = File::open("tests/data/hdf5_ref/enum_conversion_cases.h5").unwrap();
+    let ds = f.dataset("enum_u16be").unwrap();
+
+    let narrowed: [u8; 3] = read_array(&ds).unwrap();
+    assert_eq!(narrowed, [1, 255, 255]);
+
+    let floats: [f32; 3] = read_array(&ds).unwrap();
+    assert_eq!(floats, [1.0, 258.0, 4095.0]);
 }
 
 // T3d: String types
@@ -516,6 +537,12 @@ fn t3d_time_datatype_raw_and_typed_reads() {
             .as_slice()
     );
     assert_eq!(read_array::<u64, 3>(&d64).unwrap(), [0, 1, 4_102_444_800]);
+
+    let signed: [i64; 3] = read_array(&d64).unwrap();
+    assert_eq!(signed, [0, 1, 4_102_444_800]);
+
+    let floats: [f64; 3] = read_array(&d64).unwrap();
+    assert_eq!(floats, [0.0, 1.0, 4_102_444_800.0]);
 }
 
 #[test]

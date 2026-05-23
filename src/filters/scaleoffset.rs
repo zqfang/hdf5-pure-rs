@@ -1464,6 +1464,29 @@ mod tests {
     }
 
     #[test]
+    fn scaleoffset_big_endian_integer_compress_respects_fixed_minbits() {
+        let params = vec![2, 3, 4, CLS_INTEGER, 2, SIGN_UNSIGNED, ORDER_BE];
+        let input = [0x0100u16, 0x0101, 0x0107, 0x0108]
+            .into_iter()
+            .flat_map(u16::to_be_bytes)
+            .collect::<Vec<_>>();
+
+        let mut compressed = Vec::new();
+        scaleoffset_compress_into(&input, &params, &mut compressed).unwrap();
+
+        assert_eq!(&compressed[..4], &3u32.to_le_bytes());
+        assert_eq!(&compressed[5..7], &0x0100u16.to_le_bytes());
+
+        let mut decoded = Vec::new();
+        decompress_into(&compressed, &params, &mut decoded).unwrap();
+        let expected = [0x0100u16, 0x0101, 0x0107, 0x0100]
+            .into_iter()
+            .flat_map(u16::to_be_bytes)
+            .collect::<Vec<_>>();
+        assert_eq!(decoded, expected);
+    }
+
+    #[test]
     fn scaleoffset_integer_compress_caps_oversized_fixed_minbits() {
         let params = vec![2, 100, 2, CLS_INTEGER, 2, SIGN_UNSIGNED, ORDER_LE];
         let input = [1u16, 257]
@@ -1499,6 +1522,37 @@ mod tests {
     }
 
     #[test]
+    fn scaleoffset_big_endian_integer_compress_reserves_fill_marker() {
+        let fill = 0x1234u16;
+        let fill_client_word = u32::from(u16::from_le_bytes(fill.to_be_bytes()));
+        let params = vec![
+            2,
+            0,
+            4,
+            CLS_INTEGER,
+            2,
+            SIGN_UNSIGNED,
+            ORDER_BE,
+            1,
+            fill_client_word,
+        ];
+        let input = [0x0100u16, fill, 0x0103, 0x0104]
+            .into_iter()
+            .flat_map(u16::to_be_bytes)
+            .collect::<Vec<_>>();
+
+        let mut compressed = Vec::new();
+        scaleoffset_compress_into(&input, &params, &mut compressed).unwrap();
+
+        assert_eq!(&compressed[..4], &3u32.to_le_bytes());
+        assert_eq!(&compressed[5..7], &0x0100u16.to_le_bytes());
+
+        let mut decoded = Vec::new();
+        decompress_into(&compressed, &params, &mut decoded).unwrap();
+        assert_eq!(decoded, input);
+    }
+
+    #[test]
     fn scaleoffset_signed_integer_compress_reserves_fill_marker() {
         let params = vec![2, 0, 3, CLS_INTEGER, 1, SIGN_TWOS, ORDER_LE, 1, 0xf7];
         let input = [0xfe, 0xf7, 0x01];
@@ -1526,6 +1580,72 @@ mod tests {
         assert_eq!(compressed[4], 1);
         assert_eq!(compressed[5], 0xff);
         assert_eq!(compressed.len(), HEADER_LEN + 1);
+
+        let mut decoded = Vec::new();
+        decompress_into(&compressed, &params, &mut decoded).unwrap();
+        assert_eq!(decoded, input);
+    }
+
+    #[test]
+    fn scaleoffset_signed_integer_compress_respects_fixed_minbits() {
+        let params = vec![2, 2, 5, CLS_INTEGER, 2, SIGN_TWOS, ORDER_LE];
+        let input = [-2i16, -1, 0, 1, 2]
+            .into_iter()
+            .flat_map(i16::to_le_bytes)
+            .collect::<Vec<_>>();
+
+        let mut compressed = Vec::new();
+        scaleoffset_compress_into(&input, &params, &mut compressed).unwrap();
+
+        assert_eq!(&compressed[..4], &2u32.to_le_bytes());
+        assert_eq!(compressed[4], 2);
+        assert_eq!(&compressed[5..7], &(-2i16).to_le_bytes());
+
+        let mut decoded = Vec::new();
+        decompress_into(&compressed, &params, &mut decoded).unwrap();
+        let expected = [-2i16, -1, 0, 1, -2]
+            .into_iter()
+            .flat_map(i16::to_le_bytes)
+            .collect::<Vec<_>>();
+        assert_eq!(decoded, expected);
+    }
+
+    #[test]
+    fn scaleoffset_signed_integer_constant_negative_values_omit_payload() {
+        let params = vec![2, 0, 3, CLS_INTEGER, 2, SIGN_TWOS, ORDER_LE];
+        let input = [-123i16, -123, -123]
+            .into_iter()
+            .flat_map(i16::to_le_bytes)
+            .collect::<Vec<_>>();
+
+        let mut compressed = Vec::new();
+        scaleoffset_compress_into(&input, &params, &mut compressed).unwrap();
+
+        assert_eq!(&compressed[..4], &0u32.to_le_bytes());
+        assert_eq!(compressed[4], 2);
+        assert_eq!(&compressed[5..7], &(-123i16).to_le_bytes());
+        assert_eq!(compressed.len(), HEADER_LEN);
+
+        let mut decoded = Vec::new();
+        decompress_into(&compressed, &params, &mut decoded).unwrap();
+        assert_eq!(decoded, input);
+    }
+
+    #[test]
+    fn scaleoffset_signed_integer_big_endian_constant_negative_values_omit_payload() {
+        let params = vec![2, 0, 3, CLS_INTEGER, 2, SIGN_TWOS, ORDER_BE];
+        let input = [-321i16, -321, -321]
+            .into_iter()
+            .flat_map(i16::to_be_bytes)
+            .collect::<Vec<_>>();
+
+        let mut compressed = Vec::new();
+        scaleoffset_compress_into(&input, &params, &mut compressed).unwrap();
+
+        assert_eq!(&compressed[..4], &0u32.to_le_bytes());
+        assert_eq!(compressed[4], 2);
+        assert_eq!(&compressed[5..7], &(-321i16).to_le_bytes());
+        assert_eq!(compressed.len(), HEADER_LEN);
 
         let mut decoded = Vec::new();
         decompress_into(&compressed, &params, &mut decoded).unwrap();
@@ -1645,6 +1765,72 @@ mod tests {
             .map(|chunk| f64::from_be_bytes(chunk.try_into().unwrap()))
             .collect::<Vec<_>>();
         assert_eq!(values, [1.0, fill, 1.25, 1.5]);
+    }
+
+    #[test]
+    fn scaleoffset_big_endian_f32_constant_values_omit_payload() {
+        let params = vec![0, 2, 3, CLS_FLOAT, 4, SIGN_UNSIGNED, ORDER_BE];
+        let input = [3.5f32, 3.5, 3.5]
+            .into_iter()
+            .flat_map(f32::to_be_bytes)
+            .collect::<Vec<_>>();
+
+        let mut compressed = Vec::new();
+        scaleoffset_compress_into(&input, &params, &mut compressed).unwrap();
+
+        assert_eq!(&compressed[..4], &0u32.to_le_bytes());
+        assert_eq!(&compressed[5..9], &3.5f32.to_le_bytes());
+        assert_eq!(compressed.len(), HEADER_LEN);
+
+        let mut decoded = Vec::new();
+        decompress_into(&compressed, &params, &mut decoded).unwrap();
+        assert_eq!(decoded, input);
+    }
+
+    #[test]
+    fn scaleoffset_little_endian_f64_compress_roundtrips_negative_decimal_values() {
+        let params = vec![0, 2, 4, CLS_FLOAT, 8, SIGN_UNSIGNED, ORDER_LE];
+        let input = [-2.5f64, -1.25, 0.0, 3.75]
+            .into_iter()
+            .flat_map(f64::to_le_bytes)
+            .collect::<Vec<_>>();
+
+        let mut compressed = Vec::new();
+        scaleoffset_compress_into(&input, &params, &mut compressed).unwrap();
+
+        assert_eq!(&compressed[..4], &10u32.to_le_bytes());
+        assert_eq!(&compressed[5..13], &(-2.5f64).to_le_bytes());
+
+        let mut decoded = Vec::new();
+        decompress_into(&compressed, &params, &mut decoded).unwrap();
+        let values = decoded
+            .chunks_exact(8)
+            .map(|chunk| f64::from_le_bytes(chunk.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(values, [-2.5, -1.25, 0.0, 3.75]);
+    }
+
+    #[test]
+    fn scaleoffset_big_endian_f64_compress_roundtrips_negative_decimal_values() {
+        let params = vec![0, 2, 4, CLS_FLOAT, 8, SIGN_UNSIGNED, ORDER_BE];
+        let input = [-8.5f64, -0.25, 0.0, 4.75]
+            .into_iter()
+            .flat_map(f64::to_be_bytes)
+            .collect::<Vec<_>>();
+
+        let mut compressed = Vec::new();
+        scaleoffset_compress_into(&input, &params, &mut compressed).unwrap();
+
+        assert_eq!(&compressed[..4], &11u32.to_le_bytes());
+        assert_eq!(&compressed[5..13], &(-8.5f64).to_le_bytes());
+
+        let mut decoded = Vec::new();
+        decompress_into(&compressed, &params, &mut decoded).unwrap();
+        let values = decoded
+            .chunks_exact(8)
+            .map(|chunk| f64::from_be_bytes(chunk.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(values, [-8.5, -0.25, 0.0, 4.75]);
     }
 
     #[test]

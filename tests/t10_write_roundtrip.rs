@@ -51,6 +51,27 @@ fn assert_shape(ds: &Dataset, expected: &[u64]) -> hdf5_pure_rust::Result<()> {
     Ok(())
 }
 
+fn assert_h5py_script(path: &std::path::Path, script: &str, context: &str) {
+    let out = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(format!(
+            "import sys, h5py\n\
+             f = h5py.File(sys.argv[1], 'r')\n\
+             {script}\n\
+             f.close()\n\
+             print('OK')"
+        ))
+        .arg(path)
+        .output();
+    if let Ok(out) = out {
+        assert!(
+            out.status.success() && String::from_utf8_lossy(&out.stdout).contains("OK"),
+            "h5py verification failed on {context}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
 // T10a: Write + h5dump verify -- all layout types
 
 #[test]
@@ -73,6 +94,24 @@ fn t10a_contiguous_h5dump() {
         let s = String::from_utf8_lossy(&out.stdout);
         assert!(s.contains("1, 2, 3"));
     }
+
+    let out = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(format!(
+            "import h5py; f=h5py.File('{}','r'); \
+             assert f['data'].shape == (3,); \
+             assert list(f['data'][:]) == [1.0, 2.0, 3.0]; \
+             print('OK'); f.close()",
+            p.display()
+        ))
+        .output();
+    if let Ok(out) = out {
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("OK"),
+            "h5py: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
 }
 
 #[test]
@@ -91,6 +130,15 @@ fn t10a_compact_h5dump() {
         assert!(out.status.success());
         assert!(String::from_utf8_lossy(&out.stdout).contains("10, 20, 30"));
     }
+
+    assert_h5py_script(
+        &p,
+        "d = f['tiny']\n\
+         assert d.shape == (3,)\n\
+         assert d.chunks is None\n\
+         assert d[:].tolist() == [10, 20, 30]",
+        "compact dataset round-trip fixture",
+    );
 }
 
 #[test]
@@ -121,6 +169,17 @@ fn t10a_chunked_h5dump() {
         let s = String::from_utf8_lossy(&out.stdout);
         assert!(s.contains("49"));
     }
+
+    assert_h5py_script(
+        &p,
+        "d = f['chunked']\n\
+         assert d.shape == (50,)\n\
+         assert d.chunks == (10,)\n\
+         assert d.compression == 'gzip'\n\
+         assert d.compression_opts == 4\n\
+         assert d[:].tolist() == list(range(50))",
+        "chunked h5dump fixture h5py parity",
+    );
 }
 
 // T10b: Write + h5py verify
@@ -286,6 +345,17 @@ fn t10d_deflate_only() {
     for (i, v) in vals.iter().enumerate() {
         assert_eq!(*v, i as f32);
     }
+
+    assert_h5py_script(
+        &p,
+        "d = f['d']\n\
+         assert d.shape == (100,)\n\
+         assert d.chunks == (25,)\n\
+         assert d.compression == 'gzip'\n\
+         assert d.compression_opts == 6\n\
+         assert d[:].tolist() == [float(i) for i in range(100)]",
+        "deflate-only chunked writer fixture",
+    );
 }
 
 #[test]
@@ -308,6 +378,18 @@ fn t10d_shuffle_deflate() {
     for (i, v) in vals.iter().enumerate() {
         assert_eq!(*v, i as i32);
     }
+
+    assert_h5py_script(
+        &p,
+        "d = f['d']\n\
+         assert d.shape == (100,)\n\
+         assert d.chunks == (20,)\n\
+         assert d.compression == 'gzip'\n\
+         assert d.compression_opts == 4\n\
+         assert d.shuffle\n\
+         assert d[:].tolist() == list(range(100))",
+        "shuffle+deflate chunked writer fixture",
+    );
 }
 
 #[test]

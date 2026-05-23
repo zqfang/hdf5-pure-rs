@@ -170,13 +170,43 @@ This second case improved substantially after specializing the shuffle reversal
 path for common numeric element sizes and routing full 1D chunk reads directly
 into the final output buffer.
 
+3. Larger real-world single-cell-style fixture, read from the local
+   `tests/data/real_world/hcabm40k_mudataseurat.h5mu` file. This is a better
+   stress benchmark than writer-generated synthetic files because it exercises
+   a large sparse single-cell layout, many gzip-compressed chunks, and
+   real-world index metadata. It is still not an end-to-end MuData, Seurat, or
+   Scanpy loading benchmark.
+
+   Local sequential hot-cache run, 5 seconds per dataset, h5py `3.12.1` with
+   HDF5 `1.14.5`:
+
+| Dataset | Shape / dtype / layout | Reader | Average Read Time | Best Read Time |
+|---------|------------------------|--------|------------------:|---------------:|
+| `mod/RNA/X/data` | `(40,325,108)` `float64`, chunks `(1,024)`, gzip | h5py/libhdf5 | 1973.2 ms | 1729.6 ms |
+| `mod/RNA/X/data` | same | hdf5-pure-rust | 261.5 ms | 240.6 ms |
+| `mod/RNA/X/indices` | `(40,325,108)` `int32`, chunks `(2,048)`, gzip | h5py/libhdf5 | 1311.0 ms | 1101.4 ms |
+| `mod/RNA/X/indices` | same | hdf5-pure-rust | 208.8 ms | 195.0 ms |
+
+This fixture is not currently one of the documented public-download fixtures,
+so these rows should be treated as local regression data until the exact source
+and regeneration steps are documented.
+
 For reproducible local timing, use:
 
 ```bash
 scripts/run-read-benchmark.sh
 ```
 
-For arbitrary fixture datasets by name, use the benchmark example directly:
+For arbitrary fixture datasets by name, use the benchmark example directly.
+The single-cell Rust rows above were collected with:
+
+```bash
+cargo run --release --example perf_compare -- bench-read-f64 tests/data/real_world/hcabm40k_mudataseurat.h5mu mod/RNA/X/data 5
+cargo run --release --example perf_compare -- bench-read-i32 tests/data/real_world/hcabm40k_mudataseurat.h5mu mod/RNA/X/indices 5
+```
+
+For lower-level fixture datasets, the benchmark example can still be called
+directly:
 
 ```bash
 cargo run --release --example perf_compare -- bench-read-raw tests/data/hdf5_ref/v4_extensible_array_spillover.h5 extensible_array_spillover 3

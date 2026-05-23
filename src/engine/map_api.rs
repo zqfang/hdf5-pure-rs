@@ -34,6 +34,12 @@ impl H5Map {
     }
 }
 
+fn unsupported_map(name: &str) -> Error {
+    Error::Unsupported(format!(
+        "{name} requires libhdf5 map behavior not implemented in pure-Rust mode"
+    ))
+}
+
 pub trait H5MIterCallbackResult {
     fn should_stop(self) -> bool;
 }
@@ -202,8 +208,21 @@ pub fn H5Mget_access_plist(map: &H5Map) -> Result<BTreeMap<String, Vec<u8>>> {
 
 #[allow(non_snake_case)]
 pub fn H5Mget_count(map: &H5Map) -> Result<usize> {
+    let mut count = 0;
+    H5Mget_count_into(map, &mut count)?;
+    Ok(count)
+}
+
+#[allow(non_snake_case)]
+pub fn H5Mget_count_into(map: &H5Map, count: &mut usize) -> Result<()> {
     map.ensure_open()?;
-    Ok(map.entries.len())
+    *count = map.entries.len();
+    Ok(())
+}
+
+#[allow(non_snake_case)]
+pub fn H5Mget_count_async(map: &H5Map) -> Result<usize> {
+    H5Mget_count(map)
 }
 
 #[allow(non_snake_case)]
@@ -239,6 +258,23 @@ pub fn H5Mget_async_ref<'a>(map: &'a H5Map, key: &[u8]) -> Result<Option<&'a [u8
     H5Mget_ref(map, key)
 }
 
+#[allow(non_snake_case)]
+pub fn H5Mget_into(map: &H5Map, key: &[u8], value: &mut Vec<u8>) -> Result<bool> {
+    map.ensure_open()?;
+    if let Some(stored_value) = map.entries.get(key) {
+        value.clear();
+        value.extend_from_slice(stored_value);
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+#[allow(non_snake_case)]
+pub fn H5Mget_async_into(map: &H5Map, key: &[u8], value: &mut Vec<u8>) -> Result<bool> {
+    H5Mget_into(map, key, value)
+}
+
 #[deprecated(note = "use H5M__get_api_common_ref to borrow the value without cloning")]
 #[allow(non_snake_case)]
 pub fn H5M__get_api_common(map: &H5Map, key: &[u8]) -> Result<Option<Vec<u8>>> {
@@ -259,8 +295,21 @@ pub fn H5Mget_async(map: &H5Map, key: &[u8]) -> Result<Option<Vec<u8>>> {
 
 #[allow(non_snake_case)]
 pub fn H5Mexists(map: &H5Map, key: &[u8]) -> Result<bool> {
+    let mut exists = false;
+    H5Mexists_into(map, key, &mut exists)?;
+    Ok(exists)
+}
+
+#[allow(non_snake_case)]
+pub fn H5Mexists_into(map: &H5Map, key: &[u8], exists: &mut bool) -> Result<()> {
     map.ensure_open()?;
-    Ok(map.entries.contains_key(key))
+    *exists = map.entries.contains_key(key);
+    Ok(())
+}
+
+#[allow(non_snake_case)]
+pub fn H5Mexists_async(map: &H5Map, key: &[u8]) -> Result<bool> {
+    H5Mexists(map, key)
 }
 
 #[allow(non_snake_case)]
@@ -297,6 +346,27 @@ where
 }
 
 #[allow(non_snake_case)]
+pub fn H5Miterate_from_with<F, R>(map: &H5Map, idx: &mut usize, mut callback: F) -> Result<()>
+where
+    F: FnMut(&[u8], &[u8]) -> Result<R>,
+    R: H5MIterCallbackResult,
+{
+    map.ensure_open()?;
+    if *idx > map.entries.len() {
+        return Err(Error::InvalidFormat(
+            "map iteration index is past the entry count".into(),
+        ));
+    }
+    for (offset, (key, value)) in map.entries.iter().enumerate().skip(*idx) {
+        *idx = offset + 1;
+        if callback(key, value)?.should_stop() {
+            break;
+        }
+    }
+    Ok(())
+}
+
+#[allow(non_snake_case)]
 pub fn H5M_iterate_into(map: &H5Map, entries: &mut Vec<(Vec<u8>, Vec<u8>)>) -> Result<()> {
     map.ensure_open()?;
     entries.reserve(map.entries.len());
@@ -321,24 +391,34 @@ pub fn H5M_iterate(map: &H5Map) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
     Ok(entries)
 }
 
-#[deprecated(
-    note = "use H5M_iter_entries, H5Miterate_with, or H5Miterate_into to avoid returning an allocated Vec"
-)]
 #[allow(non_snake_case)]
-pub fn H5Miterate(map: &H5Map) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-    let mut entries = Vec::new();
-    H5Miterate_into(map, &mut entries)?;
-    Ok(entries)
+pub fn H5Miterate<F, R>(map: &H5Map, idx: &mut usize, mut callback: F) -> Result<()>
+where
+    F: FnMut(&[u8]) -> Result<R>,
+    R: H5MIterCallbackResult,
+{
+    map.ensure_open()?;
+    if *idx > map.entries.len() {
+        return Err(Error::InvalidFormat(
+            "map iteration index is past the entry count".into(),
+        ));
+    }
+    for (offset, (key, _value)) in map.entries.iter().enumerate().skip(*idx) {
+        *idx = offset + 1;
+        if callback(key)?.should_stop() {
+            break;
+        }
+    }
+    Ok(())
 }
 
-#[deprecated(
-    note = "use H5M_iter_entries, H5Miterate_with, or H5Miterate_into to avoid returning an allocated Vec"
-)]
 #[allow(non_snake_case)]
-pub fn H5Miterate_by_name(map: &H5Map) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-    let mut entries = Vec::new();
-    H5Miterate_into(map, &mut entries)?;
-    Ok(entries)
+pub fn H5Miterate_by_name(
+    _loc: impl Into<String>,
+    _map_name: impl Into<String>,
+    _idx: &mut usize,
+) -> Result<()> {
+    Err(unsupported_map("H5Miterate_by_name"))
 }
 
 #[allow(non_snake_case)]
@@ -348,8 +428,25 @@ pub fn H5Mdelete(map: &mut H5Map, key: &[u8]) -> Result<Option<Vec<u8>>> {
 }
 
 #[allow(non_snake_case)]
+pub fn H5Mdelete_into(map: &mut H5Map, key: &[u8], value: &mut Vec<u8>) -> Result<bool> {
+    map.ensure_open()?;
+    if let Some(removed) = map.entries.remove(key) {
+        value.clear();
+        value.extend_from_slice(&removed);
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+#[allow(non_snake_case)]
 pub fn H5Mdelete_async(map: &mut H5Map, key: &[u8]) -> Result<Option<Vec<u8>>> {
     H5Mdelete(map, key)
+}
+
+#[allow(non_snake_case)]
+pub fn H5Mdelete_async_into(map: &mut H5Map, key: &[u8], value: &mut Vec<u8>) -> Result<bool> {
+    H5Mdelete_into(map, key, value)
 }
 
 #[cfg(test)]
@@ -389,6 +486,16 @@ mod tests {
         H5M_iterate_into(&map, &mut copied).unwrap();
         assert_eq!(copied, vec![(b"k".to_vec(), b"v".to_vec())]);
 
+        let mut idx = 0;
+        let mut keys = Vec::new();
+        H5Miterate(&map, &mut idx, |key| {
+            keys.push(key.to_vec());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(keys, vec![b"k".to_vec()]);
+        assert_eq!(idx, 1);
+
         H5Mput(&mut map, b"k2".to_vec(), b"v2".to_vec()).unwrap();
         let mut stopped = Vec::new();
         H5Miterate_with(&map, |key, value| {
@@ -399,6 +506,48 @@ mod tests {
         assert_eq!(stopped, vec![(b"k".to_vec(), b"v".to_vec())]);
         assert_eq!(H5Mdelete(&mut map, b"k2").unwrap(), Some(b"v2".to_vec()));
 
+        H5Mput(&mut map, b"a".to_vec(), b"1".to_vec()).unwrap();
+        H5Mput(&mut map, b"b".to_vec(), b"2".to_vec()).unwrap();
+        let mut idx = 1;
+        let mut resumed = Vec::new();
+        H5Miterate_from_with(&map, &mut idx, |key, value| {
+            resumed.push((key.to_vec(), value.to_vec()));
+            Ok(ControlFlow::Break(()))
+        })
+        .unwrap();
+        assert_eq!(resumed, vec![(b"b".to_vec(), b"2".to_vec())]);
+        assert_eq!(idx, 2);
+
+        H5Miterate_from_with(&map, &mut idx, |key, value| {
+            resumed.push((key.to_vec(), value.to_vec()));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            resumed,
+            vec![
+                (b"b".to_vec(), b"2".to_vec()),
+                (b"k".to_vec(), b"v".to_vec())
+            ]
+        );
+        assert_eq!(idx, 3);
+        idx = 4;
+        assert!(H5Miterate_from_with(&map, &mut idx, |_key, _value| Ok(())).is_err());
+
+        idx = 1;
+        let mut resumed_keys = Vec::new();
+        H5Miterate(&map, &mut idx, |key| {
+            resumed_keys.push(key.to_vec());
+            Ok(ControlFlow::Break(()))
+        })
+        .unwrap();
+        assert_eq!(resumed_keys, vec![b"b".to_vec()]);
+        assert_eq!(idx, 2);
+        idx = 4;
+        assert!(H5Miterate(&map, &mut idx, |_key| Ok(())).is_err());
+
+        assert_eq!(H5Mdelete(&mut map, b"a").unwrap(), Some(b"1".to_vec()));
+        assert_eq!(H5Mdelete(&mut map, b"b").unwrap(), Some(b"2".to_vec()));
         assert_eq!(H5Mdelete(&mut map, b"k").unwrap(), Some(b"v".to_vec()));
         H5Mput_async(&mut map, b"k2".to_vec(), b"v2".to_vec()).unwrap();
         assert_eq!(
@@ -410,5 +559,94 @@ mod tests {
 
         let anon = H5Mcreate_anon_async("u8", "bytes");
         assert_eq!(H5Mget_count(&anon).unwrap(), 0);
+    }
+
+    #[test]
+    fn map_api_out_parameter_queries_match_existing_state() {
+        let mut map = H5Mcreate("file", "map", "u8", "bytes");
+        H5Mput(&mut map, b"a".to_vec(), b"1".to_vec()).unwrap();
+        H5Mput(&mut map, b"b".to_vec(), b"2".to_vec()).unwrap();
+
+        assert_eq!(H5Mget_count_async(&map).unwrap(), 2);
+        assert!(H5Mexists_async(&map, b"a").unwrap());
+        assert!(!H5Mexists_async(&map, b"missing").unwrap());
+
+        let mut count = usize::MAX;
+        H5Mget_count_into(&map, &mut count).unwrap();
+        assert_eq!(count, 2);
+
+        let mut exists = false;
+        H5Mexists_into(&map, b"a", &mut exists).unwrap();
+        assert!(exists);
+
+        H5Mexists_into(&map, b"missing", &mut exists).unwrap();
+        assert!(!exists);
+    }
+
+    #[test]
+    fn map_api_get_into_copies_existing_value_to_output_buffer() {
+        let mut map = H5Mcreate("file", "map", "u8", "bytes");
+        H5Mput(&mut map, b"a".to_vec(), b"1".to_vec()).unwrap();
+        H5Mput(&mut map, b"b".to_vec(), b"22".to_vec()).unwrap();
+
+        let mut value = b"stale".to_vec();
+        assert!(H5Mget_into(&map, b"a", &mut value).unwrap());
+        assert_eq!(value, b"1");
+
+        assert!(H5Mget_async_into(&map, b"b", &mut value).unwrap());
+        assert_eq!(value, b"22");
+
+        assert!(!H5Mget_into(&map, b"missing", &mut value).unwrap());
+        assert_eq!(value, b"22");
+    }
+
+    #[test]
+    fn map_api_delete_into_reuses_caller_buffer() {
+        let mut map = H5Mcreate("file", "map", "u8", "bytes");
+        H5Mput(&mut map, b"a".to_vec(), b"1".to_vec()).unwrap();
+        H5Mput(&mut map, b"b".to_vec(), b"22".to_vec()).unwrap();
+
+        let mut value = b"stale".to_vec();
+        assert!(H5Mdelete_into(&mut map, b"a", &mut value).unwrap());
+        assert_eq!(value, b"1");
+        assert!(!H5Mexists(&map, b"a").unwrap());
+
+        assert!(H5Mdelete_async_into(&mut map, b"b", &mut value).unwrap());
+        assert_eq!(value, b"22");
+
+        assert!(!H5Mdelete_into(&mut map, b"missing", &mut value).unwrap());
+        assert_eq!(value, b"22");
+    }
+
+    #[test]
+    fn map_api_out_parameter_queries_require_open_map() {
+        let mut map = H5Mcreate("file", "map", "u8", "bytes");
+        H5Mput(&mut map, b"k".to_vec(), b"v".to_vec()).unwrap();
+        H5Mclose(&mut map);
+
+        let mut count = usize::MAX;
+        assert!(H5Mget_count_into(&map, &mut count).is_err());
+        assert_eq!(count, usize::MAX);
+
+        let mut exists = true;
+        assert!(H5Mexists_into(&map, b"k", &mut exists).is_err());
+        assert!(exists);
+        assert!(H5Mget_count_async(&map).is_err());
+        assert!(H5Mexists_async(&map, b"k").is_err());
+
+        let mut value = b"stale".to_vec();
+        assert!(H5Mget_into(&map, b"k", &mut value).is_err());
+        assert_eq!(value, b"stale");
+        assert!(H5Mdelete_into(&mut map, b"k", &mut value).is_err());
+        assert_eq!(value, b"stale");
+    }
+
+    #[test]
+    fn named_map_iteration_is_explicit_unsupported_boundary() {
+        let mut idx = 0;
+        let err = H5Miterate_by_name("file", "map", &mut idx)
+            .expect_err("named H5M iteration requires libhdf5 map behavior");
+        assert!(matches!(err, Error::Unsupported(_)));
+        assert_eq!(idx, 0);
     }
 }

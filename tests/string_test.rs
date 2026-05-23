@@ -32,6 +32,9 @@ fn test_read_fixed_strings() {
     assert_eq!(dtype.size(), 10);
 
     assert_dataset_strings(&ds, ["hello", "world"]);
+    let mut strings = vec!["stale".to_string()];
+    ds.read_strings_into(&mut strings).unwrap();
+    assert_eq!(strings, ["hello", "world"]);
 }
 
 #[test]
@@ -55,4 +58,11 @@ fn test_read_vlen_string_dataset() {
     assert!(dtype.is_vlen());
 
     assert_dataset_strings(&ds, ["alpha", "beta", "gamma"]);
+    let mut strings = vec!["stale".to_string()];
+    ds.read_strings_into(&mut strings).unwrap();
+    assert_eq!(strings, ["alpha", "beta", "gamma"]);
+
+    let mut first = String::from("stale");
+    ds.read_string_into(&mut first).unwrap();
+    assert_eq!(first, "alpha");
 }

@@ -102,6 +102,127 @@ fn test_reference_virtual_dataset_regular_hyperslabs_read() {
 }
 
 #[test]
+fn test_reference_virtual_dataset_cross_axis_3d_mosaic_read() {
+    let (_guard, _env_guard) = fixture_vds_env();
+    let f = File::open("hdf5/tools/test/testfiles/vds/2_vds.h5").unwrap();
+    let ds = f.dataset("vds_dset").unwrap();
+    assert!(ds.is_virtual().unwrap());
+    let mut dims = Vec::new();
+    shape_into(&ds, &mut dims);
+    assert_eq!(dims, vec![6, 8, 14]);
+    assert_eq!(ds.create_plist().unwrap().virtual_count(), 5);
+
+    let mut vals = vec![0; ds.size().unwrap() as usize];
+    read_into(&ds, &mut vals);
+
+    let row = |plane: usize, y: usize| -> &[i32] {
+        let start = (plane * 8 * 14) + (y * 14);
+        &vals[start..start + 14]
+    };
+    assert_eq!(
+        row(0, 0),
+        &[10, 10, 10, 10, 10, 10, 10, 40, 40, 40, 40, 40, 40, 40]
+    );
+    assert_eq!(
+        row(0, 5),
+        &[20, 20, 20, 20, 20, 20, 20, 50, 50, 50, 50, 50, 50, 50]
+    );
+    assert_eq!(
+        row(5, 2),
+        &[25, 25, 25, 25, 25, 25, 25, 45, 45, 45, 45, 45, 45, 45]
+    );
+    assert_eq!(
+        row(5, 7),
+        &[35, 35, 35, 35, 35, 35, 35, 55, 55, 55, 55, 55, 55, 55]
+    );
+}
+
+#[test]
+fn test_reference_virtual_dataset_fill_gap_3d_mosaic_read() {
+    let (_guard, _env_guard) = fixture_vds_env();
+    let f = File::open("hdf5/tools/test/testfiles/vds/3_1_vds.h5").unwrap();
+    let ds = f.dataset("vds_dset").unwrap();
+    assert!(ds.is_virtual().unwrap());
+    let mut dims = Vec::new();
+    shape_into(&ds, &mut dims);
+    assert_eq!(dims, vec![5, 25, 8]);
+    assert_eq!(ds.create_plist().unwrap().virtual_count(), 6);
+
+    let mut vals = vec![0; ds.size().unwrap() as usize];
+    read_into(&ds, &mut vals);
+
+    let row = |plane: usize, y: usize| -> &[i32] {
+        let start = (plane * 25 * 8) + (y * 8);
+        &vals[start..start + 8]
+    };
+    assert_eq!(row(0, 0), &[-9; 8]);
+    assert_eq!(row(0, 1), &[10; 8]);
+    assert_eq!(row(0, 3), &[-9; 8]);
+    assert_eq!(row(0, 4), &[20; 8]);
+    assert_eq!(row(0, 8), &[-9; 8]);
+    assert_eq!(row(4, 17), &[54; 8]);
+    assert_eq!(row(4, 24), &[-9; 8]);
+}
+
+#[test]
+fn test_reference_virtual_dataset_fill_gap_slice_crosses_mapped_rows() {
+    let (_guard, _env_guard) = fixture_vds_env();
+    let f = File::open("hdf5/tools/test/testfiles/vds/3_1_vds.h5").unwrap();
+    let ds = f.dataset("vds_dset").unwrap();
+    assert!(ds.is_virtual().unwrap());
+
+    let mut vals = vec![0; 5 * 2];
+    ds.read_slice_into::<i32, _>((0..1, 0..5, 0..2), &mut vals)
+        .unwrap();
+
+    assert_eq!(
+        vals,
+        vec![
+            -9, -9, //
+            10, 10, //
+            10, 10, //
+            -9, -9, //
+            20, 20,
+        ]
+    );
+}
+
+#[test]
+fn test_reference_virtual_dataset_printf_source_missing_pattern_fills() {
+    let (_guard, _env_guard) = fixture_vds_env();
+    let f = File::open("hdf5/tools/test/testfiles/vds/vds-eiger.h5").unwrap();
+    let ds = f.dataset("VDS-Eiger").unwrap();
+    assert!(ds.is_virtual().unwrap());
+    let access = DatasetAccess::new()
+        .with_virtual_missing_source_policy(VdsMissingSourcePolicy::Fill)
+        .with_virtual_view(VdsView::LastAvailable);
+    let mut dims = Vec::new();
+    shape_with_access_into(&ds, &access, &mut dims);
+    assert_eq!(dims, vec![20, 10, 10]);
+
+    let plist = ds.create_plist().unwrap();
+    assert_eq!(plist.virtual_count(), 1);
+    assert_eq!(plist.virtual_filename(0), Some("f-%b.h5"));
+    assert_eq!(plist.virtual_dsetname(0), Some("A"));
+    assert!(matches!(
+        plist.virtual_srcspace(0),
+        Some(VirtualSelectionInfo::All)
+    ));
+    assert!(matches!(
+        plist.virtual_vspace(0),
+        Some(VirtualSelectionInfo::Regular { start, stride, count, block })
+            if start.as_slice() == [0, 0, 0]
+                && stride.as_slice() == [5, 1, 1]
+                && count.as_slice() == [u64::MAX, 1, 1]
+                && block.as_slice() == [5, 10, 10]
+    ));
+
+    let mut vals = vec![0; ds.size_with_access(&access).unwrap() as usize];
+    read_into_with_access(&ds, &access, &mut vals);
+    assert_eq!(vals, vec![0; 20 * 10 * 10]);
+}
+
+#[test]
 fn test_virtual_dataset_all_selection_read() {
     let (_guard, _env_guard) = fixture_vds_env();
     let f = File::open("tests/data/hdf5_ref/vds_all.h5").unwrap();
@@ -219,6 +340,42 @@ fn test_virtual_dataset_fill_value_for_unmapped_regions() {
 }
 
 #[test]
+fn test_virtual_dataset_fill_value_create_plist_metadata() {
+    let (_guard, _env_guard) = fixture_vds_env();
+    let f = File::open("tests/data/hdf5_ref/vds_fill_value.h5").unwrap();
+    let ds = f.dataset("vds_fill_value").unwrap();
+    assert!(ds.is_virtual().unwrap());
+
+    let plist = ds.create_plist().unwrap();
+    assert_eq!(plist.virtual_count(), 1);
+    assert!(plist.fill_value_defined);
+    let fill = (-7i32).to_le_bytes();
+    assert_eq!(plist.fill_value(), Some(fill.as_slice()));
+}
+
+#[test]
+fn test_virtual_dataset_fill_value_slice_crosses_mapped_and_unmapped_regions() {
+    let (_guard, _env_guard) = fixture_vds_env();
+    let f = File::open("tests/data/hdf5_ref/vds_fill_value.h5").unwrap();
+    let ds = f.dataset("vds_fill_value").unwrap();
+    assert!(ds.is_virtual().unwrap());
+
+    let mut vals = vec![0; 4 * 4];
+    ds.read_slice_into::<i32, _>((0..4, 1..5), &mut vals)
+        .unwrap();
+
+    assert_eq!(
+        vals,
+        vec![
+            -7, -7, -7, -7, //
+            -7, 0, 1, 2, //
+            -7, 3, 4, 5, //
+            -7, -7, -7, -7,
+        ]
+    );
+}
+
+#[test]
 fn test_virtual_dataset_f64_read() {
     let (_guard, _env_guard) = fixture_vds_env();
     let f = File::open("tests/data/hdf5_ref/vds_f64.h5").unwrap();
@@ -274,6 +431,11 @@ fn test_virtual_dataset_scalar_mapping_read() {
 
     let val = ds.read_scalar::<i32>().unwrap();
     assert_eq!(val, 42);
+
+    let mut out = 0;
+    ds.read_scalar_into_with_vds_view(VdsView::LastAvailable, &mut out)
+        .unwrap();
+    assert_eq!(out, 42);
 }
 
 #[test]
@@ -337,6 +499,19 @@ fn test_virtual_dataset_overlapping_mappings_later_mapping_wins() {
     let mut vals = vec![0; ds.size().unwrap() as usize];
     read_into(&ds, &mut vals);
     assert_eq!(vals, vec![1, 9, 8, 4]);
+}
+
+#[test]
+fn test_virtual_dataset_overlap_slice_uses_later_mapping() {
+    let (_guard, _env_guard) = fixture_vds_env();
+    let f = File::open("tests/data/hdf5_ref/vds_overlap.h5").unwrap();
+    let ds = f.dataset("vds_overlap").unwrap();
+    assert!(ds.is_virtual().unwrap());
+
+    let mut vals = vec![0; 3];
+    ds.read_slice_into::<i32, _>(1..4, &mut vals).unwrap();
+
+    assert_eq!(vals, vec![9, 8, 4]);
 }
 
 #[test]

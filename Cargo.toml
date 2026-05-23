@@ -3,13 +3,13 @@ members = [".", "derive"]
 
 [package]
 name = "hdf5-pure-rust"
-version = "0.3.4"
+version = "0.3.5"
 edition = "2021"
 description = "Pure Rust implementation of the HDF5 file format"
 license = "BSD-3-Clause"
 repository = "https://github.com/henriksson-lab/hdf5-pure-rs"
 homepage = "https://github.com/henriksson-lab/hdf5-pure-rs"
-include = ["/src/**/*", "/derive/**/*", "/benches/**/*", "/examples/**/*", "/Cargo.toml", "/README.md", "/LICENSE", "/LICENSE-*"]
+include = ["/src/**/*", "/benches/**/*", "/examples/**/*", "/scripts/*.py", "/scripts/*.sh", "/scripts/*.R", "/tests/*.rs", "/tests/data/*.h5", "/tests/data/hdf5_ref/**/*", "/Cargo.toml", "/README.md", "/LICENSE", "/LICENSE-*"]
 
 [dependencies]
 bitflags = "2.4"
@@ -30,6 +30,11 @@ tracehash = ["dep:tracehash"]
 [[bench]]
 name = "benchmark"
 harness = false
+
+[[test]]
+name = "derive_test"
+path = "tests/derive_test.rs"
+required-features = ["derive"]
 
 [dev-dependencies]
 criterion = "0.5"

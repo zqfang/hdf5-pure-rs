@@ -83,6 +83,18 @@ fn test_read_slice_into_rejects_wrong_output_length() {
 }
 
 #[test]
+fn test_read_slice_into_rejects_nonempty_output_for_empty_selection() {
+    let f = File::open("tests/data/datasets_v0.h5").unwrap();
+    let ds = f.dataset("float64_1d").unwrap();
+    let mut vals = [42.0];
+    let err = ds
+        .read_slice_into::<f64, _>(Selection::None, &mut vals)
+        .expect_err("empty selections should require an empty output buffer");
+    assert!(err.to_string().contains("expected 0"));
+    assert_eq!(vals, [42.0]);
+}
+
+#[test]
 fn test_read_slice_1d_from_start() {
     let f = File::open("tests/data/datasets_v0.h5").unwrap();
     let ds = f.dataset("float64_1d").unwrap();
@@ -237,6 +249,16 @@ fn test_read_slice_2d_point_selection() {
     let mut vals = [0; 3];
     ds.read_slice_into::<i8, _>(selection, &mut vals).unwrap();
     assert_eq!(vals, [6, 1, 5]);
+}
+
+#[test]
+fn test_read_slice_2d_point_selection_preserves_order_and_duplicates() {
+    let f = File::open("tests/data/datasets_v0.h5").unwrap();
+    let ds = f.dataset("int8_2d").unwrap();
+    let selection = Selection::Points(vec![vec![1, 2], vec![1, 2], vec![0, 1], vec![1, 0]]);
+    let mut vals = [0; 4];
+    ds.read_slice_into::<i8, _>(selection, &mut vals).unwrap();
+    assert_eq!(vals, [6, 6, 2, 4]);
 }
 
 #[test]

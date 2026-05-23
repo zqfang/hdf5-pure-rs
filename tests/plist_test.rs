@@ -1,6 +1,6 @@
 use hdf5_pure_rust::{
-    DataTransfer, DatasetAccess, DatasetSpaceStatus, File, FileCloseDegree, FileSpaceStrategy,
-    LibverBound, LinkAccess, MetadataCacheConfig, MetadataCacheImageConfig,
+    DataTransfer, DatasetAccess, DatasetSpaceStatus, File, FileBuilder, FileCloseDegree,
+    FileSpaceStrategy, LibverBound, LinkAccess, MetadataCacheConfig, MetadataCacheImageConfig,
     MetadataCacheLogOptions, ObjectCopy, ObjectCreate, VdsView,
 };
 
@@ -142,6 +142,53 @@ fn test_file_create_plist() {
     assert_eq!(plist.shared_mesg_index(0).unwrap().minimum_message_size, 32);
     plist.set_shared_mesg_phase_change(60, 30);
     assert_eq!(plist.shared_mesg_phase_change(), (60, 30));
+}
+
+#[test]
+fn test_file_builder_create_plist_preserves_property_state() {
+    use hdf5_pure_rust::hl::plist::file_create::{FileCreate, SharedMessageIndex};
+
+    let mut fcpl = FileCreate::new();
+    fcpl.set_sizes(4, 8);
+    fcpl.set_sym_k(32, 8);
+    fcpl.set_istore_k(64);
+    fcpl.set_file_space(FileSpaceStrategy::Page, true, 16);
+    fcpl.set_file_space_page_size(8192);
+    fcpl.set_shared_mesg_nindexes(1);
+    assert!(fcpl.set_shared_mesg_index(
+        0,
+        SharedMessageIndex {
+            message_type_flags: 2,
+            minimum_message_size: 32,
+        },
+    ));
+
+    let mut builder = FileBuilder::new();
+    builder.set_create_plist(&fcpl).unwrap();
+    assert_eq!(builder.fcpl().sizes(), (4, 8));
+    assert_eq!(builder.fcpl().sym_k(), (32, 8));
+    assert_eq!(builder.fcpl().istore_k(), 64);
+    assert_eq!(
+        builder.fcpl().file_space(),
+        (FileSpaceStrategy::Page, true, 16)
+    );
+    assert_eq!(builder.fcpl().file_space_page_size(), 8192);
+    assert_eq!(
+        builder
+            .fcpl()
+            .shared_mesg_index(0)
+            .unwrap()
+            .minimum_message_size,
+        32
+    );
+
+    builder.with_create_plist(|plist| {
+        plist.set_sym_k(48, 12);
+        plist.set_shared_mesg_phase_change(70, 20);
+        plist
+    });
+    assert_eq!(builder.create_plist().sym_k(), (48, 12));
+    assert_eq!(builder.create_plist().shared_mesg_phase_change(), (70, 20));
 }
 
 #[test]

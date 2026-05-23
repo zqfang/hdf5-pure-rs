@@ -89,6 +89,28 @@ fn test_write_dataset_with_attrs() {
             assert!(stdout.contains("count"));
         }
     }
+
+    let out = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(
+            "import sys, h5py\n\
+             f = h5py.File(sys.argv[1], 'r')\n\
+             d = f['data']\n\
+             assert d.shape == (3,)\n\
+             assert d[:].tolist() == [1.0, 2.0, 3.0]\n\
+             assert d.attrs['count'] == 42\n\
+             print('OK')\n\
+             f.close()",
+        )
+        .arg(&path)
+        .output();
+    if let Ok(out) = out {
+        assert!(
+            out.status.success() && String::from_utf8_lossy(&out.stdout).contains("OK"),
+            "h5py failed on dataset-attribute writer fixture: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
 }
 
 #[test]
@@ -157,6 +179,26 @@ fn test_write_root_attrs() {
         attr.read_into(std::slice::from_mut(&mut val)).unwrap();
         assert!((val - 3.14).abs() < 1e-10);
     }
+
+    let out = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(
+            "import sys, h5py\n\
+             f = h5py.File(sys.argv[1], 'r')\n\
+             assert 'pi' in f.attrs\n\
+             assert abs(float(f.attrs['pi']) - 3.14) < 1e-10\n\
+             print('OK')\n\
+             f.close()",
+        )
+        .arg(&path)
+        .output();
+    if let Ok(out) = out {
+        assert!(
+            out.status.success() && String::from_utf8_lossy(&out.stdout).contains("OK"),
+            "h5py failed on root-attribute writer fixture: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
 }
 
 #[test]
@@ -193,6 +235,29 @@ fn test_read_false_true_enum_attr_with_u64_base() {
         assert_eq!(attr.element_size(), 8);
         assert_eq!(attr.read_scalar::<u8>().unwrap(), 1);
         assert!(attr.read_scalar_bool().unwrap());
+    }
+
+    let out = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(
+            "import sys, h5py\n\
+             f = h5py.File(sys.argv[1], 'r')\n\
+             attr_id = f.attrs.get_id('ordered')\n\
+             enum_type = attr_id.get_type()\n\
+             members = {enum_type.get_member_name(i).decode('utf-8'): enum_type.get_member_value(i) for i in range(enum_type.get_nmembers())}\n\
+             assert members == {'FALSE': 0, 'TRUE': 1}\n\
+             assert int(f.attrs['ordered']) == 1\n\
+             print('OK')\n\
+             f.close()",
+        )
+        .arg(&path)
+        .output();
+    if let Ok(out) = out {
+        assert!(
+            out.status.success() && String::from_utf8_lossy(&out.stdout).contains("OK"),
+            "h5py failed on enum-attribute writer fixture: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 }
 
@@ -254,6 +319,30 @@ fn test_write_dataset_with_many_compact_attrs() {
             .read_into(std::slice::from_mut(&mut value))
             .unwrap();
         assert_eq!(value, 37);
+    }
+
+    let out = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(
+            "import sys, h5py\n\
+             f = h5py.File(sys.argv[1], 'r')\n\
+             d = f['data']\n\
+             assert list(d[:]) == [123]\n\
+             assert len(d.attrs) == 40\n\
+             assert d.attrs['attr_00'] == 0\n\
+             assert d.attrs['attr_37'] == 37\n\
+             assert d.attrs['attr_39'] == 39\n\
+             print('OK')\n\
+             f.close()",
+        )
+        .arg(&path)
+        .output();
+    if let Ok(out) = out {
+        assert!(
+            out.status.success() && String::from_utf8_lossy(&out.stdout).contains("OK"),
+            "h5py failed on many-attribute writer fixture: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 
     let out = std::process::Command::new("h5dump")

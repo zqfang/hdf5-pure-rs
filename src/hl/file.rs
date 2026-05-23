@@ -126,11 +126,7 @@ pub struct File {
     intent: FileIntent,
 }
 
-/// File-creation builder placeholder.
-///
-/// Part of the hdf5-metno compatibility layer and should not be removed.
-#[derive(Default, Clone, Debug)]
-pub struct FileCreateBuilder;
+pub use crate::hl::plist::file_create::FileCreate as FileCreateBuilder;
 
 /// File builder allowing limited compatibility with hdf5-metno open helpers.
 ///
@@ -148,7 +144,7 @@ impl Default for FileBuilder {
     fn default() -> Self {
         Self {
             fapl: crate::hl::plist::file_access::FileAccess::default(),
-            fcpl: FileCreateBuilder,
+            fcpl: FileCreateBuilder::default(),
         }
     }
 }
@@ -280,8 +276,9 @@ impl FileBuilder {
     /// Part of the hdf5-metno compatibility layer and should not be removed.
     pub fn set_create_plist(
         &mut self,
-        _fcpl: &crate::hl::plist::file_create::FileCreate,
+        fcpl: &crate::hl::plist::file_create::FileCreate,
     ) -> Result<&mut Self> {
+        self.fcpl = fcpl.clone();
         Ok(self)
     }
 

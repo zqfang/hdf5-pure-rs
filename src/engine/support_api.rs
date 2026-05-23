@@ -9,6 +9,7 @@ use std::sync::{Condvar, Mutex, Once};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::engine::free_list::{FreeListManager, FreeListStats};
 use crate::error::{Error, Result};
 
 static LIBRARY_OPEN: AtomicBool = AtomicBool::new(false);
@@ -232,6 +233,7 @@ pub fn H5_timer_get_time_string(duration: Duration) -> String {
 
 /// Initialize the H5 package: mark the library as open.
 pub fn H5__init_package() {
+    LIBRARY_TERMINATING.store(false, AtomicOrdering::SeqCst);
     LIBRARY_OPEN.store(true, AtomicOrdering::SeqCst);
 }
 
@@ -252,6 +254,22 @@ pub fn H5dont_atexit() {}
 /// Run a garbage-collection pass on free lists; no-op in pure-Rust mode.
 pub fn H5garbage_collect() {}
 
+/// Query current free-list storage sizes.
+pub fn H5get_free_list_sizes(lists: &FreeListManager) -> FreeListStats {
+    lists.get_free_list_sizes()
+}
+
+/// Set per-kind free-list entry limits.
+pub fn H5set_free_list_limits(
+    lists: &mut FreeListManager,
+    regular: usize,
+    block: usize,
+    array: usize,
+    factory: usize,
+) {
+    lists.set_free_list_limits(regular, block, array, factory);
+}
+
 /// Echo the requested debug-print mask back to the caller.
 pub fn H5__debug_mask(mask: u64) -> u64 {
     mask
@@ -265,6 +283,11 @@ pub fn H5__mpi_delete_cb() -> Result<()> {
 /// Return the HDF5 library version as `(major, minor, release)`.
 pub fn H5get_libversion() -> (u32, u32, u32) {
     (0, 1, 0)
+}
+
+/// Return the HDF5 library version through libhdf5-style out parameters.
+pub fn H5get_libversion_into(major: &mut u32, minor: &mut u32, release: &mut u32) {
+    (*major, *minor, *release) = H5get_libversion();
 }
 
 /// Check whether the linked library matches the requested version.
@@ -295,23 +318,56 @@ pub fn H5allocate_memory(size: usize) -> Vec<u8> {
     vec![0; size]
 }
 
+/// Allocate `size` bytes of zero-initialized memory.
+pub fn H5MM_malloc(size: usize) -> Vec<u8> {
+    H5allocate_memory(size)
+}
+
+/// Allocate `count * size` bytes of zero-initialized memory.
+pub fn H5MM_calloc(count: usize, size: usize) -> Result<Vec<u8>> {
+    let total = count
+        .checked_mul(size)
+        .ok_or_else(|| Error::InvalidFormat("H5MM calloc size overflow".into()))?;
+    Ok(H5allocate_memory(total))
+}
+
 /// Resize a previously allocated buffer to `size` bytes.
 pub fn H5resize_memory(mut bytes: Vec<u8>, size: usize) -> Vec<u8> {
     bytes.resize(size, 0);
     bytes
 }
 
+/// Resize a previously allocated buffer to `size` bytes.
+pub fn H5MM_realloc(bytes: Vec<u8>, size: usize) -> Vec<u8> {
+    H5resize_memory(bytes, size)
+}
+
 /// Free a previously allocated buffer.
 pub fn H5free_memory(_bytes: Vec<u8>) {}
+
+/// Free a previously allocated buffer.
+pub fn H5MM_xfree(bytes: Vec<u8>) {
+    H5free_memory(bytes);
+}
 
 /// Return whether the library was built thread-safe.
 pub fn H5is_library_threadsafe() -> bool {
     true
 }
 
+/// Return whether the library was built thread-safe through a libhdf5-style out parameter.
+pub fn H5is_library_threadsafe_into(is_threadsafe: &mut bool) {
+    *is_threadsafe = H5is_library_threadsafe();
+}
+
 /// Return whether the library is currently shutting down.
 pub fn H5is_library_terminating() -> bool {
     LIBRARY_TERMINATING.load(AtomicOrdering::SeqCst)
+}
+
+/// Return whether the library is currently shutting down through an out parameter.
+pub fn H5is_library_terminating_into(is_terminating: &mut bool) {
+    *is_terminating = H5is_library_terminating();
 }
 
 /// Hook invoked before entering user callback context.
@@ -638,6 +694,26 @@ pub fn H5FD__copy_plist() -> Result<()> {
     ))
 }
 
+/// Query VFD driver capability flags; unsupported without a libhdf5 VFD driver registry.
+pub fn H5FDdriver_query(_driver_id: u64) -> Result<u64> {
+    Err(unsupported_support("H5FDdriver_query"))
+}
+
+/// Append a plugin search path; unsupported without dynamic plugin loading.
+pub fn H5PLappend(_path: &str) -> Result<()> {
+    Err(unsupported_support("H5PLappend"))
+}
+
+/// Prepend a plugin search path; unsupported without dynamic plugin loading.
+pub fn H5PLprepend(_path: &str) -> Result<()> {
+    Err(unsupported_support("H5PLprepend"))
+}
+
+/// Replace a plugin search path; unsupported without dynamic plugin loading.
+pub fn H5PLreplace(_path: &str, _index: usize) -> Result<()> {
+    Err(unsupported_support("H5PLreplace"))
+}
+
 /// Dump pending subfiling I/O vectors; unsupported in pure-Rust mode.
 pub fn H5_subfiling_dump_iovecs() -> Result<()> {
     Err(unsupported_support("H5_subfiling_dump_iovecs"))
@@ -858,5 +934,80 @@ mod tests {
 
         H5_build_extpath_into("dir", "file.h5", &mut out);
         assert_eq!(out, "dir/file.h5");
+    }
+
+    #[test]
+    fn free_list_public_wrappers_query_and_set_limits() {
+        let mut lists = FreeListManager::new();
+        lists.blk_free(vec![0; 4]);
+        lists.blk_free(vec![0; 8]);
+        lists.arr_free(vec![0; 16]);
+
+        let stats = H5get_free_list_sizes(&lists);
+        assert_eq!(stats.block_bytes, 12);
+        assert_eq!(stats.array_bytes, 16);
+
+        H5set_free_list_limits(&mut lists, usize::MAX, 1, 0, usize::MAX);
+        let stats = H5get_free_list_sizes(&lists);
+        assert_eq!(stats.block_bytes, 4);
+        assert_eq!(stats.array_bytes, 0);
+    }
+
+    #[test]
+    fn h5mm_allocation_wrappers_zero_resize_and_reject_overflow() {
+        let mut bytes = H5MM_malloc(4);
+        assert_eq!(bytes, vec![0; 4]);
+
+        bytes[0] = 9;
+        bytes = H5MM_realloc(bytes, 6);
+        assert_eq!(&bytes[..4], &[9, 0, 0, 0]);
+        assert_eq!(&bytes[4..], &[0, 0]);
+
+        bytes = H5MM_realloc(bytes, 2);
+        assert_eq!(bytes, vec![9, 0]);
+
+        let calloc = H5MM_calloc(3, 2).unwrap();
+        assert_eq!(calloc, vec![0; 6]);
+        assert!(H5MM_calloc(usize::MAX, 2).is_err());
+
+        H5MM_xfree(calloc);
+    }
+
+    #[test]
+    fn public_h5_out_parameter_wrappers_match_convenience_queries() {
+        let mut major = u32::MAX;
+        let mut minor = u32::MAX;
+        let mut release = u32::MAX;
+        H5get_libversion_into(&mut major, &mut minor, &mut release);
+        assert_eq!((major, minor, release), H5get_libversion());
+
+        let mut is_threadsafe = false;
+        H5is_library_threadsafe_into(&mut is_threadsafe);
+        assert_eq!(is_threadsafe, H5is_library_threadsafe());
+
+        H5open();
+        let mut is_terminating = true;
+        H5is_library_terminating_into(&mut is_terminating);
+        assert!(!is_terminating);
+
+        H5close();
+        H5is_library_terminating_into(&mut is_terminating);
+        assert!(is_terminating);
+    }
+
+    #[test]
+    fn support_runtime_boundaries_are_explicitly_unsupported() {
+        for err in [
+            H5FD__copy_plist().unwrap_err(),
+            H5FDdriver_query(0).unwrap_err(),
+            H5PLappend("/tmp/hdf5-plugins").unwrap_err(),
+            H5PLprepend("/tmp/hdf5-plugins").unwrap_err(),
+            H5PLreplace("/tmp/hdf5-plugins", 0).unwrap_err(),
+            H5_subfiling_dump_iovecs().unwrap_err(),
+            H5_get_win32_times().unwrap_err(),
+            H5EA__dblock_create().unwrap_err(),
+        ] {
+            assert!(matches!(err, Error::Unsupported(_)));
+        }
     }
 }

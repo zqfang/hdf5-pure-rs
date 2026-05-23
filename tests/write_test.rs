@@ -226,6 +226,32 @@ fn test_write_with_group() {
         let ds = f.dataset("subgroup/tiny").unwrap();
         assert_dataset_raw(&ds, &[42]).unwrap();
     }
+
+    let output = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(
+            "import sys, importlib.util\n\
+             spec = importlib.util.find_spec('h5py')\n\
+             (print('SKIP h5py unavailable'), sys.exit(0)) if spec is None else None\n\
+             import h5py\n\
+             f = h5py.File(sys.argv[1], 'r')\n\
+             assert 'subgroup' in f\n\
+             assert 'tiny' in f['subgroup']\n\
+             assert f['subgroup/tiny'].shape == (1,)\n\
+             assert f['subgroup/tiny'][:].tolist() == [42]\n\
+             f.close()\n\
+             print('OK')",
+        )
+        .arg(&path)
+        .output();
+    if let Ok(out) = output {
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && (stdout.contains("OK") || stdout.contains("SKIP")),
+            "h5py failed on grouped dataset writer fixture: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
 }
 
 #[test]
@@ -415,6 +441,35 @@ fn test_write_enum_opaque_array_and_nested_compound_datatypes() {
             );
         }
     }
+
+    let output = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(
+            "import sys, h5py\n\
+             f = h5py.File(sys.argv[1], 'r')\n\
+             status = f['status']\n\
+             assert h5py.check_dtype(enum=status.dtype) == {'zero': 0, 'one': 1, 'two': 2}\n\
+             opaque = f['opaque']\n\
+             assert opaque.id.get_type().get_tag().decode('utf-8') == 'hdf5-pure-rust blob'\n\
+             matrix = f['matrix_cells']\n\
+             assert matrix.dtype.shape == (2, 3)\n\
+             assert matrix[:].tolist() == [[[0, 1, 2], [3, 4, 5]], [[6, 7, 8], [9, 10, 11]]]\n\
+             nested = f['nested_compound']\n\
+             assert nested['id'].tolist() == [7, 8]\n\
+             assert nested['nested']['a'].tolist() == [10, 20]\n\
+             assert nested['nested']['b'].tolist() == [1.25, 2.5]\n\
+             print('OK')\n\
+             f.close()",
+        )
+        .arg(&path)
+        .output();
+    if let Ok(out) = output {
+        assert!(
+            out.status.success() && String::from_utf8_lossy(&out.stdout).contains("OK"),
+            "h5py failed on complex datatype writer fixture: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
 }
 
 #[test]
@@ -467,5 +522,26 @@ fn test_write_readable_by_h5dump() {
         Err(e) => {
             println!("h5dump not available: {e}, skipping C library verification");
         }
+    }
+
+    let output = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(
+            "import sys, h5py\n\
+             f = h5py.File(sys.argv[1], 'r')\n\
+             d = f['data']\n\
+             assert d.shape == (3,)\n\
+             assert d[:].tolist() == [1.0, 2.0, 3.0]\n\
+             f.close()\n\
+             print('OK')",
+        )
+        .arg(&path)
+        .output();
+    if let Ok(out) = output {
+        assert!(
+            out.status.success() && String::from_utf8_lossy(&out.stdout).contains("OK"),
+            "h5py failed on written file: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 }

@@ -283,9 +283,36 @@ pub fn H5F__create_api_common(pkg: &mut FilePackageState, name: &str, intent: u3
     id
 }
 
+/// Create a file through the public libhdf5-style API.
+pub fn H5Fcreate(pkg: &mut FilePackageState, name: &str, intent: u32) -> Result<u64> {
+    Ok(H5F__create_api_common(pkg, name, intent))
+}
+
+/// Open a registered file by name through the public libhdf5-style API.
+pub fn H5Fopen(pkg: &FilePackageState, name: &str) -> Result<FileApiState> {
+    pkg.files
+        .values()
+        .find(|file| file.name == name || file.actual_name == name)
+        .cloned()
+        .map(H5F__post_open_api_common)
+        .ok_or_else(|| unsupported_file("H5Fopen"))
+}
+
 /// Common flush API plumbing: ensure the file's image is up to date.
 pub fn H5F__flush_api_common(file: &mut FileApiState) {
     H5F__flush(file);
+}
+
+/// Flush all pending file state through the public libhdf5-style API.
+pub fn H5Fflush(file: &mut FileApiState) -> Result<()> {
+    H5F__flush_api_common(file);
+    Ok(())
+}
+
+/// Close a file through the public libhdf5-style API.
+pub fn H5Fclose(file: FileApiState) -> Result<()> {
+    H5F__close(file);
+    Ok(())
 }
 
 /// Mount a child file at the given name inside `file`.
@@ -333,6 +360,11 @@ pub fn H5Fclose_async(_file: FileApiState) -> Result<()> {
     Err(unsupported_file("H5Fclose_async"))
 }
 
+/// Delete a file through the configured VFD; unsupported without libhdf5 file-driver behavior.
+pub fn H5Fdelete(_filename: &str) -> Result<()> {
+    Err(unsupported_file("H5Fdelete"))
+}
+
 /// Reset the metadata cache hit-rate statistics for a file.
 pub fn H5Freset_mdc_hit_rate_stats(file: &mut FileApiState) {
     file.mdc_hit_rate_resets = file.mdc_hit_rate_resets.saturating_add(1);
@@ -366,6 +398,14 @@ pub fn H5Fget_metadata_read_retry_info(file: &FileApiState) -> FileMetadataReadR
     }
 }
 
+/// Write metadata-read retry counts into caller-provided storage.
+pub fn H5Fget_metadata_read_retry_info_into(
+    file: &FileApiState,
+    out: &mut FileMetadataReadRetryInfo,
+) {
+    *out = H5Fget_metadata_read_retry_info(file);
+}
+
 /// Return the page-buffer query statistics for a file.
 pub fn H5F_get_page_buffering_stats(file: &FileApiState) -> PageBufferQueryStats {
     PageBufferQueryStats {
@@ -397,6 +437,11 @@ pub fn H5F_get_mdc_logging_status(file: &FileApiState) -> FileLoggingFlags {
 /// Public libhdf5-style metadata-cache logging status query.
 pub fn H5Fget_mdc_logging_status(file: &FileApiState) -> FileLoggingFlags {
     H5F_get_mdc_logging_status(file)
+}
+
+/// Public metadata-cache flush-disable query; unsupported without libhdf5 MDC internals.
+pub fn H5Fget_mdc_flush_disabled(_file: &FileApiState) -> Result<bool> {
+    Err(unsupported_file("H5Fget_mdc_flush_disabled"))
 }
 
 /// Public metadata-cache configuration query; unsupported without libhdf5 MDC internals.
@@ -623,9 +668,19 @@ pub fn H5F_get_access_plist(file: &FileApiState) -> u32 {
     file.intent
 }
 
+/// Return the file access property list through the public libhdf5-style API.
+pub fn H5Fget_access_plist(file: &FileApiState) -> u32 {
+    H5F_get_access_plist(file)
+}
+
 /// Return the file's public open-intent flags.
 pub fn H5Fget_intent(file: &FileApiState) -> u32 {
     H5F_shared_get_intent(file)
+}
+
+/// Write the file's public open-intent flags into caller-provided storage.
+pub fn H5Fget_intent_into(file: &FileApiState, out: &mut u32) {
+    *out = H5Fget_intent(file);
 }
 
 /// Return the number of objects currently open in the file.
@@ -633,11 +688,21 @@ pub fn H5F_get_obj_count(file: &FileApiState) -> usize {
     file.object_ids.len()
 }
 
+/// Return the number of objects currently open through the public libhdf5-style API.
+pub fn H5Fget_obj_count(file: &FileApiState) -> usize {
+    H5F_get_obj_count(file)
+}
+
 /// Copy object IDs currently open in the file into caller-provided storage.
 pub fn H5F_get_obj_ids_into(file: &FileApiState, out: &mut Vec<u64>) -> usize {
     out.clear();
     out.extend(file.object_ids.iter().copied());
     out.len()
+}
+
+/// Copy open object IDs through the public libhdf5-style API.
+pub fn H5Fget_obj_ids_into(file: &FileApiState, out: &mut Vec<u64>) -> usize {
+    H5F_get_obj_ids_into(file, out)
 }
 
 /// Visit object IDs currently open in the file without allocating a list.
@@ -885,6 +950,11 @@ pub fn H5Fget_info2(file: &FileApiState) -> FileApiInfo {
             message_info_size: u64::from(file.sohm_nindexes),
         },
     }
+}
+
+/// Write file metadata information into caller-provided storage.
+pub fn H5Fget_info2_into(file: &FileApiState, out: &mut FileApiInfo) {
+    *out = H5Fget_info2(file);
 }
 
 /// Return file metadata information in libhdf5's v1 public query shape.
@@ -1141,6 +1211,11 @@ pub fn H5Fget_mpi_atomicity(_file: &FileApiState) -> Result<bool> {
     Err(unsupported_file("H5Fget_mpi_atomicity"))
 }
 
+/// Public API to query MPI atomicity through a libhdf5-style out parameter.
+pub fn H5Fget_mpi_atomicity_into(_file: &FileApiState, _atomicity: &mut bool) -> Result<()> {
+    Err(unsupported_file("H5Fget_mpi_atomicity"))
+}
+
 /// Retrieve the MPI communicator from the file; unsupported in pure-Rust mode.
 pub fn H5F_mpi_retrieve_comm() -> Result<()> {
     Err(unsupported_file("H5F_mpi_retrieve_comm"))
@@ -1352,6 +1427,11 @@ pub fn H5Fget_filesize(file: &FileApiState) -> u64 {
     file.eof
 }
 
+/// Write the file size visible to public callers into caller-provided storage.
+pub fn H5Fget_filesize_into(file: &FileApiState, out: &mut u64) {
+    *out = H5Fget_filesize(file);
+}
+
 /// Return the low library version bound for the file.
 pub fn H5F_get_low_bound(file: &FileApiState) -> u8 {
     file.low_bound
@@ -1432,6 +1512,11 @@ pub fn H5F_get_nmounts(file: &FileApiState) -> usize {
 /// Return the file creation property list (encoded as flag bits).
 pub fn H5F_get_fcpl(file: &FileApiState) -> u64 {
     file.flags
+}
+
+/// Return the file creation property list through the public libhdf5-style API.
+pub fn H5Fget_create_plist(file: &FileApiState) -> u64 {
+    H5F_get_fcpl(file)
 }
 
 /// Return the on-disk size of an address (always 8 bytes here).
@@ -1539,6 +1624,11 @@ pub fn H5Fget_fileno(file: &FileApiState) -> u64 {
     H5F_get_fileno(file)
 }
 
+/// Write the file number into caller-provided storage.
+pub fn H5Fget_fileno_into(file: &FileApiState, out: &mut u64) {
+    *out = H5Fget_fileno(file);
+}
+
 /// Return the end-of-allocation address (shared variant).
 pub fn H5F_shared_get_eoa(file: &FileApiState) -> u64 {
     file.eoa
@@ -1567,6 +1657,11 @@ pub fn H5Fget_free_sections(_file: &FileApiState) -> Result<()> {
 /// Return the metadata-cache hit rate through the public libhdf5-style API.
 pub fn H5Fget_mdc_hit_rate(file: &FileApiState) -> f64 {
     H5F_get_mdc_hit_rate(file)
+}
+
+/// Write the metadata-cache hit rate into caller-provided storage.
+pub fn H5Fget_mdc_hit_rate_into(file: &FileApiState, out: &mut f64) {
+    *out = H5Fget_mdc_hit_rate(file);
 }
 
 /// Return the underlying VFD file handle; unsupported in pure-Rust mode.
@@ -1736,6 +1831,9 @@ mod tests {
         assert_eq!(H5F_get_page_buffering_stats(&file).resets, 1);
         assert_eq!(H5Fget_page_buffering_stats(&file).resets, 1);
         assert_eq!(H5Fget_mdc_hit_rate(&file), H5F_get_mdc_hit_rate(&file));
+        let mut hit_rate = 0.0;
+        H5Fget_mdc_hit_rate_into(&file, &mut hit_rate);
+        assert_eq!(hit_rate, H5Fget_mdc_hit_rate(&file));
 
         let flags = H5F_get_mdc_logging_status(&file);
         assert_eq!(H5Fget_mdc_logging_status(&file), flags);
@@ -1747,6 +1845,58 @@ mod tests {
     }
 
     #[test]
+    fn public_create_and_open_route_through_package_state() {
+        let mut pkg = H5F_init();
+
+        let id = H5Fcreate(&mut pkg, "created.h5", 0x12).unwrap();
+        assert!(H5F_file_id_exists(&pkg, id));
+
+        let opened = H5Fopen(&pkg, "created.h5").unwrap();
+        assert_eq!(opened.id, id);
+        assert_eq!(opened.name, "created.h5");
+        assert_eq!(opened.intent, 0x12);
+        assert_eq!(opened.fileno, id);
+
+        pkg.files.get_mut(&id).unwrap().actual_name = "resolved.h5".into();
+        assert_eq!(H5Fopen(&pkg, "resolved.h5").unwrap().id, id);
+        assert!(matches!(
+            H5Fopen(&pkg, "missing.h5"),
+            Err(Error::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn public_flush_and_close_route_through_file_callbacks() {
+        let mut file = FileApiState {
+            eoa: 128,
+            eof: 64,
+            ..FileApiState::default()
+        };
+
+        H5Fflush(&mut file).unwrap();
+        assert_eq!(file.eof, 128);
+
+        H5Fclose(file).unwrap();
+    }
+
+    #[test]
+    fn public_object_id_queries_route_through_file_state() {
+        let mut file = FileApiState::default();
+        file.object_ids.extend([42, 7, 99]);
+
+        assert_eq!(H5F_get_obj_count(&file), 3);
+        assert_eq!(H5Fget_obj_count(&file), 3);
+
+        let mut ids = vec![1];
+        assert_eq!(H5Fget_obj_ids_into(&file, &mut ids), 3);
+        assert_eq!(ids, vec![7, 42, 99]);
+
+        ids.clear();
+        assert_eq!(H5F__get_all_ids_cb_into(&file, &mut ids), 3);
+        assert_eq!(ids, vec![7, 42, 99]);
+    }
+
+    #[test]
     fn metadata_read_retry_info_public_api_reports_configured_retries() {
         let mut file = FileApiState::default();
         H5F_set_retries(&mut file, 7);
@@ -1754,6 +1904,13 @@ mod tests {
         let info = H5Fget_metadata_read_retry_info(&file);
         assert_eq!(info.nbins, H5F_NUM_METADATA_READ_RETRY_TYPES);
         assert_eq!(info.retries, [7; H5F_NUM_METADATA_READ_RETRY_TYPES]);
+
+        let mut out = FileMetadataReadRetryInfo {
+            nbins: 1,
+            retries: [99; H5F_NUM_METADATA_READ_RETRY_TYPES],
+        };
+        H5Fget_metadata_read_retry_info_into(&file, &mut out);
+        assert_eq!(out, info);
     }
 
     #[test]
@@ -1763,12 +1920,22 @@ mod tests {
             H5Fget_mpi_atomicity(&file),
             Err(Error::Unsupported(_))
         ));
+        let mut atomicity = true;
+        assert!(matches!(
+            H5Fget_mpi_atomicity_into(&file, &mut atomicity),
+            Err(Error::Unsupported(_))
+        ));
+        assert!(atomicity);
         assert!(matches!(
             H5Fget_vfd_handle(&file),
             Err(Error::Unsupported(_))
         ));
         assert!(matches!(
             H5Fget_mdc_config(&file),
+            Err(Error::Unsupported(_))
+        ));
+        assert!(matches!(
+            H5Fget_mdc_flush_disabled(&file),
             Err(Error::Unsupported(_))
         ));
         assert!(matches!(H5Fget_mdc_size(&file), Err(Error::Unsupported(_))));
@@ -1791,6 +1958,10 @@ mod tests {
         ));
         assert!(matches!(
             H5Fget_free_sections(&file),
+            Err(Error::Unsupported(_))
+        ));
+        assert!(matches!(
+            H5Fdelete("delete-me.h5"),
             Err(Error::Unsupported(_))
         ));
     }
@@ -1846,6 +2017,7 @@ mod tests {
             name: "logical.h5".into(),
             actual_name: "resolved.h5".into(),
             intent: 0x21,
+            flags: 0x40,
             eof: 99,
             eoa: 88,
             fileno: 42,
@@ -1854,10 +2026,21 @@ mod tests {
         };
 
         assert_eq!(H5Fget_intent(&file), 0x21);
+        let mut intent = 0;
+        H5Fget_intent_into(&file, &mut intent);
+        assert_eq!(intent, 0x21);
+        assert_eq!(H5Fget_access_plist(&file), 0x21);
+        assert_eq!(H5Fget_create_plist(&file), 0x40);
         assert_eq!(H5Fget_filesize(&file), 99);
+        let mut filesize = 0;
+        H5Fget_filesize_into(&file, &mut filesize);
+        assert_eq!(filesize, 99);
         assert_eq!(H5Fget_eoa(&file), 88);
         assert_eq!(H5Fget_freespace(&file), 0);
         assert_eq!(H5Fget_fileno(&file), 42);
+        let mut fileno = 0;
+        H5Fget_fileno_into(&file, &mut fileno);
+        assert_eq!(fileno, 42);
         assert_eq!(H5Fget_name(&file), "resolved.h5");
 
         let mut name = String::new();
@@ -1900,6 +2083,9 @@ mod tests {
         assert_eq!(info.free_space.total_space, 0);
         assert_eq!(info.shared_messages.header_size, H5F_sizeof_addr() as u64);
         assert_eq!(info.shared_messages.message_info_size, 3);
+        let mut info_out = FileApiInfo::default();
+        H5Fget_info2_into(&file, &mut info_out);
+        assert_eq!(info_out, info);
         assert_eq!(H5Fget_info1(&file), info);
     }
 

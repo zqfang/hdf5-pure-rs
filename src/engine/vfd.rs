@@ -324,6 +324,11 @@ impl LocalFileDriver {
         self.eoa = eoa;
     }
 
+    /// `direct` VFD: get the end-of-allocation address.
+    pub fn direct_get_eoa(&self) -> u64 {
+        self.eoa
+    }
+
     /// `direct` VFD: get the end-of-file address.
     pub fn direct_get_eof(&mut self) -> Result<u64> {
         self.driver_get_eof()
@@ -342,6 +347,11 @@ impl LocalFileDriver {
     /// `direct` VFD: write bytes to the file.
     pub fn direct_write(&mut self, addr: u64, data: &[u8]) -> Result<()> {
         self.driver_write(addr, data)
+    }
+
+    /// `direct` VFD: flush buffered writes to disk.
+    pub fn direct_flush(&mut self) -> Result<()> {
+        self.driver_flush()
     }
 
     /// `direct` VFD: truncate the file to the current EOA.
@@ -766,6 +776,12 @@ pub fn H5FD_get_driver_id_by_name(registry: &VfdRegistry, name: &str) -> Option<
     registry.by_name.get(name).copied()
 }
 
+/// Public libhdf5-style lookup of a registered VFD driver id by name.
+#[allow(non_snake_case)]
+pub fn H5FDget_driver_id(registry: &VfdRegistry, name: &str) -> Option<u64> {
+    H5FD_get_driver_id_by_name(registry, name)
+}
+
 /// Look up the name of a driver registered with the given value.
 #[allow(non_snake_case)]
 pub fn H5FD_get_driver_id_by_value(registry: &VfdRegistry, value: u64) -> Option<&str> {
@@ -851,6 +867,13 @@ pub fn H5FDquery(driver: &LocalFileDriver) -> u64 {
     H5FD_get_feature_flags(driver)
 }
 
+/// Public API: query feature flags into a caller-owned output parameter.
+#[allow(non_snake_case)]
+pub fn H5FDquery_into(driver: &LocalFileDriver, flags: &mut u64) -> Result<()> {
+    *flags = H5FD_get_feature_flags(driver);
+    Ok(())
+}
+
 /// Public API: allocate `size` bytes in the file.
 #[allow(non_snake_case)]
 pub fn H5FDalloc(driver: &mut LocalFileDriver, size: u64) -> Result<u64> {
@@ -910,6 +933,14 @@ pub fn H5FD_get_maxaddr() -> u64 {
     u64::MAX
 }
 
+/// `H5FD_set_base_addr`: VFD base address relocation is not supported by this backend.
+#[allow(non_snake_case)]
+pub fn H5FD_set_base_addr(_driver: &mut LocalFileDriver, _base_addr: u64) -> Result<()> {
+    Err(Error::Unsupported(
+        "VFD base address relocation is not implemented in pure-Rust local-only mode".into(),
+    ))
+}
+
 /// Return the feature flags reported by a driver.
 #[allow(non_snake_case)]
 pub fn H5FD_get_feature_flags(driver: &LocalFileDriver) -> u64 {
@@ -931,6 +962,17 @@ pub fn H5FDdriver_query(registry: &VfdRegistry, driver_id: u64) -> Result<u64> {
         id if id == file_driver_kind_id(FileDriverKind::Core) => Ok(0x03),
         _ => Err(unsupported_vfd_driver("custom registered")),
     }
+}
+
+/// Public API: query registered driver flags into a caller-owned output parameter.
+#[allow(non_snake_case)]
+pub fn H5FDdriver_query_into(
+    registry: &VfdRegistry,
+    driver_id: u64,
+    flags: &mut u64,
+) -> Result<()> {
+    *flags = H5FDdriver_query(registry, driver_id)?;
+    Ok(())
 }
 
 /// Setting feature flags is a no-op in the pure-Rust backend.
@@ -1002,6 +1044,28 @@ pub fn H5FDlock(driver: &mut LocalFileDriver, _read_write: bool) -> Result<()> {
 pub fn H5FDunlock(driver: &mut LocalFileDriver) -> Result<()> {
     driver.locked = false;
     Ok(())
+}
+
+/// Public API: dispatch a simple VFD control operation.
+#[allow(non_snake_case)]
+pub fn H5FDctl(driver: &mut LocalFileDriver, new_eoa: Option<u64>) -> Result<()> {
+    if let Some(eoa) = new_eoa {
+        driver.eoa = eoa;
+    }
+    Ok(())
+}
+
+/// Public API: delete a file using the requested VFD.
+#[allow(non_snake_case)]
+pub fn H5FDdelete(path: impl AsRef<Path>, kind: FileDriverKind) -> Result<()> {
+    match kind {
+        FileDriverKind::Sec2 | FileDriverKind::Stdio | FileDriverKind::Direct => {
+            delete_existing(path)
+        }
+        FileDriverKind::Core => Err(Error::Unsupported(
+            "core VFD delete is represented by in-memory driver state".into(),
+        )),
+    }
 }
 
 /// Return the file path of the underlying file, if any.
@@ -4852,13 +4916,52 @@ mod tests {
     }
 
     #[test]
+    fn direct_vfd_get_eoa_and_flush_mirror_driver_state() {
+        let path = std::env::temp_dir().join(format!(
+            "hdf5_pure_rust_direct_vfd_{}_{}.h5",
+            std::process::id(),
+            "get_eoa_flush"
+        ));
+        LocalFileDriver::direct_delete(&path).unwrap();
+
+        let mut driver = LocalFileDriver::direct_open(&path, true).unwrap();
+        assert_eq!(driver.direct_get_eoa(), 0);
+        assert_eq!(driver.direct_get_eof().unwrap(), 0);
+
+        driver.direct_set_eoa(8);
+        assert_eq!(driver.direct_get_eoa(), 8);
+        driver.direct_write(0, b"abcd").unwrap();
+        driver.direct_flush().unwrap();
+        assert_eq!(driver.direct_get_eoa(), 8);
+        assert_eq!(driver.direct_get_eof().unwrap(), 4);
+
+        driver.direct_truncate().unwrap();
+        assert_eq!(driver.direct_get_eof().unwrap(), 8);
+        drop(driver);
+        LocalFileDriver::direct_delete(&path).unwrap();
+    }
+
+    #[test]
     fn public_h5fd_runtime_wrappers_and_driver_query_are_explicit() {
         let mut registry = super::H5FD_init();
+        assert_eq!(
+            super::H5FDget_driver_id(&registry, "sec2"),
+            Some(super::file_driver_kind_id(FileDriverKind::Sec2))
+        );
+        assert_eq!(super::H5FDget_driver_id(&registry, "missing"), None);
         assert_eq!(
             super::H5FDdriver_query(&registry, super::file_driver_kind_id(FileDriverKind::Sec2))
                 .unwrap(),
             0x01
         );
+        let mut flags = 0;
+        super::H5FDdriver_query_into(
+            &registry,
+            super::file_driver_kind_id(FileDriverKind::Sec2),
+            &mut flags,
+        )
+        .unwrap();
+        assert_eq!(flags, 0x01);
         assert_eq!(
             super::H5FDdriver_query(&registry, super::file_driver_kind_id(FileDriverKind::Core))
                 .unwrap(),
@@ -4873,6 +4976,12 @@ mod tests {
             super::H5FDdriver_query(&registry, 99).unwrap_err(),
             Error::Unsupported(_)
         ));
+        flags = 0xfeed;
+        assert!(matches!(
+            super::H5FDdriver_query_into(&registry, 99, &mut flags).unwrap_err(),
+            Error::Unsupported(_)
+        ));
+        assert_eq!(flags, 0xfeed);
 
         let mut driver = LocalFileDriver {
             kind: super::FileDriverKind::Core,
@@ -4888,16 +4997,42 @@ mod tests {
         assert_eq!(super::H5FDget_eoa(&driver), 6);
         super::H5FD_free(&mut driver, 0, 6);
         assert_eq!(super::H5FDget_eoa(&driver), 6);
+        super::H5FDquery_into(&driver, &mut flags).unwrap();
+        assert_eq!(flags, 0x03);
 
         driver.core_write(0, b"abcdef").unwrap();
         super::H5FDset_eoa(&mut driver, 3);
         super::H5FDtruncate(&mut driver).unwrap();
         assert_eq!(driver.core_get_handle().unwrap(), b"abc");
+        assert!(matches!(
+            super::H5FD_set_base_addr(&mut driver, 512).unwrap_err(),
+            Error::Unsupported(_)
+        ));
 
         super::H5FDlock(&mut driver, true).unwrap();
         assert!(driver.locked);
         super::H5FDunlock(&mut driver).unwrap();
         assert!(!driver.locked);
+
+        super::H5FDctl(&mut driver, Some(11)).unwrap();
+        assert_eq!(super::H5FDget_eoa(&driver), 11);
+        super::H5FDctl(&mut driver, None).unwrap();
+        assert_eq!(super::H5FDget_eoa(&driver), 11);
+
+        let path = std::env::temp_dir().join(format!(
+            "hdf5_pure_rust_h5fddelete_{}_{}.h5",
+            std::process::id(),
+            "public"
+        ));
+        std::fs::write(&path, b"delete me").unwrap();
+        assert!(path.exists());
+        super::H5FDdelete(&path, FileDriverKind::Sec2).unwrap();
+        assert!(!path.exists());
+        super::H5FDdelete(&path, FileDriverKind::Sec2).unwrap();
+        assert!(matches!(
+            super::H5FDdelete(&path, FileDriverKind::Core).unwrap_err(),
+            Error::Unsupported(_)
+        ));
     }
 
     #[test]

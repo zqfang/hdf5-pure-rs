@@ -32,6 +32,27 @@ fn assert_h5dump_dataset_read(path: &std::path::Path, dataset: &str, context: &s
     }
 }
 
+fn assert_h5py_script(path: &std::path::Path, script: &str, context: &str) {
+    let out = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(format!(
+            "import sys, h5py\n\
+             f = h5py.File(sys.argv[1], 'r')\n\
+             {script}\n\
+             f.close()\n\
+             print('OK')"
+        ))
+        .arg(path)
+        .output();
+    if let Ok(out) = out {
+        assert!(
+            out.status.success() && String::from_utf8_lossy(&out.stdout).contains("OK"),
+            "h5py verification failed on {context}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
 #[test]
 fn test_write_chunked_no_compression() {
     let dir = tempfile::tempdir().unwrap();
@@ -77,6 +98,21 @@ fn test_write_chunked_no_compression() {
             assert_eq!(*v, i as f32, "mismatch at index {i}");
         }
     }
+
+    assert_h5dump_dataset_read(
+        &path,
+        "chunked",
+        "uncompressed fixed-array chunked writer fixture",
+    );
+    assert_h5py_script(
+        &path,
+        "d = f['chunked']\n\
+         assert d.shape == (100,)\n\
+         assert d.chunks == (10,)\n\
+         assert d.compression is None\n\
+         assert d[:].tolist() == [float(i) for i in range(100)]",
+        "uncompressed fixed-array chunked writer fixture",
+    );
 }
 
 #[test]
@@ -123,6 +159,16 @@ fn test_write_single_chunk_uses_v4_single_chunk_index() {
     let mut values = vec![0i32; ds.size().unwrap() as usize];
     read_dataset_into(&ds, &mut values).unwrap();
     assert_eq!(values, (0..12).collect::<Vec<_>>());
+
+    assert_h5py_script(
+        &path,
+        "d = f['single']\n\
+         assert d.shape == (12,)\n\
+         assert d.chunks == (16,)\n\
+         assert d.compression is None\n\
+         assert d[:].tolist() == list(range(12))",
+        "single-chunk writer fixture",
+    );
 }
 
 #[test]
@@ -171,6 +217,18 @@ fn test_write_filtered_single_chunk_uses_v4_single_chunk_index() {
     let mut values = vec![0i32; ds.size().unwrap() as usize];
     read_dataset_into(&ds, &mut values).unwrap();
     assert_eq!(values, (0..64).map(|i| i % 7).collect::<Vec<_>>());
+
+    assert_h5py_script(
+        &path,
+        "d = f['single_deflate']\n\
+         assert d.shape == (64,)\n\
+         assert d.chunks == (64,)\n\
+         assert d.compression == 'gzip'\n\
+         assert d.compression_opts == 6\n\
+         assert d.shuffle\n\
+         assert d[:].tolist() == [i % 7 for i in range(64)]",
+        "filtered single-chunk writer fixture",
+    );
 }
 
 #[test]
@@ -268,6 +326,30 @@ fn test_write_chunked_with_deflate() {
             );
         }
     }
+
+    let out = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(
+            "import sys, h5py\n\
+             f = h5py.File(sys.argv[1], 'r')\n\
+             d = f['compressed']\n\
+             assert d.shape == (100,)\n\
+             assert d.chunks == (25,)\n\
+             assert d.compression == 'gzip'\n\
+             assert d.compression_opts == 6\n\
+             assert list(d[:]) == [float(i) for i in range(100)]\n\
+             f.close()\n\
+             print('OK')",
+        )
+        .arg(&path)
+        .output();
+    if let Ok(out) = out {
+        assert!(
+            out.status.success() && String::from_utf8_lossy(&out.stdout).contains("OK"),
+            "h5py: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
 }
 
 #[test]
@@ -360,6 +442,108 @@ fn test_write_chunked_max_shape_uses_extensible_array_index() {
     let mut values = vec![0i32; ds.size().unwrap() as usize];
     read_dataset_into(&ds, &mut values).unwrap();
     assert_eq!(values, (0..12).collect::<Vec<_>>());
+
+    assert_h5dump_dataset_read(
+        &path,
+        "max_shape_ea",
+        "extensible-array max-shape chunked writer fixture",
+    );
+    let out = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(
+            "import sys, h5py\n\
+             f = h5py.File(sys.argv[1], 'r')\n\
+             d = f['max_shape_ea']\n\
+             assert d.shape == (12,)\n\
+             assert d.chunks == (3,)\n\
+             assert d.maxshape == (None,)\n\
+             assert list(d[:]) == list(range(12))\n\
+             f.close()\n\
+             print('OK')",
+        )
+        .arg(&path)
+        .output();
+    if let Ok(out) = out {
+        assert!(
+            out.status.success() && String::from_utf8_lossy(&out.stdout).contains("OK"),
+            "h5py: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+#[test]
+fn test_write_extensible_array_partial_edge_chunk_h5py_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("written_ea_partial_edge_chunk.h5");
+
+    {
+        let f = fs::File::create(&path).unwrap();
+        let mut w = HdfFileWriter::new(f);
+        w.begin().unwrap();
+        w.create_root_group().unwrap();
+
+        let data: Vec<i32> = (0..10).map(|value| value * 3 - 5).collect();
+        let data_bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
+
+        w.create_chunked_dataset(
+            "/",
+            &DatasetSpec {
+                name: "ea_partial_edge",
+                shape: &[10],
+                max_shape: Some(&[u64::MAX]),
+                dtype: DtypeSpec::I32,
+                data: &data_bytes,
+            },
+            &[4],
+            None,
+            false,
+        )
+        .unwrap();
+
+        w.finalize().unwrap();
+    }
+
+    let f = File::open(&path).unwrap();
+    let ds = f.dataset("ea_partial_edge").unwrap();
+    let info = ds.info().unwrap();
+    assert_eq!(info.layout.version, 4);
+    assert_eq!(
+        info.layout.chunk_index_type,
+        Some(ChunkIndexType::ExtensibleArray)
+    );
+
+    let expected: Vec<i32> = (0..10).map(|value| value * 3 - 5).collect();
+    let mut values = vec![0i32; ds.size().unwrap() as usize];
+    read_dataset_into(&ds, &mut values).unwrap();
+    assert_eq!(values, expected);
+
+    assert_h5dump_dataset_read(
+        &path,
+        "ea_partial_edge",
+        "extensible-array partial edge chunk file",
+    );
+    let out = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(
+            "import sys, h5py\n\
+             f = h5py.File(sys.argv[1], 'r')\n\
+             d = f['ea_partial_edge']\n\
+             assert d.shape == (10,)\n\
+             assert d.chunks == (4,)\n\
+             assert list(d[:]) == [-5, -2, 1, 4, 7, 10, 13, 16, 19, 22]\n\
+             f.close()\n\
+             print('OK')",
+        )
+        .arg(&path)
+        .output();
+    if let Ok(out) = out {
+        assert!(
+            out.status.success() && String::from_utf8_lossy(&out.stdout).contains("OK"),
+            "h5py: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
 }
 
 #[test]
@@ -403,6 +587,31 @@ fn test_write_chunked_large_max_shape_uses_extensible_array_index() {
     let mut values = vec![0u8; ds.size().unwrap() as usize];
     read_dataset_into(&ds, &mut values).unwrap();
     assert_eq!(values, data);
+
+    let out = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(
+            "import sys, h5py\n\
+             f = h5py.File(sys.argv[1], 'r')\n\
+             d = f['large_ea_grid']\n\
+             assert d.shape == (256,)\n\
+             assert d.chunks == (1,)\n\
+             assert d.maxshape == (None,)\n\
+             assert d[0] == 0\n\
+             assert d[255] == 255\n\
+             assert list(d[:]) == list(range(256))\n\
+             f.close()\n\
+             print('OK')",
+        )
+        .arg(&path)
+        .output();
+    if let Ok(out) = out {
+        assert!(
+            out.status.success() && String::from_utf8_lossy(&out.stdout).contains("OK"),
+            "h5py: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
 }
 
 #[test]
@@ -453,26 +662,16 @@ fn test_write_chunked_finite_max_shape_uses_btree_v2_index() {
     );
 
     assert_h5dump_dataset_read(&path, "finite_max_shape", "finite max-shape B-tree v2 file");
-    let out = std::process::Command::new("python3")
-        .arg("-c")
-        .arg(
-            "import sys, h5py\n\
-             f = h5py.File(sys.argv[1], 'r')\n\
-             d = f['finite_max_shape']\n\
-             assert d.shape == (12,)\n\
-             assert list(d[:]) == [-3, 4, 11, 18, 25, 32, 39, 46, 53, 60, 67, 74]\n\
-             f.close()\n\
-             print('OK')",
-        )
-        .arg(&path)
-        .output();
-    if let Ok(out) = out {
-        assert!(
-            out.status.success() && String::from_utf8_lossy(&out.stdout).contains("OK"),
-            "h5py: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
+    assert_h5py_script(
+        &path,
+        "d = f['finite_max_shape']\n\
+         assert d.shape == (12,)\n\
+         assert d.chunks == (3,)\n\
+         assert d.maxshape == (24,)\n\
+         assert d.compression is None\n\
+         assert d[:].tolist() == [-3, 4, 11, 18, 25, 32, 39, 46, 53, 60, 67, 74]",
+        "finite max-shape B-tree v2 file",
+    );
 }
 
 #[test]
@@ -520,4 +719,15 @@ fn test_write_chunked_with_shuffle_and_deflate() {
     }
 
     assert_h5dump_dataset_read(&path, "shuf_def", "shuffle+deflate chunked file");
+    assert_h5py_script(
+        &path,
+        "d = f['shuf_def']\n\
+         assert d.shape == (50,)\n\
+         assert d.chunks == (10,)\n\
+         assert d.compression == 'gzip'\n\
+         assert d.compression_opts == 4\n\
+         assert d.shuffle\n\
+         assert d[:].tolist() == list(range(50))",
+        "shuffle+deflate chunked writer fixture",
+    );
 }

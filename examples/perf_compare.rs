@@ -63,6 +63,12 @@ impl ChecksumValue for i32 {
     }
 }
 
+impl ChecksumValue for i64 {
+    fn checksum_value(self) -> f64 {
+        self as f64
+    }
+}
+
 fn read_dataset_typed<T: ChecksumValue + H5Type>(
     path: &PathBuf,
     dataset_name: &str,
@@ -147,7 +153,7 @@ fn main() -> hdf5_pure_rust::Result<()> {
     let mode = args
         .next()
         .unwrap_or_else(|| {
-            "usage: perf_compare <write|read|read-f64|read-i32|bench-read|bench-read-f64|bench-read-i32|read-raw|bench-read-raw> <path> [dataset|len] [chunk|seconds] [deflate]"
+            "usage: perf_compare <write|read|read-f64|read-i32|read-i64|bench-read|bench-read-f64|bench-read-i32|bench-read-i64|read-raw|bench-read-raw> <path> [dataset|len] [chunk|seconds] [deflate]"
                 .into()
         });
     let path = PathBuf::from(
@@ -197,6 +203,16 @@ fn main() -> hdf5_pure_rust::Result<()> {
                 checksum
             );
         }
+        "read-i64" => {
+            let dataset_name = args.next().unwrap_or_else(|| "data".to_string());
+            let start = Instant::now();
+            let checksum = read_dataset_typed::<i64>(&path, &dataset_name)?;
+            println!(
+                "read_ms={:.3} checksum={:.1}",
+                start.elapsed().as_secs_f64() * 1000.0,
+                checksum
+            );
+        }
         "bench-read" => {
             let dataset_name = args.next().unwrap_or_else(|| "data".to_string());
             let target_seconds = args
@@ -220,6 +236,14 @@ fn main() -> hdf5_pure_rust::Result<()> {
                 .map(|s| parse_f64("target_seconds", &s))
                 .unwrap_or(5.0);
             benchmark_reads::<i32>(&path, &dataset_name, target_seconds)?;
+        }
+        "bench-read-i64" => {
+            let dataset_name = args.next().unwrap_or_else(|| "data".to_string());
+            let target_seconds = args
+                .next()
+                .map(|s| parse_f64("target_seconds", &s))
+                .unwrap_or(5.0);
+            benchmark_reads::<i64>(&path, &dataset_name, target_seconds)?;
         }
         "read-raw" => {
             let dataset_name = args.next().unwrap_or_else(|| "data".to_string());

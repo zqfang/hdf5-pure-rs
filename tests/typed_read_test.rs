@@ -1,4 +1,17 @@
+use hdf5_pure_rust::hl::types::H5Type;
 use hdf5_pure_rust::File;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(C)]
+struct I16ArrayCell {
+    values: [i16; 6],
+}
+
+unsafe impl H5Type for I16ArrayCell {
+    fn type_size() -> usize {
+        std::mem::size_of::<Self>()
+    }
+}
 
 #[test]
 fn test_read_typed_f64() {
@@ -31,6 +44,14 @@ fn test_dataset_read_into_uses_caller_buffers() {
     ds.read_into(&mut values).unwrap();
     assert_eq!(values, [10, 20, 30]);
 
+    let mut narrowed = [i16::MIN; 3];
+    ds.read_into(&mut narrowed).unwrap();
+    assert_eq!(narrowed, [10, 20, 30]);
+
+    let mut widened = [-1.0f64; 3];
+    ds.read_into(&mut widened).unwrap();
+    assert_eq!(widened, [10.0, 20.0, 30.0]);
+
     let mut too_short = [0i32; 2];
     assert!(ds.read_into(&mut too_short).is_err());
 }
@@ -41,6 +62,10 @@ fn test_read_scalar_typed() {
     let ds = f.dataset("scalar").unwrap();
     let val: f64 = ds.read_scalar::<f64>().unwrap();
     assert_eq!(val, 42.0);
+
+    let mut val32 = 0.0f32;
+    ds.read_scalar_into(&mut val32).unwrap();
+    assert_eq!(val32, 42.0);
 }
 
 #[test]
@@ -182,4 +207,33 @@ fn test_read_wrong_type_size() {
     let mut value = [0u64; 1];
     let result = ds.read_into(&mut value);
     assert!(result.is_err());
+}
+
+#[test]
+fn test_read_array_datatype_into_matching_typed_cells() {
+    let f = File::open("tests/data/hdf5_ref/array_datatype_cases.h5").unwrap();
+    let ds = f.dataset("array_i16_2x3").unwrap();
+
+    let mut cells = [I16ArrayCell { values: [0; 6] }; 2];
+    ds.read_into(&mut cells).unwrap();
+    assert_eq!(
+        cells,
+        [
+            I16ArrayCell {
+                values: [0, 1, 2, 3, 4, 5]
+            },
+            I16ArrayCell {
+                values: [6, 7, 8, 9, 10, 11]
+            }
+        ]
+    );
+
+    let mut flattened = [0i16; 12];
+    let err = ds
+        .read_into(&mut flattened)
+        .expect_err("array datatype reads should preserve dataspace element boundaries");
+    assert!(
+        err.to_string().contains("requested element size 2"),
+        "unexpected error: {err}"
+    );
 }

@@ -89,6 +89,28 @@ fn assert_h5dump_dataset_read(path: &std::path::Path, dataset: &str, context: &s
     }
 }
 
+fn assert_h5py_script(path: &std::path::Path, script: &str, context: &str) {
+    let code = format!(
+        "import sys, h5py\n\
+         f = h5py.File(sys.argv[1], 'r')\n\
+         {script}\n\
+         f.close()\n\
+         print('OK')"
+    );
+    let out = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(code)
+        .arg(path)
+        .output();
+    if let Ok(out) = out {
+        assert!(
+            out.status.success() && String::from_utf8_lossy(&out.stdout).contains("OK"),
+            "h5py verification failed on {context}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
 fn dataset_scalar<T>(ds: &Dataset) -> Result<T>
 where
     T: H5Type + Default,
@@ -445,6 +467,16 @@ fn test_writable_group_attr() {
         let value: i64 = g.attr("site_id").unwrap().read_scalar::<i64>().unwrap();
         assert_eq!(value, 17);
     }
+
+    assert_h5py_script(
+        &path,
+        "g = f['sensors']\n\
+         assert g.attrs['site_id'] == 17\n\
+         d = g['pressure']\n\
+         assert d.shape == (2,)\n\
+         assert d[:].tolist() == [1013.25, 1012.0]",
+        "group attribute writer fixture",
+    );
 }
 
 #[test]
@@ -523,6 +555,13 @@ fn test_writable_root_and_group_array_attrs() {
         assert_eq!(group_attr.shape(), &[4]);
         assert_attribute_values::<i32>(&group_attr, &[10, 20, 30, 40]).unwrap();
     }
+
+    assert_h5py_script(
+        &path,
+        "assert f.attrs['calibration'].tolist() == [1.0, 2.5, 4.0]\n\
+         assert f['sensors'].attrs['ids'].tolist() == [10, 20, 30, 40]",
+        "root and group array attribute writer fixture",
+    );
 }
 
 #[test]
@@ -752,6 +791,15 @@ fn test_dataset_builder_scalar_and_array_attrs() {
         assert_eq!(scale.shape(), &[3]);
         assert_attribute_values::<f64>(&scale, &[1.0, 10.0, 100.0]).unwrap();
     }
+
+    assert_h5py_script(
+        &path,
+        "d = f['values']\n\
+         assert d[:].tolist() == [4, 5, 6]\n\
+         assert d.attrs['version'] == 2\n\
+         assert d.attrs['scale'].tolist() == [1.0, 10.0, 100.0]",
+        "dataset builder numeric attribute writer fixture",
+    );
 }
 
 #[test]
@@ -774,6 +822,16 @@ fn test_dataset_builder_fixed_string_attrs() {
         assert_eq!(attribute_string(&ds.attr("units").unwrap()).unwrap(), "ms");
         assert_eq!(attribute_string(&ds.attr("label").unwrap()).unwrap(), "猫");
     }
+
+    assert_h5py_script(
+        &path,
+        "d = f['values']\n\
+         text = lambda value: value.decode('utf-8') if isinstance(value, bytes) else str(value)\n\
+         assert d[:].tolist() == [1, 2, 3]\n\
+         assert text(d.attrs['units']).rstrip('\\x00') == 'ms'\n\
+         assert text(d.attrs['label']).rstrip('\\x00') == '猫'",
+        "dataset builder fixed-string attribute writer fixture",
+    );
 }
 
 #[test]
@@ -796,6 +854,16 @@ fn test_dataset_builder_fixed_string_array_attrs() {
         assert_attribute_strings(&ds.attr("units").unwrap(), &["ms", "s"]).unwrap();
         assert_attribute_strings(&ds.attr("labels").unwrap(), &["猫", "å"]).unwrap();
     }
+
+    assert_h5py_script(
+        &path,
+        "d = f['values']\n\
+         text = lambda value: value.decode('utf-8') if isinstance(value, bytes) else str(value)\n\
+         assert d[:].tolist() == [1, 2, 3]\n\
+         assert [text(value).rstrip('\\x00') for value in d.attrs['units'].tolist()] == ['ms', 's']\n\
+         assert [text(value).rstrip('\\x00') for value in d.attrs['labels'].tolist()] == ['猫', 'å']",
+        "dataset builder fixed-string array attribute writer fixture",
+    );
 }
 
 #[test]
@@ -817,6 +885,14 @@ fn test_dataset_builder_compact_attrs() {
         assert_dataset_values::<i16>(&ds, &[7, 8, 9]).unwrap();
         assert_eq!(ds.attr("version").unwrap().read_scalar_i64(), Some(3));
     }
+
+    assert_h5py_script(
+        &path,
+        "d = f['values']\n\
+         assert d[:].tolist() == [7, 8, 9]\n\
+         assert d.attrs['version'] == 3",
+        "compact dataset attribute writer fixture",
+    );
 }
 
 #[test]
@@ -870,6 +946,20 @@ fn test_dataset_builder_attrs_with_explicit_fill_values() {
         assert_eq!(scalar.attr("version").unwrap().read_scalar_i64(), Some(6));
         assert_eq!(dataset_scalar::<u64>(&scalar).unwrap(), 42);
     }
+
+    assert_h5py_script(
+        &path,
+        "assert f['contiguous'][:].tolist() == [1, 2, 3]\n\
+         assert f['contiguous'].fillvalue == -7\n\
+         assert f['contiguous'].attrs['version'] == 4\n\
+         assert f['compact'][:].tolist() == [7, 8]\n\
+         assert f['compact'].fillvalue == -2\n\
+         assert f['compact'].attrs['version'] == 5\n\
+         assert int(f['scalar'][()]) == 42\n\
+         assert f['scalar'].fillvalue == 99\n\
+         assert f['scalar'].attrs['version'] == 6",
+        "dataset attribute and explicit fill-value writer fixture",
+    );
 }
 
 #[test]
@@ -1475,6 +1565,19 @@ fn test_dataset_builder_fixed_max_shape_uses_fixed_chunk_indexes() {
         assert!(stdout.contains("fixed_single"));
         assert!(stdout.contains("CHUNKED"));
     }
+
+    assert_h5py_script(
+        &path,
+        "assert f['fixed_grid'].shape == (16,)\n\
+         assert f['fixed_grid'].chunks == (4,)\n\
+         assert f['fixed_grid'][:].tolist() == list(range(16))\n\
+         assert f['fixed_single'].shape == (3,)\n\
+         assert f['fixed_single'].chunks == (8,)\n\
+         assert f['fixed_single'][:].tolist() == [7, 8, 9]\n\
+         assert f['fixed_fill'][:].tolist() == [-4] * 12\n\
+         assert f['fixed_sparse'][:].tolist() == [30, 31, 32, 33, -2, -2, -2, -2, -2, -2, -2, -2, 40, 41, 42, 43]",
+        "fixed max-shape fixed-array and single-chunk fixture",
+    );
 }
 
 #[test]
@@ -1503,6 +1606,15 @@ fn test_dataset_builder_finite_max_shape_full_write_uses_btree_v2() {
     }
 
     assert_h5dump_dataset_read(&path, "data", "finite max-shape full B-tree v2 fixture");
+    assert_h5py_script(
+        &path,
+        "d = f['data']\n\
+         assert d.shape == (300,)\n\
+         assert d.maxshape == (600,)\n\
+         assert d.chunks == (1,)\n\
+         assert d[:].tolist() == list(range(300))",
+        "finite max-shape full B-tree v2 fixture",
+    );
 }
 
 #[test]
@@ -1556,6 +1668,17 @@ fn test_dataset_builder_chunked_attrs() {
         assert_eq!(ds.attr("version").unwrap().read_scalar_i64(), Some(7));
         assert_attribute_values::<f64>(&ds.attr("scale").unwrap(), &[1.0, 2.0]).unwrap();
     }
+
+    assert_h5py_script(
+        &path,
+        "d = f['data']\n\
+         assert d.shape == (16,)\n\
+         assert d.chunks == (4,)\n\
+         assert d[:].tolist() == list(range(16))\n\
+         assert d.attrs['version'] == 7\n\
+         assert d.attrs['scale'].tolist() == [1.0, 2.0]",
+        "chunked dataset attribute writer fixture",
+    );
 }
 
 #[test]
@@ -1638,6 +1761,20 @@ fn test_dataset_builder_compressed_chunked_attrs_with_fill_value() {
         let plist = ds.create_plist().unwrap();
         assert_eq!(plist.fill_value, Some((-9i16).to_le_bytes().to_vec()));
     }
+
+    assert_h5py_script(
+        &path,
+        "d = f['data']\n\
+         assert d.shape == (30,)\n\
+         assert d.chunks == (8,)\n\
+         assert d.compression == 'gzip'\n\
+         assert d.compression_opts == 3\n\
+         assert d.shuffle\n\
+         assert d.fillvalue == -9\n\
+         assert d.attrs['version'] == 8\n\
+         assert d[:].tolist() == list(range(30))",
+        "compressed chunked attribute and fill-value writer fixture",
+    );
 }
 
 #[test]
@@ -1666,6 +1803,18 @@ fn test_dataset_builder_sparse_chunked_fill_only_dataset() {
         let plist = ds.create_plist().unwrap();
         assert_eq!(plist.fill_value, Some((-11i32).to_le_bytes().to_vec()));
     }
+
+    assert_h5py_script(
+        &path,
+        "d = f['data']\n\
+         assert d.shape == (1000,)\n\
+         assert d.chunks == (128,)\n\
+         assert d.fillvalue == -11\n\
+         assert d.attrs['version'] == 14\n\
+         assert d[:10].tolist() == [-11] * 10\n\
+         assert d[990:].tolist() == [-11] * 10",
+        "sparse chunked fill-only writer fixture",
+    );
 }
 
 #[test]
@@ -1723,6 +1872,22 @@ fn test_dataset_builder_sparse_max_shape_fill_only_uses_modern_indexes() {
         &path,
         "multi_grow",
         "multi grow fill-only B-tree v2 fixture",
+    );
+    assert_h5py_script(
+        &path,
+        "single = f['single_grow']\n\
+         assert single.shape == (12,)\n\
+         assert single.maxshape == (24,)\n\
+         assert single.chunks == (4,)\n\
+         assert single.fillvalue == -3\n\
+         assert single[:].tolist() == [-3] * 12\n\
+         multi = f['multi_grow']\n\
+         assert multi.shape == (4, 4)\n\
+         assert multi.maxshape == (8, 8)\n\
+         assert multi.chunks == (2, 2)\n\
+         assert multi.fillvalue == -8\n\
+         assert multi[:].tolist() == [[-8] * 4 for _ in range(4)]",
+        "fill-only growable B-tree v2 writer fixtures",
     );
 }
 
@@ -1790,6 +1955,20 @@ fn test_dataset_builder_sparse_unfiltered_explicit_chunks_use_fixed_array() {
         assert!(values[8..24].iter().all(|&value| value == 99));
         assert_eq!(&values[24..], &last);
     }
+
+    assert_h5dump_dataset_read(
+        &path,
+        "data",
+        "sparse unfiltered fixed-array explicit-chunk fixture",
+    );
+    assert_h5py_script(
+        &path,
+        "d = f['data']\n\
+         assert d.shape == (32,)\n\
+         assert d.chunks == (8,)\n\
+         assert d[:].tolist() == [2] * 8 + [99] * 16 + [7] * 8",
+        "sparse unfiltered fixed-array explicit-chunk fixture",
+    );
 }
 
 #[test]
@@ -1826,6 +2005,21 @@ fn test_dataset_builder_sparse_filtered_explicit_chunks_use_fixed_array() {
         assert!(values[8..24].iter().all(|&value| value == 99));
         assert_eq!(&values[24..], &last);
     }
+
+    assert_h5dump_dataset_read(
+        &path,
+        "data",
+        "sparse filtered fixed-array explicit-chunk fixture",
+    );
+    assert_h5py_script(
+        &path,
+        "d = f['data']\n\
+         assert d.shape == (32,)\n\
+         assert d.chunks == (8,)\n\
+         assert d.compression == 'gzip'\n\
+         assert d[:].tolist() == [4] * 8 + [99] * 16 + [11] * 8",
+        "sparse filtered fixed-array explicit-chunk fixture",
+    );
 }
 
 #[test]
@@ -1862,6 +2056,14 @@ fn test_dataset_builder_sparse_chunked_explicit_chunks_with_max_shape_uses_btree
     assert_h5dump_dataset_read(
         &path,
         "data",
+        "sparse unfiltered B-tree v2 explicit-chunk fixture",
+    );
+    assert_h5py_script(
+        &path,
+        "d = f['data']\n\
+         assert d.shape == (16,)\n\
+         assert d.chunks == (4,)\n\
+         assert d[:].tolist() == [3] * 4 + [-2] * 8 + [9] * 4",
         "sparse unfiltered B-tree v2 explicit-chunk fixture",
     );
 }
@@ -1904,6 +2106,15 @@ fn test_dataset_builder_sparse_filtered_explicit_chunks_with_max_shape_uses_btre
         "data",
         "sparse filtered B-tree v2 explicit-chunk fixture",
     );
+    assert_h5py_script(
+        &path,
+        "d = f['data']\n\
+         assert d.shape == (16,)\n\
+         assert d.chunks == (4,)\n\
+         assert d.compression == 'gzip'\n\
+         assert d[:].tolist() == [6] * 4 + [-2] * 8 + [12] * 4",
+        "sparse filtered B-tree v2 explicit-chunk fixture",
+    );
 }
 
 #[test]
@@ -1940,6 +2151,14 @@ fn test_dataset_builder_sparse_multidim_growable_chunks_use_btree_v2() {
     assert_h5dump_dataset_read(
         &path,
         "data",
+        "sparse multidimensional growable B-tree v2 fixture",
+    );
+    assert_h5py_script(
+        &path,
+        "d = f['data']\n\
+         assert d.shape == (4, 4)\n\
+         assert d.chunks == (2, 2)\n\
+         assert d[:].tolist() == [[10, 11, -5, -5], [12, 13, -5, -5], [-5, -5, 30, 31], [-5, -5, 32, 33]]",
         "sparse multidimensional growable B-tree v2 fixture",
     );
 }
@@ -2016,6 +2235,14 @@ fn test_writable_file_scalar() {
         let val = dataset_scalar::<f64>(&ds).unwrap();
         assert!((val - std::f64::consts::PI).abs() < 1e-15);
     }
+
+    assert_h5py_script(
+        &path,
+        "d = f['pi']\n\
+         assert d.shape == ()\n\
+         assert abs(float(d[()]) - 3.141592653589793) < 1e-15",
+        "scalar dataset fixture",
+    );
 }
 
 #[test]
@@ -2310,6 +2537,19 @@ fn test_writable_file_chunked_filtered_vlen_utf8_strings() {
         assert!(stdout.contains("DEFLATE"));
         assert!(stdout.contains("SHUFFLE"));
     }
+
+    assert_h5py_script(
+        &path,
+        "d = f['names']\n\
+         assert d.shape == (5,)\n\
+         assert d.chunks == (2,)\n\
+         assert d.compression == 'gzip'\n\
+         assert d.compression_opts == 3\n\
+         assert d.shuffle\n\
+         assert [value.decode('utf-8') for value in d[:].tolist()] == ['', '猫', 'alpha', 'beta', 'delta']\n\
+         assert d.attrs['version'] == 13",
+        "chunked filtered vlen UTF-8 string fixture",
+    );
 }
 
 #[test]

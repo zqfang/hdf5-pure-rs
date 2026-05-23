@@ -36,6 +36,11 @@ pub struct SharedMessageIndex {
 }
 
 impl FileCreate {
+    /// Default file creation properties used by the pure-Rust writer.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
     /// Extract file creation properties from a File.
     pub fn from_file(f: &crate::hl::file::File) -> Self {
         let sb = f.superblock();
@@ -160,5 +165,22 @@ impl FileCreate {
     /// Set shared-message list/tree phase-change thresholds.
     pub fn set_shared_mesg_phase_change(&mut self, max_list: u32, min_btree: u32) {
         self.shared_mesg_phase_change = (max_list, min_btree);
+    }
+}
+
+impl Default for FileCreate {
+    fn default() -> Self {
+        Self {
+            superblock_version: 3,
+            sizeof_addr: 8,
+            sizeof_size: 8,
+            sym_leaf_k: 4,
+            btree_k: 16,
+            chunk_btree_k: 32,
+            file_space: (FileSpaceStrategy::Aggregate, false, 1),
+            file_space_page_size: 4096,
+            shared_mesg_indexes: Vec::new(),
+            shared_mesg_phase_change: (50, 40),
+        }
     }
 }

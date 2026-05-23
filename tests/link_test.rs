@@ -185,6 +185,112 @@ fn test_soft_link_resolution_normalizes_relative_targets() {
 }
 
 #[test]
+fn test_soft_link_resolution_normalizes_deep_relative_targets() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("soft_link_deep_relative_resolution.h5");
+
+    {
+        let mut wf = WritableFile::create(&path).unwrap();
+        let mut real = wf.create_group("real").unwrap();
+        real.new_dataset_builder("data")
+            .write::<i32>(&[77, 88])
+            .unwrap();
+        let mut aliases = wf.create_group("aliases").unwrap();
+        let mut nested = aliases.create_group("nested").unwrap();
+        nested
+            .link_soft("deep_relative_data", "../.././real//data")
+            .unwrap();
+        nested
+            .link_soft(
+                "absolute_with_dotdots",
+                "/aliases/nested/../nested/../../real/data",
+            )
+            .unwrap();
+        wf.flush().unwrap();
+    }
+
+    let f = File::open(&path).unwrap();
+    assert_i32_dataset_values(
+        &f.dataset("aliases/nested/deep_relative_data").unwrap(),
+        &[77, 88],
+    )
+    .unwrap();
+    assert_i32_dataset_values(
+        &f.dataset("aliases/nested/absolute_with_dotdots").unwrap(),
+        &[77, 88],
+    )
+    .unwrap();
+}
+
+#[test]
+fn test_soft_link_resolution_clamps_parent_walks_at_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("soft_link_root_clamp_resolution.h5");
+
+    {
+        let mut wf = WritableFile::create(&path).unwrap();
+        let mut real = wf.create_group("real").unwrap();
+        real.new_dataset_builder("data")
+            .write::<i32>(&[101, 202])
+            .unwrap();
+        let mut aliases = wf.create_group("aliases").unwrap();
+        aliases
+            .link_soft("above_root_group", "../../../real")
+            .unwrap();
+        wf.flush().unwrap();
+    }
+
+    let f = File::open(&path).unwrap();
+    assert_i32_dataset_values(
+        &f.dataset("aliases/above_root_group/data").unwrap(),
+        &[101, 202],
+    )
+    .unwrap();
+}
+
+#[test]
+fn test_soft_link_resolution_normalizes_group_targets_with_remaining_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir
+        .path()
+        .join("soft_link_group_target_remaining_path_resolution.h5");
+
+    {
+        let mut wf = WritableFile::create(&path).unwrap();
+        let mut real = wf.create_group("real").unwrap();
+        let mut deep = real.create_group("deep").unwrap();
+        deep.new_dataset_builder("data")
+            .write::<i32>(&[303, 404])
+            .unwrap();
+        let mut aliases = wf.create_group("aliases").unwrap();
+        let mut nested = aliases.create_group("nested").unwrap();
+        nested
+            .link_soft("group_alias", "../.././real//deep/..")
+            .unwrap();
+        nested
+            .link_soft("clamped_group", "../../../../real/./")
+            .unwrap();
+        wf.link_soft("through_group_alias", "/aliases/nested/group_alias/deep")
+            .unwrap();
+        wf.flush().unwrap();
+    }
+
+    let f = File::open(&path).unwrap();
+    assert_i32_dataset_values(
+        &f.dataset("aliases/nested/group_alias/deep/./data").unwrap(),
+        &[303, 404],
+    )
+    .unwrap();
+    assert_i32_dataset_values(
+        &f.dataset("aliases/nested/clamped_group/deep/data").unwrap(),
+        &[303, 404],
+    )
+    .unwrap();
+    assert_i32_dataset_values(&f.dataset("through_group_alias/data").unwrap(), &[303, 404])
+        .unwrap();
+}
+
+#[test]
 fn test_soft_link_cycle_detected_after_relative_target_normalization() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("soft_link_normalized_cycle.h5");

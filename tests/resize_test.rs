@@ -864,6 +864,17 @@ fn test_write_chunk_replaces_existing_chunk() {
         dataset_read_into(&ds, &mut vals).unwrap();
         assert_eq!(vals, vec![0, 1, 2, 3, 4, 100, 101, 102, 103, 104]);
     }
+
+    assert_logical_eoa_matches_file_len(&path);
+    assert_h5dump_dataset_read(&path, "data", "simple replaced chunk file");
+    assert_h5py_script(
+        &path,
+        "d = f['data']\n\
+         assert d.shape == (10,)\n\
+         assert d.chunks == (5,)\n\
+         assert d[:].tolist() == [0, 1, 2, 3, 4, 100, 101, 102, 103, 104]",
+        "simple replaced chunk file",
+    );
 }
 
 #[test]
@@ -905,6 +916,13 @@ fn test_write_chunk_splits_full_v1_btree_leaf() {
 
     assert_logical_eoa_matches_file_len(&path);
     assert_h5dump_dataset_read(&path, "btree_v1_full_leaf_gap", "split v1 B-tree file");
+    assert_h5py_script(
+        &path,
+        "x = f['btree_v1_full_leaf_gap']\n\
+         assert x.shape == (325,)\n\
+         assert list(x[:]) == list(range(325))",
+        "split v1 B-tree file",
+    );
 }
 
 #[test]
@@ -1042,6 +1060,14 @@ fn test_resize_then_write_appended_extensible_array_chunk() {
 
     assert_logical_eoa_matches_file_len(&path);
     assert_h5dump_dataset_read(&path, "data", "writer-created extensible-array append file");
+    assert_h5py_script(
+        &path,
+        "x = f['data']\n\
+         assert x.shape == (330,)\n\
+         assert x.chunks == (5,)\n\
+         assert list(x[:]) == list(range(330))",
+        "writer-created extensible-array append file",
+    );
 }
 
 #[test]
@@ -1302,6 +1328,15 @@ fn test_resize_then_write_appended_v4_btree2_chunk() {
 
     assert_logical_eoa_matches_file_len(&path);
     assert_h5dump_dataset_read(&path, "btree_v2", "appended v2 B-tree file");
+    assert_h5py_script(
+        &path,
+        "x = f['btree_v2']\n\
+         assert x.shape == (12, 8)\n\
+         assert list(x[:8, :].reshape(-1)) == list(range(64))\n\
+         assert list(x[8:, 0:4].reshape(-1)) == list(range(64, 80))\n\
+         assert list(x[8:, 4:8].reshape(-1)) == [0] * 16",
+        "appended v2 B-tree file",
+    );
 }
 
 #[test]
@@ -1334,6 +1369,13 @@ fn test_resize_then_write_appended_v4_extensible_array_chunk() {
 
     assert_logical_eoa_matches_file_len(&path);
     assert_h5dump_dataset_read(&path, "extensible_array", "appended extensible-array file");
+    assert_h5py_script(
+        &path,
+        "x = f['extensible_array']\n\
+         assert x.shape == (100,)\n\
+         assert list(x[:]) == [float(i) for i in range(100)]",
+        "appended extensible-array file",
+    );
 }
 
 #[test]
@@ -1377,6 +1419,15 @@ fn test_resize_then_write_non_next_v4_extensible_array_data_block_chunk() {
     assert_h5dump_dataset_read(
         &path,
         "extensible_array",
+        "non-next extensible-array data-block file",
+    );
+    assert_h5py_script(
+        &path,
+        "x = f['extensible_array']\n\
+         assert x.shape == (120,)\n\
+         assert list(x[:80]) == [float(i) for i in range(80)]\n\
+         assert list(x[80:100]) == [0.0] * 20\n\
+         assert list(x[100:120]) == [float(i) for i in range(1000, 1020)]",
         "non-next extensible-array data-block file",
     );
 }
@@ -1436,6 +1487,14 @@ fn test_write_chunk_replaces_appended_v4_extensible_array_data_block_chunk() {
         "extensible_array",
         "replaced appended extensible-array file",
     );
+    assert_h5py_script(
+        &path,
+        "x = f['extensible_array']\n\
+         assert x.shape == (120,)\n\
+         assert list(x[:100]) == [float(i) for i in range(100)]\n\
+         assert list(x[100:120]) == [float(i) for i in range(2000, 2020)]",
+        "replaced appended extensible-array file",
+    );
 }
 
 #[test]
@@ -1493,6 +1552,15 @@ fn test_write_chunk_replaces_later_v4_extensible_array_index_data_block_chunk() 
         "extensible_array",
         "replaced later extensible-array data-block file",
     );
+    assert_h5py_script(
+        &path,
+        "x = f['extensible_array']\n\
+         assert x.shape == (220,)\n\
+         assert list(x[:180]) == [float(i) for i in range(180)]\n\
+         assert list(x[180:200]) == [float(i) for i in range(3000, 3020)]\n\
+         assert list(x[200:220]) == [float(i) for i in range(200, 220)]",
+        "replaced later extensible-array data-block file",
+    );
 }
 
 #[test]
@@ -1532,6 +1600,15 @@ fn test_resize_then_write_v4_extensible_array_into_super_block() {
     assert_h5dump_dataset_read(
         &path,
         "extensible_array",
+        "super-block extensible-array append file",
+    );
+    assert_h5py_script(
+        &path,
+        "x = f['extensible_array']\n\
+         assert x.shape == (4900,)\n\
+         assert x[0:5].tolist() == [float(i) for i in range(5)]\n\
+         assert x[78:83].tolist() == [float(i) for i in range(78, 83)]\n\
+         assert x[4880:4900].tolist() == [float(i) for i in range(4880, 4900)]",
         "super-block extensible-array append file",
     );
 }
@@ -1694,6 +1771,16 @@ fn test_write_chunk_replaces_filtered_chunk() {
 
     assert_logical_eoa_matches_file_len(&path);
     assert_h5dump_dataset_read(&path, "data", "replaced shuffle-deflate chunk file");
+    assert_h5py_script(
+        &path,
+        "x = f['data']\n\
+         assert x.shape == (20,)\n\
+         assert x.chunks == (5,)\n\
+         assert x.compression == 'gzip'\n\
+         assert x.shuffle\n\
+         assert list(x[:]) == list(range(5)) + list(range(1000, 1005)) + list(range(10, 20))",
+        "replaced shuffle-deflate chunk file",
+    );
 }
 
 #[test]
@@ -1727,6 +1814,15 @@ fn test_write_chunk_replaces_fletcher32_chunk() {
 
     assert_logical_eoa_matches_file_len(&path);
     assert_h5dump_dataset_read(&path, "chunked_fletcher", "replaced fletcher32 chunk file");
+    assert_h5py_script(
+        &path,
+        "x = f['chunked_fletcher']\n\
+         assert x.shape == (100,)\n\
+         assert list(x[:25]) == [float(i) for i in range(25)]\n\
+         assert list(x[25:50]) == [float(i) for i in range(1000, 1025)]\n\
+         assert list(x[50:]) == [float(i) for i in range(50, 100)]",
+        "replaced fletcher32 chunk file",
+    );
 }
 
 #[test]

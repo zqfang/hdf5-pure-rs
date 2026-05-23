@@ -197,6 +197,10 @@ notes and completed migration details should live outside this active backlog.
 - [ ] Add h5dump/h5py round-trip coverage for writer-created modern chunk
   indexes before declaring each layout fully supported. Finite max-shape v2
   B-tree writer output now has h5py coverage.
+  h5py currently reports a metadata checksum failure for writer-created paged
+  fixed-array chunk-index output, and h5dump reports `unable to print data` for
+  the same layout; fix the checksum/metadata image and then add h5dump/h5py
+  coverage for that layout.
 - [ ] Add h5dump/h5py round-trip coverage for mutable resize/write_chunk cases
   before declaring each mutation path fully supported. v1 B-tree partial
   shrink/write, fixed-array replacement, paged fixed-array replacement,

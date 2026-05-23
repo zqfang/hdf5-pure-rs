@@ -7,10 +7,10 @@ FILE="${1:-$ROOT/target/perf_large_simple.h5}"
 LEN="${2:-32000000}"
 CHUNK="${3:-1000000}"
 DEFLATE="${4:-1}"
-SECONDS="${5:-5}"
+DURATION_SECONDS="${5:-5}"
 
 echo "benchmark_file=$FILE"
-echo "len=$LEN chunk=$CHUNK deflate=$DEFLATE seconds=$SECONDS"
+echo "len=$LEN chunk=$CHUNK deflate=$DEFLATE seconds=$DURATION_SECONDS"
 
 if [[ ! -x "$BIN" ]]; then
     cargo build --release --example perf_compare --manifest-path "$ROOT/Cargo.toml" >/dev/null
@@ -21,11 +21,11 @@ if [[ ! -f "$FILE" ]]; then
 fi
 
 echo "rust:"
-"$BIN" bench-read "$FILE" "$SECONDS"
+"$BIN" bench-read "$FILE" "$DURATION_SECONDS"
 
 if command -v python3 >/dev/null 2>&1; then
     echo "h5py:"
-    python3 - "$FILE" "$SECONDS" <<'PY'
+    python3 - "$FILE" "$DURATION_SECONDS" <<'PY'
 import sys
 import time
 

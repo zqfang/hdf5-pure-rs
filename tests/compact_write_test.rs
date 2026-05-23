@@ -60,6 +60,33 @@ fn test_write_compact_dataset() {
             assert!(stdout.contains("1, 2, 3, 4, 5"));
         }
     }
+
+    let out = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(
+            "import sys, importlib.util\n\
+             spec = importlib.util.find_spec('h5py')\n\
+             (print('SKIP h5py unavailable'), sys.exit(0)) if spec is None else None\n\
+             import h5py\n\
+             f = h5py.File(sys.argv[1], 'r')\n\
+             d = f['small']\n\
+             assert d.shape == (5,)\n\
+             assert d.dtype == 'uint8'\n\
+             assert d.id.get_create_plist().get_layout() == h5py.h5d.COMPACT\n\
+             assert d[:].tolist() == [1, 2, 3, 4, 5]\n\
+             f.close()\n\
+             print('OK')",
+        )
+        .arg(&path)
+        .output();
+    if let Ok(out) = out {
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && (stdout.contains("OK") || stdout.contains("SKIP")),
+            "h5py failed on compact writer fixture: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
 }
 
 #[test]
