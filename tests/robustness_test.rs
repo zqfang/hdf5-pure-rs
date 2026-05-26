@@ -39,6 +39,98 @@ fn test_invalid_signature() {
 }
 
 #[test]
+fn test_dataset_virtual_init_all_is_transactional_on_invalid_mapping() {
+    let mut layout = hdf5_pure_rust::engine::dataset_api::VirtualLayout {
+        mappings: vec![
+            hdf5_pure_rust::engine::dataset_api::VirtualMapping {
+                source_file: "source.h5".into(),
+                source_dataset: "/valid".into(),
+                open: false,
+                ..Default::default()
+            },
+            hdf5_pure_rust::engine::dataset_api::VirtualMapping {
+                source_file: "broken.h5".into(),
+                source_dataset: String::new(),
+                open: true,
+                ..Default::default()
+            },
+        ],
+        unlimited: false,
+    };
+
+    let err = hdf5_pure_rust::engine::dataset_api::H5D__virtual_init_all(&mut layout)
+        .expect_err("invalid VDS source mapping should reject the bulk open");
+    assert!(
+        err.to_string()
+            .contains("virtual source mapping is incomplete"),
+        "unexpected error: {err}"
+    );
+    assert_eq!(
+        layout
+            .mappings
+            .iter()
+            .map(|mapping| mapping.open)
+            .collect::<Vec<_>>(),
+        vec![false, true],
+        "bulk VDS open must not partially mutate mapping state on validation failure"
+    );
+}
+
+#[test]
+fn test_dataset_virtual_build_source_name_preserves_output_on_invalid_parse_state() {
+    let parsed = hdf5_pure_rust::engine::dataset_api::VirtualParsedName {
+        segments: vec!["prefix-".into()],
+        static_strlen: 7,
+        substitutions: 1,
+    };
+    let mut out = String::from("stale-name");
+
+    let err = hdf5_pure_rust::engine::dataset_api::H5D__virtual_build_source_name_into(
+        "src-%b",
+        Some(&parsed),
+        3,
+        &mut out,
+    )
+    .expect_err("malformed parsed VDS name state should fail");
+    assert!(
+        err.to_string()
+            .contains("VDS parsed source-name segment count does not match substitutions"),
+        "unexpected error: {err}"
+    );
+    assert_eq!(out, "stale-name");
+}
+
+#[test]
+fn test_dataset_fixed_output_reads_preserve_stale_bytes_on_validation_errors() {
+    let dataset = hdf5_pure_rust::engine::dataset_api::DatasetApi {
+        raw: vec![1, 2, 3, 4],
+        ..Default::default()
+    };
+    let mut out = [9u8, 8, 7];
+    let err = hdf5_pure_rust::engine::dataset_api::H5Dread_chunk2_into(&dataset, 3, &mut out)
+        .expect_err("out-of-bounds fixed-buffer chunk read should fail");
+    assert!(
+        err.to_string().contains("dataset chunk read out of bounds"),
+        "unexpected error: {err}"
+    );
+    assert_eq!(out, [9, 8, 7]);
+
+    let storage = hdf5_pure_rust::engine::dataset_api::H5D__compact_construct(vec![5, 6, 7]);
+    let mut compact_out = [4u8, 3];
+    let err = hdf5_pure_rust::engine::dataset_api::H5D__compact_readvv_into(
+        &storage,
+        2,
+        &mut compact_out,
+    )
+    .expect_err("out-of-bounds fixed-buffer compact read should fail");
+    assert!(
+        err.to_string().contains("compact read out of bounds"),
+        "unexpected error: {err}"
+    );
+    assert_eq!(compact_out, [4, 3]);
+}
+
+#[test]
 fn test_truncated_superblock() {
     // Valid signature but truncated
     let mut data = vec![0x89, 0x48, 0x44, 0x46, 0x0D, 0x0A, 0x1A, 0x0A];
@@ -2145,6 +2237,31 @@ fn test_unsupported_filters_fail_explicitly() {
     );
 }
 
+#[test]
+fn test_deflate_filter_rejects_trailing_bytes_without_expected_size() {
+    let mut encoded = Vec::new();
+    hdf5_pure_rust::filters::deflate::compress_into(b"deflate payload", 6, &mut encoded).unwrap();
+    encoded.extend_from_slice(b"junk");
+
+    let pipeline = FilterPipelineMessage {
+        version: 2,
+        filters: vec![FilterDesc {
+            id: FILTER_DEFLATE,
+            name: Some("deflate".into()),
+            flags: 0,
+            client_data: vec![6],
+        }],
+    };
+
+    let err = hdf5_pure_rust::filters::apply_pipeline_reverse(&encoded, &pipeline, 1)
+        .expect_err("deflate chunks with trailing bytes should fail");
+    assert!(
+        err.to_string()
+            .contains("deflate decompression left trailing input bytes"),
+        "unexpected error: {err}"
+    );
+}
+
 #[cfg(not(feature = "blosc"))]
 #[test]
 fn test_blosc_filter_fails_explicitly_without_feature() {
@@ -2429,6 +2546,42 @@ fn test_filtered_fractal_heap_direct_object_read() {
     let mut reader = HdfReader::new(Cursor::new(file_bytes));
     let read = heap.read_managed_object(&mut reader, &id).unwrap();
     assert_eq!(read, payload);
+}
+
+#[test]
+fn test_fractal_heap_direct_block_checksum_corruption_fails() {
+    let mut heap = test_fractal_heap(0);
+    heap.has_checksum = true;
+    heap.root_block_addr = 16;
+    heap.start_block_size = 64;
+    heap.max_heap_size = 32;
+
+    let checksum_pos = 4 + 1 + 8 + 4;
+    let object_offset = checksum_pos + 4;
+
+    let mut direct = vec![0u8; object_offset + 64];
+    direct[..4].copy_from_slice(b"FHDB");
+    direct[5..13].copy_from_slice(&heap.heap_addr.to_le_bytes());
+    direct[checksum_pos..checksum_pos + 4].copy_from_slice(&0xdead_beefu32.to_le_bytes());
+    direct[object_offset..object_offset + 5].copy_from_slice(b"hello");
+
+    let mut file_bytes = vec![0u8; heap.root_block_addr as usize];
+    file_bytes.extend_from_slice(&direct);
+
+    let mut id = vec![0x00];
+    id.extend_from_slice(&(object_offset as u32).to_le_bytes());
+    id.extend_from_slice(&5u64.to_le_bytes());
+
+    let mut reader = HdfReader::new(Cursor::new(file_bytes));
+    let err = heap
+        .read_managed_object(&mut reader, &id)
+        .expect_err("corrupt direct-block checksum should fail");
+
+    assert!(
+        err.to_string()
+            .contains("fractal heap direct block checksum mismatch"),
+        "unexpected error: {err}"
+    );
 }
 
 #[test]

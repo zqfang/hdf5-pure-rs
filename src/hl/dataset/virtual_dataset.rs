@@ -1,6 +1,9 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use crate::engine::dataset_api::{
+    H5D__virtual_build_source_name_into, H5D_virtual_parse_source_name, VirtualParsedName,
+};
 use crate::error::{Error, Result};
 use crate::format::messages::data_layout::LayoutClass;
 use crate::hl::plist::dataset_create::{
@@ -261,6 +264,7 @@ impl Dataset {
         drop(guard);
 
         let mappings = Self::decode_virtual_mappings(&heap_data, sizeof_size)?;
+        let mappings = Self::expand_virtual_printf_mappings(&mappings, path.as_deref(), access)?;
         let mut source_cache = VirtualSourceCache::new();
         Self::virtual_output_dims_with_cache(
             &mappings,
@@ -279,6 +283,7 @@ impl Dataset {
         access: &DatasetAccess,
     ) -> Result<Vec<u8>> {
         let mappings = Self::decode_virtual_mappings(heap_data, sizeof_size)?;
+        let mappings = Self::expand_virtual_printf_mappings(&mappings, file_path, access)?;
         let element_size = usize_from_u64(u64::from(info.datatype.size), "datatype size")?;
 
         let mut source_cache = VirtualSourceCache::new();
@@ -316,6 +321,7 @@ impl Dataset {
         output: &mut [u8],
     ) -> Result<()> {
         let mappings = Self::decode_virtual_mappings(heap_data, sizeof_size)?;
+        let mappings = Self::expand_virtual_printf_mappings(&mappings, file_path, access)?;
         let element_size = usize_from_u64(u64::from(info.datatype.size), "datatype size")?;
 
         let mut source_cache = VirtualSourceCache::new();
@@ -339,7 +345,8 @@ impl Dataset {
                 output.len()
             )));
         }
-        Self::filled_data_into(total_elements, element_size, info, output)?;
+        let mut staged = vec![0u8; output.len()];
+        Self::filled_data_into(total_elements, element_size, info, &mut staged)?;
         Self::populate_virtual_dataset_output(
             mappings,
             file_path,
@@ -347,9 +354,236 @@ impl Dataset {
             access,
             &output_dims,
             element_size,
-            output,
+            &mut staged,
             &mut source_cache,
-        )
+        )?;
+        output.copy_from_slice(&staged);
+        Ok(())
+    }
+
+    fn expand_virtual_printf_mappings(
+        mappings: &[VirtualMapping],
+        file_path: Option<&Path>,
+        access: &DatasetAccess,
+    ) -> Result<Vec<VirtualMapping>> {
+        let mut expanded = Vec::with_capacity(mappings.len());
+        for mapping in mappings {
+            let parsed_file = H5D_virtual_parse_source_name(&mapping.file_name)?;
+            let parsed_dataset = H5D_virtual_parse_source_name(&mapping.dataset_name)?;
+            let has_block_substitution = parsed_file
+                .as_ref()
+                .map(|parsed| parsed.substitutions > 0)
+                .unwrap_or(false)
+                || parsed_dataset
+                    .as_ref()
+                    .map(|parsed| parsed.substitutions > 0)
+                    .unwrap_or(false);
+
+            if !has_block_substitution {
+                expanded.push(Self::virtual_mapping_with_unescaped_names(
+                    mapping,
+                    parsed_file.as_ref(),
+                    parsed_dataset.as_ref(),
+                )?);
+                continue;
+            }
+
+            let Some(parsed_file) = parsed_file.as_ref() else {
+                expanded.push(mapping.clone());
+                continue;
+            };
+            let block_numbers = Self::available_virtual_printf_file_blocks(
+                file_path,
+                access,
+                mapping,
+                parsed_file,
+            )?;
+            if block_numbers.is_empty() {
+                expanded.push(mapping.clone());
+                continue;
+            }
+            for block_number in block_numbers {
+                expanded.push(Self::virtual_printf_mapping_for_block(
+                    mapping,
+                    parsed_file,
+                    parsed_dataset.as_ref(),
+                    block_number,
+                )?);
+            }
+        }
+        Ok(expanded)
+    }
+
+    fn virtual_mapping_with_unescaped_names(
+        mapping: &VirtualMapping,
+        parsed_file: Option<&VirtualParsedName>,
+        parsed_dataset: Option<&VirtualParsedName>,
+    ) -> Result<VirtualMapping> {
+        if parsed_file.is_none() && parsed_dataset.is_none() {
+            return Ok(mapping.clone());
+        }
+        let mut out = mapping.clone();
+        if let Some(parsed) = parsed_file {
+            H5D__virtual_build_source_name_into(
+                &mapping.file_name,
+                Some(parsed),
+                0,
+                &mut out.file_name,
+            )?;
+        }
+        if let Some(parsed) = parsed_dataset {
+            H5D__virtual_build_source_name_into(
+                &mapping.dataset_name,
+                Some(parsed),
+                0,
+                &mut out.dataset_name,
+            )?;
+        }
+        Ok(out)
+    }
+
+    fn virtual_printf_mapping_for_block(
+        mapping: &VirtualMapping,
+        parsed_file: &VirtualParsedName,
+        parsed_dataset: Option<&VirtualParsedName>,
+        block_number: u64,
+    ) -> Result<VirtualMapping> {
+        let mut out = mapping.clone();
+        H5D__virtual_build_source_name_into(
+            &mapping.file_name,
+            Some(parsed_file),
+            block_number,
+            &mut out.file_name,
+        )?;
+        if let Some(parsed) = parsed_dataset {
+            H5D__virtual_build_source_name_into(
+                &mapping.dataset_name,
+                Some(parsed),
+                block_number,
+                &mut out.dataset_name,
+            )?;
+        }
+        out.virtual_select =
+            Self::virtual_printf_block_selection(&mapping.virtual_select, block_number)?;
+        Ok(out)
+    }
+
+    fn virtual_printf_block_selection(
+        selection: &VirtualSelection,
+        block_number: u64,
+    ) -> Result<VirtualSelection> {
+        let VirtualSelection::Regular(regular) = selection else {
+            return Ok(selection.clone());
+        };
+        let unlimited_dims = regular
+            .count
+            .iter()
+            .enumerate()
+            .filter_map(|(dim, &count)| (count == u64::MAX).then_some(dim))
+            .collect::<Vec<_>>();
+        if unlimited_dims.len() != 1 {
+            return Ok(selection.clone());
+        }
+        let dim = unlimited_dims[0];
+        let mut adjusted = regular.clone();
+        let stride = adjusted.stride[dim].max(1);
+        let offset = block_number
+            .checked_mul(stride)
+            .ok_or_else(|| Error::InvalidFormat("VDS printf block coordinate overflow".into()))?;
+        adjusted.start[dim] = adjusted.start[dim]
+            .checked_add(offset)
+            .ok_or_else(|| Error::InvalidFormat("VDS printf block coordinate overflow".into()))?;
+        adjusted.count[dim] = 1;
+        Ok(VirtualSelection::Regular(adjusted))
+    }
+
+    fn available_virtual_printf_file_blocks(
+        file_path: Option<&Path>,
+        access: &DatasetAccess,
+        mapping: &VirtualMapping,
+        parsed_file: &VirtualParsedName,
+    ) -> Result<Vec<u64>> {
+        let mut blocks = Vec::new();
+        let source_path = Path::new(&mapping.file_name);
+        let source_file_name = source_path.file_name().ok_or_else(|| {
+            Error::InvalidFormat("virtual dataset source has no file name".into())
+        })?;
+        let source_file_name = source_file_name.to_str().ok_or_else(|| {
+            Error::InvalidFormat("virtual dataset source file name is not UTF-8".into())
+        })?;
+        let source_parent = source_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty());
+
+        for dir in Self::virtual_printf_search_dirs(file_path, access, source_path)? {
+            let dir = source_parent.map(|parent| dir.join(parent)).unwrap_or(dir);
+            let entries = match std::fs::read_dir(&dir) {
+                Ok(entries) => entries,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => return Err(Error::Io(err)),
+            };
+            for entry in entries {
+                let entry = entry.map_err(Error::Io)?;
+                let name = entry.file_name();
+                let Some(name) = name.to_str() else {
+                    continue;
+                };
+                if let Some(block) =
+                    parsed_virtual_block_number(source_file_name, parsed_file, name)?
+                {
+                    blocks.push(block);
+                }
+            }
+        }
+
+        blocks.sort_unstable();
+        blocks.dedup();
+        match access.virtual_view() {
+            VdsView::LastAvailable => {}
+            VdsView::FirstMissing => {
+                let first_missing = blocks
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .find_map(|(idx, block)| (block != idx as u64).then_some(idx as u64))
+                    .unwrap_or(blocks.len() as u64);
+                blocks.retain(|&block| block < first_missing);
+            }
+        }
+        Ok(blocks)
+    }
+
+    fn virtual_printf_search_dirs(
+        file_path: Option<&Path>,
+        access: &DatasetAccess,
+        source_path: &Path,
+    ) -> Result<Vec<PathBuf>> {
+        let mut dirs = Vec::new();
+        if source_path.is_absolute() {
+            if let Some(parent) = source_path.parent() {
+                dirs.push(parent.to_path_buf());
+            }
+            return Ok(dirs);
+        }
+        if let Some(prefix) = access.virtual_prefix() {
+            if !prefix.as_os_str().is_empty() && prefix != Path::new(".") {
+                dirs.push(expand_virtual_origin_prefix(file_path, prefix)?);
+            }
+        }
+        if let Ok(prefixes) = std::env::var("HDF5_VDS_PREFIX") {
+            for prefix in prefixes.split(':') {
+                if prefix.is_empty() || prefix == "." {
+                    continue;
+                }
+                dirs.push(expand_virtual_origin_prefix_str(file_path, prefix)?);
+            }
+        }
+        if let Some(base) = file_path.and_then(Path::parent) {
+            dirs.push(base.to_path_buf());
+        }
+        dirs.sort_unstable();
+        dirs.dedup();
+        Ok(dirs)
     }
 
     fn populate_virtual_dataset_output(
@@ -388,7 +622,8 @@ impl Dataset {
 
     fn should_fill_missing_virtual_source(err: &Error, access: &DatasetAccess) -> bool {
         access.virtual_missing_source_policy() == VdsMissingSourcePolicy::Fill
-            && matches!(err, Error::Io(io_err) if io_err.kind() == std::io::ErrorKind::NotFound)
+            && (matches!(err, Error::Io(io_err) if io_err.kind() == std::io::ErrorKind::NotFound)
+                || matches!(err, Error::InvalidFormat(message) if is_missing_virtual_source_message(message)))
     }
 
     fn copy_virtual_mapping(
@@ -520,8 +755,17 @@ impl Dataset {
         source_cache: &mut VirtualSourceCache,
     ) -> Result<Vec<u64>> {
         let mut output_dims = info.dataspace.dims.clone();
-        if output_dims.iter().all(|&dim| dim != 0) {
+        let has_unlimited_dims = output_dims
+            .iter()
+            .enumerate()
+            .any(|(dim, _)| Self::is_unlimited_vds_dim(info, dim));
+        if output_dims.iter().all(|&dim| dim != 0) && !has_unlimited_dims {
             return Ok(output_dims);
+        }
+        for dim in 0..output_dims.len() {
+            if Self::is_unlimited_vds_dim(info, dim) {
+                output_dims[dim] = 0;
+            }
         }
         let mut unlimited_extents: Vec<Option<(u64, u64)>> = vec![None; output_dims.len()];
         for mapping in mappings {
@@ -1133,6 +1377,99 @@ fn checked_byte_window_mut<'a>(
     Ok(data.get_mut(offset..end))
 }
 
+fn is_missing_virtual_source_message(message: &str) -> bool {
+    (message.starts_with("link '") && message.ends_with("' not found"))
+        || message.starts_with("hard link target '")
+        || message.contains("missing source dataset")
+}
+
+fn parsed_virtual_block_number(
+    source_name: &str,
+    parsed: &VirtualParsedName,
+    candidate: &str,
+) -> Result<Option<u64>> {
+    if parsed.substitutions == 0 {
+        let mut unescaped = String::new();
+        H5D__virtual_build_source_name_into(source_name, Some(parsed), 0, &mut unescaped)?;
+        return Ok((candidate == unescaped).then_some(0));
+    }
+    if parsed.segments.len() != parsed.substitutions + 1 {
+        return Err(Error::InvalidFormat(
+            "VDS parsed source-name segment count does not match substitutions".into(),
+        ));
+    }
+
+    let mut tail = candidate;
+    let mut block_number = None;
+    for idx in 0..parsed.substitutions {
+        let segment = parsed.segments[idx].as_str();
+        let Some(rest) = tail.strip_prefix(segment) else {
+            return Ok(None);
+        };
+        let next_segment = parsed.segments[idx + 1].as_str();
+        let next_pos = if next_segment.is_empty() {
+            rest.len()
+        } else {
+            let Some(next_pos) = rest.find(next_segment) else {
+                return Ok(None);
+            };
+            next_pos
+        };
+        let digits = &rest[..next_pos];
+        if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Ok(None);
+        }
+        let parsed_block = digits.parse::<u64>().map_err(|err| {
+            Error::InvalidFormat(format!("VDS source-name block number overflow: {err}"))
+        })?;
+        if block_number
+            .replace(parsed_block)
+            .is_some_and(|block| block != parsed_block)
+        {
+            return Ok(None);
+        }
+        tail = &rest[next_pos..];
+    }
+
+    let Some(last_segment) = parsed.segments.last() else {
+        return Ok(None);
+    };
+    if tail == last_segment {
+        Ok(block_number)
+    } else {
+        Ok(None)
+    }
+}
+
+fn expand_virtual_origin_prefix(file_path: Option<&Path>, prefix: &Path) -> Result<PathBuf> {
+    if let Some(prefix_str) = prefix.to_str() {
+        if prefix_str.starts_with("${ORIGIN}") {
+            return expand_virtual_origin_prefix_str(file_path, prefix_str);
+        }
+    }
+    Ok(prefix.to_path_buf())
+}
+
+fn expand_virtual_origin_prefix_str(file_path: Option<&Path>, prefix: &str) -> Result<PathBuf> {
+    const ORIGIN: &str = "${ORIGIN}";
+
+    if let Some(rest) = prefix.strip_prefix(ORIGIN) {
+        let origin_dir = file_path
+            .and_then(Path::parent)
+            .map(Path::to_path_buf)
+            .ok_or_else(|| {
+                Error::Unsupported("VDS ${ORIGIN} prefix has no base file path".into())
+            })?;
+        let trimmed = rest.strip_prefix(['/', '\\']).unwrap_or(rest);
+        if trimmed.is_empty() {
+            return Ok(origin_dir);
+        }
+        return Ok(origin_dir.join(trimmed));
+    }
+
+    Ok(PathBuf::from(prefix))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1154,6 +1491,35 @@ mod tests {
         assert!(
             err.to_string().contains("virtual test range overflow"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn missing_virtual_source_message_matches_path_resolution_only() {
+        assert!(is_missing_virtual_source_message("link 'source' not found"));
+        assert!(is_missing_virtual_source_message(
+            "hard link target '/source' not found"
+        ));
+        assert!(!is_missing_virtual_source_message(
+            "global heap object 9 not found in collection at 0x0"
+        ));
+        assert!(!is_missing_virtual_source_message(
+            "fractal heap offset 42 not found in indirect block"
+        ));
+    }
+
+    #[test]
+    fn parsed_virtual_block_number_matches_trailing_substitution() {
+        let parsed = H5D_virtual_parse_source_name("tile-%b")
+            .unwrap()
+            .expect("source name should parse");
+        assert_eq!(
+            parsed_virtual_block_number("tile-%b", &parsed, "tile-37").unwrap(),
+            Some(37)
+        );
+        assert_eq!(
+            parsed_virtual_block_number("tile-%b", &parsed, "tile-").unwrap(),
+            None
         );
     }
 }

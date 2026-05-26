@@ -856,18 +856,21 @@ impl Selection {
 
     /// Serialize this selection with an explicit class tag into caller storage.
     pub fn encode1_into(&self, out: &mut Vec<u8>) -> Result<()> {
+        let mut encoded = Vec::new();
         match self {
-            Selection::None => out.push(0),
-            Selection::All => out.push(1),
+            Selection::None => encoded.push(0),
+            Selection::All => encoded.push(1),
             Selection::Points(_) => {
-                out.push(2);
-                self.point_serialize_into(out)?;
+                encoded.push(2);
+                self.point_serialize_into(&mut encoded)?;
             }
             Selection::Hyperslab(_) | Selection::Slice(_) => {
-                out.push(3);
-                self.hyper_serialize_into(out)?;
+                encoded.push(3);
+                self.hyper_serialize_into(&mut encoded)?;
             }
         }
+        out.clear();
+        out.extend_from_slice(&encoded);
         Ok(())
     }
 
@@ -1185,8 +1188,9 @@ impl Selection {
         let rank = points.first().map_or(0, Vec::len);
         let rank_u64 = usize_to_u64(rank, "point selection rank")?;
         let point_count_u64 = usize_to_u64(points.len(), "point selection point count")?;
-        push_u64(out, rank_u64);
-        push_u64(out, point_count_u64);
+        let mut encoded = Vec::with_capacity(self.point_serial_size()?);
+        push_u64(&mut encoded, rank_u64);
+        push_u64(&mut encoded, point_count_u64);
         for point in points {
             if point.len() != rank {
                 return Err(Error::InvalidFormat(
@@ -1194,9 +1198,10 @@ impl Selection {
                 ));
             }
             for &coord in point {
-                push_u64(out, coord);
+                push_u64(&mut encoded, coord);
             }
         }
+        out.extend_from_slice(&encoded);
         Ok(())
     }
 

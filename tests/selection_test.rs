@@ -262,6 +262,27 @@ fn test_read_slice_2d_point_selection_preserves_order_and_duplicates() {
 }
 
 #[test]
+fn test_read_cell_uses_point_selection_and_preserves_stale_output_on_error() {
+    let f = File::open("tests/data/datasets_v0.h5").unwrap();
+    let ds = f.dataset("int8_2d").unwrap();
+
+    assert_eq!(ds.read_cell::<i8>(&[1, 2]).unwrap(), 6);
+
+    let mut value = -1;
+    ds.read_cell_into::<i8>(&[0, 1], &mut value).unwrap();
+    assert_eq!(value, 2);
+
+    let err = ds
+        .read_cell_into::<i8>(&[2, 0], &mut value)
+        .expect_err("out-of-bounds cell read should fail");
+    assert!(
+        err.to_string().contains("exceeds extent"),
+        "unexpected error: {err}"
+    );
+    assert_eq!(value, 2);
+}
+
+#[test]
 fn test_read_slice_2d_block_hyperslab_selection() {
     let f = File::open("tests/data/datasets_v0.h5").unwrap();
     let ds = f.dataset("int8_2d").unwrap();

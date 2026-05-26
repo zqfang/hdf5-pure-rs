@@ -776,16 +776,52 @@ pub fn H5FD_get_driver_id_by_name(registry: &VfdRegistry, name: &str) -> Option<
     registry.by_name.get(name).copied()
 }
 
+/// Return the value/id of a driver registered under the given name into caller storage.
+#[allow(non_snake_case)]
+pub fn H5FD_get_driver_id_by_name_into(
+    registry: &VfdRegistry,
+    name: &str,
+    driver_id: &mut u64,
+) -> Result<()> {
+    *driver_id = H5FD_get_driver_id_by_name(registry, name)
+        .ok_or_else(|| Error::InvalidFormat("VFD driver name is not registered".into()))?;
+    Ok(())
+}
+
 /// Public libhdf5-style lookup of a registered VFD driver id by name.
 #[allow(non_snake_case)]
 pub fn H5FDget_driver_id(registry: &VfdRegistry, name: &str) -> Option<u64> {
     H5FD_get_driver_id_by_name(registry, name)
 }
 
+/// Public libhdf5-style lookup of a registered VFD driver id into caller storage.
+#[allow(non_snake_case)]
+pub fn H5FDget_driver_id_into(
+    registry: &VfdRegistry,
+    name: &str,
+    driver_id: &mut u64,
+) -> Result<()> {
+    H5FD_get_driver_id_by_name_into(registry, name, driver_id)
+}
+
 /// Look up the name of a driver registered with the given value.
 #[allow(non_snake_case)]
 pub fn H5FD_get_driver_id_by_value(registry: &VfdRegistry, value: u64) -> Option<&str> {
     registry.by_value.get(&value).map(String::as_str)
+}
+
+/// Look up the name of a driver registered with the given value into caller storage.
+#[allow(non_snake_case)]
+pub fn H5FD_get_driver_id_by_value_into(
+    registry: &VfdRegistry,
+    value: u64,
+    name: &mut String,
+) -> Result<()> {
+    let found = H5FD_get_driver_id_by_value(registry, value)
+        .ok_or_else(|| Error::InvalidFormat("VFD driver value is not registered".into()))?;
+    name.clear();
+    name.push_str(found);
+    Ok(())
 }
 
 /// Look up the class name of a driver registered with the given value.
@@ -1080,6 +1116,19 @@ pub fn H5FDget_vfd_handle(driver: &LocalFileDriver) -> Option<&File> {
     driver.file.as_ref()
 }
 
+/// Public API: return the underlying file handle through caller-owned storage.
+#[allow(non_snake_case)]
+pub fn H5FDget_vfd_handle_into<'a>(
+    driver: &'a LocalFileDriver,
+    file_handle: &mut Option<&'a File>,
+) -> Result<()> {
+    let handle = H5FDget_vfd_handle(driver).ok_or_else(|| {
+        Error::Unsupported("H5FDget_vfd_handle requires a native file-backed VFD handle".into())
+    })?;
+    *file_handle = Some(handle);
+    Ok(())
+}
+
 /// Toggling paged aggregation is a no-op in the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD_set_paged_aggr(_driver: &mut LocalFileDriver, _enabled: bool) {}
@@ -1111,6 +1160,7 @@ pub fn H5FD__read_selection_translate_view(requests: &[VfdIoRequest]) -> &[VfdIo
 /// Translate selection requests into a caller-owned vector.
 #[allow(non_snake_case)]
 pub fn H5FD__read_selection_translate_into(requests: &[VfdIoRequest], out: &mut Vec<VfdIoRequest>) {
+    out.clear();
     out.extend_from_slice(requests);
 }
 
@@ -1137,6 +1187,7 @@ pub fn H5FD__write_selection_translate_into(
     requests: &[VfdIoRequest],
     out: &mut Vec<VfdIoRequest>,
 ) {
+    out.clear();
     out.extend_from_slice(requests);
 }
 
@@ -1345,9 +1396,19 @@ pub fn H5FD__mpio_init() -> Result<()> {
     Err(unsupported_vfd_driver("MPIO"))
 }
 
+/// `H5FD_mpio_init`: public MPIO VFD init; unsupported by the pure-Rust backend.
+#[allow(non_snake_case)]
+pub fn H5FD_mpio_init() -> Result<()> {
+    Err(unsupported_vfd_driver("MPIO"))
+}
+
 /// `H5FD__mpio_term`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__mpio_term() {}
+
+/// `H5FD_mpio_term`: public MPIO VFD termination; no runtime state is allocated here.
+#[allow(non_snake_case)]
+pub fn H5FD_mpio_term() {}
 
 /// MPI: setting atomicity is not supported.
 #[allow(non_snake_case)]
@@ -1422,6 +1483,7 @@ pub fn H5FD__mpio_vector_build_types_view(requests: &[VfdIoRequest]) -> &[VfdIoR
 /// `H5FD__mpio_vector_build_types`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__mpio_vector_build_types_into(requests: &[VfdIoRequest], out: &mut Vec<VfdIoRequest>) {
+    out.clear();
     out.extend_from_slice(requests);
 }
 
@@ -1443,6 +1505,7 @@ pub fn H5FD__selection_build_types_view(requests: &[VfdIoRequest]) -> &[VfdIoReq
 /// VFD: selection build types.
 #[allow(non_snake_case)]
 pub fn H5FD__selection_build_types_into(requests: &[VfdIoRequest], out: &mut Vec<VfdIoRequest>) {
+    out.clear();
     out.extend_from_slice(requests);
 }
 
@@ -1563,6 +1626,12 @@ pub fn H5FD__hdfs_unregister() {}
 /// `H5FD__hdfs_init`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__hdfs_init() -> Result<()> {
+    Err(unsupported_vfd_driver("HDFS"))
+}
+
+/// `H5FD_hdfs_init`: public HDFS VFD init; unsupported by the pure-Rust backend.
+#[allow(non_snake_case)]
+pub fn H5FD_hdfs_init() -> Result<()> {
     Err(unsupported_vfd_driver("HDFS"))
 }
 
@@ -2011,6 +2080,12 @@ pub fn H5FD__mirror_register() -> Result<()> {
     Err(unsupported_vfd_driver("mirror"))
 }
 
+/// `H5FD_mirror_init`: public mirror VFD init; unsupported by the pure-Rust backend.
+#[allow(non_snake_case)]
+pub fn H5FD_mirror_init() -> Result<()> {
+    Err(unsupported_vfd_driver("mirror"))
+}
+
 /// `H5FD__mirror_unregister`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__mirror_unregister() {}
@@ -2349,9 +2424,19 @@ pub fn H5FD__family_register() -> Result<()> {
     Err(unsupported_vfd_driver("family"))
 }
 
+/// `H5FD_family_init`: public family VFD init; unsupported by the pure-Rust backend.
+#[allow(non_snake_case)]
+pub fn H5FD_family_init() -> Result<()> {
+    Err(unsupported_vfd_driver("family"))
+}
+
 /// `H5FD__family_unregister`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__family_unregister() {}
+
+/// `H5FD_family_term`: public family VFD termination; no runtime state is allocated here.
+#[allow(non_snake_case)]
+pub fn H5FD_family_term() {}
 
 /// `H5FD__family_fapl_get`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
@@ -2512,6 +2597,16 @@ pub fn H5FD_multi_populate_config() -> MultiFileConfig {
         .insert(VfdMemType::Default, FileDriverKind::Sec2);
     config
 }
+
+/// `H5FD_multi_init`: public multi VFD init; unsupported by the pure-Rust backend.
+#[allow(non_snake_case)]
+pub fn H5FD_multi_init() -> Result<()> {
+    Err(unsupported_vfd_driver("multi"))
+}
+
+/// `H5FD_multi_term`: public multi VFD termination; no runtime state is allocated here.
+#[allow(non_snake_case)]
+pub fn H5FD_multi_term() {}
 
 /// VFD: vfd mem type code.
 fn vfd_mem_type_code(mem_type: VfdMemType) -> u8 {
@@ -2829,6 +2924,12 @@ pub fn H5FD__splitter_register() -> Result<()> {
     Err(unsupported_vfd_driver("splitter"))
 }
 
+/// `H5FD_splitter_init`: public splitter VFD init; unsupported by the pure-Rust backend.
+#[allow(non_snake_case)]
+pub fn H5FD_splitter_init() -> Result<()> {
+    Err(unsupported_vfd_driver("splitter"))
+}
+
 /// `H5FD__splitter_unregister`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__splitter_unregister() {}
@@ -3091,9 +3192,19 @@ pub fn H5FD__log_register() -> Result<()> {
     Err(unsupported_vfd_driver("log"))
 }
 
+/// `H5FD_log_init`: public log VFD init; unsupported by the pure-Rust backend.
+#[allow(non_snake_case)]
+pub fn H5FD_log_init() -> Result<()> {
+    Err(unsupported_vfd_driver("log"))
+}
+
 /// `H5FD__log_unregister`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__log_unregister() {}
+
+/// `H5FD_log_term`: public log VFD termination; no runtime state is allocated here.
+#[allow(non_snake_case)]
+pub fn H5FD_log_term() {}
 
 /// `H5FD__log_fapl_get`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
@@ -3319,6 +3430,12 @@ pub fn H5FD__ros3_unregister() {}
 /// `H5FD__ros3_init`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__ros3_init() -> Result<()> {
+    Err(unsupported_vfd_driver("ROS3"))
+}
+
+/// `H5FD_ros3_init`: public ROS3 VFD init; unsupported by the pure-Rust backend.
+#[allow(non_snake_case)]
+pub fn H5FD_ros3_init() -> Result<()> {
     Err(unsupported_vfd_driver("ROS3"))
 }
 
@@ -4065,6 +4182,7 @@ pub fn H5FD__subfiling_setup_context(config: &SubfilingConfig) -> SubfilingConfi
 /// `H5FD__subfiling_init_app_topology`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__subfiling_init_app_topology_into(config: &SubfilingConfig, out: &mut Vec<u32>) {
+    out.clear();
     out.extend(0..config.ioc_count);
 }
 
@@ -4753,6 +4871,7 @@ pub fn H5FD__subfiling_generate_io_vectors_into(
     requests: &[VfdIoRequest],
     out: &mut Vec<VfdIoRequest>,
 ) {
+    out.clear();
     out.extend_from_slice(requests);
 }
 
@@ -4778,6 +4897,7 @@ pub fn H5FD__subfiling_iovec_sizes_iter(
 /// `H5FD__subfiling_get_iovec_sizes`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__subfiling_get_iovec_sizes_into(requests: &[VfdIoRequest], out: &mut Vec<usize>) {
+    out.clear();
     out.extend(H5FD__subfiling_iovec_sizes_iter(requests));
 }
 
@@ -4835,6 +4955,7 @@ pub fn H5FD__subfiling_iovec_fill_first_last_into(
     requests: &[VfdIoRequest],
     out: &mut Vec<VfdIoRequest>,
 ) {
+    out.clear();
     if let Some(first) = H5FD__subfiling_iovec_fill_first_ref(requests) {
         out.push(first.clone());
     }
@@ -4866,6 +4987,7 @@ pub fn H5FD__subfiling_iovec_fill_uniform_into(
     requests: &[VfdIoRequest],
     out: &mut Vec<VfdIoRequest>,
 ) {
+    out.clear();
     out.extend_from_slice(requests);
 }
 
@@ -4948,7 +5070,37 @@ mod tests {
             super::H5FDget_driver_id(&registry, "sec2"),
             Some(super::file_driver_kind_id(FileDriverKind::Sec2))
         );
+        let mut driver_id = u64::MAX;
+        super::H5FDget_driver_id_into(&registry, "sec2", &mut driver_id).unwrap();
+        assert_eq!(driver_id, super::file_driver_kind_id(FileDriverKind::Sec2));
+        assert_eq!(
+            super::H5FD_get_driver_id_by_value(
+                &registry,
+                super::file_driver_kind_id(FileDriverKind::Sec2)
+            ),
+            Some("sec2")
+        );
+        let mut driver_name = String::from("stale");
+        super::H5FD_get_driver_id_by_value_into(
+            &registry,
+            super::file_driver_kind_id(FileDriverKind::Sec2),
+            &mut driver_name,
+        )
+        .unwrap();
+        assert_eq!(driver_name, "sec2");
         assert_eq!(super::H5FDget_driver_id(&registry, "missing"), None);
+        driver_id = 0xfeed;
+        assert!(matches!(
+            super::H5FDget_driver_id_into(&registry, "missing", &mut driver_id).unwrap_err(),
+            Error::InvalidFormat(_)
+        ));
+        assert_eq!(driver_id, 0xfeed);
+        driver_name = String::from("stale");
+        assert!(matches!(
+            super::H5FD_get_driver_id_by_value_into(&registry, 99, &mut driver_name).unwrap_err(),
+            Error::InvalidFormat(_)
+        ));
+        assert_eq!(driver_name, "stale");
         assert_eq!(
             super::H5FDdriver_query(&registry, super::file_driver_kind_id(FileDriverKind::Sec2))
                 .unwrap(),
@@ -5019,6 +5171,29 @@ mod tests {
         super::H5FDctl(&mut driver, None).unwrap();
         assert_eq!(super::H5FDget_eoa(&driver), 11);
 
+        let handle_path = std::env::temp_dir().join(format!(
+            "hdf5_pure_rust_h5fd_handle_{}_{}.h5",
+            std::process::id(),
+            "public"
+        ));
+        LocalFileDriver::sec2_delete(&handle_path).unwrap();
+        let handle_driver = LocalFileDriver::sec2_open(&handle_path, true).unwrap();
+        let mut file_handle = None;
+        super::H5FDget_vfd_handle_into(&handle_driver, &mut file_handle).unwrap();
+        let stale_handle = file_handle.map(|handle| handle as *const std::fs::File);
+        assert!(stale_handle.is_some());
+        let err = super::H5FDget_vfd_handle_into(&driver, &mut file_handle).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Unsupported: H5FDget_vfd_handle requires a native file-backed VFD handle"
+        );
+        assert_eq!(
+            file_handle.map(|handle| handle as *const std::fs::File),
+            stale_handle
+        );
+        drop(handle_driver);
+        LocalFileDriver::sec2_delete(&handle_path).unwrap();
+
         let path = std::env::temp_dir().join(format!(
             "hdf5_pure_rust_h5fddelete_{}_{}.h5",
             std::process::id(),
@@ -5033,6 +5208,98 @@ mod tests {
             super::H5FDdelete(&path, FileDriverKind::Core).unwrap_err(),
             Error::Unsupported(_)
         ));
+    }
+
+    #[test]
+    fn vfd_caller_owned_output_helpers_replace_stale_storage() {
+        let requests = [
+            super::VfdIoRequest {
+                addr: 16,
+                bytes: b"abc".to_vec(),
+            },
+            super::VfdIoRequest {
+                addr: 32,
+                bytes: b"def".to_vec(),
+            },
+        ];
+        let stale_request = super::VfdIoRequest {
+            addr: 999,
+            bytes: b"stale".to_vec(),
+        };
+
+        let mut translated = vec![stale_request.clone()];
+        super::H5FD__read_selection_translate_into(&requests, &mut translated);
+        assert_eq!(translated, requests);
+
+        super::H5FD__read_selection_translate_into(&[], &mut translated);
+        assert!(translated.is_empty());
+
+        let mut write_translated = vec![stale_request.clone()];
+        super::H5FD__write_selection_translate_into(&requests, &mut write_translated);
+        assert_eq!(write_translated, requests);
+
+        let mut generated = vec![stale_request];
+        super::H5FD__subfiling_generate_io_vectors_into(&requests, &mut generated);
+        assert_eq!(generated, requests);
+
+        let mut mpio_types = vec![super::VfdIoRequest {
+            addr: 999,
+            bytes: b"stale".to_vec(),
+        }];
+        super::H5FD__mpio_vector_build_types_into(&requests, &mut mpio_types);
+        assert_eq!(mpio_types, requests);
+
+        let mut selection_types = vec![super::VfdIoRequest {
+            addr: 999,
+            bytes: b"stale".to_vec(),
+        }];
+        super::H5FD__selection_build_types_into(&requests, &mut selection_types);
+        assert_eq!(selection_types, requests);
+
+        let mut iovec_sizes = vec![999, 1000];
+        super::H5FD__subfiling_get_iovec_sizes_into(&requests, &mut iovec_sizes);
+        assert_eq!(iovec_sizes, vec![3, 3]);
+
+        super::H5FD__subfiling_get_iovec_sizes_into(&[], &mut iovec_sizes);
+        assert!(iovec_sizes.is_empty());
+
+        let mut first_last = vec![super::VfdIoRequest {
+            addr: 999,
+            bytes: b"stale".to_vec(),
+        }];
+        super::H5FD__subfiling_iovec_fill_first_last_into(&requests, &mut first_last);
+        assert_eq!(first_last, requests);
+
+        super::H5FD__subfiling_iovec_fill_first_last_into(&[], &mut first_last);
+        assert!(first_last.is_empty());
+
+        let mut uniform = vec![super::VfdIoRequest {
+            addr: 999,
+            bytes: b"stale".to_vec(),
+        }];
+        super::H5FD__subfiling_iovec_fill_uniform_into(&requests, &mut uniform);
+        assert_eq!(uniform, requests);
+
+        let config = SubfilingConfig {
+            ioc_count: 3,
+            stripe_size: 1024,
+            stripe_count: 1,
+        };
+        let mut topology = vec![99, 100];
+        super::H5FD__subfiling_init_app_topology_into(&config, &mut topology);
+        assert_eq!(topology, vec![0, 1, 2]);
+
+        let mut gathered = vec![99, 100];
+        super::H5FD__subfiling_gather_topology_info_into(&config, &mut gathered);
+        assert_eq!(gathered, vec![0, 1, 2]);
+
+        let mut ranks = vec![99, 100];
+        super::H5FD__subfiling_identify_ioc_ranks_into(&config, &mut ranks);
+        assert_eq!(ranks, vec![0, 1, 2]);
+
+        let mut mapping = vec![99, 100];
+        super::H5FDsubfiling_get_file_mapping_into(&config, &mut mapping);
+        assert_eq!(mapping, vec![0, 1, 2]);
     }
 
     #[test]
@@ -5157,6 +5424,40 @@ mod tests {
             &mut invalid_ros3_bytes,
         )
         .is_err());
+
+        assert!(matches!(
+            super::H5FD_hdfs_init(),
+            Err(Error::Unsupported(_))
+        ));
+        assert!(matches!(
+            super::H5FD_family_init(),
+            Err(Error::Unsupported(_))
+        ));
+        super::H5FD_family_term();
+        assert!(matches!(
+            super::H5FD_multi_init(),
+            Err(Error::Unsupported(_))
+        ));
+        super::H5FD_multi_term();
+        assert!(matches!(
+            super::H5FD_splitter_init(),
+            Err(Error::Unsupported(_))
+        ));
+        assert!(matches!(super::H5FD_log_init(), Err(Error::Unsupported(_))));
+        super::H5FD_log_term();
+        assert!(matches!(
+            super::H5FD_ros3_init(),
+            Err(Error::Unsupported(_))
+        ));
+        assert!(matches!(
+            super::H5FD_mpio_init(),
+            Err(Error::Unsupported(_))
+        ));
+        super::H5FD_mpio_term();
+        assert!(matches!(
+            super::H5FD_mirror_init(),
+            Err(Error::Unsupported(_))
+        ));
 
         assert_eq!(
             super::H5FD_mirror_xmit_decode_lock(&[]).unwrap(),
@@ -5465,7 +5766,7 @@ mod tests {
         assert!(!super::H5FD__hdfs_validate_config(&invalid));
         assert!(super::H5FD__hdfs_sb_encode_into(&invalid, &mut Vec::new()).is_err());
 
-        let mut buf = [0; 4];
+        let mut buf = *b"keep";
         assert!(matches!(
             super::H5FD__hdfs_open("hdfs://nn.example.org/data.h5", &config).unwrap_err(),
             Error::Unsupported(_)
@@ -5474,6 +5775,7 @@ mod tests {
             super::H5FD__hdfs_read(0, &mut buf).unwrap_err(),
             Error::Unsupported(_)
         ));
+        assert_eq!(&buf, b"keep");
         assert!(matches!(
             super::H5FD__hdfs_write(0, &buf).unwrap_err(),
             Error::Unsupported(_)

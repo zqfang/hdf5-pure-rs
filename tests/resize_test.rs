@@ -291,6 +291,47 @@ fn test_mutable_file_renames_dense_attribute_same_length() {
 }
 
 #[test]
+fn test_mutable_file_renames_indirect_dense_attribute_heap_same_length() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("rename_indirect_dense_attr.h5");
+    let out = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(
+            r#"import sys
+try:
+    import h5py
+    import numpy as np
+except ModuleNotFoundError as exc:
+    raise exc
+payload = np.arange(900, dtype=np.int32)
+with h5py.File(sys.argv[1], "w", libver="latest") as f:
+    for i in range(20):
+        f.attrs.create(f"attr_{i:02d}", payload + i)
+"#,
+        )
+        .arg(&path)
+        .output()
+        .unwrap();
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if stderr.contains("No module named 'h5py'") || stderr.contains("No module named 'numpy'") {
+            return;
+        }
+        panic!("h5py fixture creation failed: {stderr}");
+    }
+
+    {
+        let mut mf = MutableFile::open_rw(&path).unwrap();
+        mf.rename_root_attr("attr_08", "renm_08").unwrap();
+    }
+
+    let f = File::open(&path).unwrap();
+    assert!(!f.attr_exists("attr_08").unwrap());
+    assert!(f.attr_exists("renm_08").unwrap());
+    assert!(f.attr_exists("attr_09").unwrap());
+}
+
+#[test]
 fn test_mutable_file_mutates_group_and_dataset_dense_attributes() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("mutate_nested_dense_attrs.h5");
@@ -451,6 +492,87 @@ fn test_resize_then_write_appended_chunk() {
         dataset_read_into(&ds, &mut vals).unwrap();
         assert_eq!(vals, (0..15).collect::<Vec<_>>());
     }
+
+    assert_logical_eoa_matches_file_len(&path);
+    assert_h5dump_dataset_read(&path, "data", "resized fixed-array appended chunk file");
+    assert_h5py_script(
+        &path,
+        "d = f['data']\n\
+         assert d.shape == (15,)\n\
+         assert d.chunks == (5,)\n\
+         assert d.maxshape == (None,)\n\
+         assert d.dtype.kind == 'i'\n\
+         assert d.dtype.itemsize == 4\n\
+         assert d[:].tolist() == list(range(15))",
+        "resized fixed-array appended chunk file",
+    );
+}
+
+#[test]
+fn test_resize_then_write_appended_fixed_array_chunk() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("resize_write_fixed_array_chunk.h5");
+
+    {
+        let mut wf = WritableFile::create(&path).unwrap();
+        wf.new_dataset_builder("data")
+            .shape(&[10])
+            .chunk(&[5])
+            .write::<i32>(&(0..10).collect::<Vec<_>>())
+            .unwrap();
+        wf.flush().unwrap();
+    }
+
+    {
+        let f = File::open(&path).unwrap();
+        let ds = f.dataset("data").unwrap();
+        assert_eq!(
+            ds.info().unwrap().layout.chunk_index_type,
+            Some(ChunkIndexType::FixedArray)
+        );
+    }
+
+    {
+        let mut mf = MutableFile::open_rw(&path).unwrap();
+        mf.resize_dataset("data", &[15]).unwrap();
+        let chunk: Vec<i32> = (10..15).collect();
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                chunk.as_ptr() as *const u8,
+                chunk.len() * std::mem::size_of::<i32>(),
+            )
+        };
+        mf.write_chunk("data", &[10], bytes).unwrap();
+    }
+
+    {
+        let f = File::open(&path).unwrap();
+        let ds = f.dataset("data").unwrap();
+        assert_eq!(
+            ds.info().unwrap().layout.chunk_index_type,
+            Some(ChunkIndexType::FixedArray)
+        );
+        let mut vals = vec![0; ds.size().unwrap() as usize];
+        dataset_read_into(&ds, &mut vals).unwrap();
+        assert_eq!(vals, (0..15).collect::<Vec<_>>());
+    }
+
+    assert_logical_eoa_matches_file_len(&path);
+    assert_h5dump_dataset_read(
+        &path,
+        "data",
+        "resized grown fixed-array appended chunk file",
+    );
+    assert_h5py_script(
+        &path,
+        "d = f['data']\n\
+         assert d.shape == (15,)\n\
+         assert d.chunks == (5,)\n\
+         assert d.dtype.kind == 'i'\n\
+         assert d.dtype.itemsize == 4\n\
+         assert d[:].tolist() == list(range(15))",
+        "resized grown fixed-array appended chunk file",
+    );
 }
 
 #[test]
@@ -522,6 +644,15 @@ fn test_resize_btree_v2_shrink_then_grow_does_not_reexpose_pruned_chunks() {
 
     assert_logical_eoa_matches_file_len(&path);
     assert_h5dump_dataset_read(&path, "data", "B-tree v2 shrink-grow pruned file");
+    assert_h5py_script(
+        &path,
+        "d = f['data']\n\
+         assert d.shape == (15,)\n\
+         assert d.chunks == (5,)\n\
+         assert d.maxshape == (20,)\n\
+         assert d[:].tolist() == [0, 1, 2, 3, 4] + [-7] * 10",
+        "B-tree v2 shrink-grow pruned file",
+    );
 }
 
 #[test]
@@ -564,6 +695,15 @@ fn test_resize_btree_v2_partial_shrink_then_grow_scrubs_boundary_chunk_tail() {
 
     assert_logical_eoa_matches_file_len(&path);
     assert_h5dump_dataset_read(&path, "data", "B-tree v2 partial shrink-grow scrubbed file");
+    assert_h5py_script(
+        &path,
+        "d = f['data']\n\
+         assert d.shape == (15,)\n\
+         assert d.chunks == (5,)\n\
+         assert d.maxshape == (20,)\n\
+         assert d[:].tolist() == [0, 1, 2, 3, 4, 5, 6] + [-7] * 8",
+        "B-tree v2 partial shrink-grow scrubbed file",
+    );
 }
 
 #[test]
@@ -596,6 +736,15 @@ fn test_resize_2d_btree_v2_partial_shrink_then_grow_scrubs_boundary_chunk_tail()
     assert_h5dump_dataset_read(
         &path,
         "btree_v2",
+        "2D B-tree v2 partial shrink-grow scrubbed file",
+    );
+    assert_h5py_script(
+        &path,
+        "x = f['btree_v2']\n\
+         assert x.shape == (8, 8)\n\
+         assert x.chunks == (4, 4)\n\
+         assert x[:6, :].reshape(-1).tolist() == list(range(48))\n\
+         assert x[6:, :].reshape(-1).tolist() == [0] * 16",
         "2D B-tree v2 partial shrink-grow scrubbed file",
     );
 }
@@ -638,6 +787,14 @@ fn test_resize_fixed_array_partial_shrink_then_grow_scrubs_boundary_chunk_tail()
     assert_h5dump_dataset_read(
         &path,
         "data",
+        "fixed-array partial shrink-grow scrubbed file",
+    );
+    assert_h5py_script(
+        &path,
+        "d = f['data']\n\
+         assert d.shape == (10,)\n\
+         assert d.chunks == (5,)\n\
+         assert d[:].tolist() == [0, 1, 2, 3, 4, 5, 6, -7, -7, -7]",
         "fixed-array partial shrink-grow scrubbed file",
     );
 }
@@ -683,6 +840,15 @@ fn test_resize_extensible_array_partial_shrink_then_grow_scrubs_boundary_chunk_t
     assert_h5dump_dataset_read(
         &path,
         "data",
+        "extensible-array partial shrink-grow scrubbed file",
+    );
+    assert_h5py_script(
+        &path,
+        "d = f['data']\n\
+         assert d.shape == (9,)\n\
+         assert d.chunks == (5,)\n\
+         assert d.maxshape == (None,)\n\
+         assert d[:].tolist() == [0, 1, 2, 3, 4, 5, 6, -7, -7]",
         "extensible-array partial shrink-grow scrubbed file",
     );
 }
@@ -827,6 +993,16 @@ fn test_resize_grow_uses_chunked_fill_value() {
         dataset_read_into(&ds, &mut vals).unwrap();
         assert_eq!(vals, vec![0, 1, 2, 3, 4, -7, -7, -7, -7, -7]);
     }
+
+    assert_h5dump_dataset_read(&path, "data", "resized fill-value growth file");
+    assert_h5py_script(
+        &path,
+        "d = f['data']\n\
+         assert d.shape == (10,)\n\
+         assert d.chunks == (5,)\n\
+         assert d[:].tolist() == [0, 1, 2, 3, 4, -7, -7, -7, -7, -7]",
+        "resized fill-value growth file",
+    );
 }
 
 #[test]
@@ -871,7 +1047,10 @@ fn test_write_chunk_replaces_existing_chunk() {
         &path,
         "d = f['data']\n\
          assert d.shape == (10,)\n\
+         assert d.maxshape == (None,)\n\
          assert d.chunks == (5,)\n\
+         assert d.dtype.kind == 'i'\n\
+         assert d.dtype.itemsize == 4\n\
          assert d[:].tolist() == [0, 1, 2, 3, 4, 100, 101, 102, 103, 104]",
         "simple replaced chunk file",
     );
@@ -1152,6 +1331,65 @@ fn test_write_chunk_replaces_paged_v4_fixed_array_chunk() {
 }
 
 #[test]
+fn test_write_chunk_replaces_paged_v4_fixed_array_partial_final_page() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir
+        .path()
+        .join("replace_paged_v4_fixed_array_partial_final_page.h5");
+
+    {
+        let mut wf = WritableFile::create(&path).unwrap();
+        let data: Vec<i32> = (0..4105).collect();
+        wf.new_dataset_builder("data")
+            .shape(&[4105])
+            .chunk(&[1])
+            .write::<i32>(&data)
+            .unwrap();
+        wf.close().unwrap();
+    }
+
+    {
+        let mut mf = MutableFile::open_rw(&path).unwrap();
+        let chunk = [910_405i32];
+        let bytes = unsafe {
+            std::slice::from_raw_parts(chunk.as_ptr() as *const u8, std::mem::size_of_val(&chunk))
+        };
+        mf.write_chunk("data", &[4104], bytes).unwrap();
+    }
+
+    {
+        let f = File::open(&path).unwrap();
+        let ds = f.dataset("data").unwrap();
+        assert_eq!(
+            ds.info().unwrap().layout.chunk_index_type,
+            Some(ChunkIndexType::FixedArray)
+        );
+        let mut vals = vec![0; ds.size().unwrap() as usize];
+        dataset_read_into(&ds, &mut vals).unwrap();
+        assert_eq!(vals[4102], 4102);
+        assert_eq!(vals[4103], 4103);
+        assert_eq!(vals[4104], 910_405);
+    }
+
+    assert_logical_eoa_matches_file_len(&path);
+    assert_h5dump_dataset_read(
+        &path,
+        "data",
+        "replaced paged fixed-array partial final page file",
+    );
+    assert_h5py_script(
+        &path,
+        "x = f['data']\n\
+         assert x.shape == (4105,)\n\
+         assert x.chunks == (1,)\n\
+         assert int(x[4102]) == 4102\n\
+         assert int(x[4103]) == 4103\n\
+         assert int(x[4104]) == 910405",
+        "replaced paged fixed-array partial final page file",
+    );
+}
+
+#[test]
 fn test_write_chunk_replaces_existing_v4_extensible_array_chunk() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("replace_v4_extensible_array.h5");
@@ -1332,6 +1570,10 @@ fn test_resize_then_write_appended_v4_btree2_chunk() {
         &path,
         "x = f['btree_v2']\n\
          assert x.shape == (12, 8)\n\
+         assert x.maxshape == (None, None)\n\
+         assert x.chunks == (4, 4)\n\
+         assert x.dtype.kind == 'i'\n\
+         assert x.dtype.itemsize == 4\n\
          assert list(x[:8, :].reshape(-1)) == list(range(64))\n\
          assert list(x[8:, 0:4].reshape(-1)) == list(range(64, 80))\n\
          assert list(x[8:, 4:8].reshape(-1)) == [0] * 16",
@@ -1373,6 +1615,10 @@ fn test_resize_then_write_appended_v4_extensible_array_chunk() {
         &path,
         "x = f['extensible_array']\n\
          assert x.shape == (100,)\n\
+         assert x.maxshape == (None,)\n\
+         assert x.chunks == (20,)\n\
+         assert x.dtype.kind == 'f'\n\
+         assert x.dtype.itemsize == 8\n\
          assert list(x[:]) == [float(i) for i in range(100)]",
         "appended extensible-array file",
     );
@@ -1425,6 +1671,10 @@ fn test_resize_then_write_non_next_v4_extensible_array_data_block_chunk() {
         &path,
         "x = f['extensible_array']\n\
          assert x.shape == (120,)\n\
+         assert x.maxshape == (None,)\n\
+         assert x.chunks == (20,)\n\
+         assert x.dtype.kind == 'f'\n\
+         assert x.dtype.itemsize == 8\n\
          assert list(x[:80]) == [float(i) for i in range(80)]\n\
          assert list(x[80:100]) == [0.0] * 20\n\
          assert list(x[100:120]) == [float(i) for i in range(1000, 1020)]",
@@ -1491,6 +1741,10 @@ fn test_write_chunk_replaces_appended_v4_extensible_array_data_block_chunk() {
         &path,
         "x = f['extensible_array']\n\
          assert x.shape == (120,)\n\
+         assert x.maxshape == (None,)\n\
+         assert x.chunks == (20,)\n\
+         assert x.dtype.kind == 'f'\n\
+         assert x.dtype.itemsize == 8\n\
          assert list(x[:100]) == [float(i) for i in range(100)]\n\
          assert list(x[100:120]) == [float(i) for i in range(2000, 2020)]",
         "replaced appended extensible-array file",
@@ -1606,6 +1860,10 @@ fn test_resize_then_write_v4_extensible_array_into_super_block() {
         &path,
         "x = f['extensible_array']\n\
          assert x.shape == (4900,)\n\
+         assert x.maxshape == (None,)\n\
+         assert x.chunks == (20,)\n\
+         assert x.dtype.kind == 'f'\n\
+         assert x.dtype.itemsize == 8\n\
          assert x[0:5].tolist() == [float(i) for i in range(5)]\n\
          assert x[78:83].tolist() == [float(i) for i in range(78, 83)]\n\
          assert x[4880:4900].tolist() == [float(i) for i in range(4880, 4900)]",
@@ -1777,7 +2035,10 @@ fn test_write_chunk_replaces_filtered_chunk() {
          assert x.shape == (20,)\n\
          assert x.chunks == (5,)\n\
          assert x.compression == 'gzip'\n\
+         assert x.compression_opts == 4\n\
          assert x.shuffle\n\
+         assert x.dtype.kind == 'i'\n\
+         assert x.dtype.itemsize == 4\n\
          assert list(x[:]) == list(range(5)) + list(range(1000, 1005)) + list(range(10, 20))",
         "replaced shuffle-deflate chunk file",
     );
@@ -1818,6 +2079,8 @@ fn test_write_chunk_replaces_fletcher32_chunk() {
         &path,
         "x = f['chunked_fletcher']\n\
          assert x.shape == (100,)\n\
+         assert x.chunks == (25,)\n\
+         assert x.fletcher32 is True\n\
          assert list(x[:25]) == [float(i) for i in range(25)]\n\
          assert list(x[25:50]) == [float(i) for i in range(1000, 1025)]\n\
          assert list(x[50:]) == [float(i) for i in range(50, 100)]",

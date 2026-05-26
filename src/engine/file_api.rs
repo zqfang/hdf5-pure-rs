@@ -257,9 +257,19 @@ where
     H5F_visit_obj_ids(file, visitor);
 }
 
-/// Check if a given image is an accessible HDF5 file (signature check).
-pub fn H5Fis_accessible(image: &[u8]) -> bool {
-    H5F__is_hdf5(image)
+/// Public file-accessibility probe for local files handled by this backend.
+pub fn H5Fis_accessible(container_name: &str, _fapl_id: u64) -> Result<bool> {
+    let file = match std::fs::File::open(container_name) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(Error::Io(err)),
+    };
+    let mut reader = HdfReader::new(file);
+    match Superblock::read(&mut reader) {
+        Ok(_) => Ok(true),
+        Err(Error::InvalidFormat(_)) | Err(Error::Unsupported(_)) => Ok(false),
+        Err(err) => Err(err),
+    }
 }
 
 /// Common post-open work shared by file create/open API entry points.
@@ -315,14 +325,16 @@ pub fn H5Fclose(file: FileApiState) -> Result<()> {
     Ok(())
 }
 
-/// Mount a child file at the given name inside `file`.
-pub fn H5Fmount(file: &mut FileApiState, name: &str) {
+/// Public file-mount API backed by this file state's mount table.
+pub fn H5Fmount(file: &mut FileApiState, name: &str) -> Result<()> {
     H5F_mount(file, name);
+    Ok(())
 }
 
-/// Unmount the file previously mounted at `name` inside `file`.
-pub fn H5Funmount(file: &mut FileApiState, name: &str) {
+/// Public file-unmount API backed by this file state's mount table.
+pub fn H5Funmount(file: &mut FileApiState, name: &str) -> Result<()> {
     H5F_unmount(file, name);
+    Ok(())
 }
 
 /// Common reopen API plumbing: return a new handle that shares the underlying file.
@@ -360,9 +372,10 @@ pub fn H5Fclose_async(_file: FileApiState) -> Result<()> {
     Err(unsupported_file("H5Fclose_async"))
 }
 
-/// Delete a file through the configured VFD; unsupported without libhdf5 file-driver behavior.
-pub fn H5Fdelete(_filename: &str) -> Result<()> {
-    Err(unsupported_file("H5Fdelete"))
+/// Delete a local file through the pure-Rust file backend.
+pub fn H5Fdelete(filename: &str) -> Result<()> {
+    std::fs::remove_file(filename)?;
+    Ok(())
 }
 
 /// Reset the metadata cache hit-rate statistics for a file.
@@ -439,8 +452,25 @@ pub fn H5Fget_mdc_logging_status(file: &FileApiState) -> FileLoggingFlags {
     H5F_get_mdc_logging_status(file)
 }
 
+/// Public libhdf5-style metadata-cache logging status query through caller
+/// output parameters.
+pub fn H5Fget_mdc_logging_status_into(
+    file: &FileApiState,
+    is_enabled: &mut bool,
+    is_currently_logging: &mut bool,
+) {
+    let flags = H5Fget_mdc_logging_status(file);
+    *is_enabled = flags.metadata_logging;
+    *is_currently_logging = flags.metadata_logging;
+}
+
 /// Public metadata-cache flush-disable query; unsupported without libhdf5 MDC internals.
 pub fn H5Fget_mdc_flush_disabled(_file: &FileApiState) -> Result<bool> {
+    Err(unsupported_file("H5Fget_mdc_flush_disabled"))
+}
+
+/// Public metadata-cache flush-disable query through a caller output parameter.
+pub fn H5Fget_mdc_flush_disabled_into(_file: &FileApiState, _is_disabled: &mut bool) -> Result<()> {
     Err(unsupported_file("H5Fget_mdc_flush_disabled"))
 }
 
@@ -459,8 +489,28 @@ pub fn H5Fget_mdc_size(_file: &FileApiState) -> Result<()> {
     Err(unsupported_file("H5Fget_mdc_size"))
 }
 
+/// Public metadata-cache size query through caller output parameters.
+pub fn H5Fget_mdc_size_into(
+    _file: &FileApiState,
+    _max_size: &mut usize,
+    _min_clean_size: &mut usize,
+    _cur_size: &mut usize,
+    _cur_num_entries: &mut i32,
+) -> Result<()> {
+    Err(unsupported_file("H5Fget_mdc_size"))
+}
+
 /// Public metadata-cache image query; unsupported without libhdf5 MDC internals.
 pub fn H5Fget_mdc_image_info(_file: &FileApiState) -> Result<()> {
+    Err(unsupported_file("H5Fget_mdc_image_info"))
+}
+
+/// Public metadata-cache image query through caller output parameters.
+pub fn H5Fget_mdc_image_info_into(
+    _file: &FileApiState,
+    _image_addr: &mut u64,
+    _image_size: &mut u64,
+) -> Result<()> {
     Err(unsupported_file("H5Fget_mdc_image_info"))
 }
 
@@ -469,32 +519,61 @@ pub fn H5Fget_dset_no_attrs_hint(_file: &FileApiState) -> Result<()> {
     Err(unsupported_file("H5Fget_dset_no_attrs_hint"))
 }
 
+/// Public dataset-no-attributes hint query through a caller output parameter.
+pub fn H5Fget_dset_no_attrs_hint_into(_file: &FileApiState, _minimize: &mut bool) -> Result<()> {
+    Err(unsupported_file("H5Fget_dset_no_attrs_hint"))
+}
+
 /// Public dataset-no-attributes hint setter; unsupported without file property state here.
 pub fn H5Fset_dset_no_attrs_hint(_file: &mut FileApiState, _minimize: bool) -> Result<()> {
     Err(unsupported_file("H5Fset_dset_no_attrs_hint"))
 }
 
-/// Clear the external-link file cache for this file.
-pub fn H5Fclear_elink_file_cache(_file: &mut FileApiState) {}
-
-/// Enable SWMR write access on an open file.
-pub fn H5Fstart_swmr_write(file: &mut FileApiState) {
-    file.swmr_write = true;
+/// Clear the external-link file cache for this file; unsupported without libhdf5's elink cache.
+pub fn H5Fclear_elink_file_cache(_file: &mut FileApiState) -> Result<()> {
+    Err(unsupported_file("H5Fclear_elink_file_cache"))
 }
 
-/// Begin metadata-cache logging for a file.
-pub fn H5Fstart_mdc_logging(file: &mut FileApiState) {
+/// Public API to enable SWMR write bookkeeping on this file state.
+pub fn H5Fstart_swmr_write(file: &mut FileApiState) -> Result<()> {
+    H5F__start_swmr_write(file);
+    Ok(())
+}
+
+/// Public API to begin metadata-cache logging bookkeeping.
+pub fn H5Fstart_mdc_logging(file: &mut FileApiState) -> Result<()> {
     file.metadata_logging = true;
+    Ok(())
 }
 
-/// Stop metadata-cache logging for a file.
-pub fn H5Fstop_mdc_logging(file: &mut FileApiState) {
+/// Public API to stop metadata-cache logging bookkeeping.
+pub fn H5Fstop_mdc_logging(file: &mut FileApiState) -> Result<()> {
     file.metadata_logging = false;
+    Ok(())
 }
 
 /// Convert a file's on-disk format to a different libver bound; not supported here.
 pub fn H5Fformat_convert(_file: &mut FileApiState) -> Result<()> {
     Err(unsupported_file("H5Fformat_convert"))
+}
+
+/// Change the active file format version bounds recorded on the file state.
+pub fn H5Fset_libver_bounds(file: &mut FileApiState, low: u8, high: u8) -> Result<()> {
+    if low > high {
+        return Err(Error::InvalidFormat(format!(
+            "low libver bound {low} exceeds high bound {high}"
+        )));
+    }
+    H5F__set_libver_bounds(file, low, high);
+    Ok(())
+}
+
+/// Mark future object creation to use the latest recorded format bound.
+pub fn H5Fset_latest_format(file: &mut FileApiState, latest_format: bool) -> Result<()> {
+    if latest_format {
+        H5F__set_libver_bounds(file, file.low_bound, u8::MAX);
+    }
+    Ok(())
 }
 
 /// Reset the page buffering statistics for a file.
@@ -1081,21 +1160,29 @@ pub fn H5F_shared_select_read_into(
     spans: &[(usize, usize)],
     out: &mut [u8],
 ) -> Result<()> {
-    let mut out_offset = 0usize;
+    let mut total_len = 0usize;
     for &(offset, len) in spans {
-        let end = out_offset
+        let span_end = offset
+            .checked_add(len)
+            .ok_or_else(|| Error::InvalidFormat("H5F select input offset overflow".into()))?;
+        file.image
+            .get(offset..span_end)
+            .ok_or_else(|| Error::InvalidFormat("H5F read is outside file image".into()))?;
+        total_len = total_len
             .checked_add(len)
             .ok_or_else(|| Error::InvalidFormat("H5F select output offset overflow".into()))?;
-        let dst = out
-            .get_mut(out_offset..end)
-            .ok_or_else(|| Error::InvalidFormat("H5F select output buffer is too small".into()))?;
-        H5F_block_read_into(file, offset, dst)?;
-        out_offset = end;
     }
-    if out_offset != out.len() {
+    if total_len != out.len() {
         return Err(Error::InvalidFormat(
             "H5F select output buffer length does not match requested spans".into(),
         ));
+    }
+
+    let mut out_offset = 0usize;
+    for &(offset, len) in spans {
+        let end = out_offset + len;
+        out[out_offset..end].copy_from_slice(&file.image[offset..offset + len]);
+        out_offset = end;
     }
     Ok(())
 }
@@ -1654,6 +1741,14 @@ pub fn H5Fget_free_sections(_file: &FileApiState) -> Result<()> {
     Err(unsupported_file("H5Fget_free_sections"))
 }
 
+/// Public free-space section enumeration through caller-owned section storage.
+pub fn H5Fget_free_sections_into(
+    _file: &FileApiState,
+    _sections: &mut Vec<FileApiFreeSpaceInfo>,
+) -> Result<()> {
+    Err(unsupported_file("H5Fget_free_sections"))
+}
+
 /// Return the metadata-cache hit rate through the public libhdf5-style API.
 pub fn H5Fget_mdc_hit_rate(file: &FileApiState) -> f64 {
     H5F_get_mdc_hit_rate(file)
@@ -1671,6 +1766,11 @@ pub fn H5F_get_vfd_handle() -> Result<()> {
 
 /// Public API to return the underlying VFD file handle; unsupported in pure-Rust mode.
 pub fn H5Fget_vfd_handle(_file: &FileApiState) -> Result<()> {
+    Err(unsupported_file("H5Fget_vfd_handle"))
+}
+
+/// Public API to return the underlying VFD file handle through caller storage.
+pub fn H5Fget_vfd_handle_into(_file: &FileApiState, _handle: &mut Option<u64>) -> Result<()> {
     Err(unsupported_file("H5Fget_vfd_handle"))
 }
 
@@ -1818,8 +1918,8 @@ mod tests {
         let mut file = FileApiState::default();
         H5Freset_mdc_hit_rate_stats(&mut file);
         H5Freset_page_buffering_stats(&mut file);
-        H5Fstart_swmr_write(&mut file);
-        H5Fstart_mdc_logging(&mut file);
+        H5F__start_swmr_write(&mut file);
+        H5F_start_mdc_log_on_access(&mut file);
         H5F_set_coll_metadata_reads(&mut file, true);
         H5F__set_mpi_atomicity(&mut file, true);
         H5F_incr_nopen_objs(&mut file);
@@ -1842,6 +1942,32 @@ mod tests {
         assert!(flags.metadata_logging);
         assert!(flags.coll_metadata_reads);
         assert!(flags.mpi_atomicity);
+        let mut is_enabled = false;
+        let mut is_currently_logging = false;
+        H5Fget_mdc_logging_status_into(&file, &mut is_enabled, &mut is_currently_logging);
+        assert!(is_enabled);
+        assert!(is_currently_logging);
+
+        let file = FileApiState::default();
+        H5Fget_mdc_logging_status_into(&file, &mut is_enabled, &mut is_currently_logging);
+        assert!(!is_enabled);
+        assert!(!is_currently_logging);
+    }
+
+    #[test]
+    fn file_allocation_helpers_preserve_state_on_overflow() {
+        let mut file = FileApiState {
+            eof: u64::MAX - 1,
+            eoa: u64::MAX - 1,
+            ..FileApiState::default()
+        };
+        let before = file.clone();
+
+        assert!(H5F__alloc(&mut file, 2).is_err());
+        assert_eq!(file, before);
+
+        assert!(H5Fincrement_filesize(&mut file, 2).is_err());
+        assert_eq!(file, before);
     }
 
     #[test]
@@ -1863,6 +1989,25 @@ mod tests {
             H5Fopen(&pkg, "missing.h5"),
             Err(Error::Unsupported(_))
         ));
+    }
+
+    #[test]
+    fn public_accessibility_probe_uses_superblock_parser() {
+        let dir = tempfile::tempdir().unwrap();
+        let valid = dir.path().join("valid.h5");
+        std::fs::copy("tests/data/hdf5_ref/v4_fixed_array_chunks.h5", &valid).unwrap();
+        assert!(H5Fis_accessible(valid.to_str().unwrap(), 0).unwrap());
+
+        let userblock = dir.path().join("userblock.h5");
+        let mut prefixed = vec![0u8; 512];
+        prefixed.extend_from_slice(&std::fs::read(&valid).unwrap());
+        std::fs::write(&userblock, prefixed).unwrap();
+        assert!(H5Fis_accessible(userblock.to_str().unwrap(), 0).unwrap());
+
+        let invalid = dir.path().join("invalid.bin");
+        std::fs::write(&invalid, b"not hdf5").unwrap();
+        assert!(!H5Fis_accessible(invalid.to_str().unwrap(), 0).unwrap());
+        assert!(!H5Fis_accessible(dir.path().join("missing.h5").to_str().unwrap(), 0).unwrap());
     }
 
     #[test]
@@ -1930,6 +2075,14 @@ mod tests {
             H5Fget_vfd_handle(&file),
             Err(Error::Unsupported(_))
         ));
+        let mut vfd_handle = Some(42);
+        let err = H5Fget_vfd_handle_into(&file, &mut vfd_handle).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Unsupported: H5Fget_vfd_handle requires libhdf5 file-driver behavior not implemented in pure-Rust mode"
+        );
+        assert_eq!(vfd_handle, Some(42));
+        assert!(matches!(H5F_get_vfd_handle(), Err(Error::Unsupported(_))));
         assert!(matches!(
             H5Fget_mdc_config(&file),
             Err(Error::Unsupported(_))
@@ -1938,16 +2091,66 @@ mod tests {
             H5Fget_mdc_flush_disabled(&file),
             Err(Error::Unsupported(_))
         ));
+        let mut flush_disabled = true;
+        let err = H5Fget_mdc_flush_disabled_into(&file, &mut flush_disabled).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Unsupported: H5Fget_mdc_flush_disabled requires libhdf5 file-driver behavior not implemented in pure-Rust mode"
+        );
+        assert!(flush_disabled);
         assert!(matches!(H5Fget_mdc_size(&file), Err(Error::Unsupported(_))));
+        let mut max_size = 1;
+        let mut min_clean_size = 2;
+        let mut cur_size = 3;
+        let mut cur_num_entries = 4;
+        let err = H5Fget_mdc_size_into(
+            &file,
+            &mut max_size,
+            &mut min_clean_size,
+            &mut cur_size,
+            &mut cur_num_entries,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Unsupported: H5Fget_mdc_size requires libhdf5 file-driver behavior not implemented in pure-Rust mode"
+        );
+        assert_eq!(max_size, 1);
+        assert_eq!(min_clean_size, 2);
+        assert_eq!(cur_size, 3);
+        assert_eq!(cur_num_entries, 4);
         assert!(matches!(
             H5Fget_mdc_image_info(&file),
             Err(Error::Unsupported(_))
         ));
+        let mut image_addr = 5;
+        let mut image_size = 6;
+        let err = H5Fget_mdc_image_info_into(&file, &mut image_addr, &mut image_size).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Unsupported: H5Fget_mdc_image_info requires libhdf5 file-driver behavior not implemented in pure-Rust mode"
+        );
+        assert_eq!(image_addr, 5);
+        assert_eq!(image_size, 6);
         assert!(matches!(
             H5Fget_dset_no_attrs_hint(&file),
             Err(Error::Unsupported(_))
         ));
-        let mut file = file;
+        let mut minimize_attrs = true;
+        let err = H5Fget_dset_no_attrs_hint_into(&file, &mut minimize_attrs).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Unsupported: H5Fget_dset_no_attrs_hint requires libhdf5 file-driver behavior not implemented in pure-Rust mode"
+        );
+        assert!(minimize_attrs);
+        let mut file = FileApiState {
+            low_bound: 2,
+            high_bound: 3,
+            flags: 0x55,
+            metadata_logging: false,
+            swmr_write: false,
+            ..file
+        };
         assert!(matches!(
             H5Fset_mdc_config(&mut file),
             Err(Error::Unsupported(_))
@@ -1956,14 +2159,80 @@ mod tests {
             H5Fset_dset_no_attrs_hint(&mut file, true),
             Err(Error::Unsupported(_))
         ));
+        H5Fset_libver_bounds(&mut file, 0, 4).unwrap();
+        assert_eq!(file.low_bound, 0);
+        assert_eq!(file.high_bound, 4);
+        let err = H5Fset_libver_bounds(&mut file, 5, 4).unwrap_err();
+        assert!(matches!(err, Error::InvalidFormat(_)));
+        assert_eq!(file.low_bound, 0);
+        assert_eq!(file.high_bound, 4);
+
+        H5Fset_latest_format(&mut file, true).unwrap();
+        assert_eq!(file.high_bound, u8::MAX);
+        H5Fstart_swmr_write(&mut file).unwrap();
+        assert!(file.swmr_write);
+        H5Fstart_mdc_logging(&mut file).unwrap();
+        assert!(file.metadata_logging);
+        H5Fstop_mdc_logging(&mut file).unwrap();
+        assert!(!file.metadata_logging);
+        let before_format_convert = file.clone();
+        assert!(matches!(
+            H5Fformat_convert(&mut file),
+            Err(Error::Unsupported(_))
+        ));
+        assert_eq!(file, before_format_convert);
+        assert!(matches!(
+            H5F__format_convert(&mut file),
+            Err(Error::Unsupported(_))
+        ));
+        assert_eq!(file, before_format_convert);
         assert!(matches!(
             H5Fget_free_sections(&file),
             Err(Error::Unsupported(_))
         ));
+        let mut free_sections = vec![FileApiFreeSpaceInfo {
+            version: 1,
+            metadata_size: 2,
+            total_space: 3,
+        }];
+        let err = H5Fget_free_sections_into(&file, &mut free_sections).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Unsupported: H5Fget_free_sections requires libhdf5 file-driver behavior not implemented in pure-Rust mode"
+        );
+        assert_eq!(
+            free_sections,
+            vec![FileApiFreeSpaceInfo {
+                version: 1,
+                metadata_size: 2,
+                total_space: 3,
+            }]
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let delete_path = dir.path().join("delete-me.h5");
+        std::fs::write(&delete_path, b"temporary").unwrap();
+        H5Fdelete(delete_path.to_str().unwrap()).unwrap();
+        assert!(!delete_path.exists());
         assert!(matches!(
-            H5Fdelete("delete-me.h5"),
-            Err(Error::Unsupported(_))
+            H5Fdelete(delete_path.to_str().unwrap()),
+            Err(Error::Io(_))
         ));
+        assert!(!H5Fis_accessible("maybe.h5", 0).unwrap());
+        let mut file = FileApiState::default();
+        H5Fmount(&mut file, "/child").unwrap();
+        assert!(H5F_is_mount(&file, "/child"));
+
+        H5F_mount(&mut file, "/existing");
+        H5Funmount(&mut file, "/existing").unwrap();
+        assert!(!H5F_is_mount(&file, "/existing"));
+
+        let before_elink_cache = file.clone();
+        let err = H5Fclear_elink_file_cache(&mut file).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Unsupported: H5Fclear_elink_file_cache requires libhdf5 file-driver behavior not implemented in pure-Rust mode"
+        );
+        assert_eq!(file, before_elink_cache);
     }
 
     #[test]
@@ -2001,6 +2270,12 @@ mod tests {
         );
         assert_eq!(image, file.image);
 
+        let mut short_image = *b"stale";
+        assert!(H5F__get_file_image_into(&file, &mut short_image).is_err());
+        assert_eq!(&short_image, b"stale");
+        assert!(H5Fget_file_image_into(&file, &mut short_image).is_err());
+        assert_eq!(&short_image, b"stale");
+
         let mut block = [0; 3];
         H5F_block_read_into(&file, 2, &mut block).unwrap();
         assert_eq!(&block, b"cde");
@@ -2009,6 +2284,12 @@ mod tests {
         H5F_shared_select_read_into(&file, &[(0, 2), (9, 3)], &mut selected).unwrap();
         assert_eq!(&selected, b"abjkl");
         assert!(H5F_block_read_into(&file, 10, &mut selected).is_err());
+
+        let mut stale = *b"stale";
+        assert!(H5F_shared_select_read_into(&file, &[(0, 2), (11, 2)], &mut stale).is_err());
+        assert_eq!(&stale, b"stale");
+        assert!(H5F_shared_vector_read_into(&file, &[(0, 2), (2, 2)], &mut stale).is_err());
+        assert_eq!(&stale, b"stale");
     }
 
     #[test]
@@ -2046,11 +2327,19 @@ mod tests {
         let mut name = String::new();
         H5Fget_name_into(&file, &mut name);
         assert_eq!(name, "resolved.h5");
+        let mut actual_name = String::from("stale");
+        H5F_get_actual_name_into(&file, &mut actual_name);
+        assert_eq!(actual_name, "resolved.h5");
+        let mut extpath = String::from("stale");
+        H5F_get_extpath_into(&file, &mut extpath);
+        assert_eq!(extpath, "logical.h5");
 
         file.actual_name.clear();
         assert_eq!(H5Fget_name(&file), "logical.h5");
         H5Fget_name_into(&file, &mut name);
         assert_eq!(name, "logical.h5");
+        H5F_get_actual_name_into(&file, &mut actual_name);
+        assert!(actual_name.is_empty());
 
         assert_eq!(H5Fget_file_image_size(&file), file.image.len());
         let mut image = vec![0; file.image.len()];

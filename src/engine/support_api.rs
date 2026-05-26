@@ -81,8 +81,18 @@ pub fn H5_mpi_comm_free() -> Result<()> {
     Err(unsupported_support("H5_mpi_comm_free"))
 }
 
+/// Duplicate an MPI info object; unsupported in pure-Rust mode.
+pub fn H5_mpi_info_dup() -> Result<()> {
+    Err(unsupported_support("H5_mpi_info_dup"))
+}
+
 /// Compare two MPI communicators; unsupported in pure-Rust mode.
 pub fn H5_mpi_comm_cmp() -> Result<Ordering> {
+    Err(unsupported_support("H5_mpi_comm_cmp"))
+}
+
+/// Compare two MPI communicators through an out parameter; unsupported in pure-Rust mode.
+pub fn H5_mpi_comm_cmp_into(_ordering: &mut Ordering) -> Result<()> {
     Err(unsupported_support("H5_mpi_comm_cmp"))
 }
 
@@ -546,6 +556,14 @@ pub fn H5TS_pool_create() -> Result<()> {
     ))
 }
 
+/// Queue a task on a thread pool; intentionally unsupported in pure-Rust mode.
+#[allow(non_snake_case)]
+pub fn H5TS_pool_add_task<T>(_task: &mut T) -> Result<()> {
+    Err(Error::Unsupported(
+        "thread-pool runtime is intentionally unsupported".into(),
+    ))
+}
+
 /// Format a boolean argument for the API trace log.
 pub fn H5_trace_args_bool_ref(value: bool) -> &'static str {
     if value {
@@ -699,6 +717,11 @@ pub fn H5FDdriver_query(_driver_id: u64) -> Result<u64> {
     Err(unsupported_support("H5FDdriver_query"))
 }
 
+/// Query VFD driver capability flags through caller-owned storage.
+pub fn H5FDdriver_query_into(_driver_id: u64, _flags: &mut u64) -> Result<()> {
+    Err(unsupported_support("H5FDdriver_query"))
+}
+
 /// Append a plugin search path; unsupported without dynamic plugin loading.
 pub fn H5PLappend(_path: &str) -> Result<()> {
     Err(unsupported_support("H5PLappend"))
@@ -712,6 +735,16 @@ pub fn H5PLprepend(_path: &str) -> Result<()> {
 /// Replace a plugin search path; unsupported without dynamic plugin loading.
 pub fn H5PLreplace(_path: &str, _index: usize) -> Result<()> {
     Err(unsupported_support("H5PLreplace"))
+}
+
+/// Insert a plugin search path; unsupported without dynamic plugin loading.
+pub fn H5PLinsert(_path: &str, _index: usize) -> Result<()> {
+    Err(unsupported_support("H5PLinsert"))
+}
+
+/// Remove a plugin search path; unsupported without dynamic plugin loading.
+pub fn H5PLremove(_index: usize) -> Result<()> {
+    Err(unsupported_support("H5PLremove"))
 }
 
 /// Dump pending subfiling I/O vectors; unsupported in pure-Rust mode.
@@ -749,13 +782,24 @@ pub fn H5_get_win32_times() -> Result<()> {
     Err(unsupported_support("H5_get_win32_times"))
 }
 
+/// Retrieve Windows-style high-resolution times through caller-owned storage.
+pub fn H5_get_win32_times_into(
+    _created: &mut SystemTime,
+    _accessed: &mut SystemTime,
+    _modified: &mut SystemTime,
+) -> Result<()> {
+    Err(unsupported_support("H5_get_win32_times"))
+}
+
 /// Decode a UTF-16 buffer into a `String`.
 pub fn H5_get_utf16_str_into(bytes: &[u16], out: &mut String) -> Result<()> {
-    out.clear();
+    let mut decoded = String::new();
     for item in std::char::decode_utf16(bytes.iter().copied()) {
         let ch = item.map_err(|_| Error::InvalidFormat("invalid UTF-16 string".into()))?;
-        out.push(ch);
+        decoded.push(ch);
     }
+    out.clear();
+    out.push_str(&decoded);
     Ok(())
 }
 
@@ -937,6 +981,22 @@ mod tests {
     }
 
     #[test]
+    fn utf16_decode_replaces_output_only_after_successful_decode() {
+        let mut out = String::from("stale");
+        H5_get_utf16_str_into(&[0x0041, 0xD83D, 0xDE00], &mut out)
+            .expect("valid UTF-16 should decode");
+        assert_eq!(out, "A😀");
+
+        let err = H5_get_utf16_str_into(&[0x0042, 0xD800], &mut out)
+            .expect_err("unpaired surrogate should fail");
+        assert!(matches!(err, Error::InvalidFormat(_)));
+        assert_eq!(out, "A😀");
+
+        H5_get_utf16_str_into(&[], &mut out).expect("empty UTF-16 should decode");
+        assert!(out.is_empty());
+    }
+
+    #[test]
     fn free_list_public_wrappers_query_and_set_limits() {
         let mut lists = FreeListManager::new();
         lists.blk_free(vec![0; 4]);
@@ -997,15 +1057,56 @@ mod tests {
 
     #[test]
     fn support_runtime_boundaries_are_explicitly_unsupported() {
+        let mut ordering = Ordering::Less;
+        let err = H5_mpi_comm_cmp_into(&mut ordering)
+            .expect_err("MPI communicator comparison remains unsupported");
+        assert!(matches!(err, Error::Unsupported(_)));
+        assert_eq!(ordering, Ordering::Less);
+
         for err in [
+            H5_mpi_comm_dup().unwrap_err(),
+            H5_mpi_comm_free().unwrap_err(),
+            H5_mpi_info_dup().unwrap_err(),
+            H5_mpi_comm_cmp().unwrap_err(),
+            H5_mpio_gatherv_alloc().unwrap_err(),
+            H5_mpio_gatherv_alloc_simple().unwrap_err(),
             H5FD__copy_plist().unwrap_err(),
             H5FDdriver_query(0).unwrap_err(),
+            {
+                let mut flags = 0xfeed;
+                let err = H5FDdriver_query_into(0, &mut flags).unwrap_err();
+                assert_eq!(flags, 0xfeed);
+                err
+            },
             H5PLappend("/tmp/hdf5-plugins").unwrap_err(),
             H5PLprepend("/tmp/hdf5-plugins").unwrap_err(),
             H5PLreplace("/tmp/hdf5-plugins", 0).unwrap_err(),
+            H5PLinsert("/tmp/hdf5-plugins", 0).unwrap_err(),
+            H5PLremove(0).unwrap_err(),
             H5_subfiling_dump_iovecs().unwrap_err(),
             H5_get_win32_times().unwrap_err(),
+            {
+                let original_created = UNIX_EPOCH + Duration::from_secs(11);
+                let original_accessed = UNIX_EPOCH + Duration::from_secs(22);
+                let original_modified = UNIX_EPOCH + Duration::from_secs(33);
+                let mut created = original_created;
+                let mut accessed = original_accessed;
+                let mut modified = original_modified;
+                let err = H5_get_win32_times_into(&mut created, &mut accessed, &mut modified)
+                    .unwrap_err();
+                assert_eq!(created, original_created);
+                assert_eq!(accessed, original_accessed);
+                assert_eq!(modified, original_modified);
+                err
+            },
             H5EA__dblock_create().unwrap_err(),
+            H5TS_pool_create().unwrap_err(),
+            {
+                let mut task_state = String::from("queued");
+                let err = H5TS_pool_add_task(&mut task_state).unwrap_err();
+                assert_eq!(task_state, "queued");
+                err
+            },
         ] {
             assert!(matches!(err, Error::Unsupported(_)));
         }

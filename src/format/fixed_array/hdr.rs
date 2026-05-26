@@ -62,19 +62,20 @@ pub(super) fn cache_hdr_serialize_into(
     length_size: usize,
     out: &mut Vec<u8>,
 ) -> Result<()> {
-    out.clear();
-    out.reserve(cache_hdr_image_len(addr_size, length_size)?);
-    out.extend_from_slice(b"FAHD");
-    out.push(0);
-    out.push(header.class_id);
-    out.push(u8::try_from(header.raw_element_size).map_err(|_| {
+    let mut image = Vec::with_capacity(cache_hdr_image_len(addr_size, length_size)?);
+    image.extend_from_slice(b"FAHD");
+    image.push(0);
+    image.push(header.class_id);
+    image.push(u8::try_from(header.raw_element_size).map_err(|_| {
         Error::InvalidFormat("fixed array raw element size does not fit in u8".into())
     })?);
-    out.push(header.max_page_elements_bits);
-    encode_var(out, header.elements, length_size)?;
-    encode_addr(out, header.data_block_addr, addr_size)?;
-    let checksum = checksum_metadata(&out);
-    out.extend_from_slice(&checksum.to_le_bytes());
+    image.push(header.max_page_elements_bits);
+    encode_var(&mut image, header.elements, length_size)?;
+    encode_addr(&mut image, header.data_block_addr, addr_size)?;
+    let checksum = checksum_metadata(&image);
+    image.extend_from_slice(&checksum.to_le_bytes());
+    out.clear();
+    out.extend_from_slice(&image);
     Ok(())
 }
 
@@ -332,6 +333,25 @@ mod tests {
             ..header
         };
         assert!(cache_hdr_serialize_into(&too_large_addr, 4, 4, &mut Vec::new()).is_err());
+    }
+
+    #[test]
+    fn fixed_array_header_cache_serialize_preserves_output_on_validation_error() {
+        let stale = vec![0xaa, 0xbb, 0xcc];
+        let header = FixedArrayHeader {
+            class_id: 1,
+            raw_element_size: usize::from(u8::MAX) + 1,
+            max_page_elements_bits: 0,
+            elements: 7,
+            data_block_addr: crate::io::reader::UNDEF_ADDR,
+        };
+        let mut image = stale.clone();
+
+        let err = cache_hdr_serialize_into(&header, 4, 4, &mut image)
+            .expect_err("oversized element size should fail");
+
+        assert!(err.to_string().contains("element size"));
+        assert_eq!(image, stale);
     }
 
     #[test]

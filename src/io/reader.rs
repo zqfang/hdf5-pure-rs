@@ -115,7 +115,9 @@ impl<R: Read + Seek> HdfReader<R> {
 
     /// Read bytes into a provided buffer.
     pub fn read_bytes_into(&mut self, buf: &mut [u8]) -> Result<()> {
-        self.inner.read_exact(buf)?;
+        let mut scratch = vec![0; buf.len()];
+        self.inner.read_exact(&mut scratch)?;
+        buf.copy_from_slice(&scratch);
         Ok(())
     }
 
@@ -175,7 +177,12 @@ impl<R: Read + Seek> HdfReader<R> {
 
     /// Read a file address (variable width based on sizeof_addr).
     pub fn read_addr(&mut self) -> Result<u64> {
-        self.read_uint(self.sizeof_addr)
+        let addr = self.read_uint(self.sizeof_addr)?;
+        if self.sizeof_addr < 8 && addr == max_uint_for_size(self.sizeof_addr)? {
+            Ok(UNDEF_ADDR)
+        } else {
+            Ok(addr)
+        }
     }
 
     /// Read a file length (variable width based on sizeof_size).
@@ -231,6 +238,16 @@ pub fn is_undef_addr(addr: u64) -> bool {
     addr == UNDEF_ADDR
 }
 
+fn max_uint_for_size(size: u8) -> Result<u64> {
+    match size {
+        1..=7 => Ok((1u64 << (u32::from(size) * 8)) - 1),
+        8 => Ok(u64::MAX),
+        _ => Err(Error::InvalidFormat(format!(
+            "unsupported integer size: {size}"
+        ))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -279,6 +296,17 @@ mod tests {
     }
 
     #[test]
+    fn read_bytes_into_preserves_output_on_short_read() {
+        let data = vec![1, 2];
+        let mut r = HdfReader::new(Cursor::new(data));
+        let mut buf = [9u8; 4];
+
+        assert!(r.read_bytes_into(&mut buf).is_err());
+
+        assert_eq!(buf, [9, 9, 9, 9]);
+    }
+
+    #[test]
     fn test_read_exact() {
         let data = vec![5, 6, 7];
         let mut r = HdfReader::new(Cursor::new(data));
@@ -296,6 +324,16 @@ mod tests {
         let mut r = HdfReader::new(Cursor::new(data));
         r.set_sizeof_addr(4);
         assert_eq!(r.read_addr().unwrap(), 0x12345678);
+    }
+
+    #[test]
+    fn read_addr_normalizes_width_specific_undefined_sentinel() {
+        let data = vec![0xff, 0xff, 0xff, 0xff];
+        let mut r = HdfReader::new(Cursor::new(data));
+        r.set_sizeof_addr(4);
+
+        assert_eq!(r.read_addr().unwrap(), UNDEF_ADDR);
+        assert!(is_undef_addr(UNDEF_ADDR));
     }
 
     #[test]

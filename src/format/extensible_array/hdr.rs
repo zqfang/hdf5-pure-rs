@@ -130,22 +130,21 @@ pub(super) fn cache_hdr_serialize_into(
     length_size: usize,
     out: &mut Vec<u8>,
 ) -> Result<()> {
-    out.clear();
-    out.reserve(cache_hdr_image_len(addr_size, length_size)?);
-    out.extend_from_slice(b"EAHD");
-    out.push(0);
-    out.push(header.class_id);
-    out.push(u8::try_from(header.raw_element_size).map_err(|_| {
+    let mut image = Vec::with_capacity(cache_hdr_image_len(addr_size, length_size)?);
+    image.extend_from_slice(b"EAHD");
+    image.push(0);
+    image.push(header.class_id);
+    image.push(u8::try_from(header.raw_element_size).map_err(|_| {
         Error::InvalidFormat("extensible array raw element size does not fit in u8".into())
     })?);
     let max_bits = 64 - header.max_index_set.max(1).leading_zeros() as u8;
-    out.push(max_bits);
-    out.push(header.index_block_elements);
-    out.push(u8::try_from(header.data_block_min_elements).map_err(|_| {
+    image.push(max_bits);
+    image.push(header.index_block_elements);
+    image.push(u8::try_from(header.data_block_min_elements).map_err(|_| {
         Error::InvalidFormat("extensible array minimum data block elements do not fit in u8".into())
     })?);
-    out.push(1);
-    out.push(
+    image.push(1);
+    image.push(
         header
             .data_block_page_elements
             .checked_ilog2()
@@ -153,15 +152,16 @@ pub(super) fn cache_hdr_serialize_into(
             .try_into()
             .map_err(|_| Error::InvalidFormat("extensible array page bits overflow".into()))?,
     );
-    encode_var(out, header.super_block_count, length_size)?;
-    encode_var(out, header.super_block_size, length_size)?;
-    encode_var(out, header.data_block_count, length_size)?;
-    encode_var(out, header.data_block_size, length_size)?;
-    encode_var(out, header.max_index_set, length_size)?;
-    encode_var(out, header.realized_elements, length_size)?;
-    encode_addr(out, header.index_block_addr, addr_size)?;
-    let checksum = checksum_metadata(&out);
-    out.extend_from_slice(&checksum.to_le_bytes());
+    encode_var(&mut image, header.super_block_count, length_size)?;
+    encode_var(&mut image, header.super_block_size, length_size)?;
+    encode_var(&mut image, header.data_block_count, length_size)?;
+    encode_var(&mut image, header.data_block_size, length_size)?;
+    encode_var(&mut image, header.max_index_set, length_size)?;
+    encode_var(&mut image, header.realized_elements, length_size)?;
+    encode_addr(&mut image, header.index_block_addr, addr_size)?;
+    let checksum = checksum_metadata(&image);
+    image.extend_from_slice(&checksum.to_le_bytes());
+    *out = image;
     Ok(())
 }
 
@@ -589,21 +589,25 @@ mod tests {
             max_index_set_pos: 0,
             realized_elements_pos: 0,
         };
-        let mut image = Vec::new();
+        let mut image = b"stale caller bytes".to_vec();
         cache_hdr_serialize_into(&header, 4, 4, &mut image).unwrap();
+        assert!(image.starts_with(b"EAHD"));
         assert_eq!(&image[36..40], &[0xff; 4]);
 
         let too_large_index = super::ParsedExtensibleArrayHeader {
             max_index_set: u64::from(u32::MAX) + 1,
             ..header.clone()
         };
-        assert!(cache_hdr_serialize_into(&too_large_index, 4, 4, &mut Vec::new()).is_err());
+        let mut stale = b"keep me".to_vec();
+        assert!(cache_hdr_serialize_into(&too_large_index, 4, 4, &mut stale).is_err());
+        assert_eq!(stale, b"keep me");
 
         let too_large_addr = super::ParsedExtensibleArrayHeader {
             index_block_addr: u64::from(u32::MAX) + 1,
             ..header
         };
-        assert!(cache_hdr_serialize_into(&too_large_addr, 4, 4, &mut Vec::new()).is_err());
+        assert!(cache_hdr_serialize_into(&too_large_addr, 4, 4, &mut stale).is_err());
+        assert_eq!(stale, b"keep me");
     }
 
     #[test]

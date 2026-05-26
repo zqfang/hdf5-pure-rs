@@ -9,10 +9,10 @@ use crate::format::object_header::{
 
 use super::MutableFile;
 
-struct ObjectHeaderMessageLocation {
-    msg_data_offset: u64,
-    msg_data_len: usize,
-    v2_checksum: Option<(u64, usize)>,
+pub(super) struct ObjectHeaderMessageLocation {
+    pub(super) msg_data_offset: u64,
+    pub(super) msg_data_len: usize,
+    pub(super) v2_checksum: Option<(u64, usize)>,
 }
 
 impl MutableFile {
@@ -375,7 +375,7 @@ impl MutableFile {
     }
 
     /// Find a message of the given type in an object header.
-    fn find_message_in_oh(
+    pub(super) fn find_message_in_oh(
         &self,
         oh_addr: u64,
         target_msg_type: u16,

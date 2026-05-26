@@ -62,12 +62,12 @@ impl LinkInfoMessage {
             None
         };
 
-        let fractal_heap_addr = read_le_u64(data, &mut pos, sa, "link info fractal heap address")?;
+        let fractal_heap_addr = read_addr(data, &mut pos, sa, "link info fractal heap address")?;
 
-        let name_btree_addr = read_le_u64(data, &mut pos, sa, "link info name btree address")?;
+        let name_btree_addr = read_addr(data, &mut pos, sa, "link info name btree address")?;
 
         let corder_btree_addr = if has_corder_btree {
-            let addr = read_le_u64(data, &mut pos, sa, "link info creation order btree address")?;
+            let addr = read_addr(data, &mut pos, sa, "link info creation order btree address")?;
             Some(addr)
         } else {
             None
@@ -121,6 +121,15 @@ fn read_le_u64(data: &[u8], pos: &mut usize, size: usize, context: &str) -> Resu
     Ok(val)
 }
 
+fn read_addr(data: &[u8], pos: &mut usize, size: usize, context: &str) -> Result<u64> {
+    let value = read_le_u64(data, pos, size, context)?;
+    if size < 8 && value == ((1u64 << (size * 8)) - 1) {
+        Ok(UNDEF_ADDR)
+    } else {
+        Ok(value)
+    }
+}
+
 fn checked_window<'a>(data: &'a [u8], pos: usize, len: usize, context: &str) -> Result<&'a [u8]> {
     let end = pos
         .checked_add(len)
@@ -134,4 +143,38 @@ fn advance_pos(pos: &mut usize, len: usize, context: &str) -> Result<()> {
         .checked_add(len)
         .ok_or_else(|| Error::InvalidFormat(format!("{context} offset overflow")))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn link_info_decode_normalizes_width_specific_undefined_addresses() {
+        let mut data = vec![0, 0];
+        data.extend_from_slice(&u32::MAX.to_le_bytes());
+        data.extend_from_slice(&u32::MAX.to_le_bytes());
+
+        let message = LinkInfoMessage::decode(&data, 4).unwrap();
+
+        assert_eq!(message.fractal_heap_addr, UNDEF_ADDR);
+        assert_eq!(message.name_btree_addr, UNDEF_ADDR);
+        assert!(!message.has_dense_storage());
+    }
+
+    #[test]
+    fn link_info_decode_normalizes_creation_order_btree_address() {
+        let mut data = vec![0, 0x03];
+        data.extend_from_slice(&7u64.to_le_bytes());
+        data.extend_from_slice(&u32::MAX.to_le_bytes());
+        data.extend_from_slice(&8u32.to_le_bytes());
+        data.extend_from_slice(&u32::MAX.to_le_bytes());
+
+        let message = LinkInfoMessage::decode(&data, 4).unwrap();
+
+        assert_eq!(message.max_creation_index, Some(7));
+        assert_eq!(message.fractal_heap_addr, UNDEF_ADDR);
+        assert_eq!(message.name_btree_addr, 8);
+        assert_eq!(message.corder_btree_addr, Some(UNDEF_ADDR));
+    }
 }

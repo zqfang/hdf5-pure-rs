@@ -174,7 +174,7 @@ impl GlobalHeapCollection {
     /// Serialize this collection to `out`, using the supplied size-field
     /// width.
     ///
-    /// The output buffer is cleared before the image is written.
+    /// The output buffer is replaced after the full image has been validated.
     pub fn cache_heap_serialize_into(&self, sizeof_size: u8, out: &mut Vec<u8>) -> Result<()> {
         if sizeof_size == 0 || sizeof_size > 8 {
             return Err(Error::InvalidFormat(
@@ -182,14 +182,14 @@ impl GlobalHeapCollection {
             ));
         }
         let image_len = self.cache_heap_image_len_with_size(sizeof_size)?;
-        out.clear();
-        out.try_reserve_exact(image_len).map_err(|err| {
+        let mut image = Vec::new();
+        image.try_reserve_exact(image_len).map_err(|err| {
             Error::InvalidFormat(format!("global heap image allocation failed: {err}"))
         })?;
-        out.extend_from_slice(&GCOL_MAGIC);
-        out.push(1);
-        out.extend_from_slice(&[0; 3]);
-        encode_heap_size(out, 0, sizeof_size, "global heap collection size")?;
+        image.extend_from_slice(&GCOL_MAGIC);
+        image.push(1);
+        image.extend_from_slice(&[0; 3]);
+        encode_heap_size(&mut image, 0, sizeof_size, "global heap collection size")?;
 
         for (index, data) in &self.objects {
             if *index == 0 {
@@ -205,37 +205,43 @@ impl GlobalHeapCollection {
                 .map(|size| size & !7)
                 .ok_or_else(|| Error::InvalidFormat("global heap object image overflow".into()))?;
 
-            out.extend_from_slice(
+            image.extend_from_slice(
                 &u16::try_from(*index)
                     .map_err(|_| {
                         Error::InvalidFormat("global heap object index exceeds u16".into())
                     })?
                     .to_le_bytes(),
             );
-            out.extend_from_slice(&0u16.to_le_bytes());
-            out.extend_from_slice(&[0; 4]);
-            encode_heap_size(out, data_size, sizeof_size, "global heap object size")?;
-            out.extend_from_slice(data);
-            let padded_end = out
+            image.extend_from_slice(&0u16.to_le_bytes());
+            image.extend_from_slice(&[0; 4]);
+            encode_heap_size(
+                &mut image,
+                data_size,
+                sizeof_size,
+                "global heap object size",
+            )?;
+            image.extend_from_slice(data);
+            let padded_end = image
                 .len()
                 .checked_add(padded - data.len())
                 .ok_or_else(|| Error::InvalidFormat("global heap object image overflow".into()))?;
-            out.resize(padded_end, 0);
+            image.resize(padded_end, 0);
         }
 
-        let padded_collection_len = out
+        let padded_collection_len = image
             .len()
             .checked_add(7)
             .map(|value| value & !7)
             .ok_or_else(|| Error::InvalidFormat("global heap collection size overflow".into()))?;
-        out.resize(padded_collection_len, 0);
+        image.resize(padded_collection_len, 0);
 
-        let collection_size = u64::try_from(out.len())
+        let collection_size = u64::try_from(image.len())
             .map_err(|_| Error::InvalidFormat("global heap collection size exceeds u64".into()))?;
         let encoded_size =
             encode_heap_size_bytes(collection_size, sizeof_size, "global heap collection size")?;
-        out[8..8 + usize::from(sizeof_size)]
+        image[8..8 + usize::from(sizeof_size)]
             .copy_from_slice(&encoded_size[..usize::from(sizeof_size)]);
+        *out = image;
         Ok(())
     }
 
@@ -465,10 +471,12 @@ fn heap_object_len(value: u64, context: &str) -> Result<usize> {
 }
 
 fn resize_heap_object_buffer(out: &mut Vec<u8>, len: usize) -> Result<()> {
+    if out.capacity() < len {
+        out.try_reserve_exact(len - out.len()).map_err(|err| {
+            Error::InvalidFormat(format!("global heap object allocation failed: {err}"))
+        })?;
+    }
     out.clear();
-    out.try_reserve_exact(len).map_err(|err| {
-        Error::InvalidFormat(format!("global heap object allocation failed: {err}"))
-    })?;
     out.resize(len, 0);
     Ok(())
 }
@@ -953,12 +961,21 @@ mod tests {
         too_large_index
             .insert(u32::from(u16::MAX) + 1, Vec::new())
             .unwrap();
+        let mut stale = b"stale".to_vec();
         assert!(too_large_index
-            .cache_heap_serialize_into(8, &mut Vec::new())
+            .cache_heap_serialize_into(8, &mut stale)
             .is_err());
-        assert!(collection
-            .cache_heap_serialize_into(0, &mut Vec::new())
-            .is_err());
+        assert_eq!(stale, b"stale");
+
+        let mut stale = b"stale".to_vec();
+        assert!(collection.cache_heap_serialize_into(0, &mut stale).is_err());
+        assert_eq!(stale, b"stale");
+
+        let mut zero_index = GlobalHeapCollection::create();
+        zero_index.objects.push((0, Vec::new()));
+        let mut stale = b"stale".to_vec();
+        assert!(zero_index.cache_heap_serialize_into(8, &mut stale).is_err());
+        assert_eq!(stale, b"stale");
     }
 
     #[test]
@@ -1092,6 +1109,19 @@ mod tests {
                 .contains("global heap object 9 not found in collection at 0x0"),
             "unexpected error: {err}"
         );
+
+        let mut image = Vec::new();
+        collection.cache_heap_serialize_into(8, &mut image).unwrap();
+        let mut reader = HdfReader::new(Cursor::new(image));
+        let mut stale = vec![b"keep".to_vec()];
+        let err =
+            read_global_heap_objects_batched_into(&mut reader, &refs, &mut stale).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("global heap object 9 not found in collection at 0x0"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(stale, vec![b"keep".to_vec()]);
 
         let mut image = Vec::new();
         collection.cache_heap_serialize_into(8, &mut image).unwrap();

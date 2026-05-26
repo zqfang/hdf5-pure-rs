@@ -121,6 +121,20 @@ fn t3a_integer_signed_widening_and_narrowing() {
 }
 
 #[test]
+fn t3a_integer_conversion_read_slice_into() {
+    let f = File::open("tests/data/hdf5_ref/integer_conversion_vectors.h5").unwrap();
+    let ds = f.dataset("i16_conversion").unwrap();
+
+    let mut narrowed = [0i8; 5];
+    ds.read_slice_into::<i8, _>(2..7, &mut narrowed).unwrap();
+    assert_eq!(narrowed, [0, 1, 127, 127, 127]);
+
+    let mut to_unsigned = [0u8; 6];
+    ds.read_slice_into::<u8, _>(3..9, &mut to_unsigned).unwrap();
+    assert_eq!(to_unsigned, [1, 127, 128, 255, 255, 255]);
+}
+
+#[test]
 fn t3a_integer_unsigned_widening_and_narrowing() {
     let f = File::open("tests/data/hdf5_ref/integer_conversion_vectors.h5").unwrap();
     let ds = f.dataset("u16_conversion").unwrap();
@@ -330,6 +344,18 @@ fn t3b_compound_fields() {
 }
 
 #[test]
+fn t3b_compound_fields_into_clears_on_wrong_class() {
+    let f = open();
+    let compound = f.dataset("compound").unwrap().dtype().unwrap();
+    let integer = f.dataset("int32").unwrap().dtype().unwrap();
+    let mut fields = compound.compound_fields().unwrap();
+    assert!(!fields.is_empty());
+
+    assert!(integer.compound_fields_into(&mut fields).is_err());
+    assert!(fields.is_empty());
+}
+
+#[test]
 fn t3b_compound_read_field() {
     let ds = open().dataset("compound").unwrap();
     let x: [f64; 2] = read_field_array(&ds, "x").unwrap();
@@ -366,6 +392,36 @@ fn t3c_enum_members() {
     assert!(owned_members
         .iter()
         .any(|member| member.0 == "AUTO" && member.1 == 2));
+}
+
+#[test]
+fn t3c_enum_members_into_clears_on_wrong_class() {
+    let f = open();
+    let enum_dtype = f.dataset("enum").unwrap().dtype().unwrap();
+    let integer = f.dataset("int32").unwrap().dtype().unwrap();
+    let mut members = enum_dtype.enum_members().unwrap();
+    assert!(!members.is_empty());
+
+    assert!(integer.enum_members_into(&mut members).is_err());
+    assert!(members.is_empty());
+}
+
+#[test]
+fn t3c_enum_nameof_into_replaces_or_clears_caller_string() {
+    let f = open();
+    let enum_dtype = f.dataset("enum").unwrap().dtype().unwrap();
+    let integer = f.dataset("int32").unwrap().dtype().unwrap();
+    let mut name = String::from("stale");
+
+    assert!(enum_dtype.enum_nameof_into(1, &mut name).unwrap());
+    assert_eq!(name, "ON");
+
+    assert!(!enum_dtype.enum_nameof_into(99, &mut name).unwrap());
+    assert!(name.is_empty());
+
+    name.push_str("stale");
+    assert!(integer.enum_nameof_into(1, &mut name).is_err());
+    assert_eq!(name, "stale");
 }
 
 #[test]
@@ -570,6 +626,19 @@ fn t3d_array_datatype_multidimensional_dims_and_raw_payload() {
             .collect::<Vec<_>>()
             .as_slice()
     );
+}
+
+#[test]
+fn t3d_array_dims_into_clears_on_wrong_class() {
+    let f = File::open("tests/data/hdf5_ref/array_datatype_cases.h5").unwrap();
+    let array = f.dataset("array_i16_2x3").unwrap().dtype().unwrap();
+    let integer = open().dataset("int32").unwrap().dtype().unwrap();
+    let mut dims = Vec::new();
+    array.array_dims_into(&mut dims).unwrap();
+    assert_eq!(dims, [2, 3]);
+
+    assert!(integer.array_dims_into(&mut dims).is_err());
+    assert!(dims.is_empty());
 }
 
 // T3e: Multi-dimensional

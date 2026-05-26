@@ -600,10 +600,7 @@ impl Group {
     /// List all member names in this group.
     pub fn member_names(&self) -> Result<Vec<String>> {
         let mut names = Vec::new();
-        self.visit_member_names(|name| {
-            names.push(name.to_string());
-            Ok(())
-        })?;
+        self.member_names_into(&mut names)?;
         Ok(names)
     }
 
@@ -613,6 +610,17 @@ impl Group {
         F: FnMut(&str) -> Result<()>,
     {
         self.visit_link_refs(|link| visitor(link.name))
+    }
+
+    /// Store all member names in this group in caller-provided storage.
+    pub fn member_names_into(&self, out: &mut Vec<String>) -> Result<()> {
+        let mut names = Vec::new();
+        self.visit_member_names(|name| {
+            names.push(name.to_string());
+            Ok(())
+        })?;
+        *out = names;
+        Ok(())
     }
 
     /// List all links in this group.
@@ -1366,13 +1374,15 @@ impl Group {
         visit_attr_names_at(&self.inner, self.current_metadata_addr()?, &mut f)
     }
 
-    /// Append attribute names in storage order into caller-provided storage.
+    /// Store attribute names in storage order in caller-provided storage.
     pub fn attr_names_into(&self, out: &mut Vec<String>) -> Result<()> {
-        out.clear();
+        let mut names = Vec::new();
         self.visit_attr_names(|name| {
-            out.push(name.to_string());
+            names.push(name.to_string());
             Ok(())
-        })
+        })?;
+        *out = names;
+        Ok(())
     }
 
     /// List attributes.
@@ -1392,12 +1402,14 @@ impl Group {
 
     /// Store attributes in caller-provided storage.
     pub fn attrs_into(&self, out: &mut Vec<crate::hl::attribute::Attribute>) -> Result<()> {
-        out.clear();
+        let mut attrs = Vec::new();
         crate::hl::attribute::collect_attributes_into(
             &self.inner,
             self.current_metadata_addr()?,
-            out,
-        )
+            &mut attrs,
+        )?;
+        *out = attrs;
+        Ok(())
     }
 
     /// List attributes sorted by tracked creation order.
@@ -1427,12 +1439,13 @@ impl Group {
         &self,
         out: &mut Vec<crate::hl::attribute::Attribute>,
     ) -> Result<()> {
-        out.clear();
+        let mut attrs = Vec::new();
         crate::hl::attribute::collect_attributes_by_creation_order_into(
             &self.inner,
             self.current_metadata_addr()?,
-            out,
+            &mut attrs,
         )?;
+        *out = attrs;
         Ok(())
     }
 

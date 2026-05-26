@@ -197,18 +197,61 @@ impl FileBuilder {
     /// Part of the hdf5-metno compatibility layer and should not be removed.
     pub fn open_as<P: AsRef<Path>>(&self, filename: P, mode: OpenMode) -> Result<File> {
         self.fapl.ensure_runtime_supported_driver()?;
+        let path = filename.as_ref();
         let file = match mode {
-            OpenMode::Read => File::open(filename)?,
+            OpenMode::Read => File::open(path)?,
             OpenMode::ReadSWMR => Err(Error::Unsupported(
                 "hdf5-metno compatibility: SWMR File open is not supported".into(),
             ))?,
-            OpenMode::ReadWrite => File::open_rw(filename)?,
-            OpenMode::Create => File::create(filename)?,
-            OpenMode::CreateExcl => File::create_excl(filename)?,
-            OpenMode::Append => File::append(filename)?,
+            OpenMode::ReadWrite => File::open_rw(path)?,
+            OpenMode::Create => self.create_with_fcpl(path, false)?,
+            OpenMode::CreateExcl => self.create_with_fcpl(path, true)?,
+            OpenMode::Append => {
+                if path.exists() {
+                    File::open_rw(path)?
+                } else {
+                    self.create_with_fcpl(path, false)?
+                }
+            }
         };
         file.set_access_plist(self.fapl.clone());
         Ok(file)
+    }
+
+    fn create_with_fcpl(&self, path: &Path, excl: bool) -> Result<File> {
+        let (file_space_strategy, file_space_persist, file_space_threshold) =
+            self.fcpl.file_space();
+        let writable = if excl {
+            crate::hl::writable_file::WritableFile::create_excl_with_options_and_shared_messages(
+                path,
+                self.fcpl.userblock(),
+                self.fcpl.superblock_version,
+                self.fcpl.sizeof_addr,
+                self.fcpl.sizeof_size,
+                file_space_strategy,
+                file_space_persist,
+                file_space_threshold,
+                self.fcpl.file_space_page_size(),
+                self.fcpl.shared_mesg_indexes(),
+                self.fcpl.shared_mesg_phase_change(),
+            )?
+        } else {
+            crate::hl::writable_file::WritableFile::create_with_options_and_shared_messages(
+                path,
+                self.fcpl.userblock(),
+                self.fcpl.superblock_version,
+                self.fcpl.sizeof_addr,
+                self.fcpl.sizeof_size,
+                file_space_strategy,
+                file_space_persist,
+                file_space_threshold,
+                self.fcpl.file_space_page_size(),
+                self.fcpl.shared_mesg_indexes(),
+                self.fcpl.shared_mesg_phase_change(),
+            )?
+        };
+        let _ = writable.close()?;
+        File::open_rw(path)
     }
 
     /// Sets current file access property list to a given one.
@@ -548,6 +591,19 @@ impl File {
         self.inner.lock().access_plist.clone()
     }
 
+    pub(crate) fn object_header_at(&self, addr: u64) -> Result<object_header::ObjectHeader> {
+        let mut guard = self.inner.lock();
+        object_header::ObjectHeader::read_at(&mut guard.reader, addr)
+    }
+
+    pub(crate) fn read_at(&self, addr: u64, len: usize) -> Result<Vec<u8>> {
+        let mut guard = self.inner.lock();
+        guard.reader.seek(addr)?;
+        let mut bytes = vec![0; len];
+        guard.reader.read_bytes_into(&mut bytes)?;
+        Ok(bytes)
+    }
+
     /// Replace the file's stored access-property state.
     pub fn set_access_plist(&self, plist: crate::hl::plist::file_access::FileAccess) {
         self.inner.lock().access_plist = plist;
@@ -831,11 +887,13 @@ impl File {
 
     /// Store root-group member names in caller-provided storage.
     pub fn member_names_into(&self, out: &mut Vec<String>) -> Result<()> {
-        out.clear();
+        let mut names = Vec::new();
         self.visit_member_names(|name| {
-            out.push(name.to_string());
+            names.push(name.to_string());
             Ok(())
-        })
+        })?;
+        *out = names;
+        Ok(())
     }
 
     /// Open a group by path (starting from root).
@@ -865,13 +923,15 @@ impl File {
         visit_attr_names_at(&self.inner, self.root_addr(), &mut f)
     }
 
-    /// Append root-group attribute names into caller-provided storage.
+    /// Store root-group attribute names in caller-provided storage.
     pub fn attr_names_into(&self, out: &mut Vec<String>) -> Result<()> {
-        out.clear();
+        let mut names = Vec::new();
         self.visit_attr_names(|name| {
-            out.push(name.to_string());
+            names.push(name.to_string());
             Ok(())
-        })
+        })?;
+        *out = names;
+        Ok(())
     }
 
     /// List attributes on the root group.
@@ -891,11 +951,8 @@ impl File {
 
     /// Store root-group attributes in caller-provided storage.
     pub fn attrs_into(&self, out: &mut Vec<crate::hl::attribute::Attribute>) -> Result<()> {
-        out.clear();
-        out.extend(crate::hl::attribute::collect_attributes(
-            &self.inner,
-            self.root_addr(),
-        )?);
+        let attrs = crate::hl::attribute::collect_attributes(&self.inner, self.root_addr())?;
+        *out = attrs;
         Ok(())
     }
 
@@ -924,12 +981,13 @@ impl File {
         &self,
         out: &mut Vec<crate::hl::attribute::Attribute>,
     ) -> Result<()> {
-        out.clear();
+        let mut attrs = Vec::new();
         crate::hl::attribute::collect_attributes_by_creation_order_into(
             &self.inner,
             self.root_addr(),
-            out,
+            &mut attrs,
         )?;
+        *out = attrs;
         Ok(())
     }
 
@@ -976,7 +1034,7 @@ impl File {
     }
 
     fn resolve_path(&self, path: &str) -> Result<ResolvedObject> {
-        let mut path = canonical_path(path);
+        let mut path = absolute_path(path);
         let mut traversals = 0usize;
         let mut seen_paths = HashSet::new();
 
@@ -992,10 +1050,20 @@ impl File {
             }
 
             let parts = Self::path_components(&path)?;
+            if parts.is_empty() {
+                return Ok(self.root_resolved_object(canonical_path(&path)));
+            }
             let mut current = self.root_group()?;
             let mut current_path = String::from("/");
 
             for (idx, part) in parts.iter().enumerate() {
+                if *part == ".." {
+                    path = canonical_path(&append_path_parts(
+                        parent_absolute_path(&current_path),
+                        &parts[idx + 1..],
+                    ));
+                    continue 'resolve;
+                }
                 let is_last = idx + 1 == parts.len();
                 let link = self.lookup_group_link(&current, part)?;
                 match self.resolve_path_component(
@@ -1034,7 +1102,7 @@ impl File {
         let parts: Vec<&str> = path
             .trim_start_matches('/')
             .split('/')
-            .filter(|part| !part.is_empty())
+            .filter(|part| !part.is_empty() && *part != ".")
             .collect();
         for part in &parts {
             if part.len() > Self::MAX_PATH_COMPONENT_LEN {
@@ -1260,6 +1328,39 @@ fn canonical_path(path: &str) -> String {
     }
 }
 
+fn normalized_resolution_path(path: &str) -> String {
+    let mut parts = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            other => parts.push(other),
+        }
+    }
+    if parts.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{}", parts.join("/"))
+    }
+}
+
+fn absolute_path(path: &str) -> String {
+    if path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("/{path}")
+    }
+}
+
+fn parent_absolute_path(path: &str) -> String {
+    if path == "/" {
+        return "/".to_string();
+    }
+    match path.rsplit_once('/') {
+        Some(("", _)) | None => "/".to_string(),
+        Some((parent, _)) => parent.to_string(),
+    }
+}
+
 fn join_absolute_path(parent: &str, child: &str) -> String {
     if parent == "/" {
         format!("/{child}")
@@ -1284,11 +1385,11 @@ fn append_path_parts(mut base: String, parts: &[&str]) -> String {
 
 fn resolve_soft_target(parent: &str, target: &str, remaining: &[&str]) -> String {
     let base = if target.starts_with('/') {
-        canonical_path(target)
+        normalized_resolution_path(target)
     } else {
-        canonical_path(&join_absolute_path(parent, target))
+        normalized_resolution_path(&join_absolute_path(parent, target))
     };
-    append_path_parts(base, remaining)
+    normalized_resolution_path(&append_path_parts(base, remaining))
 }
 
 /// Determine object type from an object header's messages.

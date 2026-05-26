@@ -708,6 +708,28 @@ mod error_stack_tests {
     }
 
     #[test]
+    #[allow(deprecated)]
+    fn error_stack_print_helpers_pin_streaming_and_allocating_output() {
+        let mut stack = ErrorStack::init();
+        let mut printed = String::from("prefix:");
+        stack.print_into(&mut printed).unwrap();
+        assert_eq!(printed, "prefix:");
+
+        stack.push_stack(ErrorStackEntry::new("hdf5", "major", "minor", "first"));
+        stack.printf_stack(ErrorStackEntry::new("hdf5", "major", "minor", "second"));
+
+        stack.print_into(&mut printed).unwrap();
+        assert_eq!(printed, "prefix:first\nsecond");
+
+        let mut descriptions = vec!["stale".to_string()];
+        stack.print_with(|description| descriptions.push(description.to_owned()));
+        assert_eq!(descriptions, vec!["stale", "first", "second"]);
+
+        assert_eq!(stack.print(), "first\nsecond");
+        assert_eq!(stack.print2(), "first\nsecond");
+    }
+
+    #[test]
     fn error_event_set_aliases_roundtrip() {
         let mut event = ErrorEvent::event_new("read");
         assert!(!event.completed);

@@ -115,6 +115,7 @@ impl Reference {
 
     /// Encode a reference into a caller-provided buffer.
     pub fn encode_into(&self, out: &mut Vec<u8>) -> Result<()> {
+        Self::reserve_reference_image(out, self.region.as_deref())?;
         Self::encode_obj_token_into(self.object_token, out);
         Self::encode_region_into(self.region.as_deref(), out)
     }
@@ -150,7 +151,7 @@ impl Reference {
     /// Decode a region payload as borrowed bytes.
     pub fn decode_region_slice(bytes: &[u8]) -> Result<Option<&[u8]>> {
         if bytes.is_empty() {
-            return Ok(None);
+            Ok(None)
         } else {
             let len_u64 = read_u64_le_at(bytes, 0, "reference region length")?;
             let len = usize::try_from(len_u64).map_err(|_| {
@@ -282,6 +283,13 @@ impl Reference {
             .checked_add(region.map_or(0, <[u8]>::len))
             .ok_or_else(|| Error::InvalidFormat("reference region length overflow".into()))
     }
+
+    fn reserve_reference_image(out: &mut Vec<u8>, region: Option<&[u8]>) -> Result<()> {
+        let encoded_len = Self::encoded_len_for(region)?;
+        out.try_reserve_exact(encoded_len).map_err(|err| {
+            Error::InvalidFormat(format!("reference image allocation failed: {err}"))
+        })
+    }
 }
 
 impl<'a> ReferenceRef<'a> {
@@ -338,6 +346,7 @@ impl<'a> ReferenceRef<'a> {
 
     /// Encode this reference view into a caller-provided buffer.
     pub fn encode_into(&self, out: &mut Vec<u8>) -> Result<()> {
+        Reference::reserve_reference_image(out, self.region)?;
         Reference::encode_obj_token_into(self.object_token, out);
         Reference::encode_region_into(self.region, out)
     }
@@ -411,7 +420,9 @@ mod tests {
             encoded.len()
         );
         assert_eq!(fixed.as_slice(), encoded.as_slice());
-        assert!(borrowed.encode_into_slice(&mut [0; 18]).is_err());
+        let mut stale_fixed = [0x5a; 18];
+        assert!(borrowed.encode_into_slice(&mut stale_fixed).is_err());
+        assert_eq!(stale_fixed, [0x5a; 18]);
 
         let borrowed_region =
             super::ReferenceRef::region(8, &[1, 2, 3], Some("a.h5")).with_loc_id(9);
@@ -430,6 +441,10 @@ mod tests {
         let mut encoded_from_ref = Vec::new();
         decoded.encode_into(&mut encoded_from_ref).unwrap();
         assert_eq!(encoded_from_ref, encoded);
+        let mut appended_from_ref = b"prefix".to_vec();
+        decoded.encode_into(&mut appended_from_ref).unwrap();
+        assert_eq!(&appended_from_ref[..6], b"prefix");
+        assert_eq!(&appended_from_ref[6..], encoded.as_slice());
 
         let mut token_payload = Vec::new();
         Reference::encode_obj_token_into(r.get_obj_token(), &mut token_payload);
@@ -453,10 +468,18 @@ mod tests {
             Reference::decode_region_slice(&region_payload).unwrap(),
             Some([1, 2, 3].as_slice())
         );
+        let mut stale_region = [0x3c; 10];
+        assert!(Reference::encode_region_slice(Some(&[1, 2, 3]), &mut stale_region[..9]).is_err());
+        assert_eq!(stale_region, [0x3c; 10]);
 
         let mut heap_payload = Vec::new();
         r.encode_heap_into(&mut heap_payload).unwrap();
         assert_eq!(heap_payload, encoded);
+
+        let mut appended = b"old".to_vec();
+        r.encode_into(&mut appended).unwrap();
+        assert_eq!(&appended[..3], b"old");
+        assert_eq!(&appended[3..], heap_payload.as_slice());
 
         assert!(Reference::decode_token_obj_compat(&[0; 7]).is_err());
         assert!(Reference::decode_ref(&[0; 15]).is_err());

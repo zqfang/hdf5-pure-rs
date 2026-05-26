@@ -148,10 +148,14 @@ pub fn H5ESget_op_info(
 #[allow(non_snake_case)]
 pub fn H5ESwait(
     event_set: &mut ErrorEventSet,
-    _timeout: u64,
+    timeout: u64,
     num_in_progress: &mut usize,
     err_occurred: &mut bool,
 ) -> Result<()> {
+    if timeout != H5ES_WAIT_NONE && timeout != H5ES_WAIT_FOREVER {
+        return Err(unsupported_event_set("H5ESwait finite timeout"));
+    }
+
     *num_in_progress = event_set.wait();
     *err_occurred = event_set.get_err_status();
     Ok(())
@@ -415,6 +419,33 @@ mod tests {
     }
 
     #[test]
+    fn h5es_wait_finite_timeout_is_explicit_unsupported_boundary() {
+        let mut set = H5EScreate();
+        H5ESinsert_request(&mut set, "read");
+
+        let mut num_in_progress = usize::MAX;
+        let mut err_occurred = true;
+        let err = H5ESwait(&mut set, 1, &mut num_in_progress, &mut err_occurred).unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "Unsupported: H5ESwait finite timeout requires libhdf5 asynchronous VOL event-set behavior not implemented in pure-Rust mode"
+        );
+        assert_eq!(num_in_progress, usize::MAX);
+        assert!(err_occurred);
+
+        H5ESwait(
+            &mut set,
+            H5ES_WAIT_FOREVER,
+            &mut num_in_progress,
+            &mut err_occurred,
+        )
+        .unwrap();
+        assert_eq!(num_in_progress, 1);
+        assert!(!err_occurred);
+    }
+
+    #[test]
     fn h5es_insert_entry_point_preserves_request_semantics() {
         let mut set = H5EScreate();
 
@@ -467,11 +498,18 @@ mod tests {
         };
         let unchanged = op_info.clone();
 
-        assert!(matches!(
-            H5ESget_op_info(&set, 1, &mut op_info),
-            Err(Error::Unsupported(_))
-        ));
+        let err = H5ESget_op_info(&set, 1, &mut op_info).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Unsupported: H5ESget_op_info requires libhdf5 asynchronous VOL event-set behavior not implemented in pure-Rust mode"
+        );
         assert_eq!(op_info, unchanged);
+        assert_eq!(H5ESget_count(&set), 1);
+        assert_eq!(H5ESget_op_counter(&set), 1);
+
+        let mut requests = Vec::new();
+        H5ESget_requests_into(&set, &mut requests);
+        assert_eq!(requests, ["read"]);
     }
 
     #[test]
@@ -531,21 +569,37 @@ mod tests {
         let mut set = H5EScreate();
         H5ESfail_request(&mut set, "close", "failed");
         let mut records = vec![H5ES_err_info_t::default()];
+        records[0].api_name = "sentinel".into();
+        records[0].api_args = "args".into();
+        records[0].app_file_name = "app.rs".into();
+        records[0].app_func_name = "caller".into();
+        records[0].app_line_num = 7;
+        records[0].op_ins_count = 9;
+        records[0].op_ins_ts = 11;
+        records[0].op_exec_ts = 13;
+        records[0].op_exec_time = 17;
+        records[0].err_stack_id = 42;
+        let sentinel = records[0].clone();
         let mut err_cleared = usize::MAX;
 
-        assert!(matches!(
-            H5ESget_err_info(&mut set, records.len(), &mut records, &mut err_cleared),
-            Err(Error::Unsupported(_))
-        ));
-        assert_eq!(err_cleared, usize::MAX);
-        assert!(matches!(
-            H5ES__get_err_info(&mut set, records.len(), &mut records, &mut err_cleared),
-            Err(Error::Unsupported(_))
-        ));
+        let err =
+            H5ESget_err_info(&mut set, records.len(), &mut records, &mut err_cleared).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Unsupported: H5ESget_err_info requires libhdf5 asynchronous VOL event-set behavior not implemented in pure-Rust mode"
+        );
+        assert_eq!(records[0], sentinel);
         assert_eq!(err_cleared, usize::MAX);
 
-        records[0].api_name = "H5Dwrite_async".into();
-        records[0].err_stack_id = 42;
+        let err = H5ES__get_err_info(&mut set, records.len(), &mut records, &mut err_cleared)
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Unsupported: H5ES__get_err_info requires libhdf5 asynchronous VOL event-set behavior not implemented in pure-Rust mode"
+        );
+        assert_eq!(records[0], sentinel);
+        assert_eq!(err_cleared, usize::MAX);
+
         H5ESfree_err_info(records.len(), &mut records).unwrap();
 
         assert_eq!(records, [H5ES_err_info_t::default()]);
@@ -566,10 +620,12 @@ mod tests {
 
         assert_eq!(records[0], H5ES_err_info_t::default());
         assert_eq!(records[1], second);
+        let before_error = records.clone();
         assert!(matches!(
             H5ESfree_err_info(3, &mut records),
             Err(Error::Other(_))
         ));
+        assert_eq!(records, before_error);
     }
 
     #[test]
@@ -588,17 +644,30 @@ mod tests {
         }
 
         let mut set = H5EScreate();
+        H5ESinsert_request(&mut set, "read");
+
+        let mut requests = Vec::new();
+        H5ESget_requests_into(&set, &mut requests);
+        assert_eq!(requests, ["read"]);
 
         assert!(matches!(
             H5ESregister_insert_func(&mut set, Some(insert_cb), ptr::null_mut()),
             Err(Error::Unsupported(_))
         ));
         assert!(!H5EShas_insert_func(&set));
+        assert_eq!(H5ESget_count(&set), 1);
+        assert_eq!(H5ESget_op_counter(&set), 1);
+        H5ESget_requests_into(&set, &mut requests);
+        assert_eq!(requests, ["read"]);
 
         assert!(matches!(
             H5ESregister_complete_func(&mut set, Some(complete_cb), ptr::null_mut()),
             Err(Error::Unsupported(_))
         ));
         assert!(!H5EShas_complete_func(&set));
+        assert_eq!(H5ESget_count(&set), 1);
+        assert_eq!(H5ESget_op_counter(&set), 1);
+        H5ESget_requests_into(&set, &mut requests);
+        assert_eq!(requests, ["read"]);
     }
 }

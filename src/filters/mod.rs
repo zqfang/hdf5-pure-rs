@@ -96,6 +96,27 @@ fn apply_pipeline_reverse_with_mask_into_inner(
     expected_len: Option<usize>,
     out: &mut Vec<u8>,
 ) -> Result<()> {
+    let mut staged = Vec::new();
+    apply_pipeline_reverse_with_mask_into_inner_unchecked(
+        data,
+        pipeline,
+        element_size,
+        filter_mask,
+        expected_len,
+        &mut staged,
+    )?;
+    *out = staged;
+    Ok(())
+}
+
+fn apply_pipeline_reverse_with_mask_into_inner_unchecked(
+    data: &[u8],
+    pipeline: &FilterPipelineMessage,
+    element_size: usize,
+    filter_mask: u32,
+    expected_len: Option<usize>,
+    out: &mut Vec<u8>,
+) -> Result<()> {
     validate_filter_mask(pipeline, filter_mask)?;
 
     let mut active_filters = pipeline
@@ -628,6 +649,45 @@ mod tests {
                     .contains("deflate decompression produced more bytes than expected"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn reverse_pipeline_into_preserves_output_on_validation_errors() {
+        let pipeline = deflate_pipeline();
+        let compressed = deflate_compress(b"abcd", 4);
+        let mut out = b"stale".to_vec();
+
+        let err = apply_pipeline_reverse_with_mask_expected_into(
+            &compressed,
+            &pipeline,
+            1,
+            0,
+            3,
+            &mut out,
+        )
+        .expect_err("expected-length mismatch should fail");
+        assert!(
+            err.to_string()
+                .contains("filter pipeline output length mismatch")
+                || err
+                    .to_string()
+                    .contains("deflate decompression produced more bytes than expected"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(out, b"stale");
+
+        let err = apply_pipeline_reverse_with_mask_into(b"abcd", &pipeline, 1, 0b10, &mut out)
+            .expect_err("filter mask outside pipeline should fail");
+        assert!(err.to_string().contains("filter mask"));
+        assert_eq!(out, b"stale");
+
+        let err =
+            apply_pipeline_reverse_with_mask_into(b"abcd", &shuffle_pipeline(0), 4, 0, &mut out)
+                .expect_err("invalid shuffle client data should fail");
+        assert!(err
+            .to_string()
+            .contains("shuffle filter element size is zero"));
+        assert_eq!(out, b"stale");
     }
 
     #[test]

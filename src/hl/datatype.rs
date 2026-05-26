@@ -236,8 +236,8 @@ impl Datatype {
 
     /// Store compound type fields in caller-provided storage.
     pub fn compound_fields_into(&self, out: &mut Vec<CompoundField>) -> crate::Result<()> {
-        let fields = self.msg.compound_fields_iter()?;
         out.clear();
+        let fields = self.msg.compound_fields_iter()?;
         out.reserve(fields.len());
         for field in fields {
             let field = field?;
@@ -311,8 +311,8 @@ impl Datatype {
 
     /// Store enum members as owned `(name, value)` pairs in caller-provided storage.
     pub fn enum_members_into(&self, out: &mut Vec<(String, u64)>) -> crate::Result<()> {
-        let members = self.msg.enum_members_iter()?;
         out.clear();
+        let members = self.msg.enum_members_iter()?;
         out.reserve(members.len());
         for member in members {
             let member = member?;
@@ -335,6 +335,20 @@ impl Datatype {
     pub fn enum_nameof(&self, value: u64) -> crate::Result<Option<String>> {
         self.enum_nameof_ref(value)
             .map(|name| name.map(str::to_string))
+    }
+
+    /// Store the enum symbol name for a value in caller-provided storage.
+    ///
+    /// Returns `Ok(true)` when the value is found. Returns `Ok(false)` and
+    /// clears `out` when this is an enum datatype but the value is absent.
+    pub fn enum_nameof_into(&self, value: u64, out: &mut String) -> crate::Result<bool> {
+        let Some(name) = self.enum_nameof_ref(value)? else {
+            out.clear();
+            return Ok(false);
+        };
+        out.clear();
+        out.push_str(name);
+        Ok(true)
     }
 
     pub fn enum_valueof(&self, name: &str) -> crate::Result<Option<u64>> {
@@ -363,8 +377,8 @@ impl Datatype {
 
     /// Store array dimensions in caller-provided storage.
     pub fn array_dims_into(&self, out: &mut Vec<u64>) -> crate::Result<()> {
-        let dims = self.array_dims_iter()?;
         out.clear();
+        let dims = self.array_dims_iter()?;
         out.reserve(dims.len());
         for dim in dims {
             out.push(dim?);

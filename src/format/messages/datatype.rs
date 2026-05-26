@@ -31,7 +31,8 @@ pub struct EnumMemberView<'a> {
     pub value: u64,
 }
 
-/// Floating-point bit-field layout inside the significant precision region.
+/// Floating-point bit-field layout as absolute bit positions within the
+/// datatype storage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FloatFields {
     pub sign_position: u8,
@@ -257,13 +258,12 @@ impl DatatypeMessage {
             }
         }
 
-        // Validate FloatingPoint properties against the byte size, matching
-        // upstream `H5O__dtype_decode_helper` ("sign bit position out of
-        // bounds" / "exponent size can't be zero" / "exponent starting
-        // position out of bounds" / "mantissa starting position out of
-        // bounds"). Property layout: bit_offset(u16) + precision(u16) +
-        // exp_loc(u8) + exp_size(u8) + mant_loc(u8) + mant_size(u8) +
-        // exp_bias(u32). Sign bit position lives in class_bits[1].
+        // Validate FloatingPoint properties against the byte size. Field
+        // locations are absolute bit positions within the datatype storage;
+        // the significant precision window is bit_offset..bit_offset+precision.
+        // Property layout: bit_offset(u16) + precision(u16) + exp_loc(u8) +
+        // exp_size(u8) + mant_loc(u8) + mant_size(u8) + exp_bias(u32). Sign
+        // bit position lives in class_bits[1].
         if class == DatatypeClass::FloatingPoint {
             let normalization = (class_bits[0] >> 4) & 0x03;
             if normalization == 3 {
@@ -311,20 +311,21 @@ impl DatatypeMessage {
                     "floating-point mantissa size is zero".into(),
                 ));
             }
-            if sign_loc >= precision {
+            let precision_end = bit_offset + precision;
+            if sign_loc < bit_offset || sign_loc >= precision_end {
                 return Err(Error::InvalidFormat(format!(
-                    "floating-point sign bit position {sign_loc} is outside precision {precision}"
+                    "floating-point sign bit position {sign_loc} is outside precision window {bit_offset}..{precision_end}"
                 )));
             }
-            if exp_loc + exp_size > precision {
+            if exp_loc < bit_offset || exp_loc + exp_size > precision_end {
                 return Err(Error::InvalidFormat(format!(
-                    "floating-point exponent location+size ({}) exceeds precision {precision}",
+                    "floating-point exponent location+size ({}) is outside precision window {bit_offset}..{precision_end}",
                     exp_loc + exp_size
                 )));
             }
-            if mant_loc + mant_size > precision {
+            if mant_loc < bit_offset || mant_loc + mant_size > precision_end {
                 return Err(Error::InvalidFormat(format!(
-                    "floating-point mantissa location+size ({}) exceeds precision {precision}",
+                    "floating-point mantissa location+size ({}) is outside precision window {bit_offset}..{precision_end}",
                     mant_loc + mant_size
                 )));
             }

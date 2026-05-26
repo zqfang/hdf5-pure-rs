@@ -98,6 +98,9 @@ fn test_write_dataset_with_attrs() {
              d = f['data']\n\
              assert d.shape == (3,)\n\
              assert d[:].tolist() == [1.0, 2.0, 3.0]\n\
+             assert d.attrs.get_id('count').shape == ()\n\
+             assert d.attrs.get_id('count').dtype.kind == 'i'\n\
+             assert d.attrs.get_id('count').dtype.itemsize == 8\n\
              assert d.attrs['count'] == 42\n\
              print('OK')\n\
              f.close()",
@@ -157,7 +160,8 @@ fn test_write_root_attrs() {
         w.begin().unwrap();
         w.create_root_group().unwrap();
 
-        let val_data = 3.14f64.to_le_bytes().to_vec();
+        let pi_attr = 314.0f64 / 100.0;
+        let val_data = pi_attr.to_le_bytes().to_vec();
         w.add_root_attr(&AttrSpec {
             name: "pi",
             shape: &[],
@@ -177,7 +181,8 @@ fn test_write_root_attrs() {
         let attr = f.attr("pi").unwrap();
         let mut val = 0.0f64;
         attr.read_into(std::slice::from_mut(&mut val)).unwrap();
-        assert!((val - 3.14).abs() < 1e-10);
+        let pi_attr = 314.0f64 / 100.0;
+        assert!((val - pi_attr).abs() < 1e-10);
     }
 
     let out = std::process::Command::new("python3")
@@ -350,12 +355,14 @@ fn test_write_dataset_with_many_compact_attrs() {
         .arg(&path)
         .output();
     if let Ok(out) = out {
-        if !out.status.success() {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            assert!(
-                stderr.contains("error getting attribute information"),
-                "h5dump failed unexpectedly on many-attribute writer fixture: {stderr}"
-            );
-        }
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "h5dump -H failed on many-attribute writer fixture: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(stdout.contains("attr_00"));
+        assert!(stdout.contains("attr_37"));
+        assert!(stdout.contains("attr_39"));
     }
 }

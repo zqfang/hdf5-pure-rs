@@ -102,9 +102,11 @@ fn test_list_root_attrs_v0() {
         f.attr_info_by_idx(0).unwrap(),
         f.attr(&first_name).unwrap().info()
     );
+    first_name = String::from("stale");
     assert!(f
         .attr_name_by_idx_into(names.len(), &mut first_name)
         .is_err());
+    assert_eq!(first_name, "stale");
     assert!(f.attr_info_by_idx(names.len()).is_err());
 }
 
@@ -121,7 +123,8 @@ fn test_read_float_attr_v0() {
     let f = File::open("tests/data/attrs.h5").unwrap();
     let attr = f.attr("float_attr").unwrap();
     let val = attr.read_scalar::<f64>().unwrap();
-    assert!((val - 3.14).abs() < 1e-10);
+    let pi_attr = 314.0f64 / 100.0;
+    assert!((val - pi_attr).abs() < 1e-10);
 }
 
 #[test]
@@ -166,6 +169,11 @@ fn test_dataset_attr_v0() {
     assert_eq!(attrs_len, 1);
     assert!(has_ds_attr);
     assert_eq!(val, 100);
+
+    let mut attrs = vec![attr];
+    assert!(ds.attrs_by_creation_order_into(&mut attrs).is_err());
+    assert_eq!(attrs.len(), 1);
+    assert_eq!(attrs[0].name(), "ds_attr");
 }
 
 #[test]

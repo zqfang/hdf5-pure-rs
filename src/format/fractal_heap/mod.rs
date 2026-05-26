@@ -117,6 +117,13 @@ pub struct FractalHeapManagedObjectCache {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FractalHeapManagedObjectLocation {
+    pub block_addr: u64,
+    pub block_size: u64,
+    pub object_offset: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FractalHeapCreateParams {
     pub heap_id_len: u16,
     pub table_width: u16,
@@ -2771,8 +2778,8 @@ mod tests {
         let decoded = FractalHeapHeader::read_at(&mut reader, 0).unwrap();
         assert_eq!(decoded.sizeof_addr, 4);
         assert_eq!(decoded.sizeof_size, 4);
-        assert_eq!(decoded.huge_btree_addr, u64::from(u32::MAX));
-        assert_eq!(decoded.root_block_addr, u64::from(u32::MAX));
+        assert_eq!(decoded.huge_btree_addr, UNDEF_ADDR);
+        assert_eq!(decoded.root_block_addr, UNDEF_ADDR);
 
         let too_large = FractalHeapHeader {
             root_block_addr: u64::from(u32::MAX) + 1,

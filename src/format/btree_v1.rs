@@ -137,8 +137,11 @@ impl BTreeV1Node {
         btree_addr: u64,
         out: &mut Vec<u64>,
     ) -> Result<()> {
+        let mut addrs = Vec::new();
+        Self::visit_symbol_table_addrs(reader, btree_addr, |addr| addrs.push(addr))?;
         out.clear();
-        Self::visit_symbol_table_addrs(reader, btree_addr, |addr| out.push(addr))
+        out.extend(addrs);
+        Ok(())
     }
 
     /// Visit all leaf-level symbol table node addresses without building an
@@ -297,37 +300,43 @@ impl BTreeV1Node {
         out: &mut Vec<u8>,
     ) -> Result<()> {
         self.verify_structure()?;
-        out.clear();
-        out.reserve(self.cache_image_len(sizeof_addr, sizeof_size)?);
-        out.extend_from_slice(&BTREE_MAGIC);
-        out.push(match self.node_type {
+        let mut image = Vec::with_capacity(self.cache_image_len(sizeof_addr, sizeof_size)?);
+        image.extend_from_slice(&BTREE_MAGIC);
+        image.push(match self.node_type {
             BTreeType::Group => 0,
             BTreeType::RawData => 1,
         });
-        out.push(self.level);
-        out.extend_from_slice(&self.entries_used.to_le_bytes());
+        image.push(self.level);
+        image.extend_from_slice(&self.entries_used.to_le_bytes());
         write_addr_le(
-            out,
+            &mut image,
             self.left_sibling,
             sizeof_addr,
             "v1 B-tree left sibling",
         )?;
         write_addr_le(
-            out,
+            &mut image,
             self.right_sibling,
             sizeof_addr,
             "v1 B-tree right sibling",
         )?;
         for index in 0..self.children.len() {
-            write_var_le(out, self.keys[index], sizeof_size)?;
+            write_var_le(&mut image, self.keys[index], sizeof_size)?;
             if self.children[index] == UNDEF_ADDR {
                 return Err(Error::InvalidFormat(
                     "v1 B-tree child address is undefined".into(),
                 ));
             }
-            write_addr_le(out, self.children[index], sizeof_addr, "v1 B-tree child")?;
+            write_addr_le(
+                &mut image,
+                self.children[index],
+                sizeof_addr,
+                "v1 B-tree child",
+            )?;
         }
-        write_var_le(out, *self.keys.last().unwrap_or(&0), sizeof_size)?;
+        write_var_le(&mut image, *self.keys.last().unwrap_or(&0), sizeof_size)?;
+        out.clear();
+        out.extend(image);
         Ok(())
     }
 
@@ -605,6 +614,31 @@ mod tests {
     use crate::io::reader::HdfReader;
     use std::io::Cursor;
 
+    fn append_u16_le(image: &mut Vec<u8>, value: u16) {
+        image.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn append_u64_le(image: &mut Vec<u8>, value: u64) {
+        image.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn write_group_btree_node(image: &mut Vec<u8>, addr: usize, level: u8, children: &[u64]) {
+        assert!(image.len() <= addr);
+        image.resize(addr, 0);
+
+        image.extend_from_slice(b"TREE");
+        image.push(0);
+        image.push(level);
+        append_u16_le(image, children.len().try_into().unwrap());
+        append_u64_le(image, UNDEF_ADDR);
+        append_u64_le(image, UNDEF_ADDR);
+        for (index, &child) in children.iter().enumerate() {
+            append_u64_le(image, index.try_into().unwrap());
+            append_u64_le(image, child);
+        }
+        append_u64_le(image, children.len().try_into().unwrap());
+    }
+
     #[test]
     fn btree_v1_insert_find_remove_and_split() {
         let mut node = BTreeV1Node::create(BTreeType::Group, 0);
@@ -640,15 +674,38 @@ mod tests {
 
         let mut too_large_child = node.clone();
         too_large_child.children[0] = u64::from(u32::MAX) + 1;
+        image.clear();
+        image.extend_from_slice(b"stale");
         assert!(too_large_child
             .cache_serialize_into(4, 4, &mut image)
             .is_err());
+        assert_eq!(image, b"stale");
 
         let mut too_large_key = node;
         too_large_key.keys[1] = u64::from(u32::MAX) + 1;
+        image.clear();
+        image.extend_from_slice(b"stale");
         assert!(too_large_key
             .cache_serialize_into(4, 4, &mut image)
             .is_err());
+        assert_eq!(image, b"stale");
+    }
+
+    #[test]
+    fn btree_v1_collect_into_preserves_output_on_late_traversal_error() {
+        let mut image = Vec::new();
+        write_group_btree_node(&mut image, 0, 1, &[64, 128]);
+        write_group_btree_node(&mut image, 64, 0, &[0x200]);
+        image.resize(128, 0);
+        image.extend_from_slice(b"BAD!");
+
+        let mut reader = HdfReader::new(Cursor::new(image));
+        let mut addrs = vec![0xaaaa, 0xbbbb];
+        let err =
+            BTreeV1Node::collect_symbol_table_addrs_into(&mut reader, 0, &mut addrs).unwrap_err();
+
+        assert!(matches!(err, Error::InvalidFormat(_)));
+        assert_eq!(addrs, vec![0xaaaa, 0xbbbb]);
     }
 
     #[test]

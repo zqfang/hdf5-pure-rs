@@ -64,23 +64,23 @@ pub trait Location {
 
     /// Store an attribute name by zero-based storage-order index in caller-provided storage.
     fn attr_name_by_idx_into(&self, index: usize, out: &mut String) -> crate::Result<()> {
-        out.clear();
-        let mut found = false;
+        let mut found = None;
         let mut pos = 0usize;
         self.visit_attr_names(|name| {
             if pos == index {
-                out.push_str(name);
-                found = true;
+                found = Some(name.to_string());
             }
             pos += 1;
             Ok(())
         })?;
-        if found {
-            Ok(())
-        } else {
-            Err(crate::Error::InvalidFormat(format!(
+        match found {
+            Some(name) => {
+                *out = name;
+                Ok(())
+            }
+            None => Err(crate::Error::InvalidFormat(format!(
                 "attribute index {index} is out of bounds"
-            )))
+            ))),
         }
     }
 

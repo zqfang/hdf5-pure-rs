@@ -2286,25 +2286,26 @@ pub fn H5O__fsinfo_encode_into(info: &FsInfoMessage, out: &mut Vec<u8>) -> Resul
             "file-space info page size is invalid".into(),
         ));
     }
-    out.reserve(H5O__fsinfo_image_len(info)?);
-    out.push(info.version);
-    out.push(info.free_space_strategy);
-    out.push(u8::from(info.persist));
+    let image_len = H5O__fsinfo_image_len(info)?;
+    let mut image = Vec::with_capacity(image_len);
+    image.push(info.version);
+    image.push(info.free_space_strategy);
+    image.push(u8::from(info.persist));
     encode_le_uint_width(
-        out,
+        &mut image,
         info.threshold,
         usize::from(info.sizeof_size),
         "file-space info threshold",
     )?;
     encode_le_uint_width(
-        out,
+        &mut image,
         info.page_size,
         usize::from(info.sizeof_size),
         "file-space info page size",
     )?;
-    out.extend_from_slice(&info.pgend_meta_thres.to_le_bytes());
+    image.extend_from_slice(&info.pgend_meta_thres.to_le_bytes());
     encode_le_uint_width(
-        out,
+        &mut image,
         info.eoa_pre_fsm_fsalloc,
         usize::from(info.sizeof_addr),
         "file-space info pre-free-space EOA",
@@ -2317,13 +2318,14 @@ pub fn H5O__fsinfo_encode_into(info: &FsInfoMessage, out: &mut Vec<u8>) -> Resul
         }
         for &addr in &info.fs_addr {
             encode_le_uint_width(
-                out,
+                &mut image,
                 addr,
                 usize::from(info.sizeof_addr),
                 "file-space info free-space-manager address",
             )?;
         }
     }
+    out.extend_from_slice(&image);
     Ok(())
 }
 
@@ -9751,6 +9753,106 @@ mod tests {
         assert_eq!(image.len(), first_image.len() + second_image.len());
         assert_eq!(&image[..first_image.len()], &first_image);
         assert_eq!(H5O__cache_image_len(&header).unwrap(), image.len());
+    }
+
+    #[test]
+    fn caller_owned_object_encoders_append_to_existing_output() {
+        let msg = ObjectMessage {
+            msg_type: 42,
+            flags: 0x80,
+            creation_index: 7,
+            data: b"abc".to_vec(),
+            shared: false,
+        };
+        let mut msg_image = b"stale".to_vec();
+        H5O_msg_encode_into(&msg, &mut msg_image).unwrap();
+        assert_eq!(&msg_image[..5], b"stale");
+        assert_eq!(&msg_image[5..], &[42, 0, 0x80, 7, 0, b'a', b'b', b'c']);
+
+        let header = ObjectHeaderState {
+            messages: vec![msg.clone()],
+            ..ObjectHeaderState::default()
+        };
+        let mut header_image = b"stale".to_vec();
+        H5O__cache_serialize_into(&header, &mut header_image).unwrap();
+        assert_eq!(&header_image[..5], b"stale");
+        assert_eq!(&header_image[5..], &msg_image[5..]);
+
+        let raw_chunk = ObjectHeaderChunkImage {
+            is_v2_continuation: false,
+            raw: vec![1, 2, 3],
+        };
+        let mut chunk_image = b"stale".to_vec();
+        H5O__cache_chk_serialize_into(&raw_chunk, &mut chunk_image).unwrap();
+        assert_eq!(chunk_image, b"stale\x01\x02\x03".to_vec());
+
+        let fsinfo = FsInfoMessage {
+            version: 1,
+            free_space_strategy: 2,
+            persist: false,
+            threshold: 8,
+            page_size: 4096,
+            pgend_meta_thres: 0,
+            eoa_pre_fsm_fsalloc: u64::MAX,
+            fs_addr: Vec::new(),
+            sizeof_addr: 8,
+            sizeof_size: 8,
+        };
+        let mut fsinfo_image = b"stale".to_vec();
+        H5O__fsinfo_encode_into(&fsinfo, &mut fsinfo_image).unwrap();
+        assert_eq!(&fsinfo_image[..5], b"stale");
+        assert_eq!(
+            fsinfo_image.len(),
+            5 + H5O__fsinfo_image_len(&fsinfo).unwrap()
+        );
+
+        let mut name_image = b"stale".to_vec();
+        H5O__name_encode_into("alpha", &mut name_image).unwrap();
+        assert_eq!(name_image, b"stalealpha\0".to_vec());
+    }
+
+    #[test]
+    fn caller_owned_object_encoders_preserve_output_on_errors() {
+        let stale = b"stale".to_vec();
+
+        let mut bad_chunk = b"OCHK".to_vec();
+        bad_chunk.extend_from_slice(&[0, 0, 0, 0]);
+        bad_chunk.extend_from_slice(&0u32.to_le_bytes());
+        let mut chunk_image = stale.clone();
+        assert!(H5O__cache_chk_serialize_into(
+            &ObjectHeaderChunkImage {
+                is_v2_continuation: true,
+                raw: bad_chunk,
+            },
+            &mut chunk_image,
+        )
+        .is_err());
+        assert_eq!(chunk_image, stale);
+
+        let mut bad_fsinfo = FsInfoMessage {
+            version: 1,
+            free_space_strategy: 2,
+            persist: true,
+            threshold: 8,
+            page_size: 4096,
+            pgend_meta_thres: 0,
+            eoa_pre_fsm_fsalloc: u64::MAX,
+            fs_addr: vec![u64::MAX],
+            sizeof_addr: 8,
+            sizeof_size: 8,
+        };
+        let mut fsinfo_image = stale.clone();
+        assert!(H5O__fsinfo_encode_into(&bad_fsinfo, &mut fsinfo_image).is_err());
+        assert_eq!(fsinfo_image, stale);
+
+        bad_fsinfo.persist = false;
+        bad_fsinfo.fs_addr.clear();
+        bad_fsinfo.threshold = 256;
+        bad_fsinfo.page_size = 1;
+        bad_fsinfo.sizeof_size = 1;
+        let mut fsinfo_image = stale.clone();
+        assert!(H5O__fsinfo_encode_into(&bad_fsinfo, &mut fsinfo_image).is_err());
+        assert_eq!(fsinfo_image, stale);
     }
 
     #[test]

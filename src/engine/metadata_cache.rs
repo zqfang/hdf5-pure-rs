@@ -1254,8 +1254,7 @@ pub fn H5C__deserialize_cache_image_buffer_into(
     bytes: &[u8],
     entries: &mut Vec<MetadataCacheEntry>,
 ) -> Result<()> {
-    entries.clear();
-    entries.reserve(cache_image_entry_count_hint(bytes));
+    let mut decoded = Vec::with_capacity(cache_image_entry_count_hint(bytes));
     let mut pos = 0usize;
     while pos < bytes.len() {
         let addr = read_u64_at(bytes, pos, "metadata cache image entry address")?;
@@ -1272,9 +1271,10 @@ pub fn H5C__deserialize_cache_image_buffer_into(
                 Error::InvalidFormat("metadata cache image entry payload is truncated".into())
             })?
             .to_vec();
-        entries.push(MetadataCacheEntry::new(addr, "prefetched", image));
+        decoded.push(MetadataCacheEntry::new(addr, "prefetched", image));
         pos = end;
     }
+    *entries = decoded;
     Ok(())
 }
 
@@ -1615,8 +1615,9 @@ pub fn H5C__generate_image_view(cache: &MetadataCache, addr: u64) -> Result<&[u8
 /// Copy an entry's in-core image into caller-provided storage.
 #[allow(non_snake_case)]
 pub fn H5C__generate_image_into(cache: &MetadataCache, addr: u64, out: &mut Vec<u8>) -> Result<()> {
+    let image = H5C__generate_image_view(cache, addr)?;
     out.clear();
-    out.extend_from_slice(H5C__generate_image_view(cache, addr)?);
+    out.extend_from_slice(image);
     Ok(())
 }
 
@@ -1726,8 +1727,9 @@ pub fn H5C__load_entry_view(cache: &MetadataCache, addr: u64) -> Result<&[u8]> {
 /// Load an entry image by address into caller-provided storage.
 #[allow(non_snake_case)]
 pub fn H5C__load_entry_into(cache: &MetadataCache, addr: u64, out: &mut Vec<u8>) -> Result<()> {
+    let image = H5C__load_entry_view(cache, addr)?;
     out.clear();
-    out.extend_from_slice(H5C__load_entry_view(cache, addr)?);
+    out.extend_from_slice(image);
     Ok(())
 }
 
@@ -1787,8 +1789,9 @@ pub fn H5C__serialize_single_entry_into(
     addr: u64,
     out: &mut Vec<u8>,
 ) -> Result<()> {
+    let image = H5C__serialize_single_entry_view(cache, addr)?;
     out.clear();
-    out.extend_from_slice(H5C__serialize_single_entry_view(cache, addr)?);
+    out.extend_from_slice(image);
     Ok(())
 }
 
@@ -2896,5 +2899,51 @@ mod tests {
         assert!(
             H5C__deserialize_cache_image_buffer_into(&truncated_payload, &mut entries).is_err()
         );
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].addr, 0x100);
+    }
+
+    #[test]
+    fn cache_image_into_helpers_preserve_output_on_missing_entry() {
+        let mut cache = MetadataCache::init();
+        cache
+            .insert_entry(MetadataCacheEntry::new(0x100, "btree", vec![1, 2, 3]))
+            .unwrap();
+
+        let mut generated = vec![9, 9];
+        assert!(H5C__generate_image_into(&cache, 0x200, &mut generated).is_err());
+        assert_eq!(generated, vec![9, 9]);
+        H5C__generate_image_into(&cache, 0x100, &mut generated).unwrap();
+        assert_eq!(generated, vec![1, 2, 3]);
+
+        let mut loaded = vec![8, 8];
+        assert!(H5C__load_entry_into(&cache, 0x200, &mut loaded).is_err());
+        assert_eq!(loaded, vec![8, 8]);
+        H5C__load_entry_into(&cache, 0x100, &mut loaded).unwrap();
+        assert_eq!(loaded, vec![1, 2, 3]);
+
+        let mut serialized = vec![7, 7];
+        assert!(H5C__serialize_single_entry_into(&mut cache, 0x200, &mut serialized).is_err());
+        assert_eq!(serialized, vec![7, 7]);
+        H5C__serialize_single_entry_into(&mut cache, 0x100, &mut serialized).unwrap();
+        assert_eq!(serialized, vec![1, 2, 3]);
+        assert!(cache.require_entry(0x100).unwrap().serialized);
+    }
+
+    #[test]
+    fn cache_image_deserialize_into_preserves_entries_on_error() {
+        let mut entries = vec![MetadataCacheEntry::new(0x10, "old", vec![4, 5])];
+
+        let mut truncated_payload = Vec::new();
+        truncated_payload.extend_from_slice(&0x300u64.to_le_bytes());
+        truncated_payload.extend_from_slice(&3u64.to_le_bytes());
+        truncated_payload.extend_from_slice(&[1, 2]);
+
+        assert!(
+            H5C__deserialize_cache_image_buffer_into(&truncated_payload, &mut entries).is_err()
+        );
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].addr, 0x10);
+        assert_eq!(entries[0].image, vec![4, 5]);
     }
 }

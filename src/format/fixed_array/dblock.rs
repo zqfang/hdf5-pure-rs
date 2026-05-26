@@ -81,11 +81,12 @@ pub(super) fn cache_dblock_serialize_into(
     let image_len = prefix_and_payload.len().checked_add(4).ok_or_else(|| {
         Error::InvalidFormat("fixed array data block image length overflow".into())
     })?;
+    let mut image = Vec::with_capacity(image_len);
+    image.extend_from_slice(prefix_and_payload);
+    let checksum = crate::format::checksum::checksum_metadata(&image);
+    image.extend_from_slice(&checksum.to_le_bytes());
     out.clear();
-    out.reserve(image_len);
-    out.extend_from_slice(prefix_and_payload);
-    let checksum = crate::format::checksum::checksum_metadata(&out);
-    out.extend_from_slice(&checksum.to_le_bytes());
+    out.extend_from_slice(&image);
     Ok(())
 }
 
@@ -128,14 +129,58 @@ pub(super) fn cache_dblk_page_image_len(payload_len: usize) -> Result<usize> {
     })
 }
 
+pub(super) fn dblk_page_element_count(
+    element_count: usize,
+    page_elements: usize,
+    page_index: usize,
+) -> Result<usize> {
+    let page_start = checked_usize_mul(page_index, page_elements, "fixed array page start index")?;
+    let remaining = element_count.checked_sub(page_start).ok_or_else(|| {
+        Error::InvalidFormat("fixed array page start exceeds element count".into())
+    })?;
+    Ok(page_elements.min(remaining))
+}
+
+pub(super) fn dblk_page_payload_len(
+    element_count: usize,
+    page_elements: usize,
+    raw_element_size: usize,
+    page_index: usize,
+) -> Result<usize> {
+    checked_usize_mul(
+        dblk_page_element_count(element_count, page_elements, page_index)?,
+        raw_element_size,
+        "fixed array data block page size",
+    )
+}
+
+pub(super) fn dblk_page_offset(
+    page_elements: usize,
+    raw_element_size: usize,
+    page_index: usize,
+) -> Result<usize> {
+    let full_payload_len = checked_usize_mul(
+        page_elements,
+        raw_element_size,
+        "fixed array data block page size",
+    )?;
+    let full_image_len = cache_dblk_page_image_len(full_payload_len)?;
+    checked_usize_mul(
+        page_index,
+        full_image_len,
+        "fixed array data block page offset",
+    )
+}
+
 /// Serialize a data-block page to its on-disk image (payload + checksum).
 pub(super) fn cache_dblk_page_serialize_into(payload: &[u8], out: &mut Vec<u8>) -> Result<()> {
     let image_len = cache_dblk_page_image_len(payload.len())?;
+    let mut image = Vec::with_capacity(image_len);
+    image.extend_from_slice(payload);
+    let checksum = crate::format::checksum::checksum_metadata(&image);
+    image.extend_from_slice(&checksum.to_le_bytes());
     out.clear();
-    out.reserve(image_len);
-    out.extend_from_slice(payload);
-    let checksum = crate::format::checksum::checksum_metadata(&out);
-    out.extend_from_slice(&checksum.to_le_bytes());
+    out.extend_from_slice(&image);
     Ok(())
 }
 
@@ -358,29 +403,20 @@ pub(super) fn collect_data_block_elements_into<R: Read + Seek>(
     elements.clear();
     elements.reserve(prefix.element_count);
     if prefix.paginated {
-        let page_payload = checked_usize_mul(
-            prefix.page_elements,
-            prefix.raw_element_size,
-            "fixed array data block page size",
-        )?;
-        let page_size = checked_usize_add(page_payload, 4, "fixed array data block page size")?;
         let mut page_image = Vec::new();
         for page_index in 0..prefix.pages {
-            let page_start = checked_usize_mul(
-                page_index,
-                prefix.page_elements,
-                "fixed array page start index",
-            )?;
-            let remaining = prefix
-                .element_count
-                .checked_sub(page_start)
-                .ok_or_else(|| {
-                    Error::InvalidFormat("fixed array page start exceeds element count".into())
-                })?;
-            let page_count = prefix.page_elements.min(remaining);
+            let page_count =
+                dblk_page_element_count(prefix.element_count, prefix.page_elements, page_index)?;
             if bit_is_set(&prefix.page_init, page_index) {
+                let page_payload = dblk_page_payload_len(
+                    prefix.element_count,
+                    prefix.page_elements,
+                    prefix.raw_element_size,
+                    page_index,
+                )?;
+                let page_size = cache_dblk_page_image_len(page_payload)?;
                 let page_offset =
-                    checked_usize_mul(page_index, page_size, "fixed array data block page offset")?;
+                    dblk_page_offset(prefix.page_elements, prefix.raw_element_size, page_index)?;
                 let offset = checked_usize_add(
                     prefix.prefix_size,
                     page_offset,
@@ -448,29 +484,20 @@ where
     F: FnMut(FixedArrayElement) -> Result<()>,
 {
     if prefix.paginated {
-        let page_payload = checked_usize_mul(
-            prefix.page_elements,
-            prefix.raw_element_size,
-            "fixed array data block page size",
-        )?;
-        let page_size = checked_usize_add(page_payload, 4, "fixed array data block page size")?;
         let mut page_image = Vec::new();
         for page_index in 0..prefix.pages {
-            let page_start = checked_usize_mul(
-                page_index,
-                prefix.page_elements,
-                "fixed array page start index",
-            )?;
-            let remaining = prefix
-                .element_count
-                .checked_sub(page_start)
-                .ok_or_else(|| {
-                    Error::InvalidFormat("fixed array page start exceeds element count".into())
-                })?;
-            let page_count = prefix.page_elements.min(remaining);
+            let page_count =
+                dblk_page_element_count(prefix.element_count, prefix.page_elements, page_index)?;
             if bit_is_set(&prefix.page_init, page_index) {
+                let page_payload = dblk_page_payload_len(
+                    prefix.element_count,
+                    prefix.page_elements,
+                    prefix.raw_element_size,
+                    page_index,
+                )?;
+                let page_size = cache_dblk_page_image_len(page_payload)?;
                 let page_offset =
-                    checked_usize_mul(page_index, page_size, "fixed array data block page offset")?;
+                    dblk_page_offset(prefix.page_elements, prefix.raw_element_size, page_index)?;
                 let offset = checked_usize_add(
                     prefix.prefix_size,
                     page_offset,
@@ -705,5 +732,29 @@ mod tests {
         bad[last] ^= 0xff;
         assert!(cache_dblk_page_deserialize(&bad).is_err());
         assert!(cache_dblk_page_deserialize(&bad[..3]).is_err());
+    }
+
+    #[test]
+    fn fixed_array_data_block_cache_serialize_replaces_caller_output() {
+        let payload = fixed_array_prefix(100);
+        let mut image = vec![0xaa, 0xbb, 0xcc];
+
+        cache_dblock_serialize_into(&payload, &mut image).unwrap();
+
+        assert_eq!(image.len(), payload.len() + 4);
+        assert_eq!(&image[..payload.len()], payload.as_slice());
+        verify_trailing_checksum(&image, "fixed array data block").unwrap();
+        assert!(!image.starts_with(&[0xaa, 0xbb, 0xcc]));
+    }
+
+    #[test]
+    fn fixed_array_page_cache_serialize_replaces_caller_output() {
+        let payload = 55u64.to_le_bytes();
+        let mut image = vec![0xaa, 0xbb, 0xcc];
+
+        cache_dblk_page_serialize_into(&payload, &mut image).unwrap();
+
+        assert_eq!(cache_dblk_page_deserialize(&image).unwrap(), payload);
+        assert!(!image.starts_with(&[0xaa, 0xbb, 0xcc]));
     }
 }

@@ -10,6 +10,13 @@ use crate::error::{Error, Result};
 /// - Otherwise: back-reference: length = high 3 bits + 2 (or read next byte for long match),
 ///   offset = ((control & 0x1f) << 8) | next_byte + 1
 pub fn decompress_into(data: &[u8], output: &mut [u8]) -> Result<()> {
+    let mut scratch = vec![0; output.len()];
+    decompress_checked(data, &mut scratch)?;
+    output.copy_from_slice(&scratch);
+    Ok(())
+}
+
+fn decompress_checked(data: &[u8], output: &mut [u8]) -> Result<()> {
     let expected_size = output.len();
     let mut ip = 0; // input position
     let mut op: usize = 0; // output position
@@ -155,5 +162,58 @@ mod tests {
             err.to_string().contains("lzf: literal run exceeds input"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn test_lzf_preserves_output_on_late_backref_error() {
+        let compressed = vec![0x02, b'a', b'b', b'c', 0x20, 0x04];
+        let mut result = b"stale!".to_vec();
+        let err = decompress_into(&compressed, &mut result).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("lzf: back-reference offset 5 exceeds output size 3"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(result, b"stale!");
+    }
+
+    #[test]
+    fn test_lzf_preserves_output_on_literal_and_final_length_errors() {
+        let mut result = b"stale".to_vec();
+        let err = decompress_into(&[0x04, b'H', b'e'], &mut result).unwrap_err();
+        assert!(
+            err.to_string().contains("lzf: literal run exceeds input"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(result, b"stale");
+
+        let err = decompress_into(&[0x00, b'a'], &mut result).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("lzf: output length mismatch: expected 5, got 1"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(result, b"stale");
+    }
+
+    #[test]
+    fn test_lzf_preserves_output_on_truncated_backref_headers() {
+        let mut result = b"stale".to_vec();
+
+        let err = decompress_into(&[0xe0], &mut result).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("lzf: unexpected end in long match"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(result, b"stale");
+
+        let err = decompress_into(&[0x20], &mut result).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("lzf: unexpected end reading offset"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(result, b"stale");
     }
 }

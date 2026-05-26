@@ -671,6 +671,484 @@ fn test_group_compat_relink_cross_group_dense_source_into_dense_destination_reop
 }
 
 #[test]
+fn test_group_compat_create_inside_creation_order_indexed_dense_group_is_unsupported() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("creation_order_dense_mutation_boundary.h5");
+    std::fs::copy("tests/data/hdf5_ref/dense_group_cases.h5", &path).unwrap();
+
+    let file = File::open_rw(&path).unwrap();
+    let tracked = file.group("creation_order_tracked").unwrap();
+    let mut creation_orders = Vec::new();
+    tracked
+        .visit_links_by_creation_order(|link| {
+            creation_orders.push(link.creation_order.unwrap());
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(creation_orders, (0..64).collect::<Vec<_>>());
+
+    let err = match tracked.create_group("new_child") {
+        Ok(_) => panic!("creation-order indexed dense mutation should stay unsupported"),
+        Err(err) => err,
+    };
+    assert!(matches!(err, hdf5_pure_rust::Error::Unsupported(_)));
+    assert!(
+        err.to_string()
+            .contains("object-header creation-order tracking"),
+        "unexpected error: {err}"
+    );
+    assert!(!tracked.link_exists("new_child").unwrap());
+    assert!(tracked.link_exists("tracked_00").unwrap());
+    assert!(tracked.link_exists("tracked_63").unwrap());
+
+    let reopened = File::open(&path).unwrap();
+    let tracked = reopened.group("creation_order_tracked").unwrap();
+    assert!(!tracked.link_exists("new_child").unwrap());
+    assert_eq!(group_member_count(&tracked).unwrap(), 64);
+}
+
+#[test]
+fn test_group_compat_create_dataset_and_link_inside_creation_order_indexed_dense_group_are_unsupported(
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir
+        .path()
+        .join("creation_order_dense_dataset_link_boundary.h5");
+    std::fs::copy("tests/data/hdf5_ref/dense_group_cases.h5", &path).unwrap();
+
+    let file = File::open_rw(&path).unwrap();
+    let tracked = file.group("creation_order_tracked").unwrap();
+    let initial_count = group_member_count(&tracked).unwrap();
+
+    let dataset_err = match tracked
+        .new_dataset_builder()
+        .with_data::<i32>(&[1, 2, 3])
+        .create(Some("new_values"))
+    {
+        Ok(_) => panic!("creation-order indexed dense dataset creation should stay unsupported"),
+        Err(err) => err,
+    };
+    assert!(matches!(dataset_err, hdf5_pure_rust::Error::Unsupported(_)));
+    assert!(
+        dataset_err.to_string().contains("creation-order tracking"),
+        "unexpected error: {dataset_err}"
+    );
+
+    let link_err = tracked
+        .link_soft("/missing", "new_soft_link")
+        .expect_err("creation-order indexed dense link creation should stay unsupported");
+    assert!(matches!(link_err, hdf5_pure_rust::Error::Unsupported(_)));
+    assert!(
+        link_err.to_string().contains("creation-order tracking"),
+        "unexpected error: {link_err}"
+    );
+
+    assert!(!tracked.link_exists("new_values").unwrap());
+    assert!(!tracked.link_exists("new_soft_link").unwrap());
+    assert_eq!(group_member_count(&tracked).unwrap(), initial_count);
+
+    let reopened = File::open(&path).unwrap();
+    let tracked = reopened.group("creation_order_tracked").unwrap();
+    assert!(!tracked.link_exists("new_values").unwrap());
+    assert!(!tracked.link_exists("new_soft_link").unwrap());
+    assert_eq!(group_member_count(&tracked).unwrap(), initial_count);
+    let mut creation_orders = Vec::new();
+    tracked
+        .visit_links_by_creation_order(|link| {
+            creation_orders.push(link.creation_order.unwrap());
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(creation_orders, (0..64).collect::<Vec<_>>());
+}
+
+#[test]
+fn test_group_compat_create_external_and_hard_links_inside_creation_order_indexed_dense_group_are_unsupported(
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir
+        .path()
+        .join("creation_order_dense_external_hard_link_boundary.h5");
+    std::fs::copy("tests/data/hdf5_ref/dense_group_cases.h5", &path).unwrap();
+
+    let file = File::open_rw(&path).unwrap();
+    let root = file.root_group().unwrap();
+    let tracked = file.group("creation_order_tracked").unwrap();
+    let initial_count = group_member_count(&tracked).unwrap();
+    let target_addr = root
+        .link_info("name_index_deep")
+        .unwrap()
+        .hard_link_addr
+        .unwrap();
+    let initial_refcount = object_refcount_at(&path, &file, target_addr);
+
+    let external_err = tracked
+        .link_external("external.h5", "/external_target", "new_external_link")
+        .expect_err("creation-order indexed dense external-link creation should stay unsupported");
+    assert!(matches!(
+        external_err,
+        hdf5_pure_rust::Error::Unsupported(_)
+    ));
+    assert!(
+        external_err.to_string().contains("creation-order tracking"),
+        "unexpected error: {external_err}"
+    );
+
+    let hard_err = tracked
+        .link_hard("/name_index_deep", "new_hard_link")
+        .expect_err("creation-order indexed dense hard-link creation should stay unsupported");
+    assert!(matches!(hard_err, hdf5_pure_rust::Error::Unsupported(_)));
+    assert!(
+        hard_err.to_string().contains("creation-order tracking"),
+        "unexpected error: {hard_err}"
+    );
+
+    assert!(!tracked.link_exists("new_external_link").unwrap());
+    assert!(!tracked.link_exists("new_hard_link").unwrap());
+    assert_eq!(group_member_count(&tracked).unwrap(), initial_count);
+    assert_eq!(
+        object_refcount_at(&path, &file, target_addr),
+        initial_refcount
+    );
+
+    let reopened = File::open(&path).unwrap();
+    let root = reopened.root_group().unwrap();
+    let tracked = reopened.group("creation_order_tracked").unwrap();
+    assert!(root.link_exists("name_index_deep").unwrap());
+    assert!(!tracked.link_exists("new_external_link").unwrap());
+    assert!(!tracked.link_exists("new_hard_link").unwrap());
+    assert_eq!(group_member_count(&tracked).unwrap(), initial_count);
+    assert_eq!(
+        object_refcount_at(&path, &reopened, target_addr),
+        initial_refcount
+    );
+}
+
+#[test]
+fn test_group_compat_unlink_inside_creation_order_indexed_dense_group_is_unsupported() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("creation_order_dense_unlink_boundary.h5");
+    std::fs::copy("tests/data/hdf5_ref/dense_group_cases.h5", &path).unwrap();
+
+    let file = File::open_rw(&path).unwrap();
+    let tracked = file.group("creation_order_tracked").unwrap();
+    assert!(tracked.link_exists("tracked_08").unwrap());
+
+    let err = match tracked.unlink("tracked_08") {
+        Ok(_) => panic!("creation-order indexed dense unlink should stay unsupported"),
+        Err(err) => err,
+    };
+    assert!(matches!(err, hdf5_pure_rust::Error::Unsupported(_)));
+    assert!(
+        err.to_string()
+            .contains("creation-order indexed dense links"),
+        "unexpected error: {err}"
+    );
+    assert!(tracked.link_exists("tracked_08").unwrap());
+
+    let reopened = File::open(&path).unwrap();
+    let tracked = reopened.group("creation_order_tracked").unwrap();
+    assert!(tracked.link_exists("tracked_08").unwrap());
+    assert_eq!(group_member_count(&tracked).unwrap(), 64);
+}
+
+#[test]
+fn test_group_compat_relink_same_size_inside_creation_order_indexed_dense_group() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("creation_order_dense_relink_same_size.h5");
+    let out = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(
+            r#"import sys
+try:
+    import h5py
+except ModuleNotFoundError as exc:
+    raise exc
+with h5py.File(sys.argv[1], 'w') as f:
+    g = f.create_group('creation_order_tracked', track_order=True)
+    for i in range(10):
+        g.create_group(f'tracked_{i:02d}')
+"#,
+        )
+        .arg(&path)
+        .output()
+        .unwrap();
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if stderr.contains("No module named 'h5py'") {
+            return;
+        }
+        panic!("h5py fixture creation failed: {stderr}");
+    }
+
+    let file = File::open_rw(&path).unwrap();
+    let tracked = file.group("creation_order_tracked").unwrap();
+    assert!(tracked.link_exists("tracked_08").unwrap());
+    assert!(!tracked.link_exists("renamed_08").unwrap());
+
+    tracked.relink("tracked_08", "renamed_08").unwrap();
+    assert!(!tracked.link_exists("tracked_08").unwrap());
+    assert!(tracked.link_exists("renamed_08").unwrap());
+
+    let reopened = File::open(&path).unwrap();
+    let tracked = reopened.group("creation_order_tracked").unwrap();
+    assert!(!tracked.link_exists("tracked_08").unwrap());
+    assert!(tracked.link_exists("renamed_08").unwrap());
+    assert_eq!(group_member_count(&tracked).unwrap(), 10);
+
+    let mut creation_order_names = Vec::new();
+    tracked
+        .visit_links_by_creation_order(|link| {
+            creation_order_names.push(link.name.clone());
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(creation_order_names.len(), 10);
+    assert_eq!(creation_order_names[8], "renamed_08");
+}
+
+#[test]
+fn test_group_compat_relink_into_creation_order_indexed_dense_group_preserves_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir
+        .path()
+        .join("creation_order_dense_relink_destination_boundary.h5");
+    std::fs::copy("tests/data/hdf5_ref/dense_group_cases.h5", &path).unwrap();
+
+    let file = File::open_rw(&path).unwrap();
+    let root = file.root_group().unwrap();
+    let tracked = file.group("creation_order_tracked").unwrap();
+    let root_count = group_member_count(&root).unwrap();
+    let tracked_count = group_member_count(&tracked).unwrap();
+    assert!(root.link_exists("name_index_deep").unwrap());
+    assert!(!tracked.link_exists("moved_name_index_deep").unwrap());
+
+    let err = match root.relink(
+        "name_index_deep",
+        "/creation_order_tracked/moved_name_index_deep",
+    ) {
+        Ok(_) => panic!("creation-order indexed dense destination should stay unsupported"),
+        Err(err) => err,
+    };
+    assert!(matches!(err, hdf5_pure_rust::Error::Unsupported(_)));
+    assert!(
+        err.to_string().contains("creation-order tracking"),
+        "unexpected error: {err}"
+    );
+    assert!(root.link_exists("name_index_deep").unwrap());
+    assert!(!tracked.link_exists("moved_name_index_deep").unwrap());
+    assert_eq!(group_member_count(&root).unwrap(), root_count);
+    assert_eq!(group_member_count(&tracked).unwrap(), tracked_count);
+
+    let reopened = File::open(&path).unwrap();
+    let root = reopened.root_group().unwrap();
+    let tracked = reopened.group("creation_order_tracked").unwrap();
+    assert!(root.link_exists("name_index_deep").unwrap());
+    assert!(!tracked.link_exists("moved_name_index_deep").unwrap());
+    assert_eq!(group_member_count(&root).unwrap(), root_count);
+    assert_eq!(group_member_count(&tracked).unwrap(), tracked_count);
+}
+
+#[test]
+fn test_group_compat_relink_from_creation_order_indexed_dense_group_preserves_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir
+        .path()
+        .join("creation_order_dense_relink_source_boundary.h5");
+    std::fs::copy("tests/data/hdf5_ref/dense_group_cases.h5", &path).unwrap();
+
+    let file = File::open_rw(&path).unwrap();
+    let root = file.root_group().unwrap();
+    let tracked = file.group("creation_order_tracked").unwrap();
+    let root_count = group_member_count(&root).unwrap();
+    let tracked_count = group_member_count(&tracked).unwrap();
+    assert!(tracked.link_exists("tracked_08").unwrap());
+    assert!(!root.link_exists("moved_tracked_08").unwrap());
+
+    let err = match tracked.relink("tracked_08", "/moved_tracked_08") {
+        Ok(_) => panic!("creation-order indexed dense source relink should stay unsupported"),
+        Err(err) => err,
+    };
+    assert!(matches!(err, hdf5_pure_rust::Error::Unsupported(_)));
+    assert!(
+        err.to_string().contains("creation-order tracking"),
+        "unexpected error: {err}"
+    );
+    assert!(tracked.link_exists("tracked_08").unwrap());
+    assert!(!root.link_exists("moved_tracked_08").unwrap());
+    assert_eq!(group_member_count(&root).unwrap(), root_count);
+    assert_eq!(group_member_count(&tracked).unwrap(), tracked_count);
+
+    let reopened = File::open(&path).unwrap();
+    let root = reopened.root_group().unwrap();
+    let tracked = reopened.group("creation_order_tracked").unwrap();
+    assert!(tracked.link_exists("tracked_08").unwrap());
+    assert!(!root.link_exists("moved_tracked_08").unwrap());
+    assert_eq!(group_member_count(&root).unwrap(), root_count);
+    assert_eq!(group_member_count(&tracked).unwrap(), tracked_count);
+}
+
+#[test]
+fn test_group_compat_create_inside_v1_symbol_table_group_is_unsupported() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir
+        .path()
+        .join("v1_symbol_table_group_mutation_boundary.h5");
+    std::fs::copy("tests/data/hdf5_ref/group_old.h5", &path).unwrap();
+
+    let file = File::open_rw(&path).unwrap();
+    let old = file.group("old").unwrap();
+    assert_eq!(group_member_count(&old).unwrap(), 0);
+
+    let err = match old.create_group("new_child") {
+        Ok(_) => panic!("old-format group mutation should stay unsupported"),
+        Err(err) => err,
+    };
+    assert!(
+        err.to_string().contains("v2/v3 superblock"),
+        "unexpected error: {err}"
+    );
+    assert!(!old.link_exists("new_child").unwrap());
+
+    let reopened = File::open(&path).unwrap();
+    let old = reopened.group("old").unwrap();
+    assert_eq!(group_member_count(&old).unwrap(), 0);
+    assert!(!old.link_exists("new_child").unwrap());
+}
+
+#[test]
+fn test_group_compat_create_dataset_and_link_inside_v1_symbol_table_group_are_unsupported() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("v1_symbol_table_dataset_link_boundary.h5");
+    std::fs::copy("tests/data/hdf5_ref/group_old.h5", &path).unwrap();
+
+    let file = File::open_rw(&path).unwrap();
+    let old = file.group("old").unwrap();
+    assert_eq!(group_member_count(&old).unwrap(), 0);
+
+    let dataset_err = match old
+        .new_dataset_builder()
+        .with_data::<i32>(&[1, 2, 3])
+        .create(Some("new_values"))
+    {
+        Ok(_) => panic!("old-format dataset creation should stay unsupported"),
+        Err(err) => err,
+    };
+    assert!(
+        dataset_err.to_string().contains("v2/v3 superblock"),
+        "unexpected error: {dataset_err}"
+    );
+
+    let link_err = old
+        .link_soft("/missing", "new_soft_link")
+        .expect_err("old-format soft-link creation should stay unsupported");
+    assert!(
+        link_err.to_string().contains("v2/v3 superblock"),
+        "unexpected error: {link_err}"
+    );
+
+    assert!(!old.link_exists("new_values").unwrap());
+    assert!(!old.link_exists("new_soft_link").unwrap());
+    assert_eq!(group_member_count(&old).unwrap(), 0);
+
+    let reopened = File::open(&path).unwrap();
+    let old = reopened.group("old").unwrap();
+    assert!(!old.link_exists("new_values").unwrap());
+    assert!(!old.link_exists("new_soft_link").unwrap());
+    assert_eq!(group_member_count(&old).unwrap(), 0);
+}
+
+#[test]
+fn test_group_compat_create_external_and_hard_links_inside_v1_symbol_table_group_are_unsupported() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir
+        .path()
+        .join("v1_symbol_table_external_hard_link_boundary.h5");
+    std::fs::copy("tests/data/hdf5_ref/group_old.h5", &path).unwrap();
+
+    let file = File::open_rw(&path).unwrap();
+    let root = file.root_group().unwrap();
+    let old = file.group("old").unwrap();
+    let root_count = group_member_count(&root).unwrap();
+    assert_eq!(group_member_count(&old).unwrap(), 0);
+    assert!(root.link_exists("old").unwrap());
+
+    let external_err = old
+        .link_external("external.h5", "/external_target", "new_external_link")
+        .expect_err("old-format external-link creation should stay unsupported");
+    assert!(
+        external_err.to_string().contains("v2/v3 superblock"),
+        "unexpected error: {external_err}"
+    );
+
+    let hard_err = old
+        .link_hard("/old", "new_hard_link")
+        .expect_err("old-format hard-link creation should stay unsupported");
+    assert!(
+        hard_err.to_string().contains("v2/v3 superblock"),
+        "unexpected error: {hard_err}"
+    );
+
+    assert!(!old.link_exists("new_external_link").unwrap());
+    assert!(!old.link_exists("new_hard_link").unwrap());
+    assert_eq!(group_member_count(&old).unwrap(), 0);
+    assert_eq!(group_member_count(&root).unwrap(), root_count);
+
+    let reopened = File::open(&path).unwrap();
+    let root = reopened.root_group().unwrap();
+    let old = reopened.group("old").unwrap();
+    assert!(root.link_exists("old").unwrap());
+    assert!(!old.link_exists("new_external_link").unwrap());
+    assert!(!old.link_exists("new_hard_link").unwrap());
+    assert_eq!(group_member_count(&old).unwrap(), 0);
+    assert_eq!(group_member_count(&root).unwrap(), root_count);
+}
+
+#[test]
+fn test_group_compat_relink_and_unlink_v1_symbol_table_root_are_unsupported() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("v1_symbol_table_root_mutation_boundary.h5");
+    std::fs::copy("tests/data/hdf5_ref/group_old.h5", &path).unwrap();
+
+    let file = File::open_rw(&path).unwrap();
+    let root = file.root_group().unwrap();
+    let root_count = group_member_count(&root).unwrap();
+    assert!(root.link_exists("old").unwrap());
+    assert!(!root.link_exists("renamed_old").unwrap());
+
+    let relink_err = match root.relink("old", "renamed_old") {
+        Ok(_) => panic!("old-format root relink should stay unsupported"),
+        Err(err) => err,
+    };
+    assert!(matches!(relink_err, hdf5_pure_rust::Error::Unsupported(_)));
+    assert!(
+        relink_err.to_string().contains("v2 object headers"),
+        "unexpected error: {relink_err}"
+    );
+    assert!(root.link_exists("old").unwrap());
+    assert!(!root.link_exists("renamed_old").unwrap());
+    assert_eq!(group_member_count(&root).unwrap(), root_count);
+
+    let unlink_err = match root.unlink("old") {
+        Ok(_) => panic!("old-format root unlink should stay unsupported"),
+        Err(err) => err,
+    };
+    assert!(matches!(unlink_err, hdf5_pure_rust::Error::Unsupported(_)));
+    assert!(
+        unlink_err.to_string().contains("v2 object headers"),
+        "unexpected error: {unlink_err}"
+    );
+    assert!(root.link_exists("old").unwrap());
+    assert_eq!(group_member_count(&root).unwrap(), root_count);
+
+    let reopened = File::open(&path).unwrap();
+    let root = reopened.root_group().unwrap();
+    assert!(root.link_exists("old").unwrap());
+    assert!(!root.link_exists("renamed_old").unwrap());
+    assert_eq!(group_member_count(&root).unwrap(), root_count);
+}
+
+#[test]
 fn test_group_compat_relink_cross_group_hard_alias_preserves_refcount() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("relink_cross_group_refcount.h5");
@@ -1286,6 +1764,83 @@ fn test_group_compat_create_same_group_hard_link_under_dense_root_parent_open_rw
 }
 
 #[test]
+fn test_group_compat_create_same_group_hard_link_inside_dense_parent_open_rw() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir
+        .path()
+        .join("create_same_group_hard_link_inside_dense_parent.h5");
+    {
+        let mut writable = WritableFile::create(&path).unwrap();
+        let mut parent = writable.create_group("parent").unwrap();
+        for idx in 0..9 {
+            parent
+                .new_dataset_builder(&format!("child_{idx:02}"))
+                .write::<i32>(&[idx])
+                .unwrap();
+        }
+        parent
+            .new_dataset_builder("real_data")
+            .write::<i32>(&[55, 89])
+            .unwrap();
+        writable.close().unwrap();
+    }
+
+    let file = File::open_rw(&path).unwrap();
+    let parent = file.group("parent").unwrap();
+    let initial_count = group_member_count(&parent).unwrap();
+    let old_real_addr = parent
+        .link_info("real_data")
+        .unwrap()
+        .hard_link_addr
+        .unwrap();
+    assert_eq!(object_refcount_at(&path, &file, old_real_addr), 1);
+
+    parent.link_hard("real_data", "alias_data").unwrap();
+
+    let parent = file.group("parent").unwrap();
+    assert!(parent.link_exists("real_data").unwrap());
+    assert!(parent.link_exists("alias_data").unwrap());
+    let real_addr = parent
+        .link_info("real_data")
+        .unwrap()
+        .hard_link_addr
+        .unwrap();
+    let alias_addr = parent
+        .link_info("alias_data")
+        .unwrap()
+        .hard_link_addr
+        .unwrap();
+    assert_eq!(real_addr, alias_addr);
+    assert_eq!(object_refcount_at(&path, &file, real_addr), 2);
+    assert_eq!(group_member_count(&parent).unwrap(), initial_count + 1);
+
+    let reopened = File::open(&path).unwrap();
+    let parent = reopened.group("parent").unwrap();
+    assert!(parent.link_exists("real_data").unwrap());
+    assert!(parent.link_exists("alias_data").unwrap());
+    let real_addr = parent
+        .link_info("real_data")
+        .unwrap()
+        .hard_link_addr
+        .unwrap();
+    let alias_addr = parent
+        .link_info("alias_data")
+        .unwrap()
+        .hard_link_addr
+        .unwrap();
+    assert_eq!(real_addr, alias_addr);
+    assert_eq!(object_refcount_at(&path, &reopened, real_addr), 2);
+    assert_eq!(group_member_count(&parent).unwrap(), initial_count + 1);
+    let mut values = vec![0; 2];
+    reopened
+        .dataset("parent/alias_data")
+        .unwrap()
+        .read_into(&mut values)
+        .unwrap();
+    assert_eq!(values, [55, 89]);
+}
+
+#[test]
 fn test_group_compat_open_rw_relative_hard_link_target_in_same_group() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("open_rw_relative_hard_link_target.h5");
@@ -1379,6 +1934,62 @@ fn test_group_compat_unlink_requires_read_write_file() {
     let root = file.root_group().unwrap();
     let err = root.unlink("soft_link").unwrap_err();
     assert!(matches!(err, hdf5_pure_rust::Error::Unsupported(_)));
+}
+
+#[test]
+fn test_group_compat_mutation_entry_points_require_read_write_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("readonly_group_mutation_entry_points.h5");
+    {
+        let mut writable = WritableFile::create(&path).unwrap();
+        writable.create_group("existing").unwrap();
+        writable
+            .new_dataset_builder("data")
+            .write::<i32>(&[1, 2, 3])
+            .unwrap();
+        writable.close().unwrap();
+    }
+
+    let file = File::open(&path).unwrap();
+    let root = file.root_group().unwrap();
+
+    let create_group_err = match root.create_group("created") {
+        Ok(_) => panic!("read-only create_group should fail"),
+        Err(err) => err,
+    };
+    let create_dataset_err = match root
+        .new_dataset_builder()
+        .with_data::<i32>(&[4, 5, 6])
+        .create(Some("values"))
+    {
+        Ok(_) => panic!("read-only dataset creation should fail"),
+        Err(err) => err,
+    };
+
+    for err in [
+        create_group_err,
+        create_dataset_err,
+        root.link_soft("/data", "soft_alias").unwrap_err(),
+        root.link_external("other.h5", "/data", "external_alias")
+            .unwrap_err(),
+        root.link_hard("/data", "hard_alias").unwrap_err(),
+        root.relink("existing", "renamed").unwrap_err(),
+    ] {
+        assert!(
+            matches!(err, hdf5_pure_rust::Error::Unsupported(_)),
+            "read-only group mutation should be explicitly unsupported: {err}"
+        );
+    }
+
+    let root = File::open(&path).unwrap().root_group().unwrap();
+    assert!(root.link_exists("existing").unwrap());
+    assert!(root.link_exists("data").unwrap());
+    assert!(!root.link_exists("created").unwrap());
+    assert!(!root.link_exists("values").unwrap());
+    assert!(!root.link_exists("soft_alias").unwrap());
+    assert!(!root.link_exists("external_alias").unwrap());
+    assert!(!root.link_exists("hard_alias").unwrap());
+    assert!(!root.link_exists("renamed").unwrap());
 }
 
 #[test]
@@ -1483,6 +2094,93 @@ fn test_file_open_object_registry_queries() {
     assert_eq!(f.obj_count(), 1);
     f.obj_ids_into(&mut ids);
     assert_eq!(ids, vec![f.object_id()]);
+}
+
+#[test]
+fn test_file_and_group_list_into_helpers_replace_stale_output_on_success() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("list_into_success_replaces_stale.h5");
+    {
+        let mut writable = WritableFile::create(&path).unwrap();
+        writable.add_attr("root_attr", 7i32).unwrap();
+        let mut group = writable.create_group("parent").unwrap();
+        group.add_attr("group_attr", 11i32).unwrap();
+        group.create_group("child").unwrap();
+        writable.close().unwrap();
+    }
+
+    let file = File::open(&path).unwrap();
+    let mut file_names = vec!["stale".to_string()];
+    file.member_names_into(&mut file_names).unwrap();
+    assert_eq!(file_names, vec!["parent"]);
+
+    let mut file_attr_names = vec!["stale".to_string()];
+    file.attr_names_into(&mut file_attr_names).unwrap();
+    assert_eq!(file_attr_names, vec!["root_attr"]);
+
+    let mut file_attrs = Vec::new();
+    file.attrs_into(&mut file_attrs).unwrap();
+    assert_eq!(file_attrs.len(), 1);
+    assert_eq!(file_attrs[0].name(), "root_attr");
+
+    let group = file.group("parent").unwrap();
+    let mut group_names = vec!["stale".to_string()];
+    group.member_names_into(&mut group_names).unwrap();
+    assert_eq!(group_names, vec!["child"]);
+
+    let mut group_attr_names = vec!["stale".to_string()];
+    group.attr_names_into(&mut group_attr_names).unwrap();
+    assert_eq!(group_attr_names, vec!["group_attr"]);
+
+    let mut group_attrs = Vec::new();
+    group.attrs_into(&mut group_attrs).unwrap();
+    assert_eq!(group_attrs.len(), 1);
+    assert_eq!(group_attrs[0].name(), "group_attr");
+
+    let mut ids = vec![u64::MAX];
+    file.obj_ids_into(&mut ids);
+    assert!(!ids.contains(&u64::MAX));
+    assert!(ids.contains(&file.object_id()));
+    assert!(ids.contains(&group.object_id()));
+}
+
+#[test]
+fn test_file_and_group_list_into_helpers_preserve_stale_output_on_errors() {
+    let file = File::open("tests/data/attrs.h5").unwrap();
+    let stale_attr = file.attr("int_attr").unwrap();
+    let mut attrs = vec![stale_attr.clone()];
+    let err = file.attrs_by_creation_order_into(&mut attrs).unwrap_err();
+    assert!(matches!(err, hdf5_pure_rust::Error::Unsupported(_)));
+    assert_eq!(attrs.len(), 1);
+    assert_eq!(attrs[0].name(), stale_attr.name());
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("list_into_error_preserves_stale.h5");
+    {
+        let mut writable = WritableFile::create(&path).unwrap();
+        writable.add_attr("root_attr", 7i32).unwrap();
+        writable.create_group("parent").unwrap();
+        writable.close().unwrap();
+    }
+
+    let file = File::open_rw(&path).unwrap();
+    let root = file.root_group().unwrap();
+    let parent = file.group("parent").unwrap();
+    root.relink("parent", "renamed_parent").unwrap();
+
+    let mut names = vec!["stale".to_string()];
+    assert!(parent.member_names_into(&mut names).is_err());
+    assert_eq!(names, vec!["stale"]);
+
+    let mut attr_names = vec!["stale".to_string()];
+    assert!(parent.attr_names_into(&mut attr_names).is_err());
+    assert_eq!(attr_names, vec!["stale"]);
+
+    let stale_root_attr = file.attr("root_attr").unwrap();
+    let mut parent_attrs = vec![stale_root_attr.clone()];
+    assert!(parent.attrs_into(&mut parent_attrs).is_err());
+    assert_eq!(parent_attrs.len(), 1);
+    assert_eq!(parent_attrs[0].name(), stale_root_attr.name());
 }
 
 #[test]

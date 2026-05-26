@@ -609,6 +609,49 @@ fn test_nbit_filter_big_endian_i32_read() {
 }
 
 #[test]
+fn test_nbit_filter_selected_reads_use_filtered_chunks() {
+    let f = File::open("tests/data/hdf5_ref/nbit_filter_i32.h5").unwrap();
+    let ds = f.dataset("nbit_i32").unwrap();
+
+    let mut vals = [0i32; 7];
+    read_dataset_slice_into(&ds, 17..24, &mut vals).unwrap();
+    assert_eq!(vals, [17, 18, 19, 20, 21, 22, 23]);
+
+    let f = File::open("tests/data/hdf5_ref/nbit_filter_be_i32.h5").unwrap();
+    let ds = f.dataset("nbit_be_i32").unwrap();
+
+    let mut be_vals = [0i32; 5];
+    read_dataset_slice_into(&ds, 95..100, &mut be_vals).unwrap();
+    assert_eq!(be_vals, [95, 96, 97, 98, 99]);
+
+    let f = File::open("tests/data/hdf5_ref/nbit_parity_vectors.h5").unwrap();
+    let ds = f.dataset("nbit_f32").unwrap();
+
+    let mut floats = [0.0f32; 3];
+    read_dataset_slice_into(&ds, 1..4, &mut floats).unwrap();
+    assert_eq!(
+        floats.map(f32::to_bits),
+        [1.5f32, -2.25, 123.5].map(f32::to_bits)
+    );
+}
+
+#[test]
+fn test_nbit_filter_selected_read_preserves_output_on_wrong_length() {
+    let f = File::open("tests/data/hdf5_ref/nbit_filter_i32.h5").unwrap();
+    let ds = f.dataset("nbit_i32").unwrap();
+    let mut vals = [-1i32; 3];
+
+    let err = read_dataset_slice_into(&ds, 17..24, &mut vals)
+        .expect_err("wrong-length selected NBit read should fail");
+    assert!(
+        err.to_string()
+            .contains("slice output buffer has 3 elements, expected 7"),
+        "unexpected error: {err}"
+    );
+    assert_eq!(vals, [-1; 3]);
+}
+
+#[test]
 fn test_nbit_filter_signed_unsigned_and_float_parity_vectors() {
     let f = File::open("tests/data/hdf5_ref/nbit_parity_vectors.h5").unwrap();
 
@@ -668,6 +711,22 @@ fn test_nbit_filter_compound_member_parity_vectors() {
 }
 
 #[test]
+fn test_nbit_filter_compound_field_preserves_output_on_wrong_length() {
+    let f = File::open("tests/data/hdf5_ref/nbit_parity_vectors.h5").unwrap();
+    let ds = f.dataset("nbit_compound_members").unwrap();
+    let mut codes = [-99i16; 2];
+
+    let err = read_dataset_field_into(&ds, "code", &mut codes)
+        .expect_err("wrong-length NBit compound field read should fail");
+    assert!(
+        err.to_string()
+            .contains("field output buffer has 2 elements, expected 3"),
+        "unexpected error: {err}"
+    );
+    assert_eq!(codes, [-99; 2]);
+}
+
+#[test]
 fn test_scaleoffset_filter_i32_read() {
     let f = File::open("tests/data/hdf5_ref/scaleoffset_filter_i32.h5").unwrap();
     assert_dataset_values::<i32>(
@@ -700,6 +759,55 @@ fn test_scaleoffset_filter_f32_read() {
 }
 
 #[test]
+fn test_scaleoffset_filter_selected_reads_use_filtered_chunks() {
+    let f = File::open("tests/data/hdf5_ref/scaleoffset_filter_i32.h5").unwrap();
+    let ds = f.dataset("scaleoffset_i32").unwrap();
+
+    let mut vals = [0i32; 7];
+    read_dataset_slice_into(&ds, 17..24, &mut vals).unwrap();
+    assert_eq!(vals, [17, 18, 19, 20, 21, 22, 23]);
+
+    let f = File::open("tests/data/hdf5_ref/scaleoffset_filter_be_i32.h5").unwrap();
+    let ds = f.dataset("scaleoffset_be_i32").unwrap();
+
+    let mut be_vals = [0i32; 5];
+    read_dataset_slice_into(&ds, 95..100, &mut be_vals).unwrap();
+    assert_eq!(be_vals, [95, 96, 97, 98, 99]);
+
+    let f = File::open("tests/data/hdf5_ref/scaleoffset_parity_vectors.h5").unwrap();
+
+    let ds = f.dataset("scaleoffset_f32_dscale").unwrap();
+    let mut f32_vals = [0.0f32; 3];
+    read_dataset_slice_into(&ds, 1..4, &mut f32_vals).unwrap();
+    for (actual, expected) in f32_vals.iter().zip([-0.5, 0.0, 1.25]) {
+        assert!((*actual - expected).abs() < 0.011);
+    }
+
+    let ds = f.dataset("scaleoffset_f64_dscale").unwrap();
+    let mut f64_vals = [0.0f64; 3];
+    read_dataset_slice_into(&ds, 2..5, &mut f64_vals).unwrap();
+    for (actual, expected) in f64_vals.iter().zip([0.25, 12.75, 2048.5]) {
+        assert!((*actual - expected).abs() < 0.0011);
+    }
+}
+
+#[test]
+fn test_scaleoffset_filter_selected_read_preserves_output_on_wrong_length() {
+    let f = File::open("tests/data/hdf5_ref/scaleoffset_filter_i32.h5").unwrap();
+    let ds = f.dataset("scaleoffset_i32").unwrap();
+    let mut vals = [-1i32; 3];
+
+    let err = read_dataset_slice_into(&ds, 17..24, &mut vals)
+        .expect_err("wrong-length selected ScaleOffset read should fail");
+    assert!(
+        err.to_string()
+            .contains("slice output buffer has 3 elements, expected 7"),
+        "unexpected error: {err}"
+    );
+    assert_eq!(vals, [-1; 3]);
+}
+
+#[test]
 fn test_scaleoffset_integer_parity_vectors() {
     let f = File::open("tests/data/hdf5_ref/scaleoffset_parity_vectors.h5").unwrap();
 
@@ -718,6 +826,28 @@ fn test_scaleoffset_integer_parity_vectors() {
     assert_dataset_values::<i32>(
         &f.dataset("scaleoffset_i32_zero_minbits").unwrap(),
         &[-42; 8],
+    )
+    .unwrap();
+}
+
+#[test]
+fn test_scaleoffset_i64_fill_marker_c_suite_vectors() {
+    let expected = [
+        0, 1, 2, 3, 4, 5, 1, 2, 3, 4, 5, 6, 2, 3, 4, 5, 6, 7, 3, 4, 5, 6, 7, 8, 4, 5, 6, 7, 8, 9,
+        5, 6, 7, 8, 9, 10, -2, -2, -2, -2, -2, -2,
+    ];
+
+    let le = File::open("tests/data/hdf5_ref/le_data.h5").unwrap();
+    assert_dataset_values::<i64>(
+        &le.dataset("Scale_offset_long_long_data_le").unwrap(),
+        &expected,
+    )
+    .unwrap();
+
+    let be = File::open("tests/data/hdf5_ref/be_data.h5").unwrap();
+    assert_dataset_values::<i64>(
+        &be.dataset("Scale_offset_long_long_data_be").unwrap(),
+        &expected,
     )
     .unwrap();
 }

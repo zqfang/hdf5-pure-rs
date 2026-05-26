@@ -437,15 +437,15 @@ pub fn locate_fixed_array_element_with_checksum<R: Read + Seek>(
             "fixed array data block prefix size",
         )
         .and_then(|value| checked_usize_add(value, 4, "fixed array data block prefix size"))?;
-        let page_payload = checked_usize_mul(
+        let within_page = element_index % page_elements;
+        let page_payload = dblock::dblk_page_payload_len(
+            element_count,
             page_elements,
             header.raw_element_size,
-            "fixed array data block page size",
+            page_index,
         )?;
-        let page_size = checked_usize_add(page_payload, 4, "fixed array data block page size")?;
-        let within_page = element_index % page_elements;
         let page_offset =
-            checked_usize_mul(page_index, page_size, "fixed array data block page offset")?;
+            dblock::dblk_page_offset(page_elements, header.raw_element_size, page_index)?;
         let element_offset = checked_usize_mul(
             within_page,
             header.raw_element_size,

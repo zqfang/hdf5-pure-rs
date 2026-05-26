@@ -1,6 +1,12 @@
 //! Phase T7: Dataspace and selection tests.
 
-use hdf5_pure_rust::{Dataspace, DataspaceType, File, HyperslabDim, Selection, SelectionType};
+use hdf5_pure_rust::{
+    hl::selection::{
+        H5S__point_serialize_into, H5S_select_serialize_into, H5Sget_select_bounds_into,
+        H5Sget_select_hyper_blocklist_into,
+    },
+    Dataspace, DataspaceType, File, HyperslabDim, Selection, SelectionType,
+};
 
 const FILE: &str = "tests/data/hdf5_ref/selections_test.h5";
 fn open() -> File {
@@ -218,6 +224,95 @@ fn t7c_selection_constructor_and_internal_query_aliases() {
         Selection::Hyperslab(vec![HyperslabDim::new(0, 1, 1, 1)]).selection_type(),
         SelectionType::Hyperslab
     );
+}
+
+#[test]
+fn t7c_selection_encoding_replaces_stale_output_transactionally() {
+    let mut encoded = vec![9, 8, 7];
+    Selection::All.encode1_into(&mut encoded).unwrap();
+    assert_eq!(encoded, [1]);
+
+    encoded = vec![6, 5, 4];
+    H5S_select_serialize_into(&Selection::None, &mut encoded).unwrap();
+    assert_eq!(encoded, [0]);
+
+    let malformed = Selection::Points(vec![vec![1, 2], vec![3]]);
+    encoded = vec![3, 2, 1];
+    let err = malformed
+        .encode1_into(&mut encoded)
+        .expect_err("mixed-rank point selections should fail to encode");
+    assert!(err.to_string().contains("mixed ranks"));
+    assert_eq!(encoded, [3, 2, 1]);
+
+    encoded = vec![7, 7, 7];
+    let err = H5S__point_serialize_into(&malformed, &mut encoded)
+        .expect_err("direct point serialization should fail transactionally");
+    assert!(err.to_string().contains("mixed ranks"));
+    assert_eq!(encoded, [7, 7, 7]);
+}
+
+#[test]
+fn t7c_selection_bounds_clear_stale_output_on_empty_and_error() {
+    let mut start = vec![9, 8, 7];
+    let mut end = vec![6, 5, 4];
+    assert!(!H5Sget_select_bounds_into(
+        &Selection::None,
+        &[2, 2],
+        &mut start,
+        &mut end
+    ));
+    assert!(start.is_empty());
+    assert!(end.is_empty());
+
+    start = vec![4, 3, 2];
+    end = vec![1, 0, 9];
+    let malformed = Selection::Points(vec![vec![1, 2], vec![0]]);
+    assert!(!H5Sget_select_bounds_into(
+        &malformed,
+        &[3, 3],
+        &mut start,
+        &mut end
+    ));
+    assert!(start.is_empty());
+    assert!(end.is_empty());
+
+    start = vec![7, 7, 7];
+    end = vec![8, 8, 8];
+    assert!(H5Sget_select_bounds_into(
+        &Selection::All,
+        &[2, 3],
+        &mut start,
+        &mut end
+    ));
+    assert_eq!(start, [0, 0]);
+    assert_eq!(end, [1, 2]);
+}
+
+#[test]
+fn t7c_hyperslab_blocklist_overwrites_copied_prefix_only() {
+    let selection = Selection::Hyperslab(vec![
+        HyperslabDim::new(0, 1, 2, 1),
+        HyperslabDim::new(1, 1, 2, 1),
+    ]);
+    let mut starts = vec![9; 10];
+    let mut ends = vec![8; 10];
+
+    assert_eq!(
+        H5Sget_select_hyper_blocklist_into(&selection, &[3, 3], &mut starts, &mut ends).unwrap(),
+        Some(4)
+    );
+    assert_eq!(&starts[..8], &[0, 1, 0, 2, 1, 1, 1, 2]);
+    assert_eq!(&ends[..8], &[0, 1, 0, 2, 1, 1, 1, 2]);
+    assert_eq!(&starts[8..], &[9, 9]);
+    assert_eq!(&ends[8..], &[8, 8]);
+
+    let points = Selection::Points(vec![vec![0, 0]]);
+    assert_eq!(
+        H5Sget_select_hyper_blocklist_into(&points, &[3, 3], &mut starts, &mut ends).unwrap(),
+        None
+    );
+    assert_eq!(&starts[..8], &[0, 1, 0, 2, 1, 1, 1, 2]);
+    assert_eq!(&ends[..8], &[0, 1, 0, 2, 1, 1, 1, 2]);
 }
 
 #[test]

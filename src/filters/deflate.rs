@@ -17,22 +17,30 @@ pub fn decompress_with_hint_into(
     expected_len: Option<usize>,
     out: &mut Vec<u8>,
 ) -> Result<()> {
+    let mut decoded = Vec::new();
     if let Some(expected_len) = expected_len {
-        out.reserve(expected_len);
+        decoded.reserve(expected_len);
     }
     let mut decoder = ZlibDecoder::new(data);
     decoder
-        .read_to_end(out)
+        .read_to_end(&mut decoded)
         .map_err(|e| Error::InvalidFormat(format!("deflate decompression failed: {e}")))?;
+    if decoder.total_in() != data.len() as u64 {
+        return Err(Error::InvalidFormat(
+            "deflate decompression left trailing input bytes".into(),
+        ));
+    }
+    out.extend_from_slice(&decoded);
     Ok(())
 }
 
 /// Decompress deflate (zlib) compressed data into the provided output buffer
 /// and require the decoded size to match exactly.
 pub fn decompress_exact_into(data: &[u8], out: &mut [u8]) -> Result<()> {
+    let mut decoded = vec![0; out.len()];
     let mut decoder = Decompress::new(true);
     let status = decoder
-        .decompress(data, out, FlushDecompress::Finish)
+        .decompress(data, &mut decoded, FlushDecompress::Finish)
         .map_err(|e| Error::InvalidFormat(format!("deflate decompression failed: {e}")))?;
 
     if status != Status::StreamEnd {
@@ -57,6 +65,7 @@ pub fn decompress_exact_into(data: &[u8], out: &mut [u8]) -> Result<()> {
             "deflate decompression left trailing input bytes".into(),
         ));
     }
+    out.copy_from_slice(&decoded);
     Ok(())
 }
 
@@ -88,5 +97,41 @@ pub fn filter_deflate_into(
         decompress_into(data, out)
     } else {
         compress_into(data, level, out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deflate_vec_decode_preserves_output_on_trailing_input() {
+        let mut encoded = Vec::new();
+        compress_into(b"payload", 6, &mut encoded).unwrap();
+        encoded.extend_from_slice(b"trailing");
+
+        let mut out = b"stale".to_vec();
+        let err = decompress_into(&encoded, &mut out).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("deflate decompression left trailing input bytes"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(out, b"stale");
+    }
+
+    #[test]
+    fn deflate_exact_decode_preserves_output_on_size_error() {
+        let mut encoded = Vec::new();
+        compress_into(b"payload", 6, &mut encoded).unwrap();
+
+        let mut out = *b"stale!";
+        let err = decompress_exact_into(&encoded, &mut out).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("deflate decompression produced more bytes than expected"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(&out, b"stale!");
     }
 }

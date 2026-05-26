@@ -28,6 +28,8 @@ struct DenseAttributeLocation {
     btree: BTreeV2Header,
     leaf_records: Vec<u8>,
     record_index: usize,
+    direct_block_addr: u64,
+    direct_block_size: u64,
     object_offset: u64,
     raw_data: Vec<u8>,
 }
@@ -343,9 +345,9 @@ impl MutableFile {
         }
 
         let heap = FractalHeapHeader::read_at(&mut guard.reader, attr_info.fractal_heap_addr)?;
-        if heap.io_filter_len != 0 || heap.current_root_rows != 0 {
+        if heap.io_filter_len != 0 {
             return Err(Error::Unsupported(
-                "mutating filtered or indirect dense attribute heaps is not implemented".into(),
+                "mutating filtered dense attribute heaps is not implemented".into(),
             ));
         }
 
@@ -371,12 +373,12 @@ impl MutableFile {
                 )));
             }
             if attr.name == target_name {
-                let object_offset = managed_heap_object_offset(&heap, heap_id)?;
-                found = Some((idx, object_offset, raw_data));
+                let object_location = heap.managed_object_location(&mut guard.reader, heap_id)?;
+                found = Some((idx, object_location, raw_data));
             }
         }
 
-        let (record_index, object_offset, raw_data) = found
+        let (record_index, object_location, raw_data) = found
             .ok_or_else(|| Error::InvalidFormat(format!("attribute '{target_name}' not found")))?;
         Ok(DenseAttributeLocation {
             attr_info_addr: attr_info.name_btree_addr,
@@ -384,7 +386,9 @@ impl MutableFile {
             btree,
             leaf_records,
             record_index,
-            object_offset,
+            direct_block_addr: object_location.block_addr,
+            direct_block_size: object_location.block_size,
+            object_offset: object_location.object_offset,
             raw_data,
         })
     }
@@ -425,8 +429,7 @@ impl MutableFile {
 
         let name_offset_u64 = Self::usize_to_u64(name_offset, "dense attribute name offset")?;
         let file_name_offset = location
-            .heap
-            .root_block_addr
+            .direct_block_addr
             .checked_add(location.object_offset)
             .and_then(|offset| offset.checked_add(name_offset_u64))
             .ok_or_else(|| Error::InvalidFormat("dense attribute name offset overflow".into()))?;
@@ -475,6 +478,8 @@ impl MutableFile {
         )?;
         self.rewrite_dense_attribute_direct_block_checksum(
             &location.heap,
+            location.direct_block_addr,
+            location.direct_block_size,
             file_name_offset,
             encoded_name,
         )?;
@@ -739,25 +744,27 @@ impl MutableFile {
     fn rewrite_dense_attribute_direct_block_checksum(
         &mut self,
         heap: &FractalHeapHeader,
+        block_addr: u64,
+        block_size: u64,
         patched_addr: u64,
         patched_data: &[u8],
     ) -> Result<()> {
         if !heap.has_checksum {
             return Ok(());
         }
-        let block_size = usize::try_from(heap.start_block_size)
+        let block_size = usize::try_from(block_size)
             .map_err(|_| Error::InvalidFormat("dense attribute direct block too large".into()))?;
         let checksum_pos = direct_block_checksum_pos(heap, self.superblock.sizeof_addr)?;
         let checksum_end = checksum_pos
             .checked_add(4)
             .ok_or_else(|| Error::InvalidFormat("direct block checksum offset overflow".into()))?;
         let mut guard = self.inner.lock();
-        guard.reader.seek(heap.root_block_addr)?;
+        guard.reader.seek(block_addr)?;
         let mut block = vec![0u8; block_size];
         guard.reader.read_bytes_into(&mut block)?;
         drop(guard);
         let patch_start = patched_addr
-            .checked_sub(heap.root_block_addr)
+            .checked_sub(block_addr)
             .ok_or_else(|| Error::InvalidFormat("direct block patch address underflow".into()))?;
         let patch_start = usize::try_from(patch_start)
             .map_err(|_| Error::InvalidFormat("direct block patch offset too large".into()))?;
@@ -775,11 +782,9 @@ impl MutableFile {
         let checksum = checksum_metadata(&block);
         let checksum_pos_u64 = Self::usize_to_u64(checksum_pos, "direct block checksum position")?;
         self.write_handle.seek(SeekFrom::Start(
-            heap.root_block_addr
-                .checked_add(checksum_pos_u64)
-                .ok_or_else(|| {
-                    Error::InvalidFormat("direct block checksum address overflow".into())
-                })?,
+            block_addr.checked_add(checksum_pos_u64).ok_or_else(|| {
+                Error::InvalidFormat("direct block checksum address overflow".into())
+            })?,
         ))?;
         self.write_handle.write_all(&checksum.to_le_bytes())?;
         Ok(())
@@ -826,16 +831,6 @@ fn encode_attribute_name_in_place<'a>(
     name_field.fill(0);
     name_field[..name.len()].copy_from_slice(name.as_bytes());
     Ok(name_field)
-}
-
-fn managed_heap_object_offset(heap: &FractalHeapHeader, heap_id: &[u8]) -> Result<u64> {
-    let offset_bytes = fractal_heap_offset_width(heap)?;
-    let offset_bytes = checked_window(heap_id, 1, offset_bytes, "dense attribute heap offset")?;
-    let mut offset = 0u64;
-    for (idx, byte) in offset_bytes.iter().enumerate() {
-        offset |= u64::from(*byte) << (idx * 8);
-    }
-    Ok(offset)
 }
 
 fn direct_block_checksum_pos(heap: &FractalHeapHeader, sizeof_addr: u8) -> Result<usize> {

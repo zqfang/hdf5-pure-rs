@@ -9,6 +9,8 @@ description = "Pure Rust implementation of the HDF5 file format"
 license = "BSD-3-Clause"
 repository = "https://github.com/henriksson-lab/hdf5-pure-rs"
 homepage = "https://github.com/henriksson-lab/hdf5-pure-rs"
+keywords = ["hdf5", "h5", "scientific", "ndarray", "data"]
+categories = ["science", "filesystem", "parsing", "encoding"]
 include = ["/src/**/*", "/benches/**/*", "/examples/**/*", "/scripts/*.py", "/scripts/*.sh", "/scripts/*.R", "/tests/*.rs", "/tests/data/*.h5", "/tests/data/hdf5_ref/**/*", "/Cargo.toml", "/README.md", "/LICENSE", "/LICENSE-*"]
 
 [dependencies]

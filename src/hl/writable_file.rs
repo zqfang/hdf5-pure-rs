@@ -1,9 +1,10 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::engine::writer::{AttrSpec, HdfFileWriter};
+use crate::engine::writer::{AttrSpec, HdfFileWriter, SharedMessageIndexConfig};
 use crate::error::{Error, Result};
 use crate::hl::dataset_builder::DatasetBuilder;
+use crate::hl::plist::file_create::FileSpaceStrategy;
 use crate::hl::types::{slice_as_bytes, H5Type};
 
 /// A writable HDF5 file under construction.
@@ -17,12 +18,108 @@ pub struct WritableFile {
     current_group: String,
 }
 
+fn encode_file_space_strategy(strategy: FileSpaceStrategy) -> u8 {
+    match strategy {
+        FileSpaceStrategy::FreeSpaceManager => 0,
+        FileSpaceStrategy::Page => 1,
+        FileSpaceStrategy::Aggregate => 2,
+        FileSpaceStrategy::None => 3,
+    }
+}
+
 impl WritableFile {
     /// Create a new HDF5 file (truncating if it exists).
     pub fn create<P: AsRef<Path>>(path: P) -> Result<Self> {
+        Self::create_with_options(
+            path,
+            0,
+            2,
+            8,
+            8,
+            FileSpaceStrategy::Aggregate,
+            false,
+            1,
+            4096,
+        )
+    }
+
+    /// Create a new HDF5 file with a userblock prefix.
+    pub fn create_with_userblock<P: AsRef<Path>>(path: P, userblock: u64) -> Result<Self> {
+        Self::create_with_options(
+            path,
+            userblock,
+            2,
+            8,
+            8,
+            FileSpaceStrategy::Aggregate,
+            false,
+            1,
+            4096,
+        )
+    }
+
+    /// Create a new HDF5 file with selected FCPL-backed file layout options.
+    pub fn create_with_options<P: AsRef<Path>>(
+        path: P,
+        userblock: u64,
+        superblock_version: u8,
+        sizeof_addr: u8,
+        sizeof_size: u8,
+        file_space_strategy: FileSpaceStrategy,
+        file_space_persist: bool,
+        file_space_threshold: u64,
+        file_space_page_size: u64,
+    ) -> Result<Self> {
+        Self::create_with_options_and_shared_messages(
+            path,
+            userblock,
+            superblock_version,
+            sizeof_addr,
+            sizeof_size,
+            file_space_strategy,
+            file_space_persist,
+            file_space_threshold,
+            file_space_page_size,
+            &[],
+            (50, 40),
+        )
+    }
+
+    /// Create a new HDF5 file with selected FCPL-backed file layout options,
+    /// including the shared-message table subset supported by this writer.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn create_with_options_and_shared_messages<P: AsRef<Path>>(
+        path: P,
+        userblock: u64,
+        superblock_version: u8,
+        sizeof_addr: u8,
+        sizeof_size: u8,
+        file_space_strategy: FileSpaceStrategy,
+        file_space_persist: bool,
+        file_space_threshold: u64,
+        file_space_page_size: u64,
+        shared_mesg_indexes: &[crate::hl::plist::file_create::SharedMessageIndex],
+        shared_mesg_phase_change: (u32, u32),
+    ) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         let f = fs::File::create(&path)?;
-        let mut writer = HdfFileWriter::new(f);
+        let mut writer = HdfFileWriter::new_with_base_addr(f, userblock);
+        writer.set_superblock_version(superblock_version)?;
+        writer.set_file_size_widths(sizeof_addr, sizeof_size)?;
+        writer.set_file_space_info(
+            encode_file_space_strategy(file_space_strategy),
+            file_space_persist,
+            file_space_threshold,
+            file_space_page_size,
+        )?;
+        let shared_mesg_indexes: Vec<_> = shared_mesg_indexes
+            .iter()
+            .map(|index| SharedMessageIndexConfig {
+                message_type_flags: index.message_type_flags,
+                minimum_message_size: index.minimum_message_size,
+            })
+            .collect();
+        writer.set_shared_message_info(&shared_mesg_indexes, shared_mesg_phase_change)?;
         writer.begin()?;
         writer.create_root_group()?;
 
@@ -35,6 +132,66 @@ impl WritableFile {
 
     /// Create a new HDF5 file, failing if it already exists.
     pub fn create_excl<P: AsRef<Path>>(path: P) -> Result<Self> {
+        Self::create_excl_with_userblock(path, 0)
+    }
+
+    /// Create a new HDF5 file with a userblock prefix, failing if it already exists.
+    pub fn create_excl_with_userblock<P: AsRef<Path>>(path: P, userblock: u64) -> Result<Self> {
+        Self::create_excl_with_options(
+            path,
+            userblock,
+            2,
+            8,
+            8,
+            FileSpaceStrategy::Aggregate,
+            false,
+            1,
+            4096,
+        )
+    }
+
+    /// Create a new HDF5 file with selected FCPL-backed file layout options,
+    /// failing if it already exists.
+    pub fn create_excl_with_options<P: AsRef<Path>>(
+        path: P,
+        userblock: u64,
+        superblock_version: u8,
+        sizeof_addr: u8,
+        sizeof_size: u8,
+        file_space_strategy: FileSpaceStrategy,
+        file_space_persist: bool,
+        file_space_threshold: u64,
+        file_space_page_size: u64,
+    ) -> Result<Self> {
+        Self::create_excl_with_options_and_shared_messages(
+            path,
+            userblock,
+            superblock_version,
+            sizeof_addr,
+            sizeof_size,
+            file_space_strategy,
+            file_space_persist,
+            file_space_threshold,
+            file_space_page_size,
+            &[],
+            (50, 40),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn create_excl_with_options_and_shared_messages<P: AsRef<Path>>(
+        path: P,
+        userblock: u64,
+        superblock_version: u8,
+        sizeof_addr: u8,
+        sizeof_size: u8,
+        file_space_strategy: FileSpaceStrategy,
+        file_space_persist: bool,
+        file_space_threshold: u64,
+        file_space_page_size: u64,
+        shared_mesg_indexes: &[crate::hl::plist::file_create::SharedMessageIndex],
+        shared_mesg_phase_change: (u32, u32),
+    ) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         if path.exists() {
             return Err(Error::Io(std::io::Error::new(
@@ -42,7 +199,19 @@ impl WritableFile {
                 format!("file already exists: {}", path.display()),
             )));
         }
-        Self::create(path)
+        Self::create_with_options_and_shared_messages(
+            path,
+            userblock,
+            superblock_version,
+            sizeof_addr,
+            sizeof_size,
+            file_space_strategy,
+            file_space_persist,
+            file_space_threshold,
+            file_space_page_size,
+            shared_mesg_indexes,
+            shared_mesg_phase_change,
+        )
     }
 
     /// Create a subgroup in the root group.

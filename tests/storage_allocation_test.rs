@@ -27,3 +27,26 @@ fn test_late_allocation_fill_time_never_reads_zeroes() {
     ds.read_into(&mut vals).unwrap();
     assert_eq!(vals, [0, 0, 0, 0]);
 }
+
+#[test]
+fn test_undefined_contiguous_storage_read_slice_uses_fill_policy() {
+    let f = File::open("tests/data/hdf5_ref/undefined_storage_address.h5").unwrap();
+    let ds = f.dataset("late_fill").unwrap();
+
+    let vals = ds.read_slice::<i32, _>(1..3).unwrap();
+    assert_eq!(vals, [-5, -5]);
+
+    let mut into = [0; 2];
+    ds.read_slice_into::<i32, _>(1..3, &mut into).unwrap();
+    assert_eq!(into, [-5, -5]);
+
+    let f = File::open("tests/data/hdf5_ref/late_fill_time_never.h5").unwrap();
+    let ds = f.dataset("late_never").unwrap();
+
+    let vals = ds.read_slice::<i32, _>(1..3).unwrap();
+    assert_eq!(vals, [0, 0]);
+
+    let mut into = [-1; 2];
+    ds.read_slice_into::<i32, _>(1..3, &mut into).unwrap();
+    assert_eq!(into, [0, 0]);
+}

@@ -175,4 +175,25 @@ mod tests {
         assert!(is_noop(4, 4));
         assert!(!is_noop(8, 4));
     }
+
+    #[test]
+    fn filter_shuffle_preserves_output_on_validation_errors() {
+        let data = [1, 2, 3, 4];
+        let mut out = *b"stale";
+
+        let err = filter_shuffle_into(&data, 0, false, &mut out).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("shuffle filter element size is zero"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(&out, b"stale");
+
+        let err = filter_shuffle_into(&data, 2, true, &mut out[..3]).unwrap_err();
+        assert!(
+            err.to_string().contains("shuffle output length mismatch"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(&out, b"stale");
+    }
 }

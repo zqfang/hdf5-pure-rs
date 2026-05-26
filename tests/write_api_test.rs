@@ -54,6 +54,26 @@ fn location_attr_summary_into<L: Location>(
     Ok(count)
 }
 
+fn assert_fractal_heap_uses_filters(bytes: &[u8]) {
+    let mut found_filtered_heap = false;
+    for (pos, _) in bytes
+        .windows(4)
+        .enumerate()
+        .filter(|(_, window)| *window == b"FRHP")
+    {
+        let io_filter_pos = pos + 7;
+        if io_filter_pos + 2 <= bytes.len() {
+            let io_filter_len =
+                u16::from_le_bytes([bytes[io_filter_pos], bytes[io_filter_pos + 1]]);
+            found_filtered_heap |= io_filter_len > 0;
+        }
+    }
+    assert!(
+        found_filtered_heap,
+        "expected a filtered fractal heap header"
+    );
+}
+
 fn assert_dataset_values<T>(ds: &Dataset, expected: &[T]) -> Result<()>
 where
     T: H5Type + Default + Clone + PartialEq + std::fmt::Debug,
@@ -531,6 +551,67 @@ fn test_writable_group_dense_attrs() {
         assert!(found[1]);
         assert_eq!(g.attr("attr_12").unwrap().read_scalar_i64(), Some(12));
     }
+
+    let out = std::process::Command::new("timeout")
+        .arg("10")
+        .arg("h5dump")
+        .arg("-A")
+        .arg("-g")
+        .arg("annotated")
+        .arg(&path)
+        .output();
+    if let Ok(out) = out {
+        assert!(
+            out.status.success(),
+            "h5dump -A failed or timed out on dense group attribute fixture: status={:?}, stderr={}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.contains("attr_00"));
+        assert!(stdout.contains("attr_15"));
+    }
+
+    assert_h5py_script(
+        &path,
+        "attrs = f['annotated'].attrs\n\
+         assert len(attrs) == 16\n\
+         assert attrs['attr_00'] == 0\n\
+         assert attrs['attr_12'] == 12\n\
+         assert attrs['attr_15'] == 15",
+        "dense group attribute writer fixture",
+    );
+}
+
+#[test]
+fn test_writable_dense_attrs_use_indirect_fractal_heap_blocks() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("api_write_dense_attrs_indirect_heap.h5");
+
+    {
+        let mut wf = WritableFile::create(&path).unwrap();
+        let mut g = wf.create_group("annotated").unwrap();
+        for idx in 0..40 {
+            g.add_fixed_ascii_attr(&format!("attr_{idx:02}"), "value", 256)
+                .unwrap();
+        }
+        let f = wf.close().unwrap();
+
+        let g = f.group("annotated").unwrap();
+        let mut found = [false, false];
+        let count = location_attr_summary_into(&g, &["attr_00", "attr_39"], &mut found).unwrap();
+        assert_eq!(count, 40);
+        assert!(found[0]);
+        assert!(found[1]);
+        assert_eq!(
+            attribute_string(&g.attr("attr_17").unwrap()).unwrap(),
+            "value"
+        );
+    }
+
+    let bytes = std::fs::read(&path).unwrap();
+    assert!(bytes.windows(4).any(|window| window == b"FHIB"));
+    assert_fractal_heap_uses_filters(&bytes);
 }
 
 #[test]
@@ -586,6 +667,17 @@ fn test_writable_fixed_string_attrs() {
             "猫"
         );
     }
+
+    assert_h5py_script(
+        &path,
+        "project = f.attrs['project']\n\
+         species = f['metadata'].attrs['species']\n\
+         project = project.decode('utf-8') if isinstance(project, bytes) else str(project)\n\
+         species = species.decode('utf-8') if isinstance(species, bytes) else str(species)\n\
+         assert project.rstrip('\\x00') == 'hdf'\n\
+         assert species.rstrip('\\x00') == '猫'",
+        "fixed string attribute writer fixture",
+    );
 }
 
 #[test]
@@ -729,6 +821,36 @@ fn test_writable_dense_attrs_cross_leaf_btree_boundary() {
             && window.get(5) == Some(&8)
             && u16::from_le_bytes([window[12], window[13]]) > 0
     }));
+
+    let out = std::process::Command::new("timeout")
+        .arg("10")
+        .arg("h5dump")
+        .arg("-A")
+        .arg("-g")
+        .arg("metadata")
+        .arg(&path)
+        .output();
+    if let Ok(out) = out {
+        assert!(
+            out.status.success(),
+            "h5dump -A failed or timed out on dense attribute internal-B-tree fixture: status={:?}, stderr={}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.contains("attr_00"));
+        assert!(stdout.contains("attr_63"));
+    }
+
+    assert_h5py_script(
+        &path,
+        "attrs = f['metadata'].attrs\n\
+         assert len(attrs) == 64\n\
+         assert attrs['attr_00'] == 0\n\
+         assert attrs['attr_42'] == 42\n\
+         assert attrs['attr_63'] == 63",
+        "dense attribute internal-B-tree writer fixture",
+    );
 }
 
 #[test]
@@ -767,6 +889,16 @@ fn test_writable_fixed_string_array_attrs() {
         assert_eq!(labels.shape(), &[2]);
         assert_attribute_strings(&labels, &["猫", "å"]).unwrap();
     }
+
+    assert_h5py_script(
+        &path,
+        "text = lambda value: value.decode('utf-8') if isinstance(value, bytes) else str(value)\n\
+         stages = [text(value).rstrip('\\x00') for value in f.attrs['stages'].tolist()]\n\
+         labels = [text(value).rstrip('\\x00') for value in f['metadata'].attrs['labels'].tolist()]\n\
+         assert stages == ['raw', 'qc', 'done']\n\
+         assert labels == ['猫', 'å']",
+        "fixed string array attribute writer fixture",
+    );
 }
 
 #[test]
@@ -1034,6 +1166,103 @@ fn test_writable_dense_links_support_wider_heap_ids() {
 }
 
 #[test]
+fn test_writable_dense_links_cross_leaf_btree_boundary() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("api_write_dense_link_internal_btree.h5");
+
+    {
+        let mut wf = WritableFile::create(&path).unwrap();
+        let mut group = wf.create_group("many").unwrap();
+        for idx in 0..64 {
+            group
+                .new_dataset_builder(&format!("value_{idx:02}"))
+                .write::<i32>(&[idx])
+                .unwrap();
+        }
+        let f = wf.close().unwrap();
+
+        let group = f.group("many").unwrap();
+        let mut found = [false, false];
+        let count =
+            group_member_summary_into(&group, &["value_00", "value_63"], &mut found).unwrap();
+        assert_eq!(count, 64);
+        assert!(found[0]);
+        assert!(found[1]);
+        assert_dataset_values::<i32>(&group.open_dataset("value_42").unwrap(), &[42]).unwrap();
+    }
+
+    let bytes = std::fs::read(&path).unwrap();
+    assert!(bytes.windows(16).any(|window| {
+        window.starts_with(b"BTHD")
+            && window.get(5) == Some(&5)
+            && u16::from_le_bytes([window[12], window[13]]) > 0
+    }));
+
+    let out = std::process::Command::new("timeout")
+        .arg("10")
+        .arg("h5dump")
+        .arg("-H")
+        .arg("-g")
+        .arg("many")
+        .arg(&path)
+        .output();
+    if let Ok(out) = out {
+        assert!(
+            out.status.success(),
+            "h5dump -H failed or timed out on dense link internal-B-tree fixture: status={:?}, stderr={}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.contains("value_00"));
+        assert!(stdout.contains("value_63"));
+    }
+
+    assert_h5py_script(
+        &path,
+        "g = f['many']\n\
+         assert len(g) == 64\n\
+         assert sorted(g.keys())[0] == 'value_00'\n\
+         assert sorted(g.keys())[-1] == 'value_63'\n\
+         assert int(g['value_42'][0]) == 42",
+        "dense link internal-B-tree writer fixture",
+    );
+}
+
+#[test]
+fn test_writable_dense_links_use_indirect_fractal_heap_blocks() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("api_write_dense_links_indirect_heap.h5");
+
+    {
+        let mut wf = WritableFile::create(&path).unwrap();
+        let mut group = wf.create_group("many").unwrap();
+        for idx in 0..40 {
+            let name = format!("value_{idx:02}_{}", "x".repeat(192));
+            group
+                .new_dataset_builder(&name)
+                .write::<i32>(&[idx])
+                .unwrap();
+        }
+        let f = wf.close().unwrap();
+
+        let group = f.group("many").unwrap();
+        let first = format!("value_{:02}_{}", 0, "x".repeat(192));
+        let last = format!("value_{:02}_{}", 39, "x".repeat(192));
+        let mut found = [false, false];
+        let count = group_member_summary_into(&group, &[&first, &last], &mut found).unwrap();
+        assert_eq!(count, 40);
+        assert!(found[0]);
+        assert!(found[1]);
+        assert_dataset_values::<i32>(&group.open_dataset(&last).unwrap(), &[39]).unwrap();
+    }
+
+    let bytes = std::fs::read(&path).unwrap();
+    assert!(bytes.windows(4).any(|window| window == b"FHIB"));
+    assert_fractal_heap_uses_filters(&bytes);
+}
+
+#[test]
 fn test_writable_file_chunked_compressed() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("api_write_chunked.h5");
@@ -1148,6 +1377,17 @@ fn test_writable_file_chunked_filtered_row_slab_streams_multidimensional_run() {
         assert!(stdout.contains("DEFLATE"));
         assert!(stdout.contains("SHUFFLE"));
     }
+
+    assert_h5py_script(
+        &path,
+        "d = f['fixed']\n\
+         assert d.shape == (6, 4)\n\
+         assert d.chunks == (2, 4)\n\
+         assert d.compression == 'gzip'\n\
+         assert d.shuffle\n\
+         assert d[:].reshape(-1).tolist() == list(range(24))",
+        "filtered fixed-array row-slab fixture",
+    );
 }
 
 #[test]
@@ -1189,6 +1429,21 @@ fn test_writable_file_chunked_row_slab_streams_partial_edge_run() {
         );
         assert_dataset_values::<i32>(&resizable, &data).unwrap();
     }
+
+    assert_h5py_script(
+        &path,
+        "expected = list(range(20))\n\
+         fixed = f['fixed']\n\
+         resizable = f['resizable']\n\
+         assert fixed.shape == (5, 4)\n\
+         assert fixed.chunks == (2, 4)\n\
+         assert fixed[:].reshape(-1).tolist() == expected\n\
+         assert resizable.shape == (5, 4)\n\
+         assert resizable.maxshape == (12, 4)\n\
+         assert resizable.chunks == (2, 4)\n\
+         assert resizable[:].reshape(-1).tolist() == expected",
+        "partial-edge fixed-array and B-tree v2 row-slab fixture",
+    );
 }
 
 #[test]
@@ -1238,6 +1493,25 @@ fn test_writable_file_chunked_filtered_row_slab_partial_edge_run() {
         assert!(dataset_has_filter_id(&resizable, 2).unwrap());
         assert_dataset_values::<i32>(&resizable, &data).unwrap();
     }
+
+    assert_h5py_script(
+        &path,
+        "expected = list(range(20))\n\
+         fixed = f['fixed']\n\
+         resizable = f['resizable']\n\
+         assert fixed.shape == (5, 4)\n\
+         assert fixed.chunks == (2, 4)\n\
+         assert fixed.compression == 'gzip'\n\
+         assert fixed.shuffle\n\
+         assert fixed[:].reshape(-1).tolist() == expected\n\
+         assert resizable.shape == (5, 4)\n\
+         assert resizable.maxshape == (12, 4)\n\
+         assert resizable.chunks == (2, 4)\n\
+         assert resizable.compression == 'gzip'\n\
+         assert resizable.shuffle\n\
+         assert resizable[:].reshape(-1).tolist() == expected",
+        "filtered partial-edge fixed-array and B-tree v2 row-slab fixture",
+    );
 }
 
 #[test]
@@ -1368,6 +1642,17 @@ fn test_writable_file_chunked_filtered_non_slab_multidim_round_trip() {
         assert!(stdout.contains("DEFLATE"));
         assert!(stdout.contains("SHUFFLE"));
     }
+
+    assert_h5py_script(
+        &path,
+        "d = f['data']\n\
+         assert d.shape == (5, 5)\n\
+         assert d.chunks == (2, 3)\n\
+         assert d.compression == 'gzip'\n\
+         assert d.shuffle\n\
+         assert d[:].reshape(-1).tolist() == [value * 3 - 7 for value in range(25)]",
+        "filtered fixed-array non-slab fixture",
+    );
 }
 
 #[test]
@@ -1393,6 +1678,17 @@ fn test_writable_file_chunked_fixed_array_beyond_one_page() {
         );
         assert_dataset_values::<i32>(&ds, &data).unwrap();
     }
+
+    assert_h5dump_dataset_read(&path, "data", "fixed-array partial final page fixture");
+    assert_h5py_script(
+        &path,
+        "d = f['data']\n\
+         assert d.shape == (4097,)\n\
+         assert d.chunks == (1,)\n\
+         assert d[:5].tolist() == [0, 1, 2, 3, 4]\n\
+         assert d[-3:].tolist() == [4094, 4095, 4096]",
+        "fixed-array partial final page fixture",
+    );
 }
 
 #[test]
@@ -1416,6 +1712,17 @@ fn test_writable_file_chunked_fletcher32() {
         assert_dataset_values::<i32>(&ds, &data).unwrap();
         assert!(dataset_has_filter_id(&ds, 3).unwrap());
     }
+
+    assert_h5dump_dataset_read(&path, "data", "Fletcher32 chunked writer fixture");
+    assert_h5py_script(
+        &path,
+        "d = f['data']\n\
+         assert d.shape == (64,)\n\
+         assert d.chunks == (16,)\n\
+         assert d.fletcher32 is True\n\
+         assert d[:].tolist() == list(range(64))",
+        "Fletcher32 chunked writer fixture",
+    );
 }
 
 #[test]
@@ -1612,6 +1919,8 @@ fn test_dataset_builder_finite_max_shape_full_write_uses_btree_v2() {
          assert d.shape == (300,)\n\
          assert d.maxshape == (600,)\n\
          assert d.chunks == (1,)\n\
+         assert d.dtype.kind == 'i'\n\
+         assert d.dtype.itemsize == 4\n\
          assert d[:].tolist() == list(range(300))",
         "finite max-shape full B-tree v2 fixture",
     );
@@ -1641,6 +1950,36 @@ fn test_dataset_builder_large_max_shape_full_write_uses_btree_v2() {
         assert_eq!(info.layout.chunk_index_type, Some(ChunkIndexType::BTreeV2));
         assert_dataset_values::<u8>(&ds, &data).unwrap();
     }
+
+    let out = std::process::Command::new("timeout")
+        .arg("10")
+        .arg("h5dump")
+        .arg("-pH")
+        .arg(&path)
+        .output();
+    if let Ok(out) = out {
+        assert!(
+            out.status.success(),
+            "h5dump -pH failed or timed out on large max-shape full B-tree v2 fixture: status={:?}, stderr={}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.contains("data"));
+        assert!(stdout.contains("CHUNKED"));
+    }
+
+    assert_h5py_script(
+        &path,
+        "d = f['data']\n\
+         assert d.shape == (1000001,)\n\
+         assert d.maxshape == (2000000,)\n\
+         assert d.chunks == (1,)\n\
+         assert int(d[0]) == 0\n\
+         assert d[250:253].tolist() == [250, 0, 1]\n\
+         assert int(d[1000000]) == 16",
+        "large max-shape full B-tree v2 fixture",
+    );
 }
 
 #[test]
@@ -1966,6 +2305,9 @@ fn test_dataset_builder_sparse_unfiltered_explicit_chunks_use_fixed_array() {
         "d = f['data']\n\
          assert d.shape == (32,)\n\
          assert d.chunks == (8,)\n\
+         assert d.dtype.kind == 'u'\n\
+         assert d.dtype.itemsize == 2\n\
+         assert d.fillvalue == 99\n\
          assert d[:].tolist() == [2] * 8 + [99] * 16 + [7] * 8",
         "sparse unfiltered fixed-array explicit-chunk fixture",
     );
@@ -2017,6 +2359,10 @@ fn test_dataset_builder_sparse_filtered_explicit_chunks_use_fixed_array() {
          assert d.shape == (32,)\n\
          assert d.chunks == (8,)\n\
          assert d.compression == 'gzip'\n\
+         assert d.compression_opts == 1\n\
+         assert d.dtype.kind == 'u'\n\
+         assert d.dtype.itemsize == 2\n\
+         assert d.fillvalue == 99\n\
          assert d[:].tolist() == [4] * 8 + [99] * 16 + [11] * 8",
         "sparse filtered fixed-array explicit-chunk fixture",
     );
@@ -2062,7 +2408,11 @@ fn test_dataset_builder_sparse_chunked_explicit_chunks_with_max_shape_uses_btree
         &path,
         "d = f['data']\n\
          assert d.shape == (16,)\n\
+         assert d.maxshape == (32,)\n\
          assert d.chunks == (4,)\n\
+         assert d.dtype.kind == 'i'\n\
+         assert d.dtype.itemsize == 2\n\
+         assert d.fillvalue == -2\n\
          assert d[:].tolist() == [3] * 4 + [-2] * 8 + [9] * 4",
         "sparse unfiltered B-tree v2 explicit-chunk fixture",
     );
@@ -2110,8 +2460,13 @@ fn test_dataset_builder_sparse_filtered_explicit_chunks_with_max_shape_uses_btre
         &path,
         "d = f['data']\n\
          assert d.shape == (16,)\n\
+         assert d.maxshape == (32,)\n\
          assert d.chunks == (4,)\n\
          assert d.compression == 'gzip'\n\
+         assert d.compression_opts == 1\n\
+         assert d.dtype.kind == 'i'\n\
+         assert d.dtype.itemsize == 2\n\
+         assert d.fillvalue == -2\n\
          assert d[:].tolist() == [6] * 4 + [-2] * 8 + [12] * 4",
         "sparse filtered B-tree v2 explicit-chunk fixture",
     );
@@ -2157,7 +2512,11 @@ fn test_dataset_builder_sparse_multidim_growable_chunks_use_btree_v2() {
         &path,
         "d = f['data']\n\
          assert d.shape == (4, 4)\n\
+         assert d.maxshape == (8, 8)\n\
          assert d.chunks == (2, 2)\n\
+         assert d.dtype.kind == 'i'\n\
+         assert d.dtype.itemsize == 4\n\
+         assert int(d[1, 2]) == -5\n\
          assert d[:].tolist() == [[10, 11, -5, -5], [12, 13, -5, -5], [-5, -5, 30, 31], [-5, -5, 32, 33]]",
         "sparse multidimensional growable B-tree v2 fixture",
     );
@@ -2217,6 +2576,43 @@ fn test_dataset_builder_sparse_explicit_chunks_large_max_shape_uses_btree_v2() {
         assert_eq!(filtered_values[999_999], 7);
         assert_eq!(filtered_values[1_000_000], 23);
     }
+
+    let out = std::process::Command::new("timeout")
+        .arg("10")
+        .arg("h5dump")
+        .arg("-pH")
+        .arg(&path)
+        .output();
+    if let Ok(out) = out {
+        assert!(
+            out.status.success(),
+            "h5dump -pH failed or timed out on large sparse B-tree v2 explicit-chunk fixtures: status={:?}, stderr={}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.contains("data"));
+        assert!(stdout.contains("filtered"));
+        assert!(stdout.contains("CHUNKED"));
+        assert!(stdout.contains("DEFLATE"));
+    }
+    assert_h5py_script(
+        &path,
+        "data = f['data']\n\
+         assert data.shape == (1000001,)\n\
+         assert data.maxshape == (2000000,)\n\
+         assert data.chunks == (1,)\n\
+         assert data[0:3].tolist() == [5, 9, 9]\n\
+         assert data[999998:].tolist() == [9, 9, 23]\n\
+         filtered = f['filtered']\n\
+         assert filtered.shape == (1000001,)\n\
+         assert filtered.maxshape == (2000000,)\n\
+         assert filtered.chunks == (1,)\n\
+         assert filtered.compression == 'gzip'\n\
+         assert filtered[0:3].tolist() == [5, 7, 7]\n\
+         assert filtered[999998:].tolist() == [7, 7, 23]",
+        "large sparse B-tree v2 explicit-chunk fixtures",
+    );
 }
 
 #[test]
@@ -2438,6 +2834,41 @@ fn test_dataset_builder_chunked_fixed_string_dataset() {
         assert_dataset_strings(&ds, &["red", "green", "blue", "gold"]).unwrap();
         assert_eq!(ds.attr("version").unwrap().read_scalar_i64(), Some(12));
     }
+
+    let out = std::process::Command::new("timeout")
+        .arg("10")
+        .arg("h5dump")
+        .arg("-pH")
+        .arg("-d")
+        .arg("names")
+        .arg(&path)
+        .output();
+    if let Ok(out) = out {
+        assert!(
+            out.status.success(),
+            "h5dump -pH failed or timed out on chunked fixed string fixture: status={:?}, stderr={}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.contains("STRSIZE 8"));
+        assert!(stdout.contains("CHUNKED"));
+        assert!(stdout.contains("DEFLATE"));
+        assert!(stdout.contains("SHUFFLE"));
+    }
+
+    assert_h5py_script(
+        &path,
+        "d = f['names']\n\
+         assert d.shape == (4,)\n\
+         assert d.chunks == (2,)\n\
+         assert d.compression == 'gzip'\n\
+         assert d.compression_opts == 3\n\
+         assert d.shuffle\n\
+         assert [value.decode('ascii').rstrip('\\x00') for value in d[:].tolist()] == ['red', 'green', 'blue', 'gold']\n\
+         assert d.attrs['version'] == 12",
+        "chunked fixed ASCII string fixture",
+    );
 }
 
 #[test]
@@ -2487,6 +2918,16 @@ fn test_writable_file_vlen_utf8_strings() {
         assert!(stdout.contains("alpha"));
         assert!(stdout.contains("STRSIZE H5T_VARIABLE"));
     }
+
+    assert_h5py_script(
+        &path,
+        "d = f['names']\n\
+         import h5py\n\
+         assert d.shape == (3,)\n\
+         assert h5py.check_string_dtype(d.dtype).encoding == 'utf-8'\n\
+         assert [value.decode('utf-8') for value in d[:].tolist()] == ['', '猫', 'alpha']",
+        "contiguous vlen UTF-8 string fixture",
+    );
 }
 
 #[test]
@@ -2575,6 +3016,21 @@ fn test_writable_file_chunked_vlen_utf8_strings_with_fletcher32() {
         assert!(dataset_has_filter_id(&ds, 3).unwrap());
         assert_dataset_strings(&ds, &["alpha", "", "猫"]).unwrap();
     }
+
+    assert_h5dump_dataset_read(
+        &path,
+        "names",
+        "chunked VLEN UTF-8 Fletcher32 string fixture",
+    );
+    assert_h5py_script(
+        &path,
+        "d = f['names']\n\
+         assert d.shape == (3,)\n\
+         assert d.chunks == (1,)\n\
+         assert d.fletcher32 is True\n\
+         assert [value.decode('utf-8') for value in d[:].tolist()] == ['alpha', '', '猫']",
+        "chunked VLEN UTF-8 Fletcher32 string fixture",
+    );
 }
 
 #[test]
@@ -2613,6 +3069,20 @@ fn test_writable_file_vlen_utf8_strings_accept_fill_values() {
         assert!(plist.fill_value_defined);
         assert_eq!(plist.fill_value, Some(empty_vlen_descriptor));
     }
+
+    assert_h5py_script(
+        &path,
+        "contiguous = f['contiguous']\n\
+         assert h5py.check_string_dtype(contiguous.dtype).encoding == 'utf-8'\n\
+         assert [value.decode('utf-8') for value in contiguous[:].tolist()] == ['alpha', 'beta']\n\
+         assert contiguous.fillvalue == b''\n\
+         chunked = f['chunked']\n\
+         assert h5py.check_string_dtype(chunked.dtype).encoding == 'utf-8'\n\
+         assert chunked.chunks == (1,)\n\
+         assert [value.decode('utf-8') for value in chunked[:].tolist()] == ['', '猫', 'gamma']\n\
+         assert chunked.fillvalue == b''",
+        "VLEN UTF-8 zero-descriptor fill-value writer fixture",
+    );
 }
 
 #[test]
@@ -2658,6 +3128,20 @@ fn test_writable_file_vlen_utf8_strings_encode_string_fill_value() {
         assert_ne!(&fill[4..12], &[0; 8]);
         assert_eq!(u32::from_le_bytes(fill[12..16].try_into().unwrap()), 1);
     }
+
+    assert_h5py_script(
+        &path,
+        "contiguous = f['contiguous']\n\
+         assert h5py.check_string_dtype(contiguous.dtype).encoding == 'utf-8'\n\
+         assert [value.decode('utf-8') for value in contiguous[:].tolist()] == ['alpha', 'beta']\n\
+         assert contiguous.fillvalue == b'fallback'\n\
+         chunked = f['chunked']\n\
+         assert h5py.check_string_dtype(chunked.dtype).encoding == 'utf-8'\n\
+         assert chunked.chunks == (1,)\n\
+         assert [value.decode('utf-8') for value in chunked[:].tolist()] == ['', '猫', 'gamma']\n\
+         assert chunked.fillvalue == b'missing'",
+        "VLEN UTF-8 string fill-value writer fixture",
+    );
 }
 
 #[test]

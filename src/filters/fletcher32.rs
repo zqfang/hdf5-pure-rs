@@ -51,7 +51,9 @@ pub fn append_checksum_into(data: &[u8], out: &mut Vec<u8>) -> Result<()> {
         .len()
         .checked_add(4)
         .ok_or_else(|| Error::InvalidFormat("fletcher32 output size overflow".into()))?;
-    out.reserve(additional);
+    out.try_reserve_exact(additional).map_err(|err| {
+        Error::InvalidFormat(format!("fletcher32 output allocation failed: {err}"))
+    })?;
     out.extend_from_slice(data);
     out.extend_from_slice(&fletcher32(data).to_le_bytes());
     Ok(())
@@ -139,6 +141,11 @@ mod tests {
         let mut encoded = Vec::new();
         append_checksum_into(payload, &mut encoded).unwrap();
         assert_eq!(verify_and_strip_view(&encoded).unwrap(), payload);
+
+        let mut appended = b"prefix".to_vec();
+        append_checksum_into(payload, &mut appended).unwrap();
+        assert_eq!(&appended[..6], b"prefix");
+        assert_eq!(verify_and_strip_view(&appended[6..]).unwrap(), payload);
     }
 
     #[test]
@@ -147,5 +154,19 @@ mod tests {
         let mut encoded = payload.to_vec();
         append_checksum_in_place(&mut encoded).unwrap();
         assert_eq!(verify_and_strip_view(&encoded).unwrap(), payload);
+    }
+
+    #[test]
+    fn verify_rejects_short_and_mismatched_payloads() {
+        assert!(verify_and_strip_view(&[1, 2, 3]).is_err());
+
+        let mut encoded = Vec::new();
+        append_checksum_into(b"payload", &mut encoded).unwrap();
+        encoded[0] ^= 0xff;
+        let err = verify_and_strip_view(&encoded).unwrap_err();
+        assert!(
+            err.to_string().contains("fletcher32 checksum mismatch"),
+            "unexpected error: {err}"
+        );
     }
 }

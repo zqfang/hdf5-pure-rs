@@ -1,5 +1,5 @@
 use hdf5_pure_rust::hl::types::H5Type;
-use hdf5_pure_rust::{Dataset, File};
+use hdf5_pure_rust::{Attribute, Dataset, File};
 
 fn read_vec<T: H5Type + Default>(dataset: &Dataset) -> hdf5_pure_rust::Result<Vec<T>> {
     let mut values = vec![T::default(); dataset.size()? as usize];
@@ -19,6 +19,25 @@ fn read_field_vec<T: H5Type + Default>(
 ) -> hdf5_pure_rust::Result<Vec<T>> {
     let mut values = vec![T::default(); dataset.size()? as usize];
     dataset.read_field_into(field_name, &mut values)?;
+    Ok(values)
+}
+
+fn read_attr_vec<T: H5Type + Default>(attr: &Attribute) -> hdf5_pure_rust::Result<Vec<T>> {
+    let len = attr.shape().iter().try_fold(1usize, |acc, &dim| {
+        acc.checked_mul(dim as usize)
+            .ok_or_else(|| hdf5_pure_rust::Error::InvalidFormat("attribute shape overflows".into()))
+    })?;
+    let mut values = vec![T::default(); len];
+    attr.read_into(&mut values)?;
+    Ok(values)
+}
+
+fn read_attr_strings_vec(attr: &Attribute) -> hdf5_pure_rust::Result<Vec<String>> {
+    let mut values = Vec::new();
+    attr.visit_strings(|value| {
+        values.push(value.to_string());
+        Ok(())
+    })?;
     Ok(values)
 }
 
@@ -122,7 +141,7 @@ fn test_real_world_keras_h5_model_smoke() {
     let dense_bias: Vec<f32> =
         read_vec(&f.dataset("model_weights/dense_1/dense_1/bias:0").unwrap()).unwrap();
 
-    assert_eq!(conv_kernel.len(), 3 * 3 * 1 * 32);
+    assert_eq!(conv_kernel.len(), 3 * 3 * 32);
     assert_eq!(conv_bias.len(), 32);
     assert_eq!(dense_kernel.len(), 1600 * 10);
     assert_eq!(dense_bias.len(), 10);
@@ -194,6 +213,89 @@ fn test_real_world_10x_feature_barcode_matrix_smoke() {
 }
 
 #[test]
+fn test_real_world_mudata_h5mu_metadata_and_sparse_layout() {
+    let Some(f) = open_real_world_fixture("tests/data/real_world/bmcite.h5mu") else {
+        return;
+    };
+
+    assert_eq!(f.attr("encoding-type").unwrap().read_string(), "MuData");
+    assert_eq!(f.attr("encoding-version").unwrap().read_string(), "0.1.0");
+
+    let root_members = file_member_names(&f).unwrap();
+    for expected in ["mod", "obs", "obsp", "uns", "var"] {
+        assert!(
+            root_members.contains(&expected.to_string()),
+            "missing root member {expected}"
+        );
+    }
+
+    let mod_group = f.group("mod").unwrap();
+    assert_eq!(
+        read_attr_strings_vec(&mod_group.attr("mod-order").unwrap()).unwrap(),
+        vec!["RNA", "ADT"]
+    );
+
+    let obs = f.group("obs").unwrap();
+    assert_eq!(
+        obs.attr("encoding-type").unwrap().read_string(),
+        "dataframe"
+    );
+    assert_eq!(obs.attr("_index").unwrap().read_string(), "_index");
+    assert_eq!(
+        read_attr_strings_vec(&obs.attr("column-order").unwrap()).unwrap(),
+        vec![
+            "orig.ident",
+            "nCount_RNA",
+            "nFeature_RNA",
+            "nCount_ADT",
+            "nFeature_ADT",
+            "lane",
+            "donor",
+            "celltype.l1",
+            "celltype.l2",
+            "RNA.weight",
+        ]
+    );
+
+    let rna = f.group("mod/RNA").unwrap();
+    assert_eq!(rna.attr("encoding-type").unwrap().read_string(), "anndata");
+    let rna_x = f.group("mod/RNA/X").unwrap();
+    assert_eq!(
+        rna_x.attr("encoding-type").unwrap().read_string(),
+        "csr_matrix"
+    );
+    assert_eq!(
+        read_attr_vec::<i32>(&rna_x.attr("shape").unwrap()).unwrap(),
+        vec![30672, 17009]
+    );
+    assert_eq!(
+        shape_vec(&f.dataset("mod/RNA/X/data").unwrap()).unwrap(),
+        vec![27198017]
+    );
+    assert_eq!(
+        shape_vec(&f.dataset("mod/RNA/X/indices").unwrap()).unwrap(),
+        vec![27198017]
+    );
+    assert_eq!(
+        shape_vec(&f.dataset("mod/RNA/X/indptr").unwrap()).unwrap(),
+        vec![30673]
+    );
+
+    let adt = f.group("mod/ADT").unwrap();
+    assert_eq!(adt.attr("encoding-type").unwrap().read_string(), "anndata");
+    assert_eq!(
+        shape_vec(&f.dataset("mod/ADT/X").unwrap()).unwrap(),
+        vec![30672, 25]
+    );
+    assert_eq!(
+        read_strings_vec(&f.dataset("mod/ADT/var/_index").unwrap())
+            .unwrap()
+            .len(),
+        25
+    );
+}
+
+#[test]
 #[ignore = "reproduces vlen string read hang for files written by the current pure Rust writer"]
 fn test_real_world_counthovd_sparse_matrix_strings() {
     let Some(f) = open_real_world_fixture("tests/data/real_world/counthovd.10.h5") else {
@@ -239,6 +341,35 @@ fn test_real_world_netcdf4_like_smoke() {
     assert_eq!(shape_vec(&temperature).unwrap(), vec![3, 4]);
     assert_eq!(values.len(), 12);
     assert!((values[0] - 273.15).abs() < 1e-4);
+}
+
+#[test]
+fn test_real_world_netcdf4_dimension_scale_metadata() {
+    let Some(f) = open_real_world_fixture("tests/data/real_world/netcdf4_like_climate.nc") else {
+        return;
+    };
+
+    assert_eq!(f.attr("Conventions").unwrap().read_string(), "CF-1.8");
+
+    let lat = f.dataset("lat").unwrap();
+    assert_eq!(lat.attr("CLASS").unwrap().read_string(), "DIMENSION_SCALE");
+    assert_eq!(lat.attr("NAME").unwrap().read_string(), "lat");
+    assert_eq!(lat.attr("units").unwrap().read_string(), "degrees_north");
+    assert_eq!(lat.attr("REFERENCE_LIST").unwrap().shape(), &[1]);
+
+    let lon = f.dataset("lon").unwrap();
+    assert_eq!(lon.attr("CLASS").unwrap().read_string(), "DIMENSION_SCALE");
+    assert_eq!(lon.attr("NAME").unwrap().read_string(), "lon");
+    assert_eq!(lon.attr("units").unwrap().read_string(), "degrees_east");
+    assert_eq!(lon.attr("REFERENCE_LIST").unwrap().shape(), &[1]);
+
+    let temperature = f.dataset("temperature").unwrap();
+    assert_eq!(temperature.attr("units").unwrap().read_string(), "K");
+    assert_eq!(
+        temperature.attr("standard_name").unwrap().read_string(),
+        "air_temperature"
+    );
+    assert_eq!(temperature.attr("DIMENSION_LIST").unwrap().shape(), &[2]);
 }
 
 #[test]

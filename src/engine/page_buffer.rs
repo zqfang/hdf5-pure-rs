@@ -318,6 +318,7 @@ mod tests {
 
         pb.update_entry_from_slice(0, b"defg").unwrap();
         assert!(pb.read_into(0, &mut out).is_err());
+        assert_eq!(&out, b"abc");
         assert_eq!(pb.read_view(0).unwrap(), b"defg");
         assert_eq!(pb.entry_data(0).unwrap(), b"defg");
         assert_eq!(pb.entries().count(), 1);
@@ -325,5 +326,10 @@ mod tests {
         let updated = pb.update_entry_from_slice_view(0, b"xy").unwrap();
         assert_eq!(updated, b"xy");
         assert!(pb.entry_ref(0).unwrap().dirty);
+
+        let mut formatted = String::from("stale");
+        pb.print_stats_into(&mut formatted);
+        assert!(formatted.starts_with("PageBufferStats("));
+        assert!(!formatted.contains("stale"));
     }
 }

@@ -43,6 +43,7 @@ pub struct FileAccess {
     all_coll_metadata_ops: bool,
     coll_metadata_write: bool,
     page_buffer_size: (usize, u32, u32),
+    ros3_default_page_buffer_applied: bool,
     core_write_tracking: bool,
     map_iterate_hints: Option<String>,
     object_flush_cb: bool,
@@ -135,6 +136,7 @@ impl Default for FileAccess {
             all_coll_metadata_ops: false,
             coll_metadata_write: false,
             page_buffer_size: (0, 0, 0),
+            ros3_default_page_buffer_applied: false,
             core_write_tracking: false,
             map_iterate_hints: None,
             object_flush_cb: false,
@@ -143,6 +145,27 @@ impl Default for FileAccess {
 }
 
 impl FileAccess {
+    fn clear_driver_specific_state(&mut self) {
+        if self.ros3_default_page_buffer_applied {
+            self.page_buffer_size = (0, 0, 0);
+            self.ros3_default_page_buffer_applied = false;
+        }
+        self.hdfs_config = None;
+        self.direct_config = None;
+        self.family_config = None;
+        self.family_offset = None;
+        self.multi_config = None;
+        self.multi_type = None;
+        self.ioc_config = None;
+        self.subfiling_config = None;
+        self.splitter_config = None;
+        self.log_config = None;
+        self.onion_config = None;
+        self.core_config = None;
+        self.core_write_tracking = false;
+        self.ros3_config = None;
+    }
+
     pub(crate) fn from_file(file: &crate::hl::file::File) -> Self {
         let mut plist = file.access_plist_snapshot();
         plist.userblock = file.userblock();
@@ -167,6 +190,7 @@ impl FileAccess {
 
     /// Set file-driver name as stored property-list state.
     pub fn set_driver<S: Into<String>>(&mut self, driver: S) {
+        self.clear_driver_specific_state();
         self.driver = driver.into();
     }
 
@@ -177,27 +201,32 @@ impl FileAccess {
 
     /// Set file-driver name by registered driver value.
     pub fn set_driver_by_value(&mut self, driver_value: u64) {
+        self.clear_driver_specific_state();
         self.driver = format!("driver_{driver_value}");
     }
 
     /// Select the sec2-style local file driver.
     pub fn set_fapl_sec2(&mut self) {
+        self.clear_driver_specific_state();
         self.driver = "sec2".to_string();
     }
 
     /// Select the Windows-style local file driver.
     pub fn set_fapl_windows(&mut self) {
+        self.clear_driver_specific_state();
         self.driver = "windows".to_string();
     }
 
     /// Select the stdio-style local file driver.
     pub fn set_fapl_stdio(&mut self) {
+        self.clear_driver_specific_state();
         self.driver = "stdio".to_string();
     }
 
     /// Select the direct VFD and retain its driver-specific config as
     /// property-list state. Runtime I/O remains unsupported.
     pub fn set_fapl_direct(&mut self, config: DirectFileConfig) {
+        self.clear_driver_specific_state();
         self.driver = "direct".to_string();
         self.direct_config = Some(config);
     }
@@ -205,6 +234,7 @@ impl FileAccess {
     /// Select the core VFD and retain its driver-specific config as
     /// property-list state. Runtime I/O remains unsupported.
     pub fn set_fapl_core(&mut self, config: CoreFileConfig) {
+        self.clear_driver_specific_state();
         self.driver = "core".to_string();
         self.core_config = Some(config);
     }
@@ -212,6 +242,7 @@ impl FileAccess {
     /// Select the family VFD and retain its driver-specific config as
     /// property-list state. Runtime I/O remains unsupported.
     pub fn set_fapl_family(&mut self, config: FamilyFileConfig) {
+        self.clear_driver_specific_state();
         self.driver = "family".to_string();
         self.family_config = Some(config);
     }
@@ -232,6 +263,7 @@ impl FileAccess {
     /// Select the multi VFD and retain its driver-specific config as
     /// property-list state. Runtime I/O remains unsupported.
     pub fn set_fapl_multi(&mut self, config: MultiFileConfig) {
+        self.clear_driver_specific_state();
         self.driver = "multi".to_string();
         self.multi_config = Some(config);
     }
@@ -252,6 +284,7 @@ impl FileAccess {
     /// Retain IOC VFD config as property-list state. Runtime I/O remains
     /// unsupported.
     pub fn set_fapl_ioc(&mut self, config: IocConfig) {
+        self.clear_driver_specific_state();
         self.driver = "ioc".to_string();
         self.ioc_config = Some(config);
     }
@@ -259,6 +292,7 @@ impl FileAccess {
     /// Select the subfiling VFD and retain its driver-specific config as
     /// property-list state. Runtime I/O remains unsupported.
     pub fn set_fapl_subfiling(&mut self, config: SubfilingConfig) {
+        self.clear_driver_specific_state();
         self.driver = "subfiling".to_string();
         self.subfiling_config = Some(config);
     }
@@ -274,6 +308,7 @@ impl FileAccess {
     /// Select the splitter VFD and retain its driver-specific config as
     /// property-list state. Runtime I/O remains unsupported.
     pub fn set_fapl_splitter(&mut self, config: SplitterFileConfig) {
+        self.clear_driver_specific_state();
         self.driver = "splitter".to_string();
         self.splitter_config = Some(config);
     }
@@ -289,6 +324,7 @@ impl FileAccess {
     /// Select the log VFD and retain its driver-specific config as
     /// property-list state. Runtime I/O remains unsupported.
     pub fn set_fapl_log(&mut self, config: LogFileConfig) {
+        self.clear_driver_specific_state();
         self.driver = "log".to_string();
         self.log_config = Some(config);
     }
@@ -304,6 +340,7 @@ impl FileAccess {
     /// Select the onion VFD and retain its driver-specific config as
     /// property-list state. Runtime I/O remains unsupported.
     pub fn set_fapl_onion(&mut self, config: OnionHeader) {
+        self.clear_driver_specific_state();
         self.driver = "onion".to_string();
         self.onion_config = Some(config);
     }
@@ -319,6 +356,7 @@ impl FileAccess {
     /// Select the HDFS VFD and retain its driver-specific config as
     /// property-list state. Runtime I/O remains unsupported.
     pub fn set_fapl_hdfs(&mut self, config: HdfsConfig) {
+        self.clear_driver_specific_state();
         self.driver = "hdfs".to_string();
         self.hdfs_config = Some(config);
     }
@@ -345,10 +383,12 @@ impl FileAccess {
     /// Select the ROS3 VFD and retain its driver-specific config as
     /// property-list state. Runtime I/O remains unsupported.
     pub fn set_fapl_ros3(&mut self, config: Ros3Config) {
+        self.clear_driver_specific_state();
         self.driver = "ros3".to_string();
         self.ros3_config = Some(config);
         if self.page_buffer_size.0 == 0 {
             self.page_buffer_size.0 = ROS3_DEFAULT_PAGE_BUFFER_SIZE;
+            self.ros3_default_page_buffer_applied = true;
         }
     }
 
@@ -382,8 +422,16 @@ impl FileAccess {
     }
 
     /// Set userblock size in bytes.
-    pub fn set_userblock(&mut self, userblock: u64) {
+    ///
+    /// HDF5 userblocks are either disabled (`0`) or powers of two at least
+    /// 512 bytes. Invalid sizes are rejected and leave the current value
+    /// unchanged.
+    pub fn set_userblock(&mut self, userblock: u64) -> bool {
+        if !crate::hl::plist::file_create::FileCreate::valid_userblock_size(userblock) {
+            return false;
+        }
         self.userblock = userblock;
+        true
     }
 
     /// Metadata/raw-data alignment as `(threshold, alignment)`.
@@ -392,8 +440,15 @@ impl FileAccess {
     }
 
     /// Set metadata/raw-data alignment as `(threshold, alignment)`.
-    pub fn set_alignment(&mut self, threshold: u64, alignment: u64) {
+    ///
+    /// The mutable backend cannot apply a zero alignment value. Invalid values
+    /// are rejected and leave the current policy unchanged.
+    pub fn set_alignment(&mut self, threshold: u64, alignment: u64) -> bool {
+        if alignment == 0 {
+            return false;
+        }
         self.alignment = (threshold, alignment);
+        true
     }
 
     /// Metadata cache settings `(metadata_cache_elements, raw_chunk_cache_elements,
@@ -578,13 +633,26 @@ impl FileAccess {
     }
 
     /// Set page buffer settings.
+    ///
+    /// A zero size disables page buffering and must not carry nonzero split
+    /// percentages. Nonzero settings must keep the metadata/raw minimums within
+    /// a single 100% budget.
     pub fn set_page_buffer_size(
         &mut self,
         size: usize,
         min_metadata_percent: u32,
         min_raw_data_percent: u32,
-    ) {
+    ) -> bool {
+        if (size == 0 && (min_metadata_percent != 0 || min_raw_data_percent != 0))
+            || min_metadata_percent > 100
+            || min_raw_data_percent > 100
+            || min_metadata_percent.saturating_add(min_raw_data_percent) > 100
+        {
+            return false;
+        }
         self.page_buffer_size = (size, min_metadata_percent, min_raw_data_percent);
+        self.ros3_default_page_buffer_applied = false;
+        true
     }
 
     /// HDFS VFD configuration. Not active for the direct reader.
@@ -723,6 +791,11 @@ impl FileAccess {
     /// Map API iteration hints. The Map API is intentionally not implemented.
     pub fn map_iterate_hints(&self) -> Option<()> {
         self.map_iterate_hints.as_ref().map(|_| ())
+    }
+
+    /// Borrow stored Map API iteration hints as opaque property-list state.
+    pub fn map_iterate_hints_ref(&self) -> Option<&str> {
+        self.map_iterate_hints.as_deref()
     }
 
     /// Set Map API iteration hints as opaque property-list state.

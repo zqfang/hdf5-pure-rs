@@ -18,13 +18,24 @@ const BTREE_V2_CHUNK_MERGE_PERCENT: u8 = 40;
 const EXTENSIBLE_ARRAY_INDEX_BLOCK_ELEMENTS_LIMIT: usize = u8::MAX as usize;
 const EXTENSIBLE_ARRAY_MAX_WRITER_ELEMENTS: usize = 1_000_000;
 const WRITER_MANAGED_HEAP_MIN_SIZE_BITS: u16 = 32;
+const WRITER_MANAGED_HEAP_TABLE_WIDTH: u16 = 4;
+const WRITER_MANAGED_HEAP_INDIRECT_THRESHOLD: usize = 4096;
+const WRITER_MANAGED_HEAP_DEFLATE_LEVEL: u32 = 6;
 
 /// A writable HDF5 file under construction.
 pub struct HdfFileWriter<W: Write + Seek> {
     writer: W,
     allocator: FileAllocator,
+    base_addr: u64,
+    superblock_version: u8,
     sizeof_addr: u8,
     sizeof_size: u8,
+    file_space_strategy: u8,
+    file_space_persist: bool,
+    file_space_threshold: u64,
+    file_space_page_size: u64,
+    shared_mesg_indexes: Vec<SharedMessageIndexConfig>,
+    shared_mesg_phase_change: (u32, u32),
     /// Map of group path -> object header address.
     groups: HashMap<String, u64>,
     /// Pending links: (parent_path, child_name, child_addr).
@@ -61,6 +72,19 @@ struct EncodedLinkRecord {
     name: String,
     compact_message: Vec<u8>,
     dense_message: Vec<u8>,
+}
+
+#[derive(Clone, Copy)]
+struct ManagedHeapIndirectEntry {
+    addr: u64,
+    filtered_size: u64,
+    filter_mask: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SharedMessageIndexConfig {
+    pub message_type_flags: u32,
+    pub minimum_message_size: u32,
 }
 
 impl OwnedAttrSpec {
@@ -1852,6 +1876,32 @@ fn managed_heap_root_direct_block_size(payload_bytes: usize) -> Result<usize> {
     }
 }
 
+fn managed_heap_direct_block_header_len(sizeof_addr: u8, offset_bytes: usize) -> Result<usize> {
+    checked_usize_sum_writer(
+        &[4, 1, usize::from(sizeof_addr), offset_bytes, 4],
+        "fractal heap direct block header length",
+    )
+}
+
+fn managed_heap_indirect_block_size(
+    payloads: &[Vec<u8>],
+    sizeof_addr: u8,
+    offset_bytes: usize,
+) -> Result<usize> {
+    let payload_bytes = payloads.iter().try_fold(0usize, |acc, payload| {
+        acc.checked_add(payload.len())
+            .ok_or_else(|| Error::InvalidFormat("managed heap payload size overflow".into()))
+    })?;
+    let max_payload_len = payloads.iter().map(Vec::len).max().unwrap_or(0);
+    let header_len = managed_heap_direct_block_header_len(sizeof_addr, offset_bytes)?;
+    let width = usize::from(WRITER_MANAGED_HEAP_TABLE_WIDTH);
+    let average_payload = payload_bytes.div_ceil(width);
+    let required = header_len
+        .checked_add(max_payload_len.max(average_payload))
+        .ok_or_else(|| Error::InvalidFormat("managed heap direct block size overflow".into()))?;
+    checked_next_power_of_two(required.max(512), "managed heap indirect direct block")
+}
+
 fn managed_heap_offset_bytes(max_heap_size_bits: u16) -> Result<usize> {
     let offset_bytes = usize::from(max_heap_size_bits).div_ceil(8);
     if offset_bytes == 0 || offset_bytes > 8 {
@@ -2379,6 +2429,28 @@ fn encode_chunk_payload(
     Ok(filtered)
 }
 
+fn encode_filtered_managed_heap_direct_block(direct: &[u8]) -> Result<Vec<u8>> {
+    let mut filtered = Vec::new();
+    crate::filters::deflate::compress_into(
+        direct,
+        WRITER_MANAGED_HEAP_DEFLATE_LEVEL,
+        &mut filtered,
+    )?;
+    Ok(filtered)
+}
+
+fn encode_managed_heap_filter_pipeline() -> Result<Vec<u8>> {
+    let mut pipeline = Vec::new();
+    encode_filter_pipeline_into(
+        &mut pipeline,
+        Some(WRITER_MANAGED_HEAP_DEFLATE_LEVEL),
+        false,
+        false,
+        1,
+    )?;
+    Ok(pipeline)
+}
+
 /// Verify the data buffer matches the dataset shape times element size.
 fn validate_dataset_data_len(spec: &DatasetSpec<'_>) -> Result<()> {
     validate_dtype_spec(&spec.dtype)?;
@@ -2554,11 +2626,25 @@ fn validate_dtype_spec(dtype: &DtypeSpec) -> Result<()> {
 impl<W: Write + Seek> HdfFileWriter<W> {
     /// Create a new HDF5 file writer.
     pub fn new(writer: W) -> Self {
+        Self::new_with_base_addr(writer, 0)
+    }
+
+    /// Create a new HDF5 file writer whose logical address zero starts at
+    /// `base_addr`, leaving any leading bytes as a userblock.
+    pub fn new_with_base_addr(writer: W, base_addr: u64) -> Self {
         Self {
             writer,
             allocator: FileAllocator::new(0),
+            base_addr,
+            superblock_version: 2,
             sizeof_addr: 8,
             sizeof_size: 8,
+            file_space_strategy: 2,
+            file_space_persist: false,
+            file_space_threshold: 1,
+            file_space_page_size: 4096,
+            shared_mesg_indexes: Vec::new(),
+            shared_mesg_phase_change: (50, 40),
             groups: HashMap::new(),
             links: Vec::new(),
             hard_links: Vec::new(),
@@ -2567,6 +2653,152 @@ impl<W: Write + Seek> HdfFileWriter<W> {
             pending_group_attr_specs: HashMap::new(),
             special_links: Vec::new(),
         }
+    }
+
+    /// Set the v2/v3 superblock version used for newly encoded files.
+    pub fn set_superblock_version(&mut self, version: u8) -> Result<()> {
+        if !matches!(version, 2 | 3) {
+            return Err(Error::Unsupported(format!(
+                "writer can only emit v2/v3 superblocks, not version {version}"
+            )));
+        }
+        self.superblock_version = version;
+        Ok(())
+    }
+
+    /// Set file address and length field widths for newly encoded metadata.
+    pub fn set_file_size_widths(&mut self, sizeof_addr: u8, sizeof_size: u8) -> Result<()> {
+        Superblock {
+            sizeof_addr,
+            sizeof_size,
+            ..Default::default()
+        }
+        .write_v2(&mut Vec::new())?;
+        self.sizeof_addr = sizeof_addr;
+        self.sizeof_size = sizeof_size;
+        Ok(())
+    }
+
+    /// Set shared-message FCPL fields encoded into the superblock extension.
+    pub fn set_shared_message_info(
+        &mut self,
+        indexes: &[SharedMessageIndexConfig],
+        phase_change: (u32, u32),
+    ) -> Result<()> {
+        if indexes.len() > 8 {
+            return Err(Error::InvalidFormat(format!(
+                "shared-message index count {} exceeds format maximum 8",
+                indexes.len()
+            )));
+        }
+        if phase_change.0 > u32::from(u16::MAX) || phase_change.1 > u32::from(u16::MAX) {
+            return Err(Error::InvalidFormat(
+                "shared-message phase-change thresholds exceed on-disk u16 width".into(),
+            ));
+        }
+        for (index, config) in indexes.iter().enumerate() {
+            if config.message_type_flags > u32::from(u16::MAX) {
+                return Err(Error::InvalidFormat(format!(
+                    "shared-message index {index} type flags exceed on-disk u16 width"
+                )));
+            }
+        }
+        self.shared_mesg_indexes = indexes.to_vec();
+        self.shared_mesg_phase_change = phase_change;
+        Ok(())
+    }
+
+    /// Set file-space strategy fields encoded into the superblock extension.
+    pub fn set_file_space_info(
+        &mut self,
+        strategy: u8,
+        persist: bool,
+        threshold: u64,
+        page_size: u64,
+    ) -> Result<()> {
+        if strategy > 3 {
+            return Err(Error::InvalidFormat(format!(
+                "file-space strategy {strategy} is invalid"
+            )));
+        }
+        if page_size == 0 || page_size > 1024 * 1024 * 1024 {
+            return Err(Error::InvalidFormat(format!(
+                "file-space page size {page_size} is invalid"
+            )));
+        }
+        append_encoded_size(&mut Vec::new(), threshold, self.sizeof_size)?;
+        append_encoded_size(&mut Vec::new(), page_size, self.sizeof_size)?;
+        self.file_space_strategy = strategy;
+        self.file_space_persist = persist;
+        self.file_space_threshold = threshold;
+        self.file_space_page_size = page_size;
+        Ok(())
+    }
+
+    fn should_write_file_space_info(&self) -> bool {
+        self.file_space_strategy != 2
+            || self.file_space_persist
+            || self.file_space_threshold != 1
+            || self.file_space_page_size != 4096
+    }
+
+    fn encode_file_space_info_message(&self, pre_fsm_eoa: u64) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        out.push(1);
+        out.push(self.file_space_strategy);
+        out.push(u8::from(self.file_space_persist));
+        append_encoded_size(&mut out, self.file_space_threshold, self.sizeof_size)?;
+        append_encoded_size(&mut out, self.file_space_page_size, self.sizeof_size)?;
+        out.extend_from_slice(&0u16.to_le_bytes());
+        append_encoded_addr(&mut out, pre_fsm_eoa, self.sizeof_addr)?;
+        if self.file_space_persist {
+            for _ in 0..12 {
+                append_encoded_addr(&mut out, UNDEF_ADDR, self.sizeof_addr)?;
+            }
+        }
+        Ok(out)
+    }
+
+    fn should_write_shared_message_info(&self) -> bool {
+        !self.shared_mesg_indexes.is_empty()
+    }
+
+    fn encode_shared_message_table(&self) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        out.extend_from_slice(b"SMTB");
+        let max_list = u16::try_from(self.shared_mesg_phase_change.0)
+            .map_err(|_| Error::InvalidFormat("shared-message list cutoff exceeds u16".into()))?;
+        let min_btree = u16::try_from(self.shared_mesg_phase_change.1)
+            .map_err(|_| Error::InvalidFormat("shared-message B-tree cutoff exceeds u16".into()))?;
+        for (index, config) in self.shared_mesg_indexes.iter().enumerate() {
+            let flags = u16::try_from(config.message_type_flags).map_err(|_| {
+                Error::InvalidFormat(format!(
+                    "shared-message index {index} type flags exceed u16"
+                ))
+            })?;
+            out.push(0); // Index header version.
+            out.push(0); // Empty indexes are stored as unsorted lists.
+            out.extend_from_slice(&flags.to_le_bytes());
+            out.extend_from_slice(&config.minimum_message_size.to_le_bytes());
+            out.extend_from_slice(&max_list.to_le_bytes());
+            out.extend_from_slice(&min_btree.to_le_bytes());
+            out.extend_from_slice(&0u32.to_le_bytes()); // Number of messages.
+            append_encoded_addr(&mut out, UNDEF_ADDR, self.sizeof_addr)?;
+            append_encoded_addr(&mut out, UNDEF_ADDR, self.sizeof_addr)?;
+        }
+        let checksum = checksum_metadata(&out);
+        out.extend_from_slice(&checksum.to_le_bytes());
+        Ok(out)
+    }
+
+    fn encode_shared_message_table_message(&self, table_addr: u64) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        out.push(0);
+        append_encoded_addr(&mut out, table_addr, self.sizeof_addr)?;
+        let nindexes = u8::try_from(self.shared_mesg_indexes.len())
+            .map_err(|_| Error::InvalidFormat("shared-message index count exceeds u8".into()))?;
+        out.push(nindexes);
+        Ok(out)
     }
 
     /// Write the initial file structure: superblock placeholder.
@@ -4461,15 +4693,29 @@ impl<W: Write + Seek> HdfFileWriter<W> {
         let data_block_len = if paginated {
             let page_count = entry_count.div_ceil(page_elements);
             let page_init_len = page_count.div_ceil(8);
-            let page_payload_len =
-                page_elements.checked_mul(raw_element_size).ok_or_else(|| {
-                    Error::InvalidFormat("fixed-array chunk page payload size overflow".into())
+            let mut pages_len = 0usize;
+            for page_index in 0..page_count {
+                let entry_start = page_index.checked_mul(page_elements).ok_or_else(|| {
+                    Error::InvalidFormat("fixed-array page start overflow".into())
                 })?;
-            let page_len =
-                checked_usize_sum_writer(&[page_payload_len, 4], "fixed-array chunk page size")?;
-            let pages_len = page_count.checked_mul(page_len).ok_or_else(|| {
-                Error::InvalidFormat("fixed-array chunk page block size overflow".into())
-            })?;
+                let page_entry_count = entry_count.saturating_sub(entry_start).min(page_elements);
+                let page_payload_len =
+                    page_entry_count
+                        .checked_mul(raw_element_size)
+                        .ok_or_else(|| {
+                            Error::InvalidFormat(
+                                "fixed-array chunk page payload size overflow".into(),
+                            )
+                        })?;
+                let page_len = checked_usize_sum_writer(
+                    &[page_payload_len, 4],
+                    "fixed-array chunk page size",
+                )?;
+                pages_len = checked_usize_sum_writer(
+                    &[pages_len, page_len],
+                    "fixed-array chunk page block size",
+                )?;
+            }
             checked_usize_sum_writer(
                 &[prefix_payload_len, page_init_len, 4, pages_len],
                 "fixed-array chunk data block size",
@@ -4514,10 +4760,6 @@ impl<W: Write + Seek> HdfFileWriter<W> {
             let prefix_checksum = checksum_metadata(&data_block);
             data_block.extend_from_slice(&prefix_checksum.to_le_bytes());
 
-            let page_payload_len =
-                page_elements.checked_mul(raw_element_size).ok_or_else(|| {
-                    Error::InvalidFormat("fixed-array chunk page payload size overflow".into())
-                })?;
             for page_index in 0..page_count {
                 let page_start = data_block.len();
                 let entry_start = page_index.checked_mul(page_elements).ok_or_else(|| {
@@ -4537,7 +4779,6 @@ impl<W: Write + Seek> HdfFileWriter<W> {
                         data_block.extend_from_slice(&filter_mask.to_le_bytes());
                     }
                 }
-                data_block.resize(page_start + page_payload_len, 0);
                 let page_checksum = checksum_metadata(&data_block[page_start..]);
                 data_block.extend_from_slice(&page_checksum.to_le_bytes());
             }
@@ -5009,6 +5250,9 @@ impl<W: Write + Seek> HdfFileWriter<W> {
         })?;
         let max_payload_len = payloads.iter().map(Vec::len).max().unwrap_or(0);
         let block_size = managed_heap_root_direct_block_size(payload_bytes)?.max(512);
+        if payloads.len() > 1 && block_size > WRITER_MANAGED_HEAP_INDIRECT_THRESHOLD {
+            return self.write_managed_fractal_heap_indirect(payloads, min_heap_id_len);
+        }
         let max_heap_size_bits = managed_heap_max_size_bits_for_block(block_size)?;
         let offset_bytes = managed_heap_offset_bytes(max_heap_size_bits)?;
         let heap_id_len = dense_heap_id_len_for_payloads(payloads, offset_bytes, min_heap_id_len)?;
@@ -5036,18 +5280,7 @@ impl<W: Write + Seek> HdfFileWriter<W> {
             8,
         );
 
-        let mut direct = Vec::with_capacity(block_size);
-        direct.extend_from_slice(b"FHDB");
-        direct.push(0);
-        append_encoded_addr(&mut direct, heap_addr, self.sizeof_addr)?;
-        direct.resize(
-            direct.len().checked_add(offset_bytes).ok_or_else(|| {
-                Error::InvalidFormat("fractal heap direct block header overflow".into())
-            })?,
-            0,
-        );
-        let checksum_pos = direct.len();
-        direct.extend_from_slice(&0u32.to_le_bytes());
+        let mut direct = self.begin_managed_direct_block(heap_addr, 0, block_size, offset_bytes)?;
 
         let mut heap_ids = Vec::with_capacity(payloads.len());
         for payload in payloads {
@@ -5070,15 +5303,7 @@ impl<W: Write + Seek> HdfFileWriter<W> {
             heap_id.extend_from_slice(&len.to_le_bytes()[..length_bytes]);
             heap_ids.push(heap_id);
         }
-        direct.resize(block_size, 0);
-        let checksum = checksum_metadata(&direct);
-        checked_window_mut(
-            &mut direct,
-            checksum_pos,
-            4,
-            "fractal heap direct block checksum",
-        )?
-        .copy_from_slice(&checksum.to_le_bytes());
+        self.finish_managed_direct_block(&mut direct, block_size, offset_bytes)?;
         self.write_at(direct_addr, &direct)?;
 
         let heap = self.encode_minimal_fractal_heap(
@@ -5086,16 +5311,340 @@ impl<W: Write + Seek> HdfFileWriter<W> {
             payloads.len(),
             u64_from_usize_writer(max_payload_len, "managed heap max payload length")?,
             u64_from_usize_writer(block_size, "fractal heap direct block size")?,
+            u64_from_usize_writer(block_size, "fractal heap start block size")?,
+            u64_from_usize_writer(block_size.max(65536), "fractal heap max direct block size")?,
             max_heap_size_bits,
             direct_addr,
+            1,
+            0,
+            None,
+            None,
+            0,
         )?;
         debug_assert_eq!(heap.len(), heap_header_len);
         self.write_at(heap_addr, &heap)?;
         Ok((heap_addr, heap_ids))
     }
 
+    fn write_managed_fractal_heap_indirect(
+        &mut self,
+        payloads: &[Vec<u8>],
+        min_heap_id_len: u16,
+    ) -> Result<(u64, Vec<Vec<u8>>)> {
+        let max_payload_len = payloads.iter().map(Vec::len).max().unwrap_or(0);
+        let offset_bytes = managed_heap_offset_bytes(WRITER_MANAGED_HEAP_MIN_SIZE_BITS)?;
+        let mut block_size =
+            managed_heap_indirect_block_size(payloads, self.sizeof_addr, offset_bytes)?;
+        let width = usize::from(WRITER_MANAGED_HEAP_TABLE_WIDTH);
+        let header_len = managed_heap_direct_block_header_len(self.sizeof_addr, offset_bytes)?;
+        let heap_id_len = dense_heap_id_len_for_payloads(payloads, offset_bytes, min_heap_id_len)?;
+        let offset_bytes_u16 = u16::try_from(offset_bytes)
+            .map_err(|_| Error::InvalidFormat("managed heap ID offset width exceeds u16".into()))?;
+        let length_bytes = usize::from(
+            heap_id_len
+                .checked_sub(1 + offset_bytes_u16)
+                .ok_or_else(|| {
+                    Error::InvalidFormat("managed heap ID length is too short".into())
+                })?,
+        );
+        if length_bytes == 0 || length_bytes > 8 {
+            return Err(Error::Unsupported(format!(
+                "managed heap ID length {heap_id_len} leaves unsupported length byte count {length_bytes}"
+            )));
+        }
+
+        let block_layout = loop {
+            let layout =
+                Self::layout_managed_indirect_blocks(payloads, block_size, header_len, width)?;
+            if layout.len() <= width {
+                break layout;
+            }
+            block_size = block_size.checked_mul(2).ok_or_else(|| {
+                Error::InvalidFormat("managed heap indirect direct block size overflow".into())
+            })?;
+        };
+
+        let heap_span = block_size.checked_mul(width).ok_or_else(|| {
+            Error::InvalidFormat("managed heap indirect address space overflow".into())
+        })?;
+        let max_heap_size_bits = managed_heap_max_size_bits_for_block(heap_span)?;
+        let block_data_capacity = block_size.checked_sub(header_len).ok_or_else(|| {
+            Error::InvalidFormat("managed heap filtered direct block capacity underflow".into())
+        })?;
+        let filter_pipeline = encode_managed_heap_filter_pipeline()?;
+        let heap_header_len =
+            self.minimal_fractal_heap_header_len_with_filter(filter_pipeline.len())?;
+        let heap_addr = self.allocator.allocate(
+            u64_from_usize_writer(heap_header_len, "fractal heap header length")?,
+            8,
+        );
+        let indirect_len = self.managed_indirect_block_len(1, true)?;
+        let indirect_addr = self.allocator.allocate(
+            u64_from_usize_writer(indirect_len, "fractal heap indirect block length")?,
+            8,
+        );
+
+        let mut child_entries = Vec::with_capacity(width);
+        let mut heap_ids = vec![Vec::new(); payloads.len()];
+        for (block_index, payload_range) in block_layout.iter().enumerate() {
+            let block_start = u64_from_usize_writer(
+                block_index
+                    .checked_mul(block_data_capacity)
+                    .ok_or_else(|| {
+                        Error::InvalidFormat("managed heap indirect block offset overflow".into())
+                    })?,
+                "managed heap indirect block offset",
+            )?;
+            let mut direct =
+                self.begin_managed_direct_block(heap_addr, block_start, block_size, offset_bytes)?;
+            for payload_index in payload_range.clone() {
+                let payload = &payloads[payload_index];
+                let local_offset =
+                    u64_from_usize_writer(direct.len(), "managed heap object offset")?;
+                direct.extend_from_slice(payload);
+                let heap_offset = block_start.checked_add(local_offset).ok_or_else(|| {
+                    Error::InvalidFormat("managed heap object offset overflow".into())
+                })?;
+                let len = u64_from_usize_writer(payload.len(), "dense heap payload length")?;
+                let max_len = if length_bytes == 8 {
+                    u64::MAX
+                } else {
+                    (1u64 << (length_bytes * 8)) - 1
+                };
+                if len > max_len {
+                    return Err(Error::Unsupported(format!(
+                        "dense heap payload length {len} exceeds {length_bytes}-byte managed heap ID length"
+                    )));
+                }
+                let mut heap_id = Vec::with_capacity(usize::from(heap_id_len));
+                heap_id.push(0);
+                heap_id.extend_from_slice(&heap_offset.to_le_bytes()[..offset_bytes]);
+                heap_id.extend_from_slice(&len.to_le_bytes()[..length_bytes]);
+                heap_ids[payload_index] = heap_id;
+            }
+            self.finish_managed_direct_block(&mut direct, block_size, offset_bytes)?;
+            let filtered = encode_filtered_managed_heap_direct_block(&direct)?;
+            let block_addr = self.allocator.allocate(
+                u64_from_usize_writer(filtered.len(), "filtered fractal heap direct block size")?,
+                8,
+            );
+            child_entries.push(ManagedHeapIndirectEntry {
+                addr: block_addr,
+                filtered_size: u64_from_usize_writer(
+                    filtered.len(),
+                    "filtered fractal heap direct block size",
+                )?,
+                filter_mask: 0,
+            });
+            self.write_at(block_addr, &filtered)?;
+        }
+        child_entries.resize(
+            width,
+            ManagedHeapIndirectEntry {
+                addr: UNDEF_ADDR,
+                filtered_size: 0,
+                filter_mask: 0,
+            },
+        );
+        let indirect = self.encode_managed_indirect_block(heap_addr, 0, 1, &child_entries, true)?;
+        debug_assert_eq!(indirect.len(), indirect_len);
+        self.write_at(indirect_addr, &indirect)?;
+
+        let managed_alloc_size = u64_from_usize_writer(
+            block_layout
+                .len()
+                .checked_mul(block_data_capacity)
+                .ok_or_else(|| {
+                    Error::InvalidFormat("fractal heap managed allocated size overflow".into())
+                })?,
+            "fractal heap managed allocated size",
+        )?;
+        let heap = self.encode_minimal_fractal_heap(
+            heap_id_len,
+            payloads.len(),
+            u64_from_usize_writer(max_payload_len, "managed heap max payload length")?,
+            managed_alloc_size,
+            u64_from_usize_writer(block_size, "fractal heap start block size")?,
+            u64_from_usize_writer(block_size, "fractal heap direct block size")?,
+            max_heap_size_bits,
+            indirect_addr,
+            1,
+            1,
+            Some(&filter_pipeline),
+            None,
+            0,
+        )?;
+        debug_assert_eq!(heap.len(), heap_header_len);
+        self.write_at(heap_addr, &heap)?;
+        Ok((heap_addr, heap_ids))
+    }
+
+    fn layout_managed_indirect_blocks(
+        payloads: &[Vec<u8>],
+        block_size: usize,
+        header_len: usize,
+        width: usize,
+    ) -> Result<Vec<std::ops::Range<usize>>> {
+        if block_size <= header_len {
+            return Err(Error::InvalidFormat(
+                "managed heap direct block cannot hold objects".into(),
+            ));
+        }
+        let mut ranges = Vec::new();
+        let mut start = 0usize;
+        let mut used = header_len;
+        for (idx, payload) in payloads.iter().enumerate() {
+            let needed = header_len.checked_add(payload.len()).ok_or_else(|| {
+                Error::InvalidFormat("managed heap direct block payload overflow".into())
+            })?;
+            if needed > block_size {
+                return Err(Error::Unsupported(
+                    "managed heap payload requires huge-object storage".into(),
+                ));
+            }
+            let next_used = used.checked_add(payload.len()).ok_or_else(|| {
+                Error::InvalidFormat("managed heap direct block used size overflow".into())
+            })?;
+            if idx > start && next_used > block_size {
+                ranges.push(start..idx);
+                start = idx;
+                used = header_len;
+            }
+            used = used.checked_add(payload.len()).ok_or_else(|| {
+                Error::InvalidFormat("managed heap direct block used size overflow".into())
+            })?;
+        }
+        if start < payloads.len() {
+            ranges.push(start..payloads.len());
+        }
+        if ranges.len() > width {
+            return Ok(ranges);
+        }
+        Ok(ranges)
+    }
+
+    fn begin_managed_direct_block(
+        &self,
+        heap_addr: u64,
+        block_offset: u64,
+        block_size: usize,
+        offset_bytes: usize,
+    ) -> Result<Vec<u8>> {
+        let mut direct = Vec::with_capacity(block_size);
+        direct.extend_from_slice(b"FHDB");
+        direct.push(0);
+        append_encoded_addr(&mut direct, heap_addr, self.sizeof_addr)?;
+        direct.extend_from_slice(&block_offset.to_le_bytes()[..offset_bytes]);
+        direct.extend_from_slice(&0u32.to_le_bytes());
+        Ok(direct)
+    }
+
+    fn finish_managed_direct_block(
+        &self,
+        direct: &mut Vec<u8>,
+        block_size: usize,
+        offset_bytes: usize,
+    ) -> Result<()> {
+        if direct.len() > block_size {
+            return Err(Error::InvalidFormat(
+                "fractal heap direct block image exceeds block size".into(),
+            ));
+        }
+        direct.resize(block_size, 0);
+        let checksum_pos = managed_heap_direct_block_header_len(self.sizeof_addr, offset_bytes)?
+            .checked_sub(4)
+            .ok_or_else(|| {
+                Error::InvalidFormat("fractal heap direct block checksum offset underflow".into())
+            })?;
+        let checksum = checksum_metadata(direct);
+        checked_window_mut(
+            direct,
+            checksum_pos,
+            4,
+            "fractal heap direct block checksum",
+        )?
+        .copy_from_slice(&checksum.to_le_bytes());
+        Ok(())
+    }
+
+    fn managed_indirect_block_len(&self, nrows: usize, filtered: bool) -> Result<usize> {
+        let direct_entry_extra = if filtered {
+            usize::from(self.sizeof_size)
+                .checked_add(4)
+                .ok_or_else(|| {
+                    Error::InvalidFormat("fractal heap filtered entry overflow".into())
+                })?
+        } else {
+            0
+        };
+        checked_usize_sum_writer(
+            &[
+                4,
+                1,
+                usize::from(self.sizeof_addr),
+                managed_heap_offset_bytes(WRITER_MANAGED_HEAP_MIN_SIZE_BITS)?,
+                nrows
+                    .checked_mul(usize::from(WRITER_MANAGED_HEAP_TABLE_WIDTH))
+                    .and_then(|entries| {
+                        entries.checked_mul(
+                            usize::from(self.sizeof_addr)
+                                .checked_add(direct_entry_extra)
+                                .unwrap_or(usize::MAX),
+                        )
+                    })
+                    .ok_or_else(|| {
+                        Error::InvalidFormat("fractal heap indirect block length overflow".into())
+                    })?,
+                4,
+            ],
+            "fractal heap indirect block length",
+        )
+    }
+
+    fn encode_managed_indirect_block(
+        &self,
+        heap_addr: u64,
+        block_offset: u64,
+        nrows: usize,
+        child_entries: &[ManagedHeapIndirectEntry],
+        filtered: bool,
+    ) -> Result<Vec<u8>> {
+        let width = usize::from(WRITER_MANAGED_HEAP_TABLE_WIDTH);
+        let expected = nrows.checked_mul(width).ok_or_else(|| {
+            Error::InvalidFormat("fractal heap indirect child count overflow".into())
+        })?;
+        if child_entries.len() != expected {
+            return Err(Error::InvalidFormat(
+                "fractal heap indirect child count is inconsistent".into(),
+            ));
+        }
+        let offset_bytes = managed_heap_offset_bytes(WRITER_MANAGED_HEAP_MIN_SIZE_BITS)?;
+        let mut block = Vec::with_capacity(self.managed_indirect_block_len(nrows, filtered)?);
+        block.extend_from_slice(b"FHIB");
+        block.push(0);
+        append_encoded_addr(&mut block, heap_addr, self.sizeof_addr)?;
+        block.extend_from_slice(&block_offset.to_le_bytes()[..offset_bytes]);
+        for entry in child_entries {
+            append_encoded_addr(&mut block, entry.addr, self.sizeof_addr)?;
+            if filtered {
+                append_encoded_size(&mut block, entry.filtered_size, self.sizeof_size)?;
+                block.extend_from_slice(&entry.filter_mask.to_le_bytes());
+            }
+        }
+        let checksum = checksum_metadata(&block);
+        block.extend_from_slice(&checksum.to_le_bytes());
+        Ok(block)
+    }
+
     /// Encoded size of the minimal fractal-heap header used by this writer.
     fn minimal_fractal_heap_header_len(&self) -> Result<usize> {
+        self.minimal_fractal_heap_header_len_with_filter(0)
+    }
+
+    fn minimal_fractal_heap_header_len_with_filter(
+        &self,
+        filter_pipeline_len: usize,
+    ) -> Result<usize> {
         let sa = usize::from(self.sizeof_addr);
         let ss = usize::from(self.sizeof_size);
         let fixed = 4usize + 1 + 2 + 2 + 1 + 4 + 2 + 2 + 2 + 2 + 4;
@@ -5105,9 +5654,17 @@ impl<W: Write + Seek> HdfFileWriter<W> {
         let addr_fields = sa
             .checked_mul(3)
             .ok_or_else(|| Error::InvalidFormat("fractal heap header size overflow".into()))?;
+        let filter_fields = if filter_pipeline_len == 0 {
+            0
+        } else {
+            ss.checked_add(4)
+                .and_then(|value| value.checked_add(filter_pipeline_len))
+                .ok_or_else(|| Error::InvalidFormat("fractal heap header size overflow".into()))?
+        };
         fixed
             .checked_add(size_fields)
             .and_then(|value| value.checked_add(addr_fields))
+            .and_then(|value| value.checked_add(filter_fields))
             .ok_or_else(|| Error::InvalidFormat("fractal heap header size overflow".into()))
     }
 
@@ -5118,8 +5675,15 @@ impl<W: Write + Seek> HdfFileWriter<W> {
         managed_nobjs: usize,
         max_managed_obj_size: u64,
         managed_alloc_size: u64,
+        start_block_size: u64,
+        max_direct_block_size: u64,
         max_heap_size_bits: u16,
         root_block_addr: u64,
+        start_root_rows: u16,
+        current_root_rows: u16,
+        filter_pipeline_bytes: Option<&[u8]>,
+        root_direct_filtered_size: Option<u64>,
+        root_direct_filter_mask: u32,
     ) -> Result<Vec<u8>> {
         let mut buf = Vec::new();
         let free_space = 0u64;
@@ -5131,7 +5695,12 @@ impl<W: Write + Seek> HdfFileWriter<W> {
         buf.extend_from_slice(b"FRHP");
         buf.push(0);
         buf.extend_from_slice(&heap_id_len.to_le_bytes());
-        buf.extend_from_slice(&0u16.to_le_bytes());
+        let io_filter_len = filter_pipeline_bytes.map_or(Ok(0u16), |bytes| {
+            u16::try_from(bytes.len()).map_err(|_| {
+                Error::InvalidFormat("fractal heap filter pipeline length exceeds u16".into())
+            })
+        })?;
+        buf.extend_from_slice(&io_filter_len.to_le_bytes());
         buf.push(0x02);
         buf.extend_from_slice(&max_managed_obj_size.to_le_bytes());
         append_encoded_size(&mut buf, 0, self.sizeof_size)?;
@@ -5147,12 +5716,21 @@ impl<W: Write + Seek> HdfFileWriter<W> {
         append_encoded_size(&mut buf, 0, self.sizeof_size)?;
         append_encoded_size(&mut buf, 0, self.sizeof_size)?;
         buf.extend_from_slice(&4u16.to_le_bytes());
-        append_encoded_size(&mut buf, managed_alloc_size, self.sizeof_size)?;
-        append_encoded_size(&mut buf, managed_alloc_size.max(65536), self.sizeof_size)?;
+        append_encoded_size(&mut buf, start_block_size, self.sizeof_size)?;
+        append_encoded_size(&mut buf, max_direct_block_size, self.sizeof_size)?;
         buf.extend_from_slice(&max_heap_size_bits.to_le_bytes());
-        buf.extend_from_slice(&1u16.to_le_bytes());
+        buf.extend_from_slice(&start_root_rows.to_le_bytes());
         append_encoded_addr(&mut buf, root_block_addr, self.sizeof_addr)?;
-        buf.extend_from_slice(&0u16.to_le_bytes());
+        buf.extend_from_slice(&current_root_rows.to_le_bytes());
+        if let Some(pipeline) = filter_pipeline_bytes {
+            append_encoded_size(
+                &mut buf,
+                root_direct_filtered_size.unwrap_or(0),
+                self.sizeof_size,
+            )?;
+            buf.extend_from_slice(&root_direct_filter_mask.to_le_bytes());
+            buf.extend_from_slice(pipeline);
+        }
         let checksum = checksum_metadata(&buf);
         buf.extend_from_slice(&checksum.to_le_bytes());
         Ok(buf)
@@ -5663,6 +6241,42 @@ impl<W: Write + Seek> HdfFileWriter<W> {
             self.groups.insert(path.clone(), oh_addr);
         }
 
+        let shared_table_addr = if self.should_write_shared_message_info() {
+            let table = self.encode_shared_message_table()?;
+            let table_addr = self.allocator.allocate(
+                u64_from_usize_writer(table.len(), "shared-message table size")?,
+                8,
+            );
+            self.write_at(table_addr, &table)?;
+            Some(table_addr)
+        } else {
+            None
+        };
+
+        let ext_addr = if self.should_write_file_space_info() || shared_table_addr.is_some() {
+            let mut ext_messages: Vec<(u16, Vec<u8>)> = Vec::new();
+            if let Some(table_addr) = shared_table_addr {
+                ext_messages.push((
+                    MSG_SHARED_MSG_TABLE,
+                    self.encode_shared_message_table_message(table_addr)?,
+                ));
+            }
+            if self.should_write_file_space_info() {
+                let pre_fsm_eoa = self.allocator.eof();
+                ext_messages.push((
+                    MSG_FILE_SPACE_INFO,
+                    self.encode_file_space_info_message(pre_fsm_eoa)?,
+                ));
+            }
+            let ext_refs: Vec<(u16, &[u8])> = ext_messages
+                .iter()
+                .map(|(msg_type, data)| (*msg_type, data.as_slice()))
+                .collect();
+            self.write_v2_object_header(&ext_refs, 0)?
+        } else {
+            UNDEF_ADDR
+        };
+
         // Write superblock
         let root_addr = *self
             .groups
@@ -5671,13 +6285,16 @@ impl<W: Write + Seek> HdfFileWriter<W> {
         let eof = self.allocator.eof();
 
         let sb = Superblock {
-            version: 2,
+            version: self.superblock_version,
             sizeof_addr: self.sizeof_addr,
             sizeof_size: self.sizeof_size,
             status_flags: 0,
-            base_addr: 0,
-            ext_addr: UNDEF_ADDR,
-            eof_addr: eof,
+            base_addr: self.base_addr,
+            ext_addr,
+            eof_addr: self
+                .base_addr
+                .checked_add(eof)
+                .ok_or_else(|| Error::InvalidFormat("superblock EOF address overflow".into()))?,
             root_addr,
             ..Default::default()
         };
@@ -5693,7 +6310,11 @@ impl<W: Write + Seek> HdfFileWriter<W> {
 
     /// Write `data` at the given file offset (mirrors `H5FD_write`).
     fn write_at(&mut self, offset: u64, data: &[u8]) -> Result<()> {
-        self.writer.seek(SeekFrom::Start(offset))?;
+        let physical = self
+            .base_addr
+            .checked_add(offset)
+            .ok_or_else(|| Error::InvalidFormat("writer physical address overflow".into()))?;
+        self.writer.seek(SeekFrom::Start(physical))?;
         self.writer.write_all(data)?;
         Ok(())
     }

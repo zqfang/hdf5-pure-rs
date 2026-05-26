@@ -5,12 +5,13 @@ use std::path::{Path, PathBuf};
 use crate::error::{Error, Result};
 use crate::io::reader::HdfReader;
 
-use super::{usize_from_u64, Dataset, DatasetInfo};
+use super::{usize_from_u64, Dataset, DatasetAccess, DatasetInfo};
 
 impl Dataset {
     pub(super) fn read_external_raw_data_into<R: Read + Seek>(
         reader: &mut HdfReader<R>,
         hdf5_path: Option<&Path>,
+        access: &DatasetAccess,
         info: &DatasetInfo,
         output: &mut [u8],
     ) -> Result<()> {
@@ -19,6 +20,7 @@ impl Dataset {
         })?;
         let heap = crate::format::local_heap::LocalHeap::read_at(reader, external.heap_addr)?;
         let total_bytes = output.len();
+        let mut staged = vec![0u8; total_bytes];
         let mut output_offset = 0usize;
         for entry in &external.entries {
             if output_offset >= total_bytes {
@@ -26,7 +28,7 @@ impl Dataset {
             }
             let name_offset = usize_from_u64(entry.name_offset, "external file name offset")?;
             let file_name = heap.get_str(name_offset)?;
-            let path = Self::resolve_external_raw_file_path(hdf5_path, file_name)?;
+            let path = Self::resolve_external_raw_file_path(hdf5_path, access, file_name)?;
             let remaining = total_bytes - output_offset;
             let reserved = if entry.size == u64::MAX {
                 remaining
@@ -35,7 +37,7 @@ impl Dataset {
             };
             let mut file = fs::File::open(&path)?;
             file.seek(std::io::SeekFrom::Start(entry.file_offset))?;
-            let dst = external_output_window(output, output_offset, reserved)?;
+            let dst = external_output_window(&mut staged, output_offset, reserved)?;
             file.read_exact(dst)?;
             output_offset += reserved;
         }
@@ -44,16 +46,21 @@ impl Dataset {
                 "external raw data storage covers {output_offset} of {total_bytes} bytes"
             )));
         }
+        output.copy_from_slice(&staged);
         Ok(())
     }
 
     fn resolve_external_raw_file_path(
         hdf5_path: Option<&Path>,
+        access: &DatasetAccess,
         file_name: &str,
     ) -> Result<PathBuf> {
         let path = Path::new(file_name);
         if path.is_absolute() {
             return Ok(path.to_path_buf());
+        }
+        if let Some(prefix) = access.efile_prefix() {
+            return Ok(prefix.join(path));
         }
         let base = hdf5_path.and_then(Path::parent).ok_or_else(|| {
             Error::Unsupported("relative external raw data file has no base file path".into())

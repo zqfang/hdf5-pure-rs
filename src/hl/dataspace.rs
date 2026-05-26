@@ -707,4 +707,35 @@ mod tests {
             space.raw_message()
         );
     }
+
+    #[test]
+    fn dataspace_extents_into_replaces_stale_output() {
+        let space = Dataspace::simple(vec![2, 3], Some(vec![4, u64::MAX])).unwrap();
+        let mut dims = vec![9, 8, 7];
+        let mut max_dims = Some(vec![6, 5, 4]);
+
+        space.extents_into(&mut dims, &mut max_dims);
+        assert_eq!(dims, vec![2, 3]);
+        assert_eq!(max_dims, Some(vec![4, u64::MAX]));
+
+        let scalar = Dataspace::scalar();
+        scalar.extents_into(&mut dims, &mut max_dims);
+        assert!(dims.is_empty());
+        assert_eq!(max_dims, None);
+    }
+
+    #[test]
+    fn dataspace_offset_into_replaces_on_success_and_preserves_on_error() {
+        let space = Dataspace::simple(vec![2, 3], None).unwrap();
+        let mut offsets = vec![9, 8, 7];
+
+        space.offset_simple_into(&[1, -1], &mut offsets).unwrap();
+        assert_eq!(offsets, vec![1, -1]);
+
+        let err = space
+            .offset_simple_into(&[0], &mut offsets)
+            .expect_err("rank mismatch should fail");
+        assert!(err.to_string().contains("does not match dataspace rank"));
+        assert_eq!(offsets, vec![1, -1]);
+    }
 }

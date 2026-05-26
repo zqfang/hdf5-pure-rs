@@ -55,14 +55,11 @@ pub fn decompress_into(data: &[u8], client_data: &[u32], out: &mut Vec<u8>) -> R
     let out_len = nelmts
         .checked_mul(dtype_size)
         .ok_or_else(|| Error::InvalidFormat("nbit output size overflow".into()))?;
-    let start = out.len();
-    out.resize(
-        start
-            .checked_add(out_len)
-            .ok_or_else(|| Error::InvalidFormat("nbit output size overflow".into()))?,
-        0,
-    );
-    let out = &mut out[start..];
+    let mut decoded = Vec::new();
+    decoded
+        .try_reserve_exact(out_len)
+        .map_err(|_| Error::InvalidFormat("nbit output allocation failed".into()))?;
+    decoded.resize(out_len, 0);
     let mut stream = BitStream::new(data);
 
     match client_data[3] {
@@ -90,27 +87,27 @@ pub fn decompress_into(data: &[u8], client_data: &[u32], out: &mut Vec<u8>) -> R
             validate_atomic(parms)?;
             for idx in 0..nelmts {
                 let offset = nbit_nested_offset(0, idx, parms.size)?;
-                decompress_atomic(out, offset, &mut stream, parms)?;
+                decompress_atomic(&mut decoded, offset, &mut stream, parms)?;
             }
         }
         NBIT_ARRAY => {
             for idx in 0..nelmts {
                 let mut pidx = 4usize;
                 let offset = nbit_nested_offset(0, idx, dtype_size)?;
-                decompress_array(out, offset, &mut stream, client_data, &mut pidx)?;
+                decompress_array(&mut decoded, offset, &mut stream, client_data, &mut pidx)?;
             }
         }
         NBIT_COMPOUND => {
             for idx in 0..nelmts {
                 let mut pidx = 4usize;
                 let offset = nbit_nested_offset(0, idx, dtype_size)?;
-                decompress_compound(out, offset, &mut stream, client_data, &mut pidx)?;
+                decompress_compound(&mut decoded, offset, &mut stream, client_data, &mut pidx)?;
             }
         }
         NBIT_NOOPTYPE => {
             for idx in 0..nelmts {
                 let offset = nbit_nested_offset(0, idx, dtype_size)?;
-                stream.copy_bytes(out, offset, dtype_size)?;
+                stream.copy_bytes(&mut decoded, offset, dtype_size)?;
             }
         }
         other => {
@@ -120,6 +117,7 @@ pub fn decompress_into(data: &[u8], client_data: &[u32], out: &mut Vec<u8>) -> R
         }
     }
 
+    out.extend_from_slice(&decoded);
     Ok(())
 }
 
@@ -140,7 +138,8 @@ pub fn nbit_compress_into(data: &[u8], client_data: &[u32], out: &mut Vec<u8>) -
         return Err(Error::InvalidFormat("nbit input data too short".into()));
     }
 
-    let mut writer = BitWriter::new(out);
+    let mut encoded = Vec::new();
+    let mut writer = BitWriter::new(&mut encoded);
     match client_data[3] {
         NBIT_ATOMIC => {
             let parms = AtomicParms {
@@ -196,6 +195,7 @@ pub fn nbit_compress_into(data: &[u8], client_data: &[u32], out: &mut Vec<u8>) -
         }
     }
     writer.finish();
+    out.extend_from_slice(&encoded);
     Ok(())
 }
 
@@ -220,6 +220,11 @@ pub fn can_apply_nbit(client_data: &[u32]) -> Result<()> {
     }
     let mut pidx = 4usize;
     validate_nbit_type(client_data, &mut pidx, client_data[3])?;
+    if pidx != client_data.len() {
+        return Err(Error::InvalidFormat(
+            "nbit unused trailing parameters".into(),
+        ));
+    }
     Ok(())
 }
 
@@ -1017,6 +1022,34 @@ mod tests {
     }
 
     #[test]
+    fn decompress_into_preserves_stale_output_on_truncated_payload() {
+        let mut out = b"stale".to_vec();
+        let err = decompress_into(&[], &atomic_params(8, 0), &mut out)
+            .expect_err("truncated atomic payload should fail");
+        assert!(
+            err.to_string().contains("nbit data too short"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(out, b"stale");
+    }
+
+    #[test]
+    fn decompress_into_preserves_stale_output_on_unused_trailing_parameters() {
+        let mut params = atomic_params(8, 0);
+        params[0] += 1;
+        params.push(99);
+        let mut out = b"stale".to_vec();
+
+        let err = decompress_into(&[0xff], &params, &mut out)
+            .expect_err("unused trailing NBit parameters should fail before output mutation");
+        assert!(
+            err.to_string().contains("nbit unused trailing parameters"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(out, b"stale");
+    }
+
+    #[test]
     fn rejects_truncated_noop_payload_inside_array() {
         let params = vec![7, 0, 1, NBIT_ARRAY, 2, NBIT_NOOPTYPE, 2];
         let err = decompress_err(&[0xab], &params);
@@ -1024,6 +1057,19 @@ mod tests {
             err.to_string().contains("nbit data too short"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn decompress_into_preserves_stale_output_on_truncated_nested_noop_payload() {
+        let params = vec![7, 0, 1, NBIT_ARRAY, 2, NBIT_NOOPTYPE, 2];
+        let mut out = b"stale".to_vec();
+        let err = decompress_into(&[0xab], &params, &mut out)
+            .expect_err("truncated nested noop payload should fail");
+        assert!(
+            err.to_string().contains("nbit data too short"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(out, b"stale");
     }
 
     #[test]
@@ -1056,6 +1102,38 @@ mod tests {
         let err = decompress_err(&[], &params);
         assert!(
             err.to_string().contains("truncated nbit parameters"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_trailing_top_level_parameters() {
+        let params = vec![9, 0, 1, NBIT_ATOMIC, 2, NBIT_ORDER_LE, 8, 0, 1234];
+        let err = decompress_err(&[0], &params);
+        assert!(
+            err.to_string().contains("nbit unused trailing parameters"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_trailing_nested_array_parameters() {
+        let params = vec![
+            11,
+            0,
+            1,
+            NBIT_ARRAY,
+            2,
+            NBIT_ATOMIC,
+            1,
+            NBIT_ORDER_LE,
+            4,
+            0,
+            1234,
+        ];
+        let err = decompress_err(&[0], &params);
+        assert!(
+            err.to_string().contains("nbit unused trailing parameters"),
             "unexpected error: {err}"
         );
     }
@@ -1111,6 +1189,42 @@ mod tests {
         let mut decoded = Vec::new();
         decompress_into(&compressed, &params, &mut decoded).unwrap();
         assert_eq!(decoded, input);
+    }
+
+    #[test]
+    fn nbit_compress_into_appends_and_preserves_output_on_short_input() {
+        let params = atomic_params(12, 2);
+        let input = [0b0011_1100, 0b0000_0011];
+        let mut out = b"prefix".to_vec();
+
+        nbit_compress_into(&input, &params, &mut out).unwrap();
+        assert_eq!(&out[..6], b"prefix");
+
+        let stale = out.clone();
+        let err = nbit_compress_into(&input[..1], &params, &mut out)
+            .expect_err("short NBit input should fail before changing output");
+        assert!(
+            err.to_string().contains("nbit input data too short"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(out, stale);
+    }
+
+    #[test]
+    fn nbit_compress_into_preserves_output_on_unused_trailing_parameters() {
+        let mut params = atomic_params(8, 0);
+        params[0] += 1;
+        params.push(99);
+        let input = [0xff, 0x00];
+        let mut out = b"stale".to_vec();
+
+        let err = nbit_compress_into(&input, &params, &mut out)
+            .expect_err("unused trailing NBit parameters should fail before output mutation");
+        assert!(
+            err.to_string().contains("nbit unused trailing parameters"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(out, b"stale");
     }
 
     #[test]
@@ -1395,5 +1509,43 @@ mod tests {
         let mut decoded = Vec::new();
         decompress_into(&compressed, &params, &mut decoded).unwrap();
         assert_eq!(decoded, input);
+    }
+
+    #[test]
+    fn nbit_nested_compound_decompress_into_appends_after_full_decode() {
+        let params = vec![
+            25,
+            0,
+            1,
+            NBIT_COMPOUND,
+            6,
+            2,
+            0,
+            NBIT_COMPOUND,
+            4,
+            2,
+            0,
+            NBIT_ATOMIC,
+            1,
+            NBIT_ORDER_LE,
+            4,
+            2,
+            2,
+            NBIT_NOOPTYPE,
+            1,
+            5,
+            NBIT_ATOMIC,
+            1,
+            NBIT_ORDER_LE,
+            4,
+            0,
+        ];
+        let input = [0b0011_1100, 0, 0xab, 0, 0, 0x0f];
+        let mut compressed = Vec::new();
+        nbit_compress_into(&input, &params, &mut compressed).unwrap();
+
+        let mut decoded = b"prefix".to_vec();
+        decompress_into(&compressed, &params, &mut decoded).unwrap();
+        assert_eq!(decoded, [b"prefix".as_slice(), input.as_slice()].concat());
     }
 }

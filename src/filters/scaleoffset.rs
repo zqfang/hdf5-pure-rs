@@ -85,23 +85,21 @@ pub fn decompress_into(data: &[u8], client_data: &[u32], out: &mut Vec<u8>) -> R
     let out_len = nelmts
         .checked_mul(size)
         .ok_or_else(|| Error::InvalidFormat("scaleoffset output size overflow".into()))?;
-    let start = out.len();
-    out.resize(
-        start
-            .checked_add(out_len)
-            .ok_or_else(|| Error::InvalidFormat("scaleoffset output size overflow".into()))?,
-        0,
-    );
-    let out = &mut out[start..];
+    let mut decoded = Vec::new();
+    decoded.try_reserve_exact(out_len).map_err(|err| {
+        Error::InvalidFormat(format!("scaleoffset output allocation failed: {err}"))
+    })?;
+    decoded.resize(out_len, 0);
 
-    if minbits == size * 8 {
+    let full_precision = minbits == size * 8;
+    if full_precision {
         let raw_end = HEADER_LEN.checked_add(out_len).ok_or_else(|| {
             Error::InvalidFormat("scaleoffset full-precision data too short".into())
         })?;
         let raw = data.get(HEADER_LEN..raw_end).ok_or_else(|| {
             Error::InvalidFormat("scaleoffset full-precision data too short".into())
         })?;
-        out.copy_from_slice(raw);
+        decoded.copy_from_slice(raw);
     } else if minbits != 0 {
         let parms = Parms {
             size,
@@ -113,34 +111,40 @@ pub fn decompress_into(data: &[u8], client_data: &[u32], out: &mut Vec<u8>) -> R
             let data_offset = idx
                 .checked_mul(size)
                 .ok_or_else(|| Error::InvalidFormat("scaleoffset output offset overflow".into()))?;
-            decompress_atomic(out, data_offset, &mut stream, parms)?;
+            decompress_atomic(&mut decoded, data_offset, &mut stream, parms)?;
         }
     }
 
-    match class {
-        CLS_INTEGER => {
-            let fill = if client_data.get(PARM_FILAVAIL).copied().unwrap_or(0) != 0 {
-                Some(read_fill_value(client_data, size, order))
-            } else {
-                None
-            };
-            postprocess_integer(out, size, sign, order, minbits, minval, fill)?
-        }
-        CLS_FLOAT if scale_type == 0 => {
-            postprocess_float(out, size, order, minbits, minval, client_data)?
-        }
-        CLS_FLOAT => {
-            return Err(Error::Unsupported(format!(
-                "scaleoffset float scale type {scale_type}"
-            )));
-        }
-        other => {
-            return Err(Error::Unsupported(format!(
-                "scaleoffset datatype class {other}"
-            )));
+    if !full_precision {
+        match class {
+            CLS_INTEGER => {
+                let fill = if client_data.get(PARM_FILAVAIL).copied().unwrap_or(0) != 0 {
+                    Some(read_fill_value(client_data, size, order))
+                } else {
+                    None
+                };
+                postprocess_integer(&mut decoded, size, sign, order, minbits, minval, fill)?
+            }
+            CLS_FLOAT if scale_type == 0 => {
+                postprocess_float(&mut decoded, size, order, minbits, minval, client_data)?
+            }
+            CLS_FLOAT => {
+                return Err(Error::Unsupported(format!(
+                    "scaleoffset float scale type {scale_type}"
+                )));
+            }
+            other => {
+                return Err(Error::Unsupported(format!(
+                    "scaleoffset datatype class {other}"
+                )));
+            }
         }
     }
 
+    out.try_reserve_exact(decoded.len()).map_err(|err| {
+        Error::InvalidFormat(format!("scaleoffset output allocation failed: {err}"))
+    })?;
+    out.extend_from_slice(&decoded);
     Ok(())
 }
 
@@ -278,14 +282,12 @@ pub fn scaleoffset_compress_into(
         }
     };
 
-    let header_start = out.len();
-    out.resize(
-        header_start
-            .checked_add(HEADER_LEN)
-            .ok_or_else(|| Error::InvalidFormat("scaleoffset output size overflow".into()))?,
-        0,
-    );
-    let header = &mut out[header_start..header_start + HEADER_LEN];
+    let mut encoded = Vec::new();
+    encoded.try_reserve_exact(HEADER_LEN).map_err(|err| {
+        Error::InvalidFormat(format!("scaleoffset output allocation failed: {err}"))
+    })?;
+    encoded.resize(HEADER_LEN, 0);
+    let header = &mut encoded[..HEADER_LEN];
     let minbits_u32 = u32::try_from(minbits).map_err(|_| {
         Error::InvalidFormat("scaleoffset minimum bit count does not fit in u32".into())
     })?;
@@ -298,9 +300,9 @@ pub fn scaleoffset_compress_into(
     );
 
     if minbits == size * 8 {
-        out.extend_from_slice(&packed);
+        encoded.extend_from_slice(&data[..expected]);
     } else if minbits != 0 {
-        let mut writer = BitWriter::new(out);
+        let mut writer = BitWriter::new(&mut encoded);
         let parms = Parms {
             size,
             minbits,
@@ -314,6 +316,10 @@ pub fn scaleoffset_compress_into(
         }
         writer.finish();
     }
+    out.try_reserve_exact(encoded.len()).map_err(|err| {
+        Error::InvalidFormat(format!("scaleoffset output allocation failed: {err}"))
+    })?;
+    out.extend_from_slice(&encoded);
     Ok(())
 }
 
@@ -1003,7 +1009,7 @@ fn checked_window_mut<'a>(
         .ok_or_else(|| Error::InvalidFormat(format!("{context} is truncated")))
 }
 
-fn read_fill_value(client_data: &[u32], size: usize, order: u32) -> u128 {
+fn read_fill_value(client_data: &[u32], size: usize, _order: u32) -> u128 {
     let mut raw = [0u8; 16];
     let mut pos = 0usize;
     for value in client_data.iter().skip(PARM_FILVAL) {
@@ -1015,7 +1021,7 @@ fn read_fill_value(client_data: &[u32], size: usize, order: u32) -> u128 {
             }
         }
     }
-    read_uint(&raw[..size], order)
+    read_uint(&raw[..size], ORDER_LE)
 }
 
 fn write_float32(bytes: &mut [u8], order: u32, value: f32) {
@@ -1318,6 +1324,31 @@ mod tests {
     }
 
     #[test]
+    fn decompress_into_preserves_output_on_malformed_payloads() {
+        let params = integer_params(2, 2);
+        let mut data = header(9, 0);
+        data.push(0xff);
+        let mut out = b"stale".to_vec();
+
+        let err = decompress_into(&data, &params, &mut out).unwrap_err();
+        assert!(
+            err.to_string().contains("scaleoffset data too short"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(out, b"stale");
+
+        let mut full_precision = header(16, 0);
+        full_precision.extend_from_slice(&1u16.to_le_bytes());
+        let err = decompress_into(&full_precision, &params, &mut out).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("scaleoffset full-precision data too short"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(out, b"stale");
+    }
+
+    #[test]
     fn rejects_truncated_full_precision_payload_generated_in_memory() {
         let params = integer_params(2, 2);
         let mut data = header(16, 0);
@@ -1401,6 +1432,73 @@ mod tests {
     }
 
     #[test]
+    fn scaleoffset_compress_into_appends_and_preserves_output_on_errors() {
+        let params = vec![2, 0, 4, CLS_INTEGER, 2, SIGN_UNSIGNED, ORDER_LE];
+        let input = [10u16, 11, 12, 16]
+            .into_iter()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        let mut out = b"prefix".to_vec();
+
+        scaleoffset_compress_into(&input, &params, &mut out).unwrap();
+        assert_eq!(&out[..6], b"prefix");
+
+        let mut decoded = Vec::new();
+        decompress_into(&out[6..], &params, &mut decoded).unwrap();
+        assert_eq!(decoded, input);
+
+        let stale = out.clone();
+        let err =
+            scaleoffset_compress_into(&input[..input.len() - 1], &params, &mut out).unwrap_err();
+        assert!(
+            err.to_string().contains("scaleoffset input data too short"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(out, stale);
+    }
+
+    #[test]
+    fn filter_scaleoffset_into_preserves_output_on_invalid_client_data() {
+        let params = vec![2, 0, 1, CLS_INTEGER, 2, SIGN_UNSIGNED, ORDER_LE, 1];
+        let mut out = b"stale".to_vec();
+
+        let err = filter_scaleoffset_into(&[10, 0], &params, false, &mut out)
+            .expect_err("invalid ScaleOffset client data should fail before output mutation");
+        assert!(
+            err.to_string()
+                .contains("scaleoffset fill value parameters are truncated"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(out, b"stale");
+    }
+
+    #[test]
+    fn filter_scaleoffset_into_decompress_appends_and_preserves_output_on_malformed_payload() {
+        let params = vec![2, 0, 4, CLS_INTEGER, 2, SIGN_UNSIGNED, ORDER_LE];
+        let input = [10u16, 11, 12, 16]
+            .into_iter()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        let mut compressed = Vec::new();
+        scaleoffset_compress_into(&input, &params, &mut compressed).unwrap();
+
+        let mut out = b"prefix".to_vec();
+        filter_scaleoffset_into(&compressed, &params, true, &mut out).unwrap();
+        assert_eq!(&out[..6], b"prefix");
+        assert_eq!(&out[6..], input.as_slice());
+
+        let stale = out.clone();
+        let mut malformed = header(9, 0);
+        malformed.push(0xff);
+        let err = filter_scaleoffset_into(&malformed, &params, true, &mut out).unwrap_err();
+        assert!(
+            err.to_string().contains("scaleoffset data too short"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(out, stale);
+    }
+
+    #[test]
     fn scaleoffset_u128_compress_roundtrips_wide_deltas() {
         let params = vec![2, 0, 3, CLS_INTEGER, 16, SIGN_UNSIGNED, ORDER_LE];
         let base = (1u128 << 80) + 5;
@@ -1421,19 +1519,19 @@ mod tests {
     }
 
     #[test]
-    fn scaleoffset_integer_full_precision_payload_stores_deltas() {
+    fn scaleoffset_integer_full_precision_payload_is_raw_libhdf5_passthrough() {
         let params = vec![2, 0, 2, CLS_INTEGER, 1, SIGN_UNSIGNED, ORDER_LE];
 
         let mut encoded = header(8, 1);
         encoded[5] = 100;
-        encoded.extend_from_slice(&[0, 155]);
+        encoded.extend_from_slice(&[100, 255]);
         let mut decoded = Vec::new();
         decompress_into(&encoded, &params, &mut decoded).unwrap();
         assert_eq!(decoded, [100, 255]);
 
         let mut compressed = Vec::new();
         scaleoffset_compress_into(&[100, 255], &params, &mut compressed).unwrap();
-        assert_eq!(&compressed[HEADER_LEN..], &[0, 155]);
+        assert_eq!(&compressed[HEADER_LEN..], &[100, 255]);
 
         let mut roundtripped = Vec::new();
         decompress_into(&compressed, &params, &mut roundtripped).unwrap();
@@ -1524,7 +1622,7 @@ mod tests {
     #[test]
     fn scaleoffset_big_endian_integer_compress_reserves_fill_marker() {
         let fill = 0x1234u16;
-        let fill_client_word = u32::from(u16::from_le_bytes(fill.to_be_bytes()));
+        let fill_client_word = u32::from(fill);
         let params = vec![
             2,
             0,
@@ -1566,6 +1664,58 @@ mod tests {
         let mut decoded = Vec::new();
         decompress_into(&compressed, &params, &mut decoded).unwrap();
         assert_eq!(decoded, input);
+    }
+
+    #[test]
+    fn scaleoffset_i64_signed_integer_compress_reserves_fill_marker_for_both_endians() {
+        let fill = -9_223_372_036_854_775_000i64;
+        let fill_bytes = fill.to_le_bytes();
+        let fill_low = u32::from_le_bytes(fill_bytes[..4].try_into().unwrap());
+        let fill_high = u32::from_le_bytes(fill_bytes[4..].try_into().unwrap());
+
+        let little_params = vec![
+            2,
+            0,
+            4,
+            CLS_INTEGER,
+            8,
+            SIGN_TWOS,
+            ORDER_LE,
+            1,
+            fill_low,
+            fill_high,
+        ];
+        let little_input = [fill + 10, fill, fill + 12, fill + 13]
+            .into_iter()
+            .flat_map(i64::to_le_bytes)
+            .collect::<Vec<_>>();
+        let mut little_compressed = Vec::new();
+        scaleoffset_compress_into(&little_input, &little_params, &mut little_compressed).unwrap();
+        let mut little_decoded = Vec::new();
+        decompress_into(&little_compressed, &little_params, &mut little_decoded).unwrap();
+        assert_eq!(little_decoded, little_input);
+
+        let big_params = vec![
+            2,
+            0,
+            4,
+            CLS_INTEGER,
+            8,
+            SIGN_TWOS,
+            ORDER_BE,
+            1,
+            fill_low,
+            fill_high,
+        ];
+        let big_input = [fill + 10, fill, fill + 12, fill + 13]
+            .into_iter()
+            .flat_map(i64::to_be_bytes)
+            .collect::<Vec<_>>();
+        let mut big_compressed = Vec::new();
+        scaleoffset_compress_into(&big_input, &big_params, &mut big_compressed).unwrap();
+        let mut big_decoded = Vec::new();
+        decompress_into(&big_compressed, &big_params, &mut big_decoded).unwrap();
+        assert_eq!(big_decoded, big_input);
     }
 
     #[test]
@@ -1697,7 +1847,7 @@ mod tests {
     #[test]
     fn scaleoffset_big_endian_float_compress_reserves_fill_marker() {
         let fill = -999.0f32;
-        let fill_client_word = u32::from_le_bytes(fill.to_be_bytes());
+        let fill_client_word = fill.to_bits();
         let params = vec![
             0,
             1,
@@ -1732,7 +1882,7 @@ mod tests {
     #[test]
     fn scaleoffset_big_endian_f64_compress_reserves_fill_marker() {
         let fill = -999.0f64;
-        let fill_bytes = fill.to_be_bytes();
+        let fill_bytes = fill.to_bits().to_le_bytes();
         let fill_low = u32::from_le_bytes(fill_bytes[..4].try_into().unwrap());
         let fill_high = u32::from_le_bytes(fill_bytes[4..].try_into().unwrap());
         let params = vec![

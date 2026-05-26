@@ -50,7 +50,11 @@ impl FreeListManager {
                 "free-list allocation size is zero".into(),
             ));
         }
-        Ok(vec![0; size])
+        let mut buf = Vec::new();
+        buf.try_reserve_exact(size)
+            .map_err(|err| Error::InvalidFormat(format!("free-list allocation failed: {err}")))?;
+        buf.resize(size, 0);
+        Ok(buf)
     }
 
     fn checked_array_size(count: usize, elem_size: usize) -> Result<usize> {
@@ -64,6 +68,11 @@ impl FreeListManager {
             return Err(Error::InvalidFormat(
                 "free-list allocation size is zero".into(),
             ));
+        }
+        if buf.capacity() < new_size {
+            buf.try_reserve_exact(new_size - buf.len()).map_err(|err| {
+                Error::InvalidFormat(format!("free-list allocation failed: {err}"))
+            })?;
         }
         buf.resize(new_size, 0);
         Ok(())
@@ -79,6 +88,11 @@ impl FreeListManager {
             return Err(Error::InvalidFormat(
                 "free-list allocation size is zero".into(),
             ));
+        }
+        if out.capacity() < size {
+            out.try_reserve_exact(size - out.len()).map_err(|err| {
+                Error::InvalidFormat(format!("free-list allocation failed: {err}"))
+            })?;
         }
         out.clear();
         out.resize(size, 0);
@@ -380,6 +394,10 @@ impl FreeListManager {
 mod tests {
     use super::*;
 
+    fn assert_invalid_format(result: Result<()>) {
+        assert!(matches!(result, Err(Error::InvalidFormat(_))));
+    }
+
     #[test]
     fn block_free_list_reuses_buffers() {
         let mut lists = FreeListManager::new();
@@ -405,5 +423,151 @@ mod tests {
         assert_eq!(reused.len(), 8);
         assert!(reused.capacity() >= original_capacity);
         assert_eq!(lists.get_free_list_sizes().array_bytes, 0);
+    }
+
+    #[test]
+    fn malloc_into_replaces_stale_on_success_and_preserves_on_errors() {
+        let mut out = b"stale".to_vec();
+        FreeListManager::malloc_into(3, &mut out).unwrap();
+        assert_eq!(out, vec![0; 3]);
+
+        out = b"stale".to_vec();
+        assert_invalid_format(FreeListManager::malloc_into(0, &mut out));
+        assert_eq!(out, b"stale");
+
+        assert_invalid_format(FreeListManager::malloc_into(usize::MAX, &mut out));
+        assert_eq!(out, b"stale");
+    }
+
+    #[test]
+    fn typed_malloc_into_helpers_replace_stale_on_success_and_preserve_on_errors() {
+        let mut lists = FreeListManager::new();
+
+        let mut regular = b"stale".to_vec();
+        lists.reg_malloc_into(3, &mut regular).unwrap();
+        assert_eq!(regular, vec![0; 3]);
+        regular = b"stale".to_vec();
+        assert_invalid_format(lists.reg_malloc_into(0, &mut regular));
+        assert_eq!(regular, b"stale");
+        assert_invalid_format(lists.reg_malloc_into(usize::MAX, &mut regular));
+        assert_eq!(regular, b"stale");
+
+        let mut block = b"stale".to_vec();
+        lists.blk_malloc_into(3, &mut block).unwrap();
+        assert_eq!(block, vec![0; 3]);
+        block = b"stale".to_vec();
+        assert_invalid_format(lists.blk_malloc_into(0, &mut block));
+        assert_eq!(block, b"stale");
+        assert_invalid_format(lists.blk_malloc_into(usize::MAX, &mut block));
+        assert_eq!(block, b"stale");
+
+        let mut factory = b"stale".to_vec();
+        lists.fac_malloc_into(3, &mut factory).unwrap();
+        assert_eq!(factory, vec![0; 3]);
+        factory = b"stale".to_vec();
+        assert_invalid_format(lists.fac_malloc_into(0, &mut factory));
+        assert_eq!(factory, b"stale");
+        assert_invalid_format(lists.fac_malloc_into(usize::MAX, &mut factory));
+        assert_eq!(factory, b"stale");
+    }
+
+    #[test]
+    fn array_and_sequence_into_helpers_preserve_stale_after_validation_errors() {
+        let mut lists = FreeListManager::new();
+
+        let mut array = b"stale".to_vec();
+        lists.arr_malloc_into(2, 2, &mut array).unwrap();
+        assert_eq!(array, vec![0; 4]);
+        array = b"stale".to_vec();
+        assert_invalid_format(lists.arr_malloc_into(0, 2, &mut array));
+        assert_eq!(array, b"stale");
+        assert_invalid_format(lists.arr_malloc_into(usize::MAX, 2, &mut array));
+        assert_eq!(array, b"stale");
+        assert_invalid_format(lists.arr_malloc_into(usize::MAX, 1, &mut array));
+        assert_eq!(array, b"stale");
+
+        let mut sequence = b"stale".to_vec();
+        lists.seq_malloc_into(2, 2, &mut sequence).unwrap();
+        assert_eq!(sequence, vec![0; 4]);
+        sequence = b"stale".to_vec();
+        assert_invalid_format(lists.seq_malloc_into(0, 2, &mut sequence));
+        assert_eq!(sequence, b"stale");
+        assert_invalid_format(lists.seq_malloc_into(usize::MAX, 2, &mut sequence));
+        assert_eq!(sequence, b"stale");
+        assert_invalid_format(lists.seq_malloc_into(usize::MAX, 1, &mut sequence));
+        assert_eq!(sequence, b"stale");
+    }
+
+    #[test]
+    fn calloc_into_helpers_replace_stale_on_success_and_preserve_on_errors() {
+        let mut lists = FreeListManager::new();
+
+        let mut regular = b"stale".to_vec();
+        lists.reg_calloc_into(3, &mut regular).unwrap();
+        assert_eq!(regular, vec![0; 3]);
+        regular = b"stale".to_vec();
+        assert_invalid_format(lists.reg_calloc_into(0, &mut regular));
+        assert_eq!(regular, b"stale");
+
+        let mut block = b"stale".to_vec();
+        lists.blk_calloc_into(3, &mut block).unwrap();
+        assert_eq!(block, vec![0; 3]);
+        block = b"stale".to_vec();
+        assert_invalid_format(lists.blk_calloc_into(0, &mut block));
+        assert_eq!(block, b"stale");
+
+        let mut array = b"stale".to_vec();
+        lists.arr_calloc_into(2, 2, &mut array).unwrap();
+        assert_eq!(array, vec![0; 4]);
+        array = b"stale".to_vec();
+        assert_invalid_format(lists.arr_calloc_into(usize::MAX, 2, &mut array));
+        assert_eq!(array, b"stale");
+
+        let mut sequence = b"stale".to_vec();
+        lists.seq_calloc_into(2, 2, &mut sequence).unwrap();
+        assert_eq!(sequence, vec![0; 4]);
+        sequence = b"stale".to_vec();
+        assert_invalid_format(lists.seq_calloc_into(usize::MAX, 2, &mut sequence));
+        assert_eq!(sequence, b"stale");
+
+        let mut factory = b"stale".to_vec();
+        lists.fac_calloc_into(3, &mut factory).unwrap();
+        assert_eq!(factory, vec![0; 3]);
+        factory = b"stale".to_vec();
+        assert_invalid_format(lists.fac_calloc_into(0, &mut factory));
+        assert_eq!(factory, b"stale");
+    }
+
+    #[test]
+    fn realloc_in_place_helpers_preserve_stale_after_validation_errors() {
+        let mut lists = FreeListManager::new();
+
+        let mut block = b"stale".to_vec();
+        lists.blk_realloc_in_place(&mut block, 3).unwrap();
+        assert_eq!(block, b"sta");
+        assert_invalid_format(lists.blk_realloc_in_place(&mut block, 0));
+        assert_eq!(block, b"sta");
+        assert_invalid_format(lists.blk_realloc_in_place(&mut block, usize::MAX));
+        assert_eq!(block, b"sta");
+
+        let mut array = b"stale".to_vec();
+        lists.arr_realloc_in_place(&mut array, 2, 2).unwrap();
+        assert_eq!(array, b"stal");
+        assert_invalid_format(lists.arr_realloc_in_place(&mut array, 0, 2));
+        assert_eq!(array, b"stal");
+        assert_invalid_format(lists.arr_realloc_in_place(&mut array, usize::MAX, 2));
+        assert_eq!(array, b"stal");
+        assert_invalid_format(lists.arr_realloc_in_place(&mut array, usize::MAX, 1));
+        assert_eq!(array, b"stal");
+
+        let mut sequence = b"stale".to_vec();
+        lists.seq_realloc_in_place(&mut sequence, 2, 2).unwrap();
+        assert_eq!(sequence, b"stal");
+        assert_invalid_format(lists.seq_realloc_in_place(&mut sequence, 0, 2));
+        assert_eq!(sequence, b"stal");
+        assert_invalid_format(lists.seq_realloc_in_place(&mut sequence, usize::MAX, 2));
+        assert_eq!(sequence, b"stal");
+        assert_invalid_format(lists.seq_realloc_in_place(&mut sequence, usize::MAX, 1));
+        assert_eq!(sequence, b"stal");
     }
 }

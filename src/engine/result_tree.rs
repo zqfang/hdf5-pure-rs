@@ -127,6 +127,11 @@ mod tests {
             1
         );
         assert_eq!(found, vec![b]);
+        assert_eq!(
+            tree.search_into(ResultRange { start: 2, end: 2 }, &mut found),
+            1
+        );
+        assert_eq!(found, vec![b, a]);
 
         found.clear();
         tree.search_visit(ResultRange { start: 0, end: 20 }, |range| found.push(range));

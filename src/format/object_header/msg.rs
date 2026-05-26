@@ -34,7 +34,7 @@ const MSG_FLAG_DONTSHARE: u8 = 0x04;
 const MSG_FLAG_FAIL_IF_UNKNOWN_AND_OPEN_FOR_WRITE: u8 = 0x08;
 const MSG_FLAG_MARK_IF_UNKNOWN: u8 = 0x10;
 const MSG_FLAG_WAS_UNKNOWN: u8 = 0x20;
-const MSG_KNOWN_FLAGS: u8 = 0xff;
+const MSG_KNOWN_FLAGS: u8 = 0x3f;
 
 /// Decode the message stream of a v1 object header chunk. Walks the chunk
 /// between `[reader.position(), chunk_end)`, dispatches NIL padding and
@@ -933,6 +933,9 @@ mod tests {
 
     #[test]
     fn object_header_messages_reject_bad_flag_combinations() {
+        let err = validate_message_flags(0x40).expect_err("reserved message flag should fail");
+        assert!(err.to_string().contains("reserved bits"));
+
         let mut messages = Vec::new();
         let mut continuations = Vec::new();
         let mut ranges = vec![(0, 8)];

@@ -49,6 +49,15 @@ impl PropertyClass {
             closed: false,
         }
     }
+
+    /// Return an error if the property class has been closed.
+    fn ensure_open(&self) -> Result<()> {
+        if self.closed {
+            Err(Error::InvalidFormat("property class is closed".into()))
+        } else {
+            Ok(())
+        }
+    }
 }
 
 impl PropertyList {
@@ -121,11 +130,8 @@ pub fn H5P__close_class(class: &mut PropertyClass) {
 /// Increment or decrement list/class dependencies on a property class.
 #[allow(non_snake_case)]
 pub fn H5P__access_class(class: &PropertyClass) -> Result<&PropertyClass> {
-    if class.closed {
-        Err(Error::InvalidFormat("property class is closed".into()))
-    } else {
-        Ok(class)
-    }
+    class.ensure_open()?;
+    Ok(class)
 }
 
 /// Internal routine to create a new property list of a given class.
@@ -172,9 +178,7 @@ pub fn H5P__create_prop(name: impl Into<String>, value: impl Into<Vec<u8>>) -> P
 /// Add a property record to a property class.
 #[allow(non_snake_case)]
 pub fn H5P__add_prop(class: &mut PropertyClass, prop: Property) -> Result<()> {
-    if class.closed {
-        return Err(Error::InvalidFormat("property class is closed".into()));
-    }
+    class.ensure_open()?;
     class.properties.insert(prop.name.clone(), prop);
     Ok(())
 }
@@ -282,6 +286,7 @@ pub fn H5P__find_prop_plist<'a>(list: &'a PropertyList, name: &str) -> Result<&'
 /// Look up a property by name in a property class.
 #[allow(non_snake_case)]
 pub fn H5P__find_prop_pclass<'a>(class: &'a PropertyClass, name: &str) -> Result<&'a Property> {
+    class.ensure_open()?;
     class
         .properties
         .get(name)
@@ -368,6 +373,7 @@ pub fn H5P__class_get(class: &PropertyClass, name: &str) -> Result<Vec<u8>> {
 /// Set the value of a registered property on a property class.
 #[allow(non_snake_case)]
 pub fn H5P__class_set(class: &mut PropertyClass, name: &str, value: Vec<u8>) -> Result<()> {
+    class.ensure_open()?;
     let prop = class
         .properties
         .get_mut(name)
@@ -519,6 +525,7 @@ pub fn H5P_remove(list: &mut PropertyList, name: &str) -> Result<Property> {
 /// Remove a registered property from a property class.
 #[allow(non_snake_case)]
 pub fn H5P__unregister(class: &mut PropertyClass, name: &str) -> Result<Property> {
+    class.ensure_open()?;
     class
         .properties
         .remove(name)
@@ -975,6 +982,11 @@ fn plist_del(list: &mut PropertyList, name: &str) -> Result<()> {
     Ok(())
 }
 
+fn plist_clear_fapl_driver_config(list: &mut PropertyList) -> Result<()> {
+    plist_del(list, "fapl_hdfs_config")?;
+    plist_del(list, "fapl_ros3_config")
+}
+
 /// Internal helper that compares two property value buffers.
 fn prop_cmp(left: &[u8], right: &[u8]) -> bool {
     left == right
@@ -1219,9 +1231,10 @@ pub fn H5Pset_fapl_hdfs(list: &mut PropertyList) -> Result<()> {
 /// Set the HDFS file-access driver with the given configuration.
 #[allow(non_snake_case)]
 pub fn H5Pset_fapl_hdfs_config(list: &mut PropertyList, config: HdfsFaplConfig) -> Result<()> {
-    plist_set(list, "driver", b"hdfs".to_vec())?;
     let mut encoded = Vec::new();
     H5P__encode_hdfs_fapl_config_into(&config, &mut encoded)?;
+    plist_clear_fapl_driver_config(list)?;
+    plist_set(list, "driver", b"hdfs".to_vec())?;
     plist_set(list, "fapl_hdfs_config", encoded)
 }
 
@@ -1239,6 +1252,7 @@ pub fn H5Pget_fapl_hdfs_config(list: &PropertyList) -> Result<Option<HdfsFaplCon
 /// Set the direct file-access driver on the property list.
 #[allow(non_snake_case)]
 pub fn H5Pset_fapl_direct(list: &mut PropertyList) -> Result<()> {
+    plist_clear_fapl_driver_config(list)?;
     plist_set(list, "driver", b"direct".to_vec())
 }
 
@@ -1269,6 +1283,7 @@ pub fn H5Pset_dxpl_mpio_collective_opt(_list: &mut PropertyList) -> Result<()> {
 /// Set the family file-access driver on the property list.
 #[allow(non_snake_case)]
 pub fn H5Pset_fapl_family(list: &mut PropertyList) -> Result<()> {
+    plist_clear_fapl_driver_config(list)?;
     plist_set(list, "driver", b"family".to_vec())
 }
 
@@ -1695,6 +1710,7 @@ pub fn H5P__facc_reg_prop(class: &mut PropertyClass) -> Result<()> {
 /// Set the default `sec2` driver on the FAPL.
 #[allow(non_snake_case)]
 pub fn H5P__facc_set_def_driver(list: &mut PropertyList) -> Result<()> {
+    plist_clear_fapl_driver_config(list)?;
     plist_set(list, "driver", b"sec2".to_vec())
 }
 
@@ -1708,6 +1724,7 @@ pub fn H5P__facc_set_def_driver_check_predefined(name: &str) -> bool {
 #[allow(non_snake_case)]
 pub fn H5P_set_driver(list: &mut PropertyList, name: &str) -> Result<()> {
     if H5P__facc_set_def_driver_check_predefined(name) {
+        plist_clear_fapl_driver_config(list)?;
         plist_set(list, "driver", name.as_bytes().to_vec())
     } else {
         unsupported_driver(name)
@@ -2449,6 +2466,7 @@ pub fn H5Pset_fapl_log(_list: &mut PropertyList) -> Result<()> {
 /// Set the core file-access driver on the property list.
 #[allow(non_snake_case)]
 pub fn H5Pset_fapl_core(list: &mut PropertyList) -> Result<()> {
+    plist_clear_fapl_driver_config(list)?;
     plist_set(list, "driver", b"core".to_vec())
 }
 
@@ -2577,9 +2595,10 @@ pub fn H5Pset_fapl_ros3(list: &mut PropertyList) -> Result<()> {
 /// Set the ROS3 file-access driver with the given configuration.
 #[allow(non_snake_case)]
 pub fn H5Pset_fapl_ros3_config(list: &mut PropertyList, config: Ros3FaplConfig) -> Result<()> {
-    plist_set(list, "driver", b"ros3".to_vec())?;
     let mut encoded = Vec::new();
     H5P__encode_ros3_fapl_config_into(&config, &mut encoded)?;
+    plist_clear_fapl_driver_config(list)?;
+    plist_set(list, "driver", b"ros3".to_vec())?;
     plist_set(list, "fapl_ros3_config", encoded)
 }
 
@@ -2683,13 +2702,29 @@ mod tests {
         let mut buffered = Vec::new();
         H5P__iterate_pclass_into(&class, &mut buffered);
         assert_eq!(buffered, vec!["fill".to_string(), "layout".to_string()]);
+        let mut appended_names = vec!["stale".to_string()];
+        H5P__iterate_pclass_into(&class, &mut appended_names);
+        assert_eq!(
+            appended_names,
+            vec![
+                "stale".to_string(),
+                "fill".to_string(),
+                "layout".to_string()
+            ]
+        );
         let mut list = H5P__create(&class).unwrap();
         assert_eq!(H5P_peek_ref(&list, "layout").unwrap(), &[1]);
         H5P_set(&mut list, "layout", vec![2]).unwrap();
         assert_eq!(H5P__get_size_plist(&list, "layout").unwrap(), 1);
-        let mut copied_layout = Vec::new();
+        let mut copied_layout = b"stale".to_vec();
         H5P__plist_get_into(&list, "layout", &mut copied_layout).unwrap();
-        assert_eq!(copied_layout, vec![2]);
+        assert_eq!(copied_layout, b"stale\x02");
+        H5P__plist_get_into(&list, "missing", &mut copied_layout).unwrap();
+        assert_eq!(copied_layout, b"stale\x02");
+        let mut closed = list.clone();
+        H5P_close(&mut closed);
+        assert!(H5P__plist_get_into(&closed, "layout", &mut copied_layout).is_err());
+        assert_eq!(copied_layout, b"stale\x02");
         assert!(H5P__open_class_path_test(&class, "root/dataset_create"));
         assert!(H5P_remove(&mut list, "layout").is_ok());
     }
@@ -2706,6 +2741,25 @@ mod tests {
         H5P__free_prop(&mut prop);
         assert!(prop.name.is_empty());
         assert!(prop.value.is_empty());
+    }
+
+    #[test]
+    fn closed_property_class_rejects_direct_property_helpers() {
+        let mut class = H5Pcreate_class("dataset_create", None);
+        H5P__register(&mut class, "layout", vec![2]).unwrap();
+        H5P__close_class(&mut class);
+
+        let class_get_error = H5P__class_get_ref(&class, "layout").unwrap_err();
+        assert!(class_get_error
+            .to_string()
+            .contains("property class is closed"));
+        assert!(H5P__get_size_pclass(&class, "layout").is_err());
+        assert!(
+            H5P__copy_prop_pclass(&class, &mut H5Pcreate_class("copy", None), "layout").is_err()
+        );
+        assert!(H5P__class_set(&mut class, "layout", vec![3]).is_err());
+        assert!(H5P__unregister(&mut class, "layout").is_err());
+        assert_eq!(H5P_get_nprops_pclass(&class), 0);
     }
 
     #[test]
@@ -2757,7 +2811,7 @@ mod tests {
     fn property_encoding_roundtrips_scalars() {
         let mut bool_bytes = Vec::new();
         H5P__encode_bool_into(true, &mut bool_bytes);
-        assert_eq!(H5P__decode_bool(&bool_bytes).unwrap(), true);
+        assert!(H5P__decode_bool(&bool_bytes).unwrap());
         let mut uint64_bytes = Vec::new();
         H5P__encode_uint64_t_into(42, &mut uint64_bytes);
         assert_eq!(H5P__decode_uint64_t(&uint64_bytes).unwrap(), 42);

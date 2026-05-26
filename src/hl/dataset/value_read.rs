@@ -345,26 +345,18 @@ impl Dataset {
         field_name: &str,
         out: &mut [T],
     ) -> Result<()> {
-        let mut index = 0usize;
-        let out_len = out.len();
-        self.visit_field(field_name, |value| {
-            let Some(dst) = out.get_mut(index) else {
-                return Err(Error::InvalidFormat(format!(
-                    "field output buffer has too few elements: expected more than {}",
-                    out_len
-                )));
-            };
-            *dst = value;
-            index += 1;
-            Ok(())
-        })?;
-        if index != out_len {
-            Err(Error::InvalidFormat(format!(
-                "field output buffer has {out_len} elements, expected {index}"
-            )))
-        } else {
-            Ok(())
+        let values = self.read_field(field_name)?;
+        if out.len() != values.len() {
+            return Err(Error::InvalidFormat(format!(
+                "field output buffer has {} elements, expected {}",
+                out.len(),
+                values.len()
+            )));
         }
+        for (dst, value) in out.iter_mut().zip(values) {
+            *dst = value;
+        }
+        Ok(())
     }
 
     /// Visit raw bytes for a compound field without collecting per-record buffers.
@@ -420,29 +412,25 @@ impl Dataset {
     /// `out` must be exactly `record_count * field_size` bytes. Bytes for each
     /// selected field are packed contiguously in record order.
     pub fn read_field_raw_into(&self, field_name: &str, out: &mut [u8]) -> Result<()> {
-        let mut offset = 0usize;
-        let out_len = out.len();
-        self.visit_field_raw(field_name, |bytes| {
-            let end = offset.checked_add(bytes.len()).ok_or_else(|| {
-                Error::InvalidFormat("compound field output size overflow".into())
-            })?;
-            let Some(dst) = out.get_mut(offset..end) else {
-                return Err(Error::InvalidFormat(format!(
-                    "raw field output buffer has too few bytes: expected more than {}",
-                    out_len
-                )));
-            };
-            dst.copy_from_slice(bytes);
-            offset = end;
-            Ok(())
+        let values = self.read_field_raw(field_name)?;
+        let expected = values.iter().try_fold(0usize, |len, bytes| {
+            len.checked_add(bytes.len())
+                .ok_or_else(|| Error::InvalidFormat("compound field output size overflow".into()))
         })?;
-        if offset != out_len {
-            Err(Error::InvalidFormat(format!(
-                "raw field output buffer has {out_len} bytes, expected {offset}"
-            )))
-        } else {
-            Ok(())
+        if out.len() != expected {
+            return Err(Error::InvalidFormat(format!(
+                "raw field output buffer has {} bytes, expected {expected}",
+                out.len()
+            )));
         }
+
+        let mut offset = 0usize;
+        for bytes in values {
+            let end = offset + bytes.len();
+            out[offset..end].copy_from_slice(&bytes);
+            offset = end;
+        }
+        Ok(())
     }
 
     /// Read a compound field as recursively decoded high-level values.
@@ -459,11 +447,13 @@ impl Dataset {
 
     /// Read a compound field as recursively decoded high-level values into caller-provided storage.
     pub fn read_field_values_into(&self, field_name: &str, out: &mut Vec<H5Value>) -> Result<()> {
-        out.clear();
+        let mut values = Vec::new();
         self.visit_field_values(field_name, |value| {
-            out.push(value);
+            values.push(value);
             Ok(())
-        })
+        })?;
+        *out = values;
+        Ok(())
     }
 
     /// Visit a compound field as recursively decoded high-level values.

@@ -260,6 +260,12 @@ pub fn get_val(group: &Group, name: &str) -> Result<Option<LinkValue>> {
     get_val_with(group, name, |value| Ok(value.map(LinkValueRef::to_owned)))
 }
 
+pub fn get_val_into(group: &Group, name: &str, out: &mut Option<LinkValue>) -> Result<()> {
+    let value = get_val(group, name)?;
+    *out = value;
+    Ok(())
+}
+
 pub fn get_val_by_idx_cb_borrowed(link: &LinkMessage) -> Option<LinkValueRef<'_>> {
     get_val_cb_borrowed(link)
 }
@@ -286,6 +292,12 @@ where
 
 pub fn get_val_by_idx(group: &Group, index: usize) -> Result<Option<LinkValue>> {
     get_val_by_idx_with(group, index, |value| Ok(value.map(LinkValueRef::to_owned)))
+}
+
+pub fn get_val_by_idx_into(group: &Group, index: usize, out: &mut Option<LinkValue>) -> Result<()> {
+    let value = get_val_by_idx(group, index)?;
+    *out = value;
+    Ok(())
 }
 
 pub fn exists_final_cb(group: &Group, name: &str) -> Result<bool> {
@@ -632,5 +644,71 @@ mod tests {
         assert_eq!(out.hard_link_addr, link.hard_link_addr);
         assert_eq!(out.soft_link_target, link.soft_link_target);
         assert_eq!(out.external_link, link.external_link);
+    }
+
+    #[test]
+    fn link_value_into_replaces_on_success_and_preserves_on_missing_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("link_value_into.h5");
+
+        {
+            let mut writer = crate::hl::writable_file::WritableFile::create(&path).unwrap();
+            writer
+                .new_dataset_builder("hard")
+                .write::<i32>(&[1])
+                .unwrap();
+            writer.link_soft("soft", "/hard").unwrap();
+            writer
+                .link_external("external", "missing.h5", "/remote")
+                .unwrap();
+            writer.flush().unwrap();
+        }
+
+        let file = crate::hl::file::File::open(&path).unwrap();
+        let root = file.root_group().unwrap();
+        let mut value = Some(LinkValue::External {
+            filename: "stale.h5".into(),
+            object_path: "/stale".into(),
+        });
+
+        get_val_into(&root, "soft", &mut value).unwrap();
+        assert_eq!(value, Some(LinkValue::Soft("/hard".into())));
+
+        get_val_into(&root, "hard", &mut value).unwrap();
+        assert_eq!(value, None);
+
+        value = Some(LinkValue::Soft("stale".into()));
+        let err = get_val_into(&root, "missing", &mut value)
+            .expect_err("missing link should fail without touching caller output");
+        assert!(err.to_string().contains("not found"));
+        assert_eq!(value, Some(LinkValue::Soft("stale".into())));
+    }
+
+    #[test]
+    fn link_value_by_idx_into_replaces_on_success_and_preserves_on_missing_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("link_value_by_idx_into.h5");
+
+        {
+            let mut writer = crate::hl::writable_file::WritableFile::create(&path).unwrap();
+            writer.link_soft("soft", "/target").unwrap();
+            writer.flush().unwrap();
+        }
+
+        let file = crate::hl::file::File::open(&path).unwrap();
+        let root = file.root_group().unwrap();
+        let mut value = Some(LinkValue::External {
+            filename: "stale.h5".into(),
+            object_path: "/stale".into(),
+        });
+
+        get_val_by_idx_into(&root, 0, &mut value).unwrap();
+        assert_eq!(value, Some(LinkValue::Soft("/target".into())));
+
+        value = Some(LinkValue::Soft("stale".into()));
+        let err = get_val_by_idx_into(&root, 1, &mut value)
+            .expect_err("missing link index should fail without touching caller output");
+        assert!(err.to_string().contains("out of bounds"));
+        assert_eq!(value, Some(LinkValue::Soft("stale".into())));
     }
 }

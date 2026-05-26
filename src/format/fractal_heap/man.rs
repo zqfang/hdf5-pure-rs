@@ -11,7 +11,7 @@ use crate::io::reader::HdfReader;
 use super::iblock::{FilteredIndirectBlock, IndirectBlock};
 use super::{
     DirectBlockSpan, FilteredIndirectBlockCacheKey, FractalHeapHeader,
-    FractalHeapManagedObjectCache, IndirectBlockCacheKey,
+    FractalHeapManagedObjectCache, FractalHeapManagedObjectLocation, IndirectBlockCacheKey,
 };
 
 impl FractalHeapHeader {
@@ -94,6 +94,113 @@ impl FractalHeapHeader {
                 op,
             )
         }
+    }
+
+    pub(crate) fn managed_object_location<R: Read + Seek>(
+        &self,
+        reader: &mut HdfReader<R>,
+        heap_id: &[u8],
+    ) -> Result<FractalHeapManagedObjectLocation> {
+        match heap_id.first().copied() {
+            Some(id) if ((id >> 4) & 0x03) == 0 => {}
+            Some(id) => {
+                return Err(Error::Unsupported(format!(
+                    "dense heap ID type {} cannot be rewritten in place",
+                    (id >> 4) & 0x03
+                )));
+            }
+            None => return Err(Error::InvalidFormat("dense heap ID is truncated".into())),
+        }
+        if self.io_filter_len != 0 {
+            return Err(Error::Unsupported(
+                "mutating filtered dense heap objects is not implemented".into(),
+            ));
+        }
+
+        let (offset, length) = self.decode_managed_heap_id(heap_id)?;
+        if self.current_root_rows == 0 {
+            validate_location_range(self.start_block_size, offset, length)?;
+            return Ok(FractalHeapManagedObjectLocation {
+                block_addr: self.root_block_addr,
+                block_size: self.start_block_size,
+                object_offset: offset,
+            });
+        }
+
+        self.managed_object_location_in_indirect_block(
+            reader,
+            self.root_block_addr,
+            usize::from(self.current_root_rows),
+            0,
+            offset,
+            length,
+        )
+    }
+
+    fn managed_object_location_in_indirect_block<R: Read + Seek>(
+        &self,
+        reader: &mut HdfReader<R>,
+        block_addr: u64,
+        nrows: usize,
+        block_start: u64,
+        offset: u64,
+        length: u64,
+    ) -> Result<FractalHeapManagedObjectLocation> {
+        let iblock = self.decode_indirect_block(reader, block_addr, nrows)?;
+        let width = usize::from(self.table_width);
+        let max_direct_rows = self.max_direct_rows_checked()?;
+        let mut current_heap_offset = block_start;
+        let mut entry_index = 0usize;
+
+        for row in 0..iblock.nrows {
+            if row < max_direct_rows {
+                let block_size = self.checked_row_block_size(row)?;
+                for _ in 0..width {
+                    let child_addr = iblock.child_addrs[entry_index];
+                    entry_index += 1;
+                    let block_end = checked_add_heap_offset(current_heap_offset, block_size)?;
+                    if offset >= current_heap_offset && offset < block_end {
+                        if crate::io::reader::is_undef_addr(child_addr) {
+                            break;
+                        }
+                        let object_offset = offset - current_heap_offset;
+                        validate_location_range(block_size, object_offset, length)?;
+                        return Ok(FractalHeapManagedObjectLocation {
+                            block_addr: child_addr,
+                            block_size,
+                            object_offset,
+                        });
+                    }
+                    current_heap_offset = block_end;
+                }
+            } else {
+                let child_rows = self.child_indirect_rows(row)?;
+                let child_span = self.indirect_data_span(reader, child_rows)?;
+                for _ in 0..width {
+                    let child_addr = iblock.child_addrs[entry_index];
+                    entry_index += 1;
+                    let child_end = checked_add_heap_offset(current_heap_offset, child_span)?;
+                    if offset >= current_heap_offset && offset < child_end {
+                        if crate::io::reader::is_undef_addr(child_addr) {
+                            break;
+                        }
+                        return self.managed_object_location_in_indirect_block(
+                            reader,
+                            child_addr,
+                            child_rows,
+                            current_heap_offset,
+                            offset,
+                            length,
+                        );
+                    }
+                    current_heap_offset = child_end;
+                }
+            }
+        }
+
+        Err(Error::InvalidFormat(format!(
+            "fractal heap offset {offset} not found in indirect block"
+        )))
     }
 
     fn decode_managed_heap_id(&self, heap_id: &[u8]) -> Result<(u64, u64)> {
@@ -628,6 +735,18 @@ fn read_le_u64_prefix(bytes: &[u8], len: usize, context: &str) -> Result<u64> {
         value |= u64::from(*byte) << (i * 8);
     }
     Ok(value)
+}
+
+fn validate_location_range(block_size: u64, offset: u64, length: u64) -> Result<()> {
+    let end = offset
+        .checked_add(length)
+        .ok_or_else(|| Error::InvalidFormat("fractal heap object range overflow".into()))?;
+    if end > block_size {
+        return Err(Error::InvalidFormat(
+            "fractal heap object exceeds direct block".into(),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

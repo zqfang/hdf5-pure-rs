@@ -39,6 +39,34 @@ fn t11a_be_filters() {
 }
 
 #[test]
+fn t11a_c_suite_nbit_custom_float_read() {
+    let expected = [
+        0.333344, 0.666687, 1.0, 1.33337, 1.66663, 2.0, 0.666687, 1.0, 1.33337, 1.66663, 2.0,
+        2.33325, 1.0, 1.33337, 1.66663, 2.0, 2.33325, 2.66675, 1.33337, 1.66663, 2.0, 2.33325,
+        2.66675, 3.0, 1.66663, 2.0, 2.33325, 2.66675, 3.0, 3.33325, 2.0, 2.33325, 2.66675, 3.0,
+        3.33325, 3.66675, -2.19995, -2.19995, -2.19995, -2.19995, -2.19995, -2.19995,
+    ];
+
+    for (file_name, nbit_name) in [
+        ("le_data.h5", "Nbit_float_data_le"),
+        ("be_data.h5", "Nbit_float_data_be"),
+    ] {
+        let f = File::open(&format!("{REF_DIR}/{file_name}")).unwrap();
+        let ds = f.dataset(nbit_name).unwrap();
+        assert_eq!(ds.shape().unwrap(), vec![7, 6]);
+
+        let mut values = vec![0.0f32; ds.size().unwrap() as usize];
+        ds.read_into(&mut values).unwrap();
+        for (actual, expected) in values.iter().zip(expected) {
+            assert!(
+                (*actual - expected).abs() < 0.0001,
+                "{file_name} {nbit_name}: expected {expected}, got {actual}"
+            );
+        }
+    }
+}
+
+#[test]
 fn t11a_typed_read_be() {
     // Read big-endian data with byte-swap
     let f = File::open("tests/data/bigendian.h5").unwrap();

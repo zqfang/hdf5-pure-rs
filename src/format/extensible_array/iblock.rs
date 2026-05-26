@@ -92,11 +92,14 @@ pub(super) fn cache_iblock_serialize_into(
     let image_len = prefix_and_payload.len().checked_add(4).ok_or_else(|| {
         Error::InvalidFormat("extensible array index block image length overflow".into())
     })?;
-    out.clear();
-    out.reserve(image_len);
-    out.extend_from_slice(prefix_and_payload);
-    let checksum = crate::format::checksum::checksum_metadata(&out);
-    out.extend_from_slice(&checksum.to_le_bytes());
+    let mut image = Vec::new();
+    image.try_reserve_exact(image_len).map_err(|_| {
+        Error::InvalidFormat("extensible array index block image allocation failed".into())
+    })?;
+    image.extend_from_slice(prefix_and_payload);
+    let checksum = crate::format::checksum::checksum_metadata(&image);
+    image.extend_from_slice(&checksum.to_le_bytes());
+    *out = image;
     Ok(())
 }
 
@@ -432,5 +435,23 @@ mod tests {
             Err(err) => err,
         };
         assert!(err.to_string().contains("checksum"));
+    }
+
+    #[test]
+    fn extensible_array_index_block_cache_serialize_replaces_stale_output() {
+        let mut prefix = b"EAIB".to_vec();
+        prefix.push(0);
+        prefix.push(1);
+        prefix.extend_from_slice(&100u64.to_le_bytes());
+        prefix.extend_from_slice(&55u64.to_le_bytes());
+
+        let mut image = b"stale".to_vec();
+        cache_iblock_serialize_into(&prefix, &mut image).unwrap();
+        assert_eq!(image.len(), prefix.len() + 4);
+        assert_eq!(&image[..prefix.len()], prefix.as_slice());
+        assert_eq!(
+            u32::from_le_bytes(image[image.len() - 4..].try_into().unwrap()),
+            checksum_metadata(&prefix)
+        );
     }
 }

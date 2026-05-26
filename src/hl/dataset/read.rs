@@ -134,6 +134,7 @@ impl Dataset {
                         Self::read_external_raw_data_into(
                             &mut guard.reader,
                             path.as_deref(),
+                            access,
                             &info,
                             out,
                         )?;

@@ -52,8 +52,117 @@ fn test_dataset_read_into_uses_caller_buffers() {
     ds.read_into(&mut widened).unwrap();
     assert_eq!(widened, [10.0, 20.0, 30.0]);
 
-    let mut too_short = [0i32; 2];
+    let mut too_short = [-7i32, -8];
     assert!(ds.read_into(&mut too_short).is_err());
+    assert_eq!(too_short, [-7, -8]);
+}
+
+#[test]
+fn test_dataset_read_allocating_applies_typed_conversion() {
+    let f = File::open("tests/data/datasets_v0.h5").unwrap();
+    let ds = f.dataset("int32_1d").unwrap();
+
+    let narrowed = ds.read::<i16>().unwrap();
+    assert_eq!(narrowed, vec![10, 20, 30]);
+
+    let as_float = ds.read::<f32>().unwrap();
+    assert_eq!(as_float, vec![10.0, 20.0, 30.0]);
+}
+
+#[test]
+fn test_converted_dataset_read_into_preserves_output_on_wrong_length() {
+    let f = File::open("tests/data/datasets_v0.h5").unwrap();
+    let ds = f.dataset("int32_1d").unwrap();
+    let mut stale = [-7i16, -8];
+
+    let err = ds
+        .read_into(&mut stale)
+        .expect_err("converted full-dataset reads should reject the wrong output length");
+    assert!(
+        err.to_string().contains("output buffer"),
+        "unexpected error: {err}"
+    );
+    assert_eq!(stale, [-7, -8]);
+}
+
+#[test]
+fn test_unsigned_integer_conversion_read_slice_into() {
+    let f = File::open("tests/data/hdf5_ref/integer_conversion_vectors.h5").unwrap();
+    let ds = f.dataset("u16_conversion").unwrap();
+
+    let mut to_signed = [0i8; 7];
+    ds.read_slice_into::<i8, _>(1..8, &mut to_signed).unwrap();
+    assert_eq!(to_signed, [1, 127, 127, 127, 127, 127, 127]);
+
+    let mut narrowed = [0u8; 6];
+    ds.read_slice_into::<u8, _>(3..9, &mut narrowed).unwrap();
+    assert_eq!(narrowed, [128, 255, 255, 255, 255, 255]);
+}
+
+#[test]
+fn test_converted_read_slice_into_preserves_output_on_wrong_length() {
+    let f = File::open("tests/data/hdf5_ref/integer_conversion_vectors.h5").unwrap();
+    let ds = f.dataset("u16_conversion").unwrap();
+    let mut stale = [-5i8, -6, -7];
+
+    let err = ds
+        .read_slice_into::<i8, _>(1..5, &mut stale)
+        .expect_err("converted selected reads should reject the wrong output length");
+    assert!(
+        err.to_string().contains("slice output buffer"),
+        "unexpected error: {err}"
+    );
+    assert_eq!(stale, [-5, -6, -7]);
+}
+
+#[test]
+fn test_float_conversion_read_slice_into() {
+    let f = File::open("tests/data/hdf5_ref/float_conversion_vectors.h5").unwrap();
+    let ds = f.dataset("f64_conversion").unwrap();
+
+    let mut narrowed = [0.0f32; 8];
+    ds.read_slice_into::<f32, _>(1..9, &mut narrowed).unwrap();
+    assert_eq!(
+        narrowed.map(f32::to_bits),
+        [
+            (-129.75f32).to_bits(),
+            (-1.5f32).to_bits(),
+            (-0.0f32).to_bits(),
+            0.0f32.to_bits(),
+            1.5f32.to_bits(),
+            127.25f32.to_bits(),
+            128.75f32.to_bits(),
+            f32::INFINITY.to_bits(),
+        ]
+    );
+
+    let mut to_integer = [0i16; 8];
+    ds.read_slice_into::<i16, _>(1..9, &mut to_integer).unwrap();
+    assert_eq!(to_integer, [-129, -1, 0, 0, 1, 127, 128, i16::MAX]);
+
+    let ds = f.dataset("i16_to_float_conversion").unwrap();
+    let mut to_float = [0.0f64; 5];
+    ds.read_slice_into::<f64, _>(1..6, &mut to_float).unwrap();
+    assert_eq!(to_float, [-1.0, 0.0, 1.0, 127.0, 128.0]);
+}
+
+#[test]
+fn test_big_endian_float_conversion_read_slice_into() {
+    let f = File::open("tests/data/hdf5_ref/float_conversion_vectors.h5").unwrap();
+    let ds = f.dataset("be_f32_conversion").unwrap();
+
+    let mut widened = [0.0f64; 6];
+    ds.read_slice_into::<f64, _>(1..7, &mut widened).unwrap();
+    assert_eq!(
+        widened
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>(),
+        [-129.75, -1.5, -0.0, 0.0, 1.5, 127.25]
+            .iter()
+            .map(|value: &f64| value.to_bits())
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -66,6 +175,9 @@ fn test_read_scalar_typed() {
     let mut val32 = 0.0f32;
     ds.read_scalar_into(&mut val32).unwrap();
     assert_eq!(val32, 42.0);
+
+    let narrowed: i32 = ds.read_scalar().unwrap();
+    assert_eq!(narrowed, 42);
 }
 
 #[test]
@@ -143,6 +255,22 @@ fn test_raw_message_inspection_apis() {
 }
 
 #[test]
+fn test_h5type_output_helpers_clear_when_unsupported() {
+    let mut fields = vec![hdf5_pure_rust::hl::types::FieldDescriptor {
+        name: "stale".to_string(),
+        offset: 1,
+        size: 1,
+        type_class: hdf5_pure_rust::hl::types::TypeClass::Integer { signed: false },
+    }];
+    assert!(u8::compound_fields_into(&mut fields).is_none());
+    assert!(fields.is_empty());
+
+    let mut members = vec![("stale".to_string(), 7)];
+    assert!(u8::enum_members_into(&mut members).is_none());
+    assert!(members.is_empty());
+}
+
+#[test]
 fn test_read_chunked_typed() {
     let f = File::open("tests/data/datasets_v0.h5").unwrap();
     let ds = f.dataset("chunked").unwrap();
@@ -197,6 +325,16 @@ fn test_attribute_read_into_uses_caller_buffers() {
     let mut values32 = [0.0f32; 3];
     attr.read_into(&mut values32).unwrap();
     assert_eq!(values32, [1.0, 2.0, 3.0]);
+
+    let mut too_short = [-7.0f32, -8.0];
+    let err = attr
+        .read_into(&mut too_short)
+        .expect_err("converted attribute reads should reject the wrong output length");
+    assert!(
+        err.to_string().contains("attribute typed output buffer"),
+        "unexpected error: {err}"
+    );
+    assert_eq!(too_short, [-7.0, -8.0]);
 }
 
 #[test]
@@ -228,7 +366,7 @@ fn test_read_array_datatype_into_matching_typed_cells() {
         ]
     );
 
-    let mut flattened = [0i16; 12];
+    let mut flattened = [-1i16; 12];
     let err = ds
         .read_into(&mut flattened)
         .expect_err("array datatype reads should preserve dataspace element boundaries");
@@ -236,4 +374,5 @@ fn test_read_array_datatype_into_matching_typed_cells() {
         err.to_string().contains("requested element size 2"),
         "unexpected error: {err}"
     );
+    assert_eq!(flattened, [-1; 12]);
 }

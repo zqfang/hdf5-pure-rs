@@ -177,9 +177,25 @@ pub fn H5Mget_key_type(map: &H5Map) -> Result<&str> {
 }
 
 #[allow(non_snake_case)]
+pub fn H5Mget_key_type_into(map: &H5Map, out: &mut String) -> Result<()> {
+    let key_type = H5Mget_key_type(map)?;
+    out.clear();
+    out.push_str(key_type);
+    Ok(())
+}
+
+#[allow(non_snake_case)]
 pub fn H5Mget_val_type(map: &H5Map) -> Result<&str> {
     map.ensure_open()?;
     Ok(&map.value_type)
+}
+
+#[allow(non_snake_case)]
+pub fn H5Mget_val_type_into(map: &H5Map, out: &mut String) -> Result<()> {
+    let value_type = H5Mget_val_type(map)?;
+    out.clear();
+    out.push_str(value_type);
+    Ok(())
 }
 
 #[allow(non_snake_case)]
@@ -358,10 +374,12 @@ where
         ));
     }
     for (offset, (key, value)) in map.entries.iter().enumerate().skip(*idx) {
-        *idx = offset + 1;
+        let next_idx = offset + 1;
         if callback(key, value)?.should_stop() {
+            *idx = next_idx;
             break;
         }
+        *idx = next_idx;
     }
     Ok(())
 }
@@ -369,6 +387,7 @@ where
 #[allow(non_snake_case)]
 pub fn H5M_iterate_into(map: &H5Map, entries: &mut Vec<(Vec<u8>, Vec<u8>)>) -> Result<()> {
     map.ensure_open()?;
+    entries.clear();
     entries.reserve(map.entries.len());
     H5M_iterate_with(map, |key, value| {
         entries.push((key.to_vec(), value.to_vec()));
@@ -404,10 +423,12 @@ where
         ));
     }
     for (offset, (key, _value)) in map.entries.iter().enumerate().skip(*idx) {
-        *idx = offset + 1;
+        let next_idx = offset + 1;
         if callback(key)?.should_stop() {
+            *idx = next_idx;
             break;
         }
+        *idx = next_idx;
     }
     Ok(())
 }
@@ -581,6 +602,14 @@ mod tests {
 
         H5Mexists_into(&map, b"missing", &mut exists).unwrap();
         assert!(!exists);
+
+        let mut key_type = String::from("stale");
+        H5Mget_key_type_into(&map, &mut key_type).unwrap();
+        assert_eq!(key_type, "u8");
+
+        let mut value_type = String::from("stale");
+        H5Mget_val_type_into(&map, &mut value_type).unwrap();
+        assert_eq!(value_type, "bytes");
     }
 
     #[test]
@@ -619,6 +648,28 @@ mod tests {
     }
 
     #[test]
+    fn map_api_iterate_into_replaces_stale_output() {
+        let mut map = H5Mcreate("file", "map", "u8", "bytes");
+        H5Mput(&mut map, b"a".to_vec(), b"1".to_vec()).unwrap();
+        H5Mput(&mut map, b"b".to_vec(), b"2".to_vec()).unwrap();
+
+        let mut entries = vec![(b"stale".to_vec(), b"value".to_vec())];
+        H5M_iterate_into(&map, &mut entries).unwrap();
+        assert_eq!(
+            entries,
+            vec![
+                (b"a".to_vec(), b"1".to_vec()),
+                (b"b".to_vec(), b"2".to_vec())
+            ]
+        );
+
+        H5Mdelete(&mut map, b"a").unwrap();
+        H5Mdelete(&mut map, b"b").unwrap();
+        H5Miterate_into(&map, &mut entries).unwrap();
+        assert!(entries.is_empty());
+    }
+
+    #[test]
     fn map_api_out_parameter_queries_require_open_map() {
         let mut map = H5Mcreate("file", "map", "u8", "bytes");
         H5Mput(&mut map, b"k".to_vec(), b"v".to_vec()).unwrap();
@@ -627,6 +678,14 @@ mod tests {
         let mut count = usize::MAX;
         assert!(H5Mget_count_into(&map, &mut count).is_err());
         assert_eq!(count, usize::MAX);
+
+        let mut key_type = String::from("stale-key");
+        assert!(H5Mget_key_type_into(&map, &mut key_type).is_err());
+        assert_eq!(key_type, "stale-key");
+
+        let mut value_type = String::from("stale-value");
+        assert!(H5Mget_val_type_into(&map, &mut value_type).is_err());
+        assert_eq!(value_type, "stale-value");
 
         let mut exists = true;
         assert!(H5Mexists_into(&map, b"k", &mut exists).is_err());
@@ -643,10 +702,40 @@ mod tests {
 
     #[test]
     fn named_map_iteration_is_explicit_unsupported_boundary() {
-        let mut idx = 0;
+        let mut idx = 7;
         let err = H5Miterate_by_name("file", "map", &mut idx)
             .expect_err("named H5M iteration requires libhdf5 map behavior");
-        assert!(matches!(err, Error::Unsupported(_)));
-        assert_eq!(idx, 0);
+        assert_eq!(
+            err.to_string(),
+            "Unsupported: H5Miterate_by_name requires libhdf5 map behavior not implemented in pure-Rust mode"
+        );
+        assert_eq!(idx, 7);
+    }
+
+    #[test]
+    fn map_iteration_preserves_failed_callback_index() {
+        let mut map = H5Mcreate("file", "map", "u8", "bytes");
+        H5Mput(&mut map, b"a".to_vec(), b"1".to_vec()).unwrap();
+        H5Mput(&mut map, b"b".to_vec(), b"2".to_vec()).unwrap();
+        H5Mput(&mut map, b"c".to_vec(), b"3".to_vec()).unwrap();
+
+        let mut idx = 1;
+        let err = H5Miterate_from_with(&map, &mut idx, |key, value| {
+            assert_eq!(key, b"b");
+            assert_eq!(value, b"2");
+            Err::<(), _>(Error::InvalidFormat("callback failure".into()))
+        })
+        .expect_err("callback error should propagate");
+        assert!(matches!(err, Error::InvalidFormat(_)));
+        assert_eq!(idx, 1);
+
+        let mut idx = 1;
+        let err = H5Miterate(&map, &mut idx, |key| {
+            assert_eq!(key, b"b");
+            Err::<(), _>(Error::InvalidFormat("callback failure".into()))
+        })
+        .expect_err("callback error should propagate");
+        assert!(matches!(err, Error::InvalidFormat(_)));
+        assert_eq!(idx, 1);
     }
 }

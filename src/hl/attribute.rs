@@ -1241,15 +1241,17 @@ impl Attribute {
 
     /// Read the first string element into caller-provided storage.
     pub fn read_string_into(&self, out: &mut String) -> Result<()> {
-        out.clear();
+        let mut next = String::new();
         let mut seen = false;
         self.visit_strings(|value| {
             if !seen {
-                out.push_str(value);
+                next.push_str(value);
                 seen = true;
             }
             Ok(())
-        })
+        })?;
+        *out = next;
+        Ok(())
     }
 
     /// Read the attribute as string elements.
@@ -2116,6 +2118,104 @@ mod tests {
         ));
         assert_eq!(attr.raw_datatype_message_ref().class, DatatypeClass::String);
         assert_eq!(attr.raw_dataspace_message_ref().dims, &[2]);
+    }
+
+    #[test]
+    fn attribute_caller_owned_reads_preserve_output_on_errors() {
+        let invalid_string_attr = Attribute {
+            msg: crate::format::messages::attribute::AttributeMessage {
+                version: 3,
+                name: "labels".to_string(),
+                char_encoding: 0,
+                datatype: DatatypeMessage {
+                    version: 1,
+                    class: DatatypeClass::String,
+                    class_bits: [0, 0, 0],
+                    size: 4,
+                    properties: vec![1, 0, 0, 0],
+                },
+                dataspace: DataspaceMessage {
+                    version: 2,
+                    space_type: DataspaceType::Simple,
+                    ndims: 1,
+                    dims: vec![2],
+                    max_dims: None,
+                },
+                data: b"ok\0\0\xff\0\0\0".to_vec(),
+            },
+            creation_order: None,
+            inner: None,
+            object_id: None,
+        };
+        let mut text = String::from("stale");
+        let err = invalid_string_attr
+            .read_string_into(&mut text)
+            .expect_err("invalid UTF-8 should fail");
+        assert!(err.to_string().contains("not UTF-8"));
+        assert_eq!(text, "stale");
+
+        let numeric_attr = Attribute {
+            msg: default_attribute_message("count", 42i32.to_le_bytes().to_vec()).unwrap(),
+            creation_order: None,
+            inner: None,
+            object_id: None,
+        };
+        let mut text = String::from("stale");
+        let err = numeric_attr
+            .read_string_into(&mut text)
+            .expect_err("numeric attribute should not decode as a string");
+        assert!(err.to_string().contains("not a string attribute"));
+        assert_eq!(text, "stale");
+
+        let mut raw = [9u8; 3];
+        let err = numeric_attr
+            .read_raw_into(&mut raw)
+            .expect_err("wrong raw output size should fail");
+        assert!(err.to_string().contains("raw output buffer"));
+        assert_eq!(raw, [9, 9, 9]);
+
+        let mut typed = [7i16; 2];
+        let err = numeric_attr
+            .read_into(&mut typed)
+            .expect_err("wrong typed output size should fail");
+        assert!(err.to_string().contains("output buffer"));
+        assert_eq!(typed, [7, 7]);
+
+        let unsupported_float_attr = Attribute {
+            msg: crate::format::messages::attribute::AttributeMessage {
+                version: 3,
+                name: "half".to_string(),
+                char_encoding: 0,
+                datatype: DatatypeMessage {
+                    version: 1,
+                    class: DatatypeClass::FloatingPoint,
+                    class_bits: [0, 0, 0],
+                    size: 2,
+                    properties: vec![0, 0, 0, 0],
+                },
+                dataspace: DataspaceMessage {
+                    version: 2,
+                    space_type: DataspaceType::Simple,
+                    ndims: 1,
+                    dims: vec![1],
+                    max_dims: None,
+                },
+                data: 1.0f32.to_le_bytes()[..2].to_vec(),
+            },
+            creation_order: None,
+            inner: None,
+            object_id: None,
+        };
+        let mut converted = [123i16];
+        let err = unsupported_float_attr
+            .read_into(&mut converted)
+            .expect_err("unsupported attribute conversion should fail");
+        assert!(
+            err.to_string()
+                .contains("floating-point conversion supports 4- and 8-byte source payloads"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(converted, [123]);
     }
 
     #[test]

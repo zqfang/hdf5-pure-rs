@@ -90,6 +90,7 @@ impl<W: Write + Seek> HdfWriter<W> {
 
     /// Write a variable-width unsigned integer (1-8 bytes, little-endian).
     pub fn write_uint(&mut self, val: u64, size: u8) -> Result<()> {
+        ensure_uint_fits(val, size)?;
         match size {
             1 => self.write_u8(val as u8),
             2 => self.write_u16(val as u16),
@@ -104,6 +105,9 @@ impl<W: Write + Seek> HdfWriter<W> {
 
     /// Write a file address (variable width based on sizeof_addr).
     pub fn write_addr(&mut self, val: u64) -> Result<()> {
+        if val == crate::io::reader::UNDEF_ADDR {
+            return self.write_undefined_addr();
+        }
         self.write_uint(val, self.sizeof_addr)
     }
 
@@ -114,13 +118,22 @@ impl<W: Write + Seek> HdfWriter<W> {
 
     /// Write a variable-length encoded integer (1-8 bytes).
     pub fn write_var_uint(&mut self, val: u64, nbytes: u8) -> Result<()> {
-        if nbytes == 0 || nbytes > 8 {
-            return Err(Error::InvalidFormat(format!(
-                "invalid variable uint size: {nbytes}"
-            )));
-        }
+        ensure_uint_fits(val, nbytes)?;
         for i in 0..nbytes {
             self.write_u8((val >> (i * 8)) as u8)?;
+        }
+        Ok(())
+    }
+
+    fn write_undefined_addr(&mut self) -> Result<()> {
+        if self.sizeof_addr == 0 || self.sizeof_addr > 8 {
+            return Err(Error::InvalidFormat(format!(
+                "unsupported integer size: {}",
+                self.sizeof_addr
+            )));
+        }
+        for _ in 0..self.sizeof_addr {
+            self.write_u8(0xff)?;
         }
         Ok(())
     }
@@ -157,6 +170,24 @@ impl<W: Write + Seek> HdfWriter<W> {
     pub fn inner(&self) -> &W {
         &self.inner
     }
+}
+
+fn ensure_uint_fits(val: u64, size: u8) -> Result<()> {
+    let max = match size {
+        1..=7 => (1u64 << (u32::from(size) * 8)) - 1,
+        8 => u64::MAX,
+        0 | 9..=u8::MAX => {
+            return Err(Error::InvalidFormat(format!(
+                "unsupported integer size: {size}"
+            )));
+        }
+    };
+    if val > max {
+        return Err(Error::InvalidFormat(format!(
+            "integer value {val} does not fit in {size} bytes"
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -216,6 +247,41 @@ mod tests {
         w.write_uint(0xabcdef, 3).unwrap();
 
         assert_eq!(buf.into_inner(), vec![0xef, 0xcd, 0xab]);
+    }
+
+    #[test]
+    fn write_uint_rejects_truncating_values_without_partial_output() {
+        let mut buf = Cursor::new(vec![0xaa]);
+        buf.set_position(1);
+        let mut w = HdfWriter::new(&mut buf);
+
+        let err = w.write_uint(0x1_000000, 3).unwrap_err();
+
+        assert!(err.to_string().contains("does not fit in 3 bytes"));
+        assert_eq!(buf.into_inner(), vec![0xaa]);
+    }
+
+    #[test]
+    fn write_var_uint_rejects_truncating_values_without_partial_output() {
+        let mut buf = Cursor::new(vec![0xaa]);
+        buf.set_position(1);
+        let mut w = HdfWriter::new(&mut buf);
+
+        let err = w.write_var_uint(0x1_0000, 2).unwrap_err();
+
+        assert!(err.to_string().contains("does not fit in 2 bytes"));
+        assert_eq!(buf.into_inner(), vec![0xaa]);
+    }
+
+    #[test]
+    fn write_addr_encodes_undefined_sentinel_at_configured_width() {
+        let mut buf = Cursor::new(Vec::new());
+        let mut w = HdfWriter::new(&mut buf);
+        w.set_sizeof_addr(4);
+
+        w.write_addr(crate::io::reader::UNDEF_ADDR).unwrap();
+
+        assert_eq!(buf.into_inner(), vec![0xff, 0xff, 0xff, 0xff]);
     }
 
     #[test]

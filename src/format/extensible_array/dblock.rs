@@ -72,12 +72,15 @@ pub(super) fn cache_dblock_serialize_into(
         .ok_or_else(|| {
             Error::InvalidFormat("extensible array data block image length overflow".into())
         })?;
-    out.clear();
-    out.reserve(image_len);
-    out.extend_from_slice(prefix);
-    out.extend_from_slice(payload);
-    let checksum = crate::format::checksum::checksum_metadata(&out);
-    out.extend_from_slice(&checksum.to_le_bytes());
+    let mut image = Vec::new();
+    image.try_reserve_exact(image_len).map_err(|_| {
+        Error::InvalidFormat("extensible array data block image allocation failed".into())
+    })?;
+    image.extend_from_slice(prefix);
+    image.extend_from_slice(payload);
+    let checksum = crate::format::checksum::checksum_metadata(&image);
+    image.extend_from_slice(&checksum.to_le_bytes());
+    *out = image;
     Ok(())
 }
 
@@ -123,11 +126,14 @@ pub(super) fn cache_dblk_page_deserialize(payload: &[u8]) -> Result<&[u8]> {
 /// Serialize a data-block page to its on-disk image (payload + checksum).
 pub(super) fn cache_dblk_page_serialize_into(payload: &[u8], out: &mut Vec<u8>) -> Result<()> {
     let image_len = cache_dblk_page_image_len(payload.len())?;
-    out.clear();
-    out.reserve(image_len);
-    out.extend_from_slice(payload);
-    let checksum = crate::format::checksum::checksum_metadata(&out);
-    out.extend_from_slice(&checksum.to_le_bytes());
+    let mut image = Vec::new();
+    image.try_reserve_exact(image_len).map_err(|_| {
+        Error::InvalidFormat("extensible array data block page image allocation failed".into())
+    })?;
+    image.extend_from_slice(payload);
+    let checksum = crate::format::checksum::checksum_metadata(&image);
+    image.extend_from_slice(&checksum.to_le_bytes());
+    *out = image;
     Ok(())
 }
 
@@ -376,12 +382,12 @@ pub(super) fn append_data_block_elements_with_scratch<R: Read + Seek>(
         data_block_addr,
         data_block_elements,
     )?;
+    if count > data_block_elements {
+        return Err(Error::InvalidFormat(
+            "extensible array data block read count exceeds data block elements".into(),
+        ));
+    }
     if prefix.pages == 0 {
-        if count > data_block_elements {
-            return Err(Error::InvalidFormat(
-                "extensible array data block read count exceeds data block elements".into(),
-            ));
-        }
         let prefix_payload_size =
             extensible_array_prefix_payload_size(usize::from(reader.sizeof_addr()), header)?;
         let payload_size = super::checked_usize_mul(
@@ -643,7 +649,7 @@ mod tests {
     #[test]
     fn extensible_array_page_cache_serializes_and_validates_checksum() {
         let payload = 55u64.to_le_bytes();
-        let mut image = Vec::new();
+        let mut image = b"stale".to_vec();
         cache_dblk_page_serialize_into(&payload, &mut image).unwrap();
         assert_eq!(
             cache_dblk_page_image_len(payload.len()).unwrap(),
@@ -656,5 +662,36 @@ mod tests {
         bad[last] ^= 0xff;
         assert!(cache_dblk_page_deserialize(&bad).is_err());
         assert!(cache_dblk_page_deserialize(&bad[..3]).is_err());
+    }
+
+    #[test]
+    fn extensible_array_paginated_rejects_read_count_past_block_elements() {
+        let mut bytes = extensible_array_prefix(100);
+        append_checksum(&mut bytes);
+
+        let mut elements = vec![FixedArrayElement {
+            addr: 7,
+            nbytes: None,
+            filter_mask: 0,
+        }];
+        let mut reader = HdfReader::new(Cursor::new(bytes));
+        let err = append_data_block_elements(
+            &mut reader,
+            100,
+            &header(1),
+            false,
+            0,
+            0,
+            2,
+            Some(&[0x80]),
+            3,
+            &mut elements,
+        )
+        .expect_err("paginated data block over-read should fail");
+        assert!(err
+            .to_string()
+            .contains("read count exceeds data block elements"));
+        assert_eq!(elements.len(), 1);
+        assert_eq!(elements[0].addr, 7);
     }
 }

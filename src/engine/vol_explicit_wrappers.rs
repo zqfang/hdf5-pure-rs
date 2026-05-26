@@ -8,7 +8,7 @@ use super::{
     H5VL__register_connector_by_value, H5VL__set_def_conn, H5VL__wrap_obj, H5VL_conn_dec_rc,
     H5VL_conn_inc_rc, H5VL_new_vol_obj, H5VL_object_unwrap, H5VL_pass_through_get_wrap_ctx,
     H5VL_restore_lib_state, H5VL_retrieve_lib_state, H5VL_wrap_register, VolConnector, VolLibState,
-    VolObject, VolRegistry,
+    VolObject, VolRegistry, VolSubclass,
 };
 use crate::error::{Error, Result};
 use std::fmt;
@@ -397,6 +397,21 @@ pub fn H5VLget_connector_id_by_name(registry: &VolRegistry, name: &str) -> Optio
 /// Look up a connector id by value.
 pub fn H5VLget_connector_id_by_value(registry: &VolRegistry, value: u64) -> Option<u64> {
     H5VL__get_connector_by_value(registry, value).map(|connector| connector.id)
+}
+
+/// Return the connector id attached to a VOL object.
+pub fn H5VLget_connector_id(object: &VolObject) -> u64 {
+    object.connector_id
+}
+
+/// Test whether a connector name is registered.
+pub fn H5VLis_connector_registered_by_name(registry: &VolRegistry, name: &str) -> bool {
+    H5VL__get_connector_by_name(registry, name).is_some()
+}
+
+/// Test whether a connector value is registered.
+pub fn H5VLis_connector_registered_by_value(registry: &VolRegistry, value: u64) -> bool {
+    H5VL__get_connector_by_value(registry, value).is_some()
 }
 
 /// Borrow the name of a connector by id.
@@ -1035,6 +1050,30 @@ pub fn H5VLobject_get(object: &VolObject) -> &str {
     &object.name
 }
 
+/// VOL wrapper: query whether an object is managed by the native connector.
+pub fn H5VLobject_is_native(_object: &VolObject, _is_native: &mut bool) -> Result<()> {
+    Err(unsupported_vol("H5VLobject_is_native"))
+}
+
+/// VOL wrapper: query whether a connector supports an optional operation.
+pub fn H5VLquery_optional(
+    _object: &VolObject,
+    _subclass: VolSubclass,
+    _opt_type: i32,
+    _flags: &mut u64,
+) -> Result<()> {
+    Err(unsupported_vol("H5VLquery_optional"))
+}
+
+/// VOL wrapper: verify that an object belongs to a connector.
+pub fn H5VLobject_verify(
+    _object: &VolObject,
+    _connector_id: u64,
+    _verified: &mut bool,
+) -> Result<()> {
+    Err(unsupported_vol("H5VLobject_verify"))
+}
+
 /// VOL wrapper: invoke a connector-specific op on a object.
 pub fn H5VLobject_specific() -> Result<()> {
     Err(unsupported_vol("H5VLobject_specific"))
@@ -1555,11 +1594,23 @@ mod tests {
     fn token_and_connector_names_have_allocation_aware_accessors() {
         let mut registry = VolRegistry::default();
         let id = H5VLregister_connector(&mut registry, "native", 0);
+        let object = H5VL_new_vol_obj(id, "object");
 
+        assert_eq!(H5VLget_connector_id(&object), id);
+        assert!(H5VLis_connector_registered_by_name(&registry, "native"));
+        assert!(!H5VLis_connector_registered_by_name(&registry, "missing"));
+        assert!(H5VLis_connector_registered_by_value(&registry, 0));
+        assert!(!H5VLis_connector_registered_by_value(&registry, 99));
         assert_eq!(H5VLget_connector_name_view(&registry, id), Some("native"));
         let mut connector_name = FixedStrBuf::<32>::new("connector=");
         assert!(H5VLget_connector_name_fmt(&registry, id, &mut connector_name).unwrap());
         assert_eq!(connector_name.as_str(), "connector=native");
+
+        let mut missing_connector_name = FixedStrBuf::<32>::new("missing=");
+        assert!(
+            !H5VLget_connector_name_fmt(&registry, id + 1, &mut missing_connector_name).unwrap()
+        );
+        assert_eq!(missing_connector_name.as_str(), "missing=");
 
         let mut token = FixedStrBuf::<16>::new("token=");
         H5VLtoken_fmt(42, &mut token).unwrap();
@@ -1625,5 +1676,47 @@ mod tests {
 
         H5VL__native_introspect_get_conn_cls_into(&connector, &mut copied_connector);
         assert_eq!(copied_connector, connector);
+    }
+
+    #[test]
+    fn object_is_native_is_explicit_unsupported_boundary() {
+        let object = H5VL_new_vol_obj(0, "object");
+        let mut is_native = true;
+
+        let err = H5VLobject_is_native(&object, &mut is_native).unwrap_err();
+
+        assert!(is_native);
+        assert_eq!(
+            err.to_string(),
+            "Unsupported: H5VLobject_is_native requires a concrete VOL connector operation that is not implemented"
+        );
+    }
+
+    #[test]
+    fn query_optional_is_explicit_unsupported_boundary() {
+        let object = H5VL_new_vol_obj(0, "object");
+        let mut flags = 0x55;
+
+        let err = H5VLquery_optional(&object, VolSubclass::Dataset, 7, &mut flags).unwrap_err();
+
+        assert_eq!(flags, 0x55);
+        assert_eq!(
+            err.to_string(),
+            "Unsupported: H5VLquery_optional requires a concrete VOL connector operation that is not implemented"
+        );
+    }
+
+    #[test]
+    fn object_verify_is_explicit_unsupported_boundary() {
+        let object = H5VL_new_vol_obj(7, "object");
+        let mut verified = true;
+
+        let err = H5VLobject_verify(&object, 7, &mut verified).unwrap_err();
+
+        assert!(verified);
+        assert_eq!(
+            err.to_string(),
+            "Unsupported: H5VLobject_verify requires a concrete VOL connector operation that is not implemented"
+        );
     }
 }

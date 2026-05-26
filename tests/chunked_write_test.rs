@@ -1,7 +1,8 @@
 use std::fs;
 
-use hdf5_pure_rust::engine::writer::{DatasetSpec, DtypeSpec, HdfFileWriter};
+use hdf5_pure_rust::engine::writer::{DatasetSpec, DtypeSpec, FillValueSpec, HdfFileWriter};
 use hdf5_pure_rust::format::messages::data_layout::ChunkIndexType;
+use hdf5_pure_rust::io::reader::UNDEF_ADDR;
 use hdf5_pure_rust::{Dataset, File, H5Type, Result};
 
 fn assert_dataset_shape(ds: &Dataset, expected: &[u64]) -> Result<()> {
@@ -110,6 +111,8 @@ fn test_write_chunked_no_compression() {
          assert d.shape == (100,)\n\
          assert d.chunks == (10,)\n\
          assert d.compression is None\n\
+         assert d.dtype.kind == 'f'\n\
+         assert d.dtype.itemsize == 4\n\
          assert d[:].tolist() == [float(i) for i in range(100)]",
         "uncompressed fixed-array chunked writer fixture",
     );
@@ -160,6 +163,7 @@ fn test_write_single_chunk_uses_v4_single_chunk_index() {
     read_dataset_into(&ds, &mut values).unwrap();
     assert_eq!(values, (0..12).collect::<Vec<_>>());
 
+    assert_h5dump_dataset_read(&path, "single", "single-chunk writer fixture");
     assert_h5py_script(
         &path,
         "d = f['single']\n\
@@ -218,6 +222,11 @@ fn test_write_filtered_single_chunk_uses_v4_single_chunk_index() {
     read_dataset_into(&ds, &mut values).unwrap();
     assert_eq!(values, (0..64).map(|i| i % 7).collect::<Vec<_>>());
 
+    assert_h5dump_dataset_read(
+        &path,
+        "single_deflate",
+        "filtered single-chunk writer fixture",
+    );
     assert_h5py_script(
         &path,
         "d = f['single_deflate']\n\
@@ -396,6 +405,23 @@ fn test_write_chunked_fixed_array_beyond_one_page() {
     read_dataset_into(&ds, &mut values).unwrap();
     let expected: Vec<u8> = (0..4_105).map(|i| (i % 251) as u8).collect();
     assert_eq!(values, expected);
+
+    assert_h5dump_dataset_read(
+        &path,
+        "paged_fixed_array",
+        "direct writer paged fixed-array partial final page fixture",
+    );
+    assert_h5py_script(
+        &path,
+        "d = f['paged_fixed_array']\n\
+         assert d.shape == (4105,)\n\
+         assert d.chunks == (1,)\n\
+         assert d.compression is None\n\
+         assert d[:5].tolist() == [0, 1, 2, 3, 4]\n\
+         assert d[4094:4099].tolist() == [78, 79, 80, 81, 82]\n\
+         assert d[-3:].tolist() == [86, 87, 88]",
+        "direct writer paged fixed-array partial final page fixture",
+    );
 }
 
 #[test]
@@ -457,6 +483,8 @@ fn test_write_chunked_max_shape_uses_extensible_array_index() {
              assert d.shape == (12,)\n\
              assert d.chunks == (3,)\n\
              assert d.maxshape == (None,)\n\
+             assert d.dtype.kind == 'i'\n\
+             assert d.dtype.itemsize == 4\n\
              assert list(d[:]) == list(range(12))\n\
              f.close()\n\
              print('OK')",
@@ -531,6 +559,9 @@ fn test_write_extensible_array_partial_edge_chunk_h5py_read() {
              d = f['ea_partial_edge']\n\
              assert d.shape == (10,)\n\
              assert d.chunks == (4,)\n\
+             assert d.maxshape == (None,)\n\
+             assert d.dtype.kind == 'i'\n\
+             assert d.dtype.itemsize == 4\n\
              assert list(d[:]) == [-5, -2, 1, 4, 7, 10, 13, 16, 19, 22]\n\
              f.close()\n\
              print('OK')",
@@ -588,6 +619,11 @@ fn test_write_chunked_large_max_shape_uses_extensible_array_index() {
     read_dataset_into(&ds, &mut values).unwrap();
     assert_eq!(values, data);
 
+    assert_h5dump_dataset_read(
+        &path,
+        "large_ea_grid",
+        "large extensible-array chunk-1 writer fixture",
+    );
     let out = std::process::Command::new("python3")
         .arg("-c")
         .arg(
@@ -597,6 +633,8 @@ fn test_write_chunked_large_max_shape_uses_extensible_array_index() {
              assert d.shape == (256,)\n\
              assert d.chunks == (1,)\n\
              assert d.maxshape == (None,)\n\
+             assert d.dtype.kind == 'u'\n\
+             assert d.dtype.itemsize == 1\n\
              assert d[0] == 0\n\
              assert d[255] == 255\n\
              assert list(d[:]) == list(range(256))\n\
@@ -668,9 +706,76 @@ fn test_write_chunked_finite_max_shape_uses_btree_v2_index() {
          assert d.shape == (12,)\n\
          assert d.chunks == (3,)\n\
          assert d.maxshape == (24,)\n\
+         assert d.dtype.kind == 'i'\n\
+         assert d.dtype.itemsize == 4\n\
          assert d.compression is None\n\
          assert d[:].tolist() == [-3, 4, 11, 18, 25, 32, 39, 46, 53, 60, 67, 74]",
         "finite max-shape B-tree v2 file",
+    );
+}
+
+#[test]
+fn test_write_sparse_fill_only_max_shape_uses_btree_v2_undefined_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir
+        .path()
+        .join("written_sparse_fill_only_max_shape_btree_v2.h5");
+    let fill = (-6i16).to_le_bytes();
+
+    {
+        let f = fs::File::create(&path).unwrap();
+        let mut w = HdfFileWriter::new(f);
+        w.begin().unwrap();
+        w.create_root_group().unwrap();
+
+        w.create_sparse_chunked_dataset_with_attrs_and_fill(
+            "/",
+            &DatasetSpec {
+                name: "fill_only_btree_v2",
+                shape: &[12],
+                max_shape: Some(&[24]),
+                dtype: DtypeSpec::I16,
+                data: &[],
+            },
+            &[4],
+            None,
+            false,
+            false,
+            Some(FillValueSpec::with_value(1, 2, &fill)),
+            &[],
+        )
+        .unwrap();
+
+        w.finalize().unwrap();
+    }
+
+    let f = File::open(&path).unwrap();
+    let ds = f.dataset("fill_only_btree_v2").unwrap();
+    let info = ds.info().unwrap();
+    assert_eq!(info.layout.version, 4);
+    assert_eq!(info.layout.chunk_index_type, Some(ChunkIndexType::BTreeV2));
+    assert_eq!(info.layout.chunk_index_addr, Some(UNDEF_ADDR));
+
+    let mut values = vec![0i16; ds.size().unwrap() as usize];
+    read_dataset_into(&ds, &mut values).unwrap();
+    assert_eq!(values, vec![-6; 12]);
+
+    assert_h5dump_dataset_read(
+        &path,
+        "fill_only_btree_v2",
+        "fill-only max-shape B-tree v2 undefined-index writer fixture",
+    );
+    assert_h5py_script(
+        &path,
+        "d = f['fill_only_btree_v2']\n\
+         assert d.shape == (12,)\n\
+         assert d.maxshape == (24,)\n\
+         assert d.chunks == (4,)\n\
+         assert d.dtype.kind == 'i'\n\
+         assert d.dtype.itemsize == 2\n\
+         assert d.fillvalue == -6\n\
+         assert d[:].tolist() == [-6] * 12",
+        "fill-only max-shape B-tree v2 undefined-index writer fixture",
     );
 }
 

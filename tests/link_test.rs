@@ -111,6 +111,32 @@ fn test_write_and_read_hard_links() {
 }
 
 #[test]
+fn test_link_name_by_idx_into_preserves_output_on_missing_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("link_name_by_idx_into.h5");
+
+    {
+        let mut wf = WritableFile::create(&path).unwrap();
+        wf.new_dataset_builder("a").write::<i32>(&[1]).unwrap();
+        wf.new_dataset_builder("b").write::<i32>(&[2]).unwrap();
+        wf.flush().unwrap();
+    }
+
+    let f = File::open(&path).unwrap();
+    let root = f.root_group().unwrap();
+    let mut name = String::from("stale");
+
+    hdf5_pure_rust::hl::link::get_name_by_idx_into(&root, 0, &mut name).unwrap();
+    assert!(name == "a" || name == "b");
+
+    name = String::from("stale");
+    let err = hdf5_pure_rust::hl::link::get_name_by_idx_into(&root, 2, &mut name)
+        .expect_err("out-of-bounds link index should fail");
+    assert!(err.to_string().contains("out of bounds"));
+    assert_eq!(name, "stale");
+}
+
+#[test]
 fn test_soft_link_resolution_and_cycle_limit() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("soft_link_resolution.h5");
@@ -291,6 +317,156 @@ fn test_soft_link_resolution_normalizes_group_targets_with_remaining_path() {
 }
 
 #[test]
+fn test_soft_link_resolution_normalizes_chained_relative_parent_targets() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir
+        .path()
+        .join("soft_link_chained_relative_parent_targets.h5");
+
+    {
+        let mut wf = WritableFile::create(&path).unwrap();
+        let mut org = wf.create_group("org").unwrap();
+        let mut team_a = org.create_group("team_a").unwrap();
+        let mut datasets = team_a.create_group("datasets").unwrap();
+        let mut year = datasets.create_group("2026").unwrap();
+        let mut run = year.create_group("run").unwrap();
+        run.new_dataset_builder("data")
+            .write::<i32>(&[505, 606])
+            .unwrap();
+
+        team_a
+            .link_soft("current", "datasets/./2026/../2026")
+            .unwrap();
+        let mut team_b = org.create_group("team_b").unwrap();
+        let mut views = team_b.create_group("views").unwrap();
+        views
+            .link_soft("current_run", "../../team_a/./current/run/..")
+            .unwrap();
+        wf.flush().unwrap();
+    }
+
+    let f = File::open(&path).unwrap();
+    assert_i32_dataset_values(
+        &f.dataset("org/team_b/views/current_run/run/data").unwrap(),
+        &[505, 606],
+    )
+    .unwrap();
+
+    let views = f.group("org/team_b/views").unwrap();
+    assert_i32_dataset_values(
+        &views.open_dataset("current_run/run/data").unwrap(),
+        &[505, 606],
+    )
+    .unwrap();
+}
+
+#[test]
+fn test_soft_link_resolution_normalizes_remaining_parent_after_current_group_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir
+        .path()
+        .join("soft_link_remaining_parent_after_current_group_target.h5");
+
+    {
+        let mut wf = WritableFile::create(&path).unwrap();
+        let mut aliases = wf.create_group("aliases").unwrap();
+        let mut nested = aliases.create_group("nested").unwrap();
+        nested.link_soft("here", ".").unwrap();
+        let mut sibling = aliases.create_group("sibling").unwrap();
+        sibling
+            .new_dataset_builder("data")
+            .write::<i32>(&[707, 808])
+            .unwrap();
+        wf.flush().unwrap();
+    }
+
+    let f = File::open(&path).unwrap();
+    assert_i32_dataset_values(
+        &f.dataset("aliases/nested/here/../sibling/data").unwrap(),
+        &[707, 808],
+    )
+    .unwrap();
+
+    let nested = f.group("aliases/nested").unwrap();
+    assert_i32_dataset_values(
+        &nested.open_dataset("here/../sibling/data").unwrap(),
+        &[707, 808],
+    )
+    .unwrap();
+}
+
+#[test]
+fn test_soft_link_resolution_normalizes_remaining_parent_after_absolute_group_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir
+        .path()
+        .join("soft_link_remaining_parent_after_absolute_group_target.h5");
+
+    {
+        let mut wf = WritableFile::create(&path).unwrap();
+        let mut root_target = wf.create_group("root_target").unwrap();
+        let mut leaf = root_target.create_group("leaf").unwrap();
+        leaf.new_dataset_builder("data")
+            .write::<i32>(&[909, 1001])
+            .unwrap();
+        let mut aliases = wf.create_group("aliases").unwrap();
+        aliases
+            .link_soft("absolute_leaf", "/root_target/leaf")
+            .unwrap();
+        wf.flush().unwrap();
+    }
+
+    let f = File::open(&path).unwrap();
+    assert_i32_dataset_values(
+        &f.dataset("aliases/absolute_leaf/../leaf/data").unwrap(),
+        &[909, 1001],
+    )
+    .unwrap();
+
+    let aliases = f.group("aliases").unwrap();
+    assert_i32_dataset_values(
+        &aliases.open_dataset("absolute_leaf/../leaf/data").unwrap(),
+        &[909, 1001],
+    )
+    .unwrap();
+}
+
+#[test]
+fn test_soft_link_resolution_normalizes_remaining_path_after_root_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir
+        .path()
+        .join("soft_link_remaining_path_after_root_target.h5");
+
+    {
+        let mut wf = WritableFile::create(&path).unwrap();
+        wf.new_dataset_builder("root_data")
+            .write::<i32>(&[111, 222])
+            .unwrap();
+        let mut aliases = wf.create_group("aliases").unwrap();
+        aliases.link_soft("root_alias", "/").unwrap();
+        wf.flush().unwrap();
+    }
+
+    let f = File::open(&path).unwrap();
+    assert_i32_dataset_values(
+        &f.dataset("aliases/root_alias/./aliases/../root_data")
+            .unwrap(),
+        &[111, 222],
+    )
+    .unwrap();
+
+    let aliases = f.group("aliases").unwrap();
+    assert_i32_dataset_values(
+        &aliases
+            .open_dataset("root_alias/./aliases/../root_data")
+            .unwrap(),
+        &[111, 222],
+    )
+    .unwrap();
+}
+
+#[test]
 fn test_soft_link_cycle_detected_after_relative_target_normalization() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("soft_link_normalized_cycle.h5");
@@ -396,6 +572,53 @@ fn test_dense_links_include_soft_external_and_hard_aliases() {
         Ok(())
     })
     .unwrap();
+
+    let out = std::process::Command::new("h5dump")
+        .arg("-H")
+        .arg(&path)
+        .output();
+    if let Ok(out) = out {
+        assert!(
+            out.status.success(),
+            "h5dump -H failed on dense mixed-link writer fixture: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.contains("soft_alias"));
+        assert!(stdout.contains("external_alias"));
+        assert!(stdout.contains("hard_alias"));
+    }
+
+    let output = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(
+            "import sys, importlib.util\n\
+             spec = importlib.util.find_spec('h5py')\n\
+             (print('SKIP h5py unavailable'), sys.exit(0)) if spec is None else None\n\
+             import h5py\n\
+             f = h5py.File(sys.argv[1], 'r')\n\
+             assert int(f['hard_alias'][0]) == 1\n\
+             assert int(f['soft_alias'][0]) == 0\n\
+             soft = f.get('soft_alias', getlink=True)\n\
+             external = f.get('external_alias', getlink=True)\n\
+             assert isinstance(soft, h5py.SoftLink)\n\
+             assert soft.path == '/data_00'\n\
+             assert isinstance(external, h5py.ExternalLink)\n\
+             assert external.filename == 'missing.h5'\n\
+             assert external.path == '/remote'\n\
+             f.close()\n\
+             print('OK')",
+        )
+        .arg(&path)
+        .output();
+    if let Ok(out) = output {
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && (stdout.contains("OK") || stdout.contains("SKIP")),
+            "h5py failed on dense mixed-link writer fixture: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
 }
 
 #[test]
@@ -434,6 +657,45 @@ fn test_group_compat_unlink_dense_root_soft_and_external_links() {
 }
 
 #[test]
+fn test_group_compat_unlink_nested_dense_soft_and_external_links() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("open_rw_nested_dense_unlink_non_hard.h5");
+
+    {
+        let mut wf = WritableFile::create(&path).unwrap();
+        let mut parent = wf.create_group("parent").unwrap();
+        for idx in 0..9 {
+            parent
+                .new_dataset_builder(&format!("data_{idx:02}"))
+                .write::<i32>(&[idx])
+                .unwrap();
+        }
+        parent.link_soft("soft_alias", "/parent/data_00").unwrap();
+        parent
+            .link_external("external_alias", "missing.h5", "/remote")
+            .unwrap();
+        wf.flush().unwrap();
+    }
+
+    let file = File::open_rw(&path).unwrap();
+    let parent = file.group("parent").unwrap();
+    parent.unlink("soft_alias").unwrap();
+    parent.unlink("external_alias").unwrap();
+
+    assert!(!parent.link_exists("soft_alias").unwrap());
+    assert!(!parent.link_exists("external_alias").unwrap());
+    assert!(parent.link_exists("data_08").unwrap());
+    assert_i32_dataset_values(&file.dataset("parent/data_08").unwrap(), &[8]).unwrap();
+
+    let reopened = File::open(&path).unwrap();
+    let parent = reopened.group("parent").unwrap();
+    assert!(!parent.link_exists("soft_alias").unwrap());
+    assert!(!parent.link_exists("external_alias").unwrap());
+    assert!(parent.link_exists("data_08").unwrap());
+    assert_i32_dataset_values(&reopened.dataset("parent/data_08").unwrap(), &[8]).unwrap();
+}
+
+#[test]
 fn test_group_compat_unlink_dense_root_hard_link_is_unsupported() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir
@@ -456,10 +718,13 @@ fn test_group_compat_unlink_dense_root_hard_link_is_unsupported() {
     let err = root.unlink("data_08").unwrap_err();
     assert!(matches!(err, Error::Unsupported(_)));
     assert!(root.link_exists("data_08").unwrap());
+    assert!(root.link_exists("soft_alias").unwrap());
     assert_i32_dataset_values(&file.dataset("data_08").unwrap(), &[8]).unwrap();
 
     let reopened = File::open(&path).unwrap();
     assert!(file_has_member(&reopened, "data_08").unwrap());
+    let reopened_root = reopened.root_group().unwrap();
+    assert!(reopened_root.link_exists("soft_alias").unwrap());
     assert_i32_dataset_values(&reopened.dataset("data_08").unwrap(), &[8]).unwrap();
 }
 
@@ -815,6 +1080,49 @@ fn test_group_compat_relink_changed_size_dense_root_link_grows() {
     assert!(!file_has_member(&reopened, "data_08").unwrap());
     assert!(file_has_member(&reopened, "longer_data_name_08").unwrap());
     assert_i32_dataset_values(&reopened.dataset("longer_data_name_08").unwrap(), &[8]).unwrap();
+}
+
+#[test]
+fn test_group_compat_relink_same_size_indirect_dense_root_link_heap() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("open_rw_root_indirect_dense_relink.h5");
+    let suffix = "x".repeat(2_000);
+    let old_name = format!("link_008_{suffix}");
+    let new_name = format!("renm_008_{suffix}");
+    let out = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(
+            r#"import sys
+try:
+    import h5py
+except ModuleNotFoundError as exc:
+    raise exc
+suffix = "x" * 2000
+with h5py.File(sys.argv[1], "w", libver="latest") as f:
+    for i in range(40):
+        f.create_group(f"link_{i:03d}_{suffix}")
+"#,
+        )
+        .arg(&path)
+        .output()
+        .unwrap();
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if stderr.contains("No module named 'h5py'") {
+            return;
+        }
+        panic!("h5py fixture creation failed: {stderr}");
+    }
+
+    let file = File::open_rw(&path).unwrap();
+    let root = file.root_group().unwrap();
+    root.relink(&old_name, &new_name).unwrap();
+    assert!(!root.link_exists(&old_name).unwrap());
+    assert!(root.link_exists(&new_name).unwrap());
+
+    let reopened = File::open(&path).unwrap();
+    assert!(!file_has_member(&reopened, &old_name).unwrap());
+    assert!(file_has_member(&reopened, &new_name).unwrap());
 }
 
 #[test]

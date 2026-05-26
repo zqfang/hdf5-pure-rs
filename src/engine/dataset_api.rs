@@ -403,14 +403,19 @@ pub fn H5D__virtual_reset_layout(layout: &mut VirtualLayout) {
     layout.unlimited = false;
 }
 
-/// Open a dataset.
-#[allow(non_snake_case)]
-pub fn H5D__virtual_open_source_dset(mapping: &mut VirtualMapping) -> Result<()> {
+fn validate_virtual_source_mapping(mapping: &VirtualMapping) -> Result<()> {
     if mapping.source_file.is_empty() || mapping.source_dataset.is_empty() {
         return Err(Error::InvalidFormat(
             "virtual source mapping is incomplete".into(),
         ));
     }
+    Ok(())
+}
+
+/// Open a dataset.
+#[allow(non_snake_case)]
+pub fn H5D__virtual_open_source_dset(mapping: &mut VirtualMapping) -> Result<()> {
+    validate_virtual_source_mapping(mapping)?;
     mapping.open = true;
     Ok(())
 }
@@ -424,8 +429,11 @@ pub fn H5D__virtual_set_extent_unlim(layout: &mut VirtualLayout) {
 /// Initialize the dataset subsystem.
 #[allow(non_snake_case)]
 pub fn H5D__virtual_init_all(layout: &mut VirtualLayout) -> Result<()> {
+    for mapping in &layout.mappings {
+        validate_virtual_source_mapping(mapping)?;
+    }
     for mapping in &mut layout.mappings {
-        H5D__virtual_open_source_dset(mapping)?;
+        mapping.open = true;
     }
     Ok(())
 }
@@ -699,7 +707,8 @@ pub fn H5Dread_chunk2_slice(dataset: &DatasetApi, offset: usize, len: usize) -> 
 /// Copy a raw chunk byte range into caller-provided storage.
 #[allow(non_snake_case)]
 pub fn H5Dread_chunk2_into(dataset: &DatasetApi, offset: usize, out: &mut [u8]) -> Result<()> {
-    out.copy_from_slice(H5Dread_chunk2_slice(dataset, offset, out.len())?);
+    let src = H5Dread_chunk2_slice(dataset, offset, out.len())?;
+    out.copy_from_slice(src);
     Ok(())
 }
 
@@ -4985,6 +4994,32 @@ mod tests {
             Err(Error::InvalidFormat(_))
         ));
         assert_eq!(out, vec![vec![0; 2]]);
+    }
+
+    #[test]
+    fn read_chunk2_into_preserves_output_on_range_errors() {
+        let dataset = DatasetApi {
+            name: Some("raw".into()),
+            extent: vec![6],
+            raw: b"abcdef".to_vec(),
+            virtual_layout: None,
+        };
+        let mut out = *b"ZZ";
+        H5Dread_chunk2_into(&dataset, 2, &mut out).unwrap();
+        assert_eq!(&out, b"cd");
+
+        out = *b"st";
+        assert!(matches!(
+            H5Dread_chunk2_into(&dataset, usize::MAX, &mut out),
+            Err(Error::InvalidFormat(_))
+        ));
+        assert_eq!(&out, b"st");
+
+        assert!(matches!(
+            H5Dread_chunk2_into(&dataset, 5, &mut out),
+            Err(Error::InvalidFormat(_))
+        ));
+        assert_eq!(&out, b"st");
     }
 
     #[test]

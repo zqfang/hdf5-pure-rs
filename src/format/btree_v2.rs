@@ -215,27 +215,28 @@ impl BTreeV2Header {
         image: &mut Vec<u8>,
     ) -> Result<()> {
         self.validate()?;
-        image.clear();
-        image.reserve(self.cache_hdr_image_len_with_widths(sizeof_addr, sizeof_size)?);
-        image.extend_from_slice(&B2HD_MAGIC);
-        image.push(0);
-        image.push(self.tree_type);
-        image.extend_from_slice(&self.node_size.to_le_bytes());
-        image.extend_from_slice(&self.record_size.to_le_bytes());
-        image.extend_from_slice(&self.depth.to_le_bytes());
-        image.push(self.split_pct);
-        image.push(self.merge_pct);
+        let mut next_image =
+            Vec::with_capacity(self.cache_hdr_image_len_with_widths(sizeof_addr, sizeof_size)?);
+        next_image.extend_from_slice(&B2HD_MAGIC);
+        next_image.push(0);
+        next_image.push(self.tree_type);
+        next_image.extend_from_slice(&self.node_size.to_le_bytes());
+        next_image.extend_from_slice(&self.record_size.to_le_bytes());
+        next_image.extend_from_slice(&self.depth.to_le_bytes());
+        next_image.push(self.split_pct);
+        next_image.push(self.merge_pct);
         write_hdr_addr_fixed_le(
-            image,
+            &mut next_image,
             self.root_addr,
             sizeof_addr,
             self.total_records,
             "v2 B-tree root",
         )?;
-        image.extend_from_slice(&self.root_nrecords.to_le_bytes());
-        write_fixed_le(image, self.total_records, sizeof_size)?;
-        let checksum = checksum_metadata(image);
-        image.extend_from_slice(&checksum.to_le_bytes());
+        next_image.extend_from_slice(&self.root_nrecords.to_le_bytes());
+        write_fixed_le(&mut next_image, self.total_records, sizeof_size)?;
+        let checksum = checksum_metadata(&next_image);
+        next_image.extend_from_slice(&checksum.to_le_bytes());
+        *image = next_image;
         Ok(())
     }
 
@@ -815,16 +816,16 @@ impl BTreeV2LeafNode {
         image: &mut Vec<u8>,
     ) -> Result<()> {
         self.assert_leaf(record_size)?;
-        image.clear();
-        image.reserve(self.cache_leaf_image_len(record_size)?);
-        image.extend_from_slice(&B2LF_MAGIC);
-        image.push(0);
-        image.push(tree_type);
+        let mut next_image = Vec::with_capacity(self.cache_leaf_image_len(record_size)?);
+        next_image.extend_from_slice(&B2LF_MAGIC);
+        next_image.push(0);
+        next_image.push(tree_type);
         for record in &self.records {
-            image.extend_from_slice(record);
+            next_image.extend_from_slice(record);
         }
-        let checksum = checksum_metadata(image);
-        image.extend_from_slice(&checksum.to_le_bytes());
+        let checksum = checksum_metadata(&next_image);
+        next_image.extend_from_slice(&checksum.to_le_bytes());
+        *image = next_image;
         Ok(())
     }
 
@@ -1006,20 +1007,25 @@ impl BTreeV2InternalNode {
             infos[0].max_nrec,
             "v2 B-tree leaf record capacity",
         )?);
-        image.clear();
-        image.reserve(self.cache_int_image_len(header, sizeof_addr)?);
-        image.extend_from_slice(&B2IN_MAGIC);
-        image.push(0);
-        image.push(header.tree_type);
+        let mut next_image = Vec::with_capacity(self.cache_int_image_len(header, sizeof_addr)?);
+        next_image.extend_from_slice(&B2IN_MAGIC);
+        next_image.push(0);
+        next_image.push(header.tree_type);
         for record in &self.records {
-            image.extend_from_slice(record);
+            next_image.extend_from_slice(record);
         }
         for (addr, nrecords) in &self.children {
-            write_addr_fixed_le(image, *addr, sizeof_addr, "v2 B-tree internal child")?;
-            write_fixed_le(image, u64::from(*nrecords), nrec_size)?;
+            write_addr_fixed_le(
+                &mut next_image,
+                *addr,
+                sizeof_addr,
+                "v2 B-tree internal child",
+            )?;
+            write_fixed_le(&mut next_image, u64::from(*nrecords), nrec_size)?;
         }
-        let checksum = checksum_metadata(image);
-        image.extend_from_slice(&checksum.to_le_bytes());
+        let checksum = checksum_metadata(&next_image);
+        next_image.extend_from_slice(&checksum.to_le_bytes());
+        *image = next_image;
         Ok(())
     }
 
@@ -2176,7 +2182,7 @@ mod tests {
     use super::{
         checked_usize_sum, checked_window, checked_window_mut, compute_node_info,
         read_leaf_records, BTreeV2Header, BTreeV2InternalNode, BTreeV2LeafNode, BTreeV2Neighbor,
-        BTreeV2TestContext, BTreeV2TestRecord, BTreeV2Tree,
+        BTreeV2TestContext, BTreeV2TestRecord, BTreeV2Tree, B2HD_MAGIC,
     };
 
     #[test]
@@ -2268,6 +2274,28 @@ mod tests {
     }
 
     #[test]
+    fn btree_v2_internal_cache_serialize_preserves_output_on_error() {
+        let header = BTreeV2Header {
+            depth: 1,
+            ..BTreeV2Header::hdr_create(10, 256, 2, 100, 40).unwrap()
+        };
+        let internal = BTreeV2InternalNode::create_internal(
+            vec![vec![2, 0]],
+            vec![(u64::from(u32::MAX) + 1, 1), (20, 1)],
+            2,
+        )
+        .unwrap();
+        let mut image = vec![0xaa, 0xbb, 0xcc];
+
+        let err = internal
+            .cache_int_serialize_into(&header, 4, &mut image)
+            .expect_err("too-wide child address should fail");
+
+        assert!(err.to_string().contains("does not fit"));
+        assert_eq!(image, vec![0xaa, 0xbb, 0xcc]);
+    }
+
+    #[test]
     fn btree_v2_header_cache_serialize_checks_configured_widths() {
         let header = BTreeV2Header {
             root_addr: 0x0102_0304,
@@ -2327,6 +2355,34 @@ mod tests {
         assert!(nonempty_undef_root
             .cache_hdr_serialize_into(&mut image)
             .is_err());
+    }
+
+    #[test]
+    fn btree_v2_header_cache_serialize_replaces_only_on_success() {
+        let header = BTreeV2Header {
+            root_addr: 0x0102_0304,
+            root_nrecords: 1,
+            total_records: 1,
+            ..BTreeV2Header::hdr_create(10, 256, 2, 100, 40).unwrap()
+        };
+        let too_large_addr = BTreeV2Header {
+            root_addr: u64::from(u32::MAX) + 1,
+            ..header.clone()
+        };
+        let mut image = vec![0xaa, 0xbb, 0xcc];
+
+        let err = too_large_addr
+            .cache_hdr_serialize_with_widths_into(4, 4, &mut image)
+            .expect_err("too-wide root address should fail");
+
+        assert!(err.to_string().contains("does not fit"));
+        assert_eq!(image, vec![0xaa, 0xbb, 0xcc]);
+
+        header
+            .cache_hdr_serialize_with_widths_into(4, 4, &mut image)
+            .unwrap();
+        assert_eq!(&image[..4], &B2HD_MAGIC);
+        assert_ne!(image, vec![0xaa, 0xbb, 0xcc]);
     }
 
     #[test]

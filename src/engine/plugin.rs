@@ -375,7 +375,12 @@ pub fn H5PL__find_plugin_in_path_table_into(
     name: &str,
     candidate: &mut PathBuf,
 ) -> bool {
-    H5PL__path_table_paths(table).any(|path| H5PL__find_plugin_in_path_into(path, name, candidate))
+    for path in H5PL__path_table_paths(table) {
+        if H5PL__find_plugin_in_path_into(path, name, candidate) {
+            return true;
+        }
+    }
+    false
 }
 
 #[allow(non_snake_case)]
@@ -386,10 +391,13 @@ pub fn H5PL__find_plugin_in_path_table(table: &PluginPathTable, name: &str) -> O
 
 #[allow(non_snake_case)]
 pub fn H5PL__find_plugin_in_path_into(path: &Path, name: &str, candidate: &mut PathBuf) -> bool {
-    candidate.clear();
-    candidate.push(path);
-    candidate.push(name);
-    candidate.exists()
+    let found = path.join(name);
+    if found.exists() {
+        *candidate = found;
+        true
+    } else {
+        false
+    }
 }
 
 #[allow(non_snake_case)]
@@ -547,6 +555,9 @@ pub fn H5PLget_buf_into(
         ));
     };
     let bytes = path.as_bytes();
+    if buf_size == 0 {
+        return Ok(bytes.len());
+    }
     out.clear();
     out.extend_from_slice(&bytes[..bytes.len().min(buf_size)]);
     Ok(bytes.len())
@@ -590,6 +601,8 @@ mod tests {
         let mut path_buf = b"stale".to_vec();
         assert_eq!(H5PLget_buf_into(&registry, 1, &mut path_buf, 2).unwrap(), 4);
         assert_eq!(path_buf, b"/m");
+        assert_eq!(H5PLget_buf_into(&registry, 1, &mut path_buf, 0).unwrap(), 4);
+        assert_eq!(path_buf, b"/m");
         let mut num_paths = 0;
         H5PLsize_into(&registry, &mut num_paths).unwrap();
         assert_eq!(num_paths, 3);
@@ -621,8 +634,186 @@ mod tests {
         H5PLset_loading_state(&mut registry, 0);
         let err = H5PL__open(&mut registry, "known").unwrap_err();
         assert_eq!(err.to_string(), "Unsupported: plugin loading is disabled");
+        assert!(!registry.open_plugins.contains_key("known"));
         let err = H5PL_load_owned(&mut registry, "known".to_owned()).unwrap_err();
         assert_eq!(err.to_string(), "Unsupported: plugin loading is disabled");
+        assert!(!registry.open_plugins.contains_key("known"));
+    }
+
+    #[test]
+    fn plugin_failed_open_load_and_close_preserve_open_counts() {
+        let mut registry = H5PL__init_package();
+        H5PL__add_plugin_ref(&mut registry.cache, "known");
+        H5PL__open(&mut registry, "known").unwrap();
+        H5PL_load_owned(&mut registry, "known".to_owned()).unwrap();
+        assert_eq!(registry.open_plugins.get("known"), Some(&2));
+
+        let err = H5PL__open(&mut registry, "missing").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Unsupported: dynamic plugin loading is not supported for 'missing'"
+        );
+        assert_eq!(registry.open_plugins.get("known"), Some(&2));
+        assert!(!registry.open_plugins.contains_key("missing"));
+
+        let err = H5PL_load_owned(&mut registry, "missing".to_owned()).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Unsupported: dynamic plugin loading is not supported for 'missing'"
+        );
+        assert_eq!(registry.open_plugins.get("known"), Some(&2));
+        assert!(!registry.open_plugins.contains_key("missing"));
+
+        let err = H5PL__close(&mut registry, "missing").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Invalid HDF5 format: plugin 'missing' is not open"
+        );
+        assert_eq!(registry.open_plugins.get("known"), Some(&2));
+    }
+
+    #[test]
+    fn plugin_term_package_clears_cache_paths_and_open_counts() {
+        let mut registry = H5PL__init_package();
+        H5PL__add_plugin_ref(&mut registry.cache, "known");
+        H5PLappend(&mut registry, "/plugins/a");
+        H5PLappend(&mut registry, "/plugins/b");
+
+        H5PL__open(&mut registry, "known").unwrap();
+        H5PL_load_owned(&mut registry, "known".to_owned()).unwrap();
+        assert_eq!(registry.open_plugins.get("known"), Some(&2));
+        assert_eq!(
+            H5PL_iter_plugins(&registry).collect::<Vec<_>>(),
+            vec!["known"]
+        );
+        assert_eq!(H5PLsize(&registry), 2);
+
+        H5PL_term_package(&mut registry);
+
+        assert!(registry.open_plugins.is_empty());
+        assert_eq!(H5PL_iter_plugins(&registry).count(), 0);
+        assert_eq!(H5PLsize(&registry), 0);
+        assert_eq!(H5PLget_loading_state(&registry), H5PL_ALL_PLUGIN);
+    }
+
+    #[test]
+    fn plugin_invalid_cache_and_path_indexes_preserve_state() {
+        let mut cache = H5PL__create_plugin_cache();
+        H5PL__add_plugin_ref(&mut cache, "known");
+
+        let err = H5PL__insert_at(&mut cache, 2, "late").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Invalid HDF5 format: plugin cache index 2 out of range"
+        );
+        assert_eq!(
+            H5PL__plugin_cache_iter(&cache).collect::<Vec<_>>(),
+            vec!["known"]
+        );
+
+        let err = H5PL__replace_at(&mut cache, 1, "other").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Invalid HDF5 format: plugin cache index 1 out of range"
+        );
+        assert_eq!(
+            H5PL__plugin_cache_iter(&cache).collect::<Vec<_>>(),
+            vec!["known"]
+        );
+
+        let mut registry = H5PL__init_package();
+        H5PLappend(&mut registry, "/plugins/a");
+        let original_paths: Vec<_> = H5PL__path_table_paths(&registry.paths)
+            .map(Path::to_path_buf)
+            .collect();
+
+        let err = H5PLinsert(&mut registry, 2, "/plugins/b").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Invalid HDF5 format: plugin path index 2 out of range"
+        );
+        assert_eq!(
+            H5PL__path_table_paths(&registry.paths)
+                .map(Path::to_path_buf)
+                .collect::<Vec<_>>(),
+            original_paths
+        );
+
+        let err = H5PLreplace(&mut registry, 1, "/plugins/c").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Invalid HDF5 format: plugin path index 1 out of range"
+        );
+        assert_eq!(
+            H5PL__path_table_paths(&registry.paths)
+                .map(Path::to_path_buf)
+                .collect::<Vec<_>>(),
+            original_paths
+        );
+
+        let mut removed = PathBuf::from("stale");
+        let err = H5PLremove_into(&mut registry, 1, &mut removed).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Invalid HDF5 format: plugin path index 1 out of range"
+        );
+        assert_eq!(removed, PathBuf::from("stale"));
+        assert_eq!(
+            H5PL__path_table_paths(&registry.paths)
+                .map(Path::to_path_buf)
+                .collect::<Vec<_>>(),
+            original_paths
+        );
+
+        let mut stale_path = PathBuf::from("stale-path");
+        let err = H5PLget_into(&registry, 1, &mut stale_path).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Invalid HDF5 format: plugin path index 1 out of range"
+        );
+        assert_eq!(stale_path, PathBuf::from("stale-path"));
+
+        let mut stale_string = String::from("stale-string");
+        let err = H5PLget_str_into(&registry, 1, &mut stale_string).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Invalid HDF5 format: plugin path index 1 out of range"
+        );
+        assert_eq!(stale_string, "stale-string");
+
+        let mut stale_bytes = b"stale-bytes".to_vec();
+        let err = H5PLget_buf_into(&registry, 1, &mut stale_bytes, 4).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Invalid HDF5 format: plugin path index 1 out of range"
+        );
+        assert_eq!(stale_bytes, b"stale-bytes");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plugin_get_string_outputs_preserve_state_for_non_utf8_paths() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let mut registry = H5PL__init_package();
+        H5PLappend(&mut registry, PathBuf::from(OsString::from_vec(vec![0xff])));
+
+        let mut stale_string = String::from("stale-string");
+        let err = H5PLget_str_into(&registry, 0, &mut stale_string).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Invalid HDF5 format: plugin path is not valid UTF-8"
+        );
+        assert_eq!(stale_string, "stale-string");
+
+        let mut stale_bytes = b"stale-bytes".to_vec();
+        let err = H5PLget_buf_into(&registry, 0, &mut stale_bytes, 4).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Invalid HDF5 format: plugin path is not valid UTF-8"
+        );
+        assert_eq!(stale_bytes, b"stale-bytes");
     }
 
     #[test]
@@ -704,15 +895,13 @@ mod tests {
         assert_eq!(paths, vec![PathBuf::from("/tmp")]);
 
         let mut candidate = PathBuf::from("stale");
+        let stale = candidate.clone();
         assert!(!H5PL__find_plugin_in_path_table_into(
             &registry.paths,
             "definitely-missing-hdf5-plugin",
             &mut candidate
         ));
-        assert_eq!(
-            candidate,
-            PathBuf::from("/tmp/definitely-missing-hdf5-plugin")
-        );
+        assert_eq!(candidate, stale);
     }
 
     #[test]
@@ -767,6 +956,20 @@ mod tests {
         std::fs::write(&plugin_path, b"placeholder").unwrap();
 
         H5PL__append_path(&mut table, dir.clone());
+        let mut candidate = PathBuf::from("stale");
+        assert!(H5PL__find_plugin_in_path_into(
+            &dir,
+            plugin_name,
+            &mut candidate
+        ));
+        assert_eq!(candidate, plugin_path.clone());
+        candidate = PathBuf::from("stale");
+        assert!(!H5PL__find_plugin_in_path_into(
+            &dir,
+            "missing-plugin",
+            &mut candidate
+        ));
+        assert_eq!(candidate, PathBuf::from("stale"));
         assert_eq!(
             H5PL__find_plugin_in_path(&dir, plugin_name),
             Some(plugin_path.clone())

@@ -256,12 +256,14 @@ pub fn H5T_reclaim_cb(dtype: &RuntimeDatatype, data: &mut Vec<u8>) {
 /// Encode a datatype to its on-disk representation.
 #[allow(non_snake_case)]
 pub fn H5Tencode_into(dtype: &RuntimeDatatype, out: &mut Vec<u8>) -> Result<()> {
+    let mut encoded = Vec::with_capacity(8 + dtype.message.properties.len());
+    encoded.push(((dtype.message.version & 0x0f) << 4) | (dtype.message.class as u8));
+    encoded.extend_from_slice(&dtype.message.class_bits);
+    encoded.extend_from_slice(&dtype.message.size.to_le_bytes());
+    encoded.extend_from_slice(&dtype.message.properties);
+    DatatypeMessage::decode(&encoded)?;
     out.clear();
-    out.push(((dtype.message.version & 0x0f) << 4) | (dtype.message.class as u8));
-    out.extend_from_slice(&dtype.message.class_bits);
-    out.extend_from_slice(&dtype.message.size.to_le_bytes());
-    out.extend_from_slice(&dtype.message.properties);
-    DatatypeMessage::decode(&out)?;
+    out.extend_from_slice(&encoded);
     Ok(())
 }
 
@@ -8461,7 +8463,9 @@ mod tests {
 
         let mut malformed = dtype.clone();
         malformed.message.properties.truncate(3);
+        let stale_image = image.clone();
         assert!(H5Tencode_into(&malformed, &mut image).is_err());
+        assert_eq!(image, stale_image);
         assert!(H5Tdecode(&image[..7]).is_err());
     }
 

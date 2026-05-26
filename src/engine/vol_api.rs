@@ -352,10 +352,22 @@ pub fn H5VLget_value(registry: &VolRegistry, id: u64) -> Result<u64> {
 }
 
 #[allow(non_snake_case)]
+pub fn H5VLget_value_into(registry: &VolRegistry, id: u64, value: &mut u64) -> Result<()> {
+    *value = H5VLget_value(registry, id)?;
+    Ok(())
+}
+
+#[allow(non_snake_case)]
 pub fn H5VLget_cap_flags(registry: &VolRegistry, id: u64) -> Result<u64> {
     H5VL__get_connector_by_id(registry, id)
         .map(|connector| connector.cap_flags)
         .ok_or_else(|| Error::InvalidFormat("VOL connector id is not registered".into()))
+}
+
+#[allow(non_snake_case)]
+pub fn H5VLget_cap_flags_into(registry: &VolRegistry, id: u64, flags: &mut u64) -> Result<()> {
+    *flags = H5VLget_cap_flags(registry, id)?;
+    Ok(())
 }
 
 #[allow(non_snake_case)]
@@ -648,6 +660,19 @@ pub fn H5VL_setup_token_args(token: u64) -> u64 {
 }
 
 #[allow(non_snake_case)]
+pub fn H5VLtoken_from_str(token: &str) -> Result<u64> {
+    token
+        .parse::<u64>()
+        .map_err(|_| Error::InvalidFormat("VOL token string is not a valid integer token".into()))
+}
+
+#[allow(non_snake_case)]
+pub fn H5VLtoken_from_str_into(token: &str, dst: &mut u64) -> Result<()> {
+    *dst = H5VLtoken_from_str(token)?;
+    Ok(())
+}
+
+#[allow(non_snake_case)]
 pub fn H5VL_conn_prop_get_cap_flags(connector: &VolConnector) -> u64 {
     connector.cap_flags
 }
@@ -936,6 +961,12 @@ mod tests {
         }
         assert_eq!(H5VLget_value(&registry, id).unwrap(), 42);
         assert_eq!(H5VLget_cap_flags(&registry, id).unwrap(), 0x1234);
+        let mut value = u64::MAX;
+        H5VLget_value_into(&registry, id, &mut value).unwrap();
+        assert_eq!(value, 42);
+        let mut cap_flags = u64::MAX;
+        H5VLget_cap_flags_into(&registry, id, &mut cap_flags).unwrap();
+        assert_eq!(cap_flags, 0x1234);
         assert!(matches!(
             H5VLget_value(&registry, u64::MAX),
             Err(Error::InvalidFormat(_))
@@ -944,6 +975,18 @@ mod tests {
             H5VLget_cap_flags(&registry, u64::MAX),
             Err(Error::InvalidFormat(_))
         ));
+        value = 9876;
+        assert!(matches!(
+            H5VLget_value_into(&registry, u64::MAX, &mut value),
+            Err(Error::InvalidFormat(_))
+        ));
+        assert_eq!(value, 9876);
+        cap_flags = 6789;
+        assert!(matches!(
+            H5VLget_cap_flags_into(&registry, u64::MAX, &mut cap_flags),
+            Err(Error::InvalidFormat(_))
+        ));
+        assert_eq!(cap_flags, 6789);
 
         let connector = registry.connectors.get(&id).unwrap();
         let mut rendered = String::from("connector=");
@@ -1024,6 +1067,21 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "Unsupported: VOL optional operation query is unsupported in pure-Rust mode (subclass Dataset, op 17)"
+        );
+    }
+
+    #[test]
+    fn vol_token_from_str_preserves_caller_output_on_parse_error() {
+        let mut token = 123;
+
+        H5VLtoken_from_str_into("456", &mut token).unwrap();
+        assert_eq!(token, 456);
+
+        let err = H5VLtoken_from_str_into("not-a-token", &mut token).unwrap_err();
+        assert_eq!(token, 456);
+        assert_eq!(
+            err.to_string(),
+            "Invalid HDF5 format: VOL token string is not a valid integer token"
         );
     }
 

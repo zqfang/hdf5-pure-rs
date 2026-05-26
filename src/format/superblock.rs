@@ -337,45 +337,50 @@ impl Superblock {
     /// Write a v2 superblock to a writer.
     pub fn write_v2(&self, buf: &mut Vec<u8>) -> Result<()> {
         Self::validate_sizes(self.sizeof_addr, self.sizeof_size)?;
+        let mut image = Vec::new();
+        image
+            .try_reserve_exact(self.checked_size()?)
+            .map_err(|_| Error::InvalidFormat("superblock v2 image allocation failed".into()))?;
         // Signature
-        buf.extend_from_slice(&HDF5_SIGNATURE);
+        image.extend_from_slice(&HDF5_SIGNATURE);
         // Version
-        buf.push(self.version);
+        image.push(self.version);
         // sizeof_addr, sizeof_size
-        buf.push(self.sizeof_addr);
-        buf.push(self.sizeof_size);
+        image.push(self.sizeof_addr);
+        image.push(self.sizeof_size);
         // Status flags
-        buf.push(self.status_flags);
+        image.push(self.status_flags);
 
         // Addresses (little-endian, sizeof_addr bytes each)
         write_addr(
-            buf,
+            &mut image,
             self.base_addr,
             self.sizeof_addr,
             "superblock base address",
         )?;
         write_addr(
-            buf,
+            &mut image,
             self.ext_addr,
             self.sizeof_addr,
             "superblock extension address",
         )?;
         write_addr(
-            buf,
+            &mut image,
             self.eof_addr,
             self.sizeof_addr,
             "superblock EOF address",
         )?;
         write_addr(
-            buf,
+            &mut image,
             self.root_addr,
             self.sizeof_addr,
             "superblock root address",
         )?;
 
         // Checksum (over everything before this point)
-        let checksum = checksum_metadata(buf);
-        buf.extend_from_slice(&checksum.to_le_bytes());
+        let checksum = checksum_metadata(&image);
+        image.extend_from_slice(&checksum.to_le_bytes());
+        buf.extend_from_slice(&image);
         Ok(())
     }
 
@@ -540,13 +545,42 @@ mod tests {
             eof_addr: 0x1_0000,
             ..Default::default()
         };
-        let mut buf = Vec::new();
+        let mut buf = b"stale".to_vec();
         let err = sb.write_v2(&mut buf).unwrap_err();
         assert!(
             err.to_string()
                 .contains("superblock EOF address does not fit in 2 bytes"),
             "unexpected error: {err}"
         );
+        assert_eq!(buf, b"stale");
+    }
+
+    #[test]
+    fn write_v2_appends_complete_image_and_checksums_only_superblock_bytes() {
+        let sb = Superblock {
+            version: 2,
+            sizeof_addr: 4,
+            sizeof_size: 4,
+            status_flags: 1,
+            base_addr: 0,
+            ext_addr: UNDEF_ADDR,
+            eof_addr: 0x1000,
+            root_addr: 0x60,
+            ..Default::default()
+        };
+        let mut buf = b"prefix".to_vec();
+        sb.write_v2(&mut buf).unwrap();
+        assert_eq!(&buf[..6], b"prefix");
+        assert_eq!(buf.len(), 6 + sb.checked_size().unwrap());
+        assert_eq!(&buf[6 + 16..6 + 20], &[0xff; 4]);
+
+        let mut reader = HdfReader::new(Cursor::new(buf[6..].to_vec()));
+        let decoded = Superblock::read(&mut reader).unwrap();
+        assert_eq!(decoded.sizeof_addr, 4);
+        assert_eq!(decoded.sizeof_size, 4);
+        assert_eq!(decoded.ext_addr, UNDEF_ADDR);
+        assert_eq!(decoded.eof_addr, 0x1000);
+        assert_eq!(decoded.root_addr, 0x60);
     }
 
     #[test]

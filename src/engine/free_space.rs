@@ -420,13 +420,13 @@ impl FreeSpaceManager {
 
     /// Append the serialized section-info image with trailing checksum to `out`.
     pub fn cache_sinfo_serialize_into(&self, out: &mut Vec<u8>) -> Result<()> {
-        out.reserve(self.cache_sinfo_image_len()?);
-        let start = out.len();
+        let mut image = Vec::with_capacity(self.cache_sinfo_image_len()?);
         for section in self.sections.values() {
-            section.serialize_checked(out)?;
+            section.serialize_checked(&mut image)?;
         }
-        let checksum = crate::format::checksum::checksum_metadata(&out[start..]);
-        out.extend_from_slice(&checksum.to_le_bytes());
+        let checksum = crate::format::checksum::checksum_metadata(&image);
+        image.extend_from_slice(&checksum.to_le_bytes());
+        out.extend_from_slice(&image);
         Ok(())
     }
 
@@ -927,7 +927,9 @@ mod tests {
 
         let mut fs = FreeSpaceManager::new();
         fs.sections.insert(invalid.addr, invalid);
-        assert!(fs.cache_sinfo_serialize_into(&mut Vec::new()).is_err());
+        let mut stale = vec![9, 8, 7];
+        assert!(fs.cache_sinfo_serialize_into(&mut stale).is_err());
+        assert_eq!(stale, vec![9, 8, 7]);
 
         let valid = FreeSpaceSection::new(4, 8, FreeSpaceClass::Small).unwrap();
         assert!(FreeSpaceManager::sinfo_serialize_node_cb(&[valid], &mut out).is_ok());

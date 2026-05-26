@@ -136,11 +136,9 @@ impl Dataset {
         &self,
         out: &mut Vec<crate::hl::attribute::Attribute>,
     ) -> Result<()> {
-        out.clear();
-        out.extend(crate::hl::attribute::collect_attributes_by_creation_order(
-            &self.inner,
-            self.addr,
-        )?);
+        let attrs =
+            crate::hl::attribute::collect_attributes_by_creation_order(&self.inner, self.addr)?;
+        *out = attrs;
         Ok(())
     }
 

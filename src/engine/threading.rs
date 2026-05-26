@@ -510,7 +510,8 @@ pub fn atomic_init_usize(value: usize) -> AtomicUsize {
 #[cfg(test)]
 mod tests {
     use super::{
-        atomic_fetch_add_int, atomic_init_int, atomic_load_int, TsKey, TsMutex, TsThreadPool,
+        atomic_fetch_add_int, atomic_init_int, atomic_load_int, TsKey, TsMutex, TsRwLock,
+        TsThreadPool,
     };
 
     #[test]
@@ -545,5 +546,22 @@ mod tests {
         );
         assert_eq!(key.key_take_value(), Some(NoClone("value".to_string())));
         assert!(key.key_with_value(|_| ()).is_none());
+    }
+
+    #[test]
+    fn recursive_rwlock_stats_into_replaces_stale_output() {
+        let lock = TsRwLock::rec_rwlock_init();
+        lock.rec_rwlock_rdlock();
+        lock.rec_rwlock_rdunlock();
+        lock.rec_rwlock_wrlock();
+        lock.rec_rwlock_wrunlock();
+
+        let mut stats = String::from("stale");
+        lock.rec_rwlock_print_stats_into(&mut stats);
+        assert_eq!(stats, "rdlock=1, wrlock=1, rdunlock=1, wrunlock=1");
+
+        lock.rec_rwlock_reset_stats();
+        lock.rec_rwlock_print_stats_into(&mut stats);
+        assert_eq!(stats, "rdlock=0, wrlock=0, rdunlock=0, wrunlock=0");
     }
 }

@@ -141,6 +141,29 @@ impl Dataset {
         self.read_slice_into_impl(shape, selection, out)
     }
 
+    /// Read a single dataset cell at row-major coordinates.
+    pub fn read_cell<T: crate::hl::types::H5Type>(&self, coords: &[u64]) -> Result<T> {
+        let selection = crate::hl::selection::Selection::Points(vec![coords.to_vec()]);
+        let mut values = self.read_slice::<T, _>(selection)?;
+        values
+            .pop()
+            .ok_or_else(|| Error::InvalidFormat("cell selection produced no value".into()))
+    }
+
+    /// Read a single dataset cell into caller-provided scalar storage.
+    pub fn read_cell_into<T: crate::hl::types::H5Type>(
+        &self,
+        coords: &[u64],
+        out: &mut T,
+    ) -> Result<()> {
+        let selection = crate::hl::selection::Selection::Points(vec![coords.to_vec()]);
+        let shape = self.shape()?;
+        let mut tmp = [*out];
+        self.read_selection_into(&shape, &selection, &mut tmp)?;
+        *out = tmp[0];
+        Ok(())
+    }
+
     fn read_slice_into_impl<T: crate::hl::types::H5Type>(
         &self,
         shape: &[u64],

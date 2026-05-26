@@ -106,6 +106,65 @@ fn test_compound_read_field_wrong_size() {
 }
 
 #[test]
+fn test_compound_read_field_into_preserves_output_on_error() {
+    let f = File::open("tests/data/compound.h5").unwrap();
+    let ds = f.dataset("points").unwrap();
+
+    let mut wrong_type = [-1i32; 3];
+    assert!(ds.read_field_into("x", &mut wrong_type).is_err());
+    assert_eq!(wrong_type, [-1, -1, -1]);
+
+    let mut missing = [-2i32; 3];
+    assert!(ds.read_field_into("missing", &mut missing).is_err());
+    assert_eq!(missing, [-2, -2, -2]);
+
+    let mut too_short = [-3i32; 2];
+    assert!(ds.read_field_into("label", &mut too_short).is_err());
+    assert_eq!(too_short, [-3, -3]);
+
+    let mut too_long = [-4i32; 4];
+    assert!(ds.read_field_into("label", &mut too_long).is_err());
+    assert_eq!(too_long, [-4, -4, -4, -4]);
+}
+
+#[test]
+fn test_compound_read_field_raw_into_preserves_output_on_error() {
+    let f = File::open("tests/data/compound.h5").unwrap();
+    let ds = f.dataset("points").unwrap();
+
+    let mut missing = [0xA5u8; 12];
+    assert!(ds.read_field_raw_into("missing", &mut missing).is_err());
+    assert_eq!(missing, [0xA5; 12]);
+
+    let mut too_short = [0x5Au8; 8];
+    assert!(ds.read_field_raw_into("label", &mut too_short).is_err());
+    assert_eq!(too_short, [0x5A; 8]);
+
+    let mut too_long = [0x3Cu8; 16];
+    assert!(ds.read_field_raw_into("label", &mut too_long).is_err());
+    assert_eq!(too_long, [0x3C; 16]);
+}
+
+#[test]
+fn test_compound_read_field_values_into_replaces_only_on_success() {
+    let f = File::open("tests/data/compound.h5").unwrap();
+    let ds = f.dataset("points").unwrap();
+
+    let mut values = vec![H5Value::Int(-1)];
+    ds.read_field_values_into("label", &mut values).unwrap();
+    assert_eq!(
+        values,
+        vec![H5Value::Int(10), H5Value::Int(20), H5Value::Int(30)]
+    );
+
+    assert!(ds.read_field_values_into("missing", &mut values).is_err());
+    assert_eq!(
+        values,
+        vec![H5Value::Int(10), H5Value::Int(20), H5Value::Int(30)]
+    );
+}
+
+#[test]
 fn test_compound_fields_api() {
     let f = File::open("tests/data/compound.h5").unwrap();
     let ds = f.dataset("points").unwrap();

@@ -74,6 +74,7 @@ impl MutableFile {
         self.rewrite_chunk_index(
             index_kind,
             index_addr,
+            ds.addr(),
             &info,
             chunk_coords,
             chunk_data_dims,
@@ -206,6 +207,7 @@ impl MutableFile {
         &mut self,
         index_kind: WritableChunkIndexKind,
         index_addr: u64,
+        dataset_addr: u64,
         info: &crate::hl::dataset::DatasetInfo,
         chunk_coords: &[u64],
         chunk_data_dims: &[u64],
@@ -217,6 +219,7 @@ impl MutableFile {
         match index_kind {
             WritableChunkIndexKind::FixedArray => self.rewrite_fixed_array_chunk(
                 index_addr,
+                dataset_addr,
                 &info,
                 chunk_coords,
                 chunk_data_dims,

@@ -132,7 +132,8 @@ fn t5a_root_int_attr() {
 fn t5a_root_float_attr() {
     let attr = open().attr("root_float").unwrap();
     let val = attr.read_scalar::<f64>().unwrap();
-    assert!((val - 3.14).abs() < 1e-10);
+    let pi_attr = 314.0f64 / 100.0;
+    assert!((val - pi_attr).abs() < 1e-10);
 }
 
 #[test]

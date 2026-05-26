@@ -46,8 +46,11 @@ struct DenseLinkLocation {
     btree_header_addr: u64,
     heap: FractalHeapHeader,
     btree: BTreeV2Header,
+    creation_order_indexed: bool,
     leaf_records: Vec<u8>,
     record_index: usize,
+    direct_block_addr: u64,
+    direct_block_size: u64,
     object_offset: u64,
     raw_data: Vec<u8>,
 }
@@ -582,7 +585,7 @@ impl MutableFile {
     }
 
     fn unlink_dense_link(&mut self, group_addr: u64, name: &str) -> Result<()> {
-        let mut location = self.find_dense_link_location(group_addr, name, None)?;
+        let mut location = self.find_dense_link_location(group_addr, name, None, false)?;
         let link = compact_link_view(&location.raw_data, self.superblock.sizeof_addr)?;
         if link.link_type == LinkType::Hard {
             let target_addr = link.hard_link_addr.ok_or_else(|| {
@@ -619,8 +622,7 @@ impl MutableFile {
         }
 
         let object_addr = location
-            .heap
-            .root_block_addr
+            .direct_block_addr
             .checked_add(location.object_offset)
             .ok_or_else(|| Error::InvalidFormat("dense link object address overflow".into()))?;
         let tombstone = vec![0u8; location.raw_data.len()];
@@ -636,7 +638,13 @@ impl MutableFile {
             .ok_or_else(|| Error::InvalidFormat("dense link record offset overflow".into()))?;
         location.leaf_records.drain(record_start..record_end);
 
-        self.rewrite_dense_link_direct_block_checksum(&location.heap, object_addr, &tombstone)?;
+        self.rewrite_dense_link_direct_block_checksum(
+            &location.heap,
+            location.direct_block_addr,
+            location.direct_block_size,
+            object_addr,
+            &tombstone,
+        )?;
         self.rewrite_dense_link_name_index(&location)?;
         self.write_handle.flush()?;
         self.reopen_reader()?;
@@ -1076,10 +1084,9 @@ impl MutableFile {
 
                     let heap =
                         FractalHeapHeader::read_at(&mut guard.reader, link_info.fractal_heap_addr)?;
-                    if heap.io_filter_len != 0 || heap.current_root_rows != 0 {
+                    if heap.io_filter_len != 0 {
                         return Err(Error::Unsupported(
-                            "mutating filtered or indirect dense link heaps is not implemented"
-                                .into(),
+                            "mutating filtered dense link heaps is not implemented".into(),
                         ));
                     }
                     let btree =
@@ -1279,10 +1286,9 @@ impl MutableFile {
 
                     let heap =
                         FractalHeapHeader::read_at(&mut guard.reader, link_info.fractal_heap_addr)?;
-                    if heap.io_filter_len != 0 || heap.current_root_rows != 0 {
+                    if heap.io_filter_len != 0 {
                         return Err(Error::Unsupported(
-                            "mutating filtered or indirect dense link heaps is not implemented"
-                                .into(),
+                            "mutating filtered dense link heaps is not implemented".into(),
                         ));
                     }
                     let btree =
@@ -1427,11 +1433,18 @@ impl MutableFile {
         old_name: &str,
         new_name: &str,
     ) -> Result<()> {
-        let mut location = self.find_dense_link_location(group_addr, old_name, Some(new_name))?;
+        let mut location =
+            self.find_dense_link_location(group_addr, old_name, Some(new_name), true)?;
         let link = compact_link_view(&location.raw_data, self.superblock.sizeof_addr)?;
         let name_offset = link.name_offset;
         let name_size = link.name_size;
         if new_name.len() != name_size {
+            if location.creation_order_indexed {
+                return Err(Error::Unsupported(
+                    "dense relink with changed message size for creation-order indexed links is not implemented"
+                        .into(),
+                ));
+            }
             let link = LinkMessage::decode(&location.raw_data, self.superblock.sizeof_addr)?;
             let mut renamed =
                 encode_renamed_link_message(&link, new_name, self.superblock.sizeof_addr)?;
@@ -1451,8 +1464,7 @@ impl MutableFile {
             renamed.resize(location.raw_data.len(), 0);
 
             let object_addr = location
-                .heap
-                .root_block_addr
+                .direct_block_addr
                 .checked_add(location.object_offset)
                 .ok_or_else(|| Error::InvalidFormat("dense link object address overflow".into()))?;
             self.write_handle.seek(SeekFrom::Start(object_addr))?;
@@ -1477,7 +1489,13 @@ impl MutableFile {
                 record_size,
             )?;
 
-            self.rewrite_dense_link_direct_block_checksum(&location.heap, object_addr, &renamed)?;
+            self.rewrite_dense_link_direct_block_checksum(
+                &location.heap,
+                location.direct_block_addr,
+                location.direct_block_size,
+                object_addr,
+                &renamed,
+            )?;
             self.rewrite_dense_link_name_index(&location)?;
             self.write_handle.flush()?;
             self.reopen_reader()?;
@@ -1486,8 +1504,7 @@ impl MutableFile {
 
         let name_offset_u64 = Self::usize_to_u64(name_offset, "dense link name offset")?;
         let file_name_offset = location
-            .heap
-            .root_block_addr
+            .direct_block_addr
             .checked_add(location.object_offset)
             .and_then(|offset| offset.checked_add(name_offset_u64))
             .ok_or_else(|| Error::InvalidFormat("dense link name offset overflow".into()))?;
@@ -1518,6 +1535,8 @@ impl MutableFile {
 
         self.rewrite_dense_link_direct_block_checksum(
             &location.heap,
+            location.direct_block_addr,
+            location.direct_block_size,
             file_name_offset,
             &encoded_name,
         )?;
@@ -1534,7 +1553,7 @@ impl MutableFile {
         new_addr: u64,
         operation: &str,
     ) -> Result<()> {
-        let mut location = self.find_dense_link_location(group_addr, name, None)?;
+        let mut location = self.find_dense_link_location(group_addr, name, None, false)?;
         let link = compact_link_view(&location.raw_data, self.superblock.sizeof_addr)?;
         if link.link_type != LinkType::Hard {
             return Err(Error::Unsupported(format!(
@@ -1552,14 +1571,15 @@ impl MutableFile {
             "hard link address",
         )?;
         let object_addr = location
-            .heap
-            .root_block_addr
+            .direct_block_addr
             .checked_add(location.object_offset)
             .ok_or_else(|| Error::InvalidFormat("dense link object address overflow".into()))?;
         self.write_handle.seek(SeekFrom::Start(object_addr))?;
         self.write_handle.write_all(&location.raw_data)?;
         self.rewrite_dense_link_direct_block_checksum(
             &location.heap,
+            location.direct_block_addr,
+            location.direct_block_size,
             object_addr,
             &location.raw_data,
         )
@@ -1699,6 +1719,7 @@ impl MutableFile {
         group_addr: u64,
         target_name: &str,
         reject_duplicate_name: Option<&str>,
+        allow_creation_order_indexed: bool,
     ) -> Result<DenseLinkLocation> {
         let mut guard = self.inner.lock();
         let link_info = Self::read_dense_link_info_message(&mut guard.reader, group_addr)?;
@@ -1707,16 +1728,17 @@ impl MutableFile {
                 "link '{target_name}' not found"
             )));
         }
-        if link_info.corder_btree_addr.is_some() {
+        let creation_order_indexed = link_info.corder_btree_addr.is_some();
+        if creation_order_indexed && !allow_creation_order_indexed {
             return Err(Error::Unsupported(
                 "mutating creation-order indexed dense links is not implemented".into(),
             ));
         }
 
         let heap = FractalHeapHeader::read_at(&mut guard.reader, link_info.fractal_heap_addr)?;
-        if heap.io_filter_len != 0 || heap.current_root_rows != 0 {
+        if heap.io_filter_len != 0 {
             return Err(Error::Unsupported(
-                "mutating filtered or indirect dense link heaps is not implemented".into(),
+                "mutating filtered dense link heaps is not implemented".into(),
             ));
         }
 
@@ -1742,20 +1764,23 @@ impl MutableFile {
                 )));
             }
             if link.name == target_name {
-                let object_offset = managed_heap_object_offset(&heap, heap_id)?;
-                found = Some((idx, object_offset, raw_data));
+                let object_location = heap.managed_object_location(&mut guard.reader, heap_id)?;
+                found = Some((idx, object_location, raw_data));
             }
         }
 
-        let (record_index, object_offset, raw_data) =
+        let (record_index, object_location, raw_data) =
             found.ok_or_else(|| Error::InvalidFormat(format!("link '{target_name}' not found")))?;
         Ok(DenseLinkLocation {
             btree_header_addr: link_info.name_btree_addr,
             heap,
             btree,
+            creation_order_indexed,
             leaf_records,
             record_index,
-            object_offset,
+            direct_block_addr: object_location.block_addr,
+            direct_block_size: object_location.block_size,
+            object_offset: object_location.object_offset,
             raw_data,
         })
     }
@@ -2006,26 +2031,28 @@ impl MutableFile {
     fn rewrite_dense_link_direct_block_checksum(
         &mut self,
         heap: &FractalHeapHeader,
+        block_addr: u64,
+        block_size: u64,
         patched_addr: u64,
         patched_data: &[u8],
     ) -> Result<()> {
         if !heap.has_checksum {
             return Ok(());
         }
-        let block_size = usize::try_from(heap.start_block_size)
+        let block_size = usize::try_from(block_size)
             .map_err(|_| Error::InvalidFormat("dense link direct block too large".into()))?;
         let checksum_pos = direct_block_checksum_pos(heap, self.superblock.sizeof_addr)?;
         let checksum_end = checksum_pos
             .checked_add(4)
             .ok_or_else(|| Error::InvalidFormat("direct block checksum offset overflow".into()))?;
         let mut guard = self.inner.lock();
-        guard.reader.seek(heap.root_block_addr)?;
+        guard.reader.seek(block_addr)?;
         let mut block = vec![0u8; block_size];
         guard.reader.read_bytes_into(&mut block)?;
         drop(guard);
 
         let patch_start = patched_addr
-            .checked_sub(heap.root_block_addr)
+            .checked_sub(block_addr)
             .ok_or_else(|| Error::InvalidFormat("direct block patch address underflow".into()))?;
         let patch_start = usize::try_from(patch_start)
             .map_err(|_| Error::InvalidFormat("direct block patch offset too large".into()))?;
@@ -2043,11 +2070,9 @@ impl MutableFile {
         let checksum = checksum_metadata(&block);
         let checksum_pos_u64 = Self::usize_to_u64(checksum_pos, "direct block checksum position")?;
         self.write_handle.seek(SeekFrom::Start(
-            heap.root_block_addr
-                .checked_add(checksum_pos_u64)
-                .ok_or_else(|| {
-                    Error::InvalidFormat("direct block checksum address overflow".into())
-                })?,
+            block_addr.checked_add(checksum_pos_u64).ok_or_else(|| {
+                Error::InvalidFormat("direct block checksum address overflow".into())
+            })?,
         ))?;
         self.write_handle.write_all(&checksum.to_le_bytes())?;
         Ok(())
@@ -2452,10 +2477,9 @@ impl MutableFile {
 
                     let heap =
                         FractalHeapHeader::read_at(&mut guard.reader, link_info.fractal_heap_addr)?;
-                    if heap.io_filter_len != 0 || heap.current_root_rows != 0 {
+                    if heap.io_filter_len != 0 {
                         return Err(Error::Unsupported(
-                            "mutating filtered or indirect dense link heaps is not implemented"
-                                .into(),
+                            "mutating filtered dense link heaps is not implemented".into(),
                         ));
                     }
                     let btree =
@@ -2536,7 +2560,7 @@ impl MutableFile {
             Err(Error::Unsupported(msg))
                 if msg.contains("dense or creation-order indexed links") =>
             {
-                let location = self.find_dense_link_location(group_addr, name, None)?;
+                let location = self.find_dense_link_location(group_addr, name, None, false)?;
                 let link = compact_link_view(&location.raw_data, self.superblock.sizeof_addr)?;
                 if link.link_type != LinkType::Hard {
                     return Err(Error::Unsupported(format!(
@@ -2711,6 +2735,51 @@ impl MutableFile {
     }
 
     fn compact_messages_replacing_and_appending_hard_link(
+        &self,
+        group_addr: u64,
+        target_name: &str,
+        target_addr: u64,
+        new_name: &str,
+        operation: &str,
+    ) -> Result<(u8, Vec<OwnedObjectHeaderMessage>)> {
+        match self.compact_messages_replacing_and_appending_compact_hard_link(
+            group_addr,
+            target_name,
+            target_addr,
+            new_name,
+            operation,
+        ) {
+            Err(Error::Unsupported(msg))
+                if msg.contains("dense or creation-order indexed links") =>
+            {
+                let (flags, messages) = self.compact_messages_from_dense_links_for_append(
+                    group_addr, new_name, operation,
+                )?;
+                let replacement = [(target_name.to_string(), target_addr)];
+                let (flags, mut messages) = replace_hard_links_in_messages(
+                    messages,
+                    flags,
+                    &replacement,
+                    self.superblock.sizeof_addr,
+                    operation,
+                )?;
+                messages.push(OwnedObjectHeaderMessage {
+                    msg_type: object_header::MSG_LINK,
+                    flags: 0,
+                    creation_index: None,
+                    data: encode_hard_link_message(
+                        new_name,
+                        target_addr,
+                        self.superblock.sizeof_addr,
+                    )?,
+                });
+                Ok((flags, messages))
+            }
+            other => other,
+        }
+    }
+
+    fn compact_messages_replacing_and_appending_compact_hard_link(
         &self,
         group_addr: u64,
         target_name: &str,
@@ -3552,31 +3621,6 @@ fn read_u32_le_at(raw: &[u8], pos: usize, context: &str) -> Result<u32> {
         .try_into()
         .map_err(|_| Error::InvalidFormat(format!("{context} is truncated")))?;
     Ok(u32::from_le_bytes(bytes))
-}
-
-fn managed_heap_object_offset(heap: &FractalHeapHeader, heap_id: &[u8]) -> Result<u64> {
-    match heap_id.first().copied() {
-        Some(id) if ((id >> 4) & 0x03) == 0 => {}
-        Some(id) => {
-            return Err(Error::Unsupported(format!(
-                "dense link heap ID type {} cannot be rewritten in place",
-                (id >> 4) & 0x03
-            )));
-        }
-        None => {
-            return Err(Error::InvalidFormat(
-                "dense link heap ID is truncated".into(),
-            ))
-        }
-    }
-
-    let offset_bytes = fractal_heap_offset_width(heap)?;
-    let offset_bytes = checked_window(heap_id, 1, offset_bytes, "dense link heap offset")?;
-    let mut offset = 0u64;
-    for (idx, byte) in offset_bytes.iter().enumerate() {
-        offset |= u64::from(*byte) << (idx * 8);
-    }
-    Ok(offset)
 }
 
 fn direct_block_checksum_pos(heap: &FractalHeapHeader, sizeof_addr: u8) -> Result<usize> {

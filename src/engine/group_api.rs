@@ -813,6 +813,11 @@ pub fn H5G__common_path_into(left: &str, right: &str, out: &mut String) {
 /// Build a full path by joining a parent and child path component.
 #[allow(non_snake_case)]
 pub fn H5G__build_fullpath_into(parent: &str, child: &str, out: &mut String) {
+    if child.starts_with('/') {
+        H5G_normalize_into(child, out);
+        return;
+    }
+
     let absolute = parent.is_empty() || parent.starts_with('/');
     let mut stack = Vec::new();
     H5G__component_parts_into(parent.trim_end_matches('/'), &mut stack);
@@ -1720,6 +1725,12 @@ mod tests {
         let mut common = String::new();
         H5G__common_path_into("/alpha/gamma/x", "/alpha/gamma/y", &mut common);
         assert_eq!(common, "/alpha/gamma");
+
+        let mut full = String::from("stale");
+        H5G__build_fullpath_into("/alpha/beta", "../gamma", &mut full);
+        assert_eq!(full, "/alpha/gamma");
+        H5G__build_fullpath_into("/alpha/beta", "/delta/./epsilon/..", &mut full);
+        assert_eq!(full, "/delta");
 
         let entry = GroupEntry {
             name: "dense".into(),

@@ -1,7 +1,7 @@
 use std::any::TypeId;
 
 use crate::error::{Error, Result};
-use crate::format::messages::datatype::{ByteOrder, DatatypeClass, DatatypeMessage};
+use crate::format::messages::datatype::{ByteOrder, DatatypeClass, DatatypeMessage, FloatFields};
 use crate::hl::types::{self, H5Type};
 
 #[derive(Debug, Clone, Copy)]
@@ -21,7 +21,7 @@ enum ConversionKind {
         dst_signed: bool,
     },
     FloatToFloat {
-        src_size: usize,
+        source: FloatSource,
         dst_size: usize,
     },
     IntegerToFloat {
@@ -30,10 +30,22 @@ enum ConversionKind {
         dst_size: usize,
     },
     FloatToInteger {
-        src_size: usize,
+        source: FloatSource,
         dst_size: usize,
         dst_signed: bool,
     },
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FloatSource {
+    size: usize,
+    layout: Option<FloatLayout>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FloatLayout {
+    fields: FloatFields,
+    exponent_bias: u32,
 }
 
 impl ReadConversion {
@@ -53,7 +65,9 @@ impl ReadConversion {
             class if is_integer_like_class(class) => {
                 Self::kind_for_integer_source::<T>(datatype, requested, stored)?
             }
-            DatatypeClass::FloatingPoint => Self::kind_for_float_source::<T>(requested, stored)?,
+            DatatypeClass::FloatingPoint => {
+                Self::kind_for_float_source::<T>(datatype, requested, stored)?
+            }
             _ => Self::kind_for_passthrough(requested, stored)?,
         };
 
@@ -98,19 +112,21 @@ impl ReadConversion {
 
     /// Source class is FloatingPoint. Mirrors libhdf5's
     /// `H5T__conv_f_f` / `H5T__conv_f_i` selection.
-    fn kind_for_float_source<T: H5Type>(requested: usize, stored: usize) -> Result<ConversionKind> {
+    fn kind_for_float_source<T: H5Type>(
+        datatype: &DatatypeMessage,
+        requested: usize,
+        stored: usize,
+    ) -> Result<ConversionKind> {
+        let source = FloatSource::from_datatype(datatype, stored)?;
         if let Some(dst_size) = target_float::<T>() {
-            Ok(if requested == stored {
+            Ok(if requested == stored && source.layout.is_none() {
                 ConversionKind::SameSizeBytes
             } else {
-                ConversionKind::FloatToFloat {
-                    src_size: stored,
-                    dst_size,
-                }
+                ConversionKind::FloatToFloat { source, dst_size }
             })
         } else if let Some((dst_signed, dst_size)) = target_integer::<T>() {
             Ok(ConversionKind::FloatToInteger {
-                src_size: stored,
+                source,
                 dst_size,
                 dst_signed,
             })
@@ -183,8 +199,8 @@ impl ReadConversion {
                     dst_signed,
                 )?;
             }
-            ConversionKind::FloatToFloat { src_size, dst_size } => {
-                convert_float_bytes_into(bytes, src_size, self.byte_order, raw_out, dst_size)?;
+            ConversionKind::FloatToFloat { source, dst_size } => {
+                convert_float_source_bytes_into(bytes, source, self.byte_order, raw_out, dst_size)?;
             }
             ConversionKind::IntegerToFloat {
                 src_size,
@@ -201,13 +217,13 @@ impl ReadConversion {
                 )?;
             }
             ConversionKind::FloatToInteger {
-                src_size,
+                source,
                 dst_size,
                 dst_signed,
             } => {
-                convert_float_to_integer_bytes_into(
+                convert_float_source_to_integer_bytes_into(
                     bytes,
-                    src_size,
+                    source,
                     self.byte_order,
                     raw_out,
                     dst_size,
@@ -247,9 +263,15 @@ impl ReadConversion {
         match self.kind {
             ConversionKind::SameSizeBytes => Ok(self.element_size),
             ConversionKind::Integer { src_size, .. }
-            | ConversionKind::FloatToFloat { src_size, .. }
+            | ConversionKind::FloatToFloat {
+                source: FloatSource { size: src_size, .. },
+                ..
+            }
             | ConversionKind::IntegerToFloat { src_size, .. }
-            | ConversionKind::FloatToInteger { src_size, .. } => {
+            | ConversionKind::FloatToInteger {
+                source: FloatSource { size: src_size, .. },
+                ..
+            } => {
                 if src_size == 0 {
                     Err(Error::InvalidFormat(
                         "conversion source element size is zero".into(),
@@ -337,6 +359,9 @@ pub(crate) fn convert_between_datatypes_into(
             out,
         );
     }
+    if source.class == DatatypeClass::Array && destination.class == DatatypeClass::Array {
+        return convert_array_datatype_bytes_into(bytes, source, destination, out);
+    }
     match (source.class, destination.class) {
         (DatatypeClass::FloatingPoint, DatatypeClass::FloatingPoint) => {
             convert_float_bytes_to_order_into(
@@ -362,6 +387,67 @@ pub(crate) fn convert_between_datatypes_into(
             source.class, source.size, destination.class, destination.size
         ))),
     }
+}
+
+fn convert_array_datatype_bytes_into(
+    bytes: &[u8],
+    source: &DatatypeMessage,
+    destination: &DatatypeMessage,
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    let source_dims = array_dims_vec(source)?;
+    let destination_dims = array_dims_vec(destination)?;
+    if source_dims != destination_dims {
+        return Err(Error::Unsupported(format!(
+            "virtual dataset array datatype conversion from dimensions {:?} to {:?} is not supported",
+            source_dims, destination_dims
+        )));
+    }
+
+    let src_size = usize::try_from(source.size).map_err(|_| {
+        Error::InvalidFormat("source array datatype size does not fit in usize".into())
+    })?;
+    let dst_size = usize::try_from(destination.size).map_err(|_| {
+        Error::InvalidFormat("destination array datatype size does not fit in usize".into())
+    })?;
+    if src_size == 0 || dst_size == 0 {
+        return Err(Error::InvalidFormat(
+            "array datatype conversion element size is zero".into(),
+        ));
+    }
+    if bytes.len() % src_size != 0 {
+        return Err(Error::InvalidFormat(format!(
+            "byte count {} is not a multiple of source array size {src_size}",
+            bytes.len()
+        )));
+    }
+
+    let source_base = source.array_base()?;
+    let destination_base = destination.array_base()?;
+    let mut converted_array = Vec::new();
+    out.clear();
+    out.reserve(conversion_output_len(bytes.len(), src_size, dst_size)?);
+
+    for chunk in bytes.chunks_exact(src_size) {
+        convert_between_datatypes_into(
+            chunk,
+            &source_base,
+            &destination_base,
+            &mut converted_array,
+        )?;
+        if converted_array.len() != dst_size {
+            return Err(Error::InvalidFormat(format!(
+                "array datatype base conversion produced {} bytes, expected {dst_size}",
+                converted_array.len()
+            )));
+        }
+        out.extend_from_slice(&converted_array);
+    }
+    Ok(())
+}
+
+fn array_dims_vec(datatype: &DatatypeMessage) -> Result<Vec<u64>> {
+    datatype.array_dims_iter()?.collect()
 }
 
 fn is_integer_like_class(class: DatatypeClass) -> bool {
@@ -431,6 +517,60 @@ fn target_float<T: H5Type>() -> Option<usize> {
         Some(8)
     } else {
         None
+    }
+}
+
+impl FloatSource {
+    fn from_datatype(datatype: &DatatypeMessage, size: usize) -> Result<Self> {
+        validate_float_size(size, "source")?;
+        let layout = if is_standard_float_layout(datatype, size) {
+            None
+        } else {
+            Some(FloatLayout {
+                fields: datatype.float_fields().ok_or_else(|| {
+                    Error::InvalidFormat("floating-point datatype fields are missing".into())
+                })?,
+                exponent_bias: datatype.exponent_bias().ok_or_else(|| {
+                    Error::InvalidFormat("floating-point exponent bias is missing".into())
+                })?,
+            })
+        };
+        Ok(Self { size, layout })
+    }
+}
+
+fn is_standard_float_layout(datatype: &DatatypeMessage, size: usize) -> bool {
+    let Some(fields) = datatype.float_fields() else {
+        return false;
+    };
+    let Some(precision) = datatype.precision() else {
+        return false;
+    };
+    let Some(bit_offset) = datatype.bit_offset() else {
+        return false;
+    };
+    match size {
+        4 => {
+            bit_offset == 0
+                && precision == 32
+                && fields.sign_position == 31
+                && fields.exponent_position == 23
+                && fields.exponent_size == 8
+                && fields.mantissa_position == 0
+                && fields.mantissa_size == 23
+                && datatype.exponent_bias() == Some(127)
+        }
+        8 => {
+            bit_offset == 0
+                && precision == 64
+                && fields.sign_position == 63
+                && fields.exponent_position == 52
+                && fields.exponent_size == 11
+                && fields.mantissa_position == 0
+                && fields.mantissa_size == 52
+                && datatype.exponent_bias() == Some(1023)
+        }
+        _ => false,
     }
 }
 
@@ -611,18 +751,17 @@ fn convert_float_bytes(
     convert_float_bytes_to_order(bytes, src_size, src_order, dst_size, None)
 }
 
-fn convert_float_bytes_into(
+fn convert_float_source_bytes_into(
     bytes: &[u8],
-    src_size: usize,
+    source: FloatSource,
     src_order: Option<ByteOrder>,
     out: &mut [u8],
     dst_size: usize,
 ) -> Result<()> {
-    validate_float_size(src_size, "source")?;
     validate_float_size(dst_size, "target")?;
-    validate_conversion_buffers(bytes, src_size, out, dst_size, "source float")?;
-    for (idx, chunk) in bytes.chunks_exact(src_size).enumerate() {
-        let value = read_float(chunk, src_size, src_order)?;
+    validate_conversion_buffers(bytes, source.size, out, dst_size, "source float")?;
+    for (idx, chunk) in bytes.chunks_exact(source.size).enumerate() {
+        let value = read_float_source(chunk, source, src_order)?;
         let dst = conversion_output_window(out, idx, dst_size)?;
         write_float_ordered(dst, value, None)?;
     }
@@ -768,23 +907,22 @@ fn convert_float_to_integer_bytes(
     convert_float_to_integer_bytes_to_order(bytes, src_size, src_order, dst_size, dst_signed, None)
 }
 
-fn convert_float_to_integer_bytes_into(
+fn convert_float_source_to_integer_bytes_into(
     bytes: &[u8],
-    src_size: usize,
+    source: FloatSource,
     src_order: Option<ByteOrder>,
     out: &mut [u8],
     dst_size: usize,
     dst_signed: bool,
 ) -> Result<()> {
-    validate_float_size(src_size, "source")?;
     if dst_size == 0 || dst_size > 16 {
         return Err(Error::Unsupported(
             "float-to-integer conversion supports 1..=16 byte integer targets".into(),
         ));
     }
-    validate_conversion_buffers(bytes, src_size, out, dst_size, "source float")?;
-    for (idx, chunk) in bytes.chunks_exact(src_size).enumerate() {
-        let value = read_float(chunk, src_size, src_order)?;
+    validate_conversion_buffers(bytes, source.size, out, dst_size, "source float")?;
+    for (idx, chunk) in bytes.chunks_exact(source.size).enumerate() {
+        let value = read_float_source(chunk, source, src_order)?;
         let raw = clamp_float_to_integer(value, dst_size, dst_signed);
         let dst = conversion_output_window(out, idx, dst_size)?;
         write_uint_ordered(dst, raw, None);
@@ -942,6 +1080,57 @@ fn read_float(bytes: &[u8], size: usize, byte_order: Option<ByteOrder>) -> Resul
     }
 }
 
+fn read_float_source(
+    bytes: &[u8],
+    source: FloatSource,
+    byte_order: Option<ByteOrder>,
+) -> Result<f64> {
+    if source.layout.is_none() {
+        return read_float(bytes, source.size, byte_order);
+    }
+    let input = bytes
+        .get(..source.size)
+        .ok_or_else(|| Error::InvalidFormat("floating-point payload is truncated".into()))?;
+    let layout = source.layout.expect("checked above");
+    decode_float_layout(read_unsigned(input, byte_order), layout)
+}
+
+fn decode_float_layout(raw: u128, layout: FloatLayout) -> Result<f64> {
+    let fields = layout.fields;
+    if fields.exponent_size > 127 || fields.mantissa_size > 127 {
+        return Err(Error::Unsupported(
+            "floating-point conversion supports field sizes up to 127 bits".into(),
+        ));
+    }
+    let sign = ((raw >> fields.sign_position) & 1) != 0;
+    let exponent_mask = (1u128 << fields.exponent_size) - 1;
+    let mantissa_mask = (1u128 << fields.mantissa_size) - 1;
+    let exponent = (raw >> fields.exponent_position) & exponent_mask;
+    let mantissa = (raw >> fields.mantissa_position) & mantissa_mask;
+    let max_exponent = exponent_mask;
+    let sign_mul = if sign { -1.0 } else { 1.0 };
+
+    if exponent == max_exponent {
+        if mantissa == 0 {
+            return Ok(sign_mul * f64::INFINITY);
+        }
+        return Ok(f64::NAN);
+    }
+
+    let denom = 2f64.powi(i32::from(fields.mantissa_size));
+    let fraction = mantissa as f64 / denom;
+    let value = if exponent == 0 {
+        if mantissa == 0 {
+            0.0
+        } else {
+            fraction * 2f64.powi(1 - layout.exponent_bias as i32)
+        }
+    } else {
+        (1.0 + fraction) * 2f64.powi(exponent as i32 - layout.exponent_bias as i32)
+    };
+    Ok(sign_mul * value)
+}
+
 fn write_float_ordered(bytes: &mut [u8], value: f64, byte_order: Option<ByteOrder>) -> Result<()> {
     match bytes.len() {
         4 => bytes.copy_from_slice(&(value as f32).to_ne_bytes()),
@@ -1012,6 +1201,7 @@ pub(crate) fn maybe_swap_elements(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::writer::DtypeSpec;
 
     fn fixed_type(size: u32, signed: bool, order: ByteOrder) -> DatatypeMessage {
         let mut class_bits = [0u8; 3];
@@ -1072,6 +1262,25 @@ mod tests {
         }
     }
 
+    fn array_type(dims: &[u32], base: DtypeSpec) -> DatatypeMessage {
+        let bytes = DtypeSpec::Array {
+            dims: dims.to_vec(),
+            base: Box::new(base),
+        }
+        .encode()
+        .expect("array datatype should encode");
+        DatatypeMessage::decode(&bytes).expect("array datatype should decode")
+    }
+
+    fn encoded_big_endian_u16_type() -> Vec<u8> {
+        let mut bytes = DtypeSpec::U16
+            .encode()
+            .expect("fixed-point datatype should encode");
+        bytes[1] |= 0x01;
+        DatatypeMessage::decode(&bytes).expect("patched big-endian fixed-point type should decode");
+        bytes
+    }
+
     #[test]
     fn reads_big_endian_u128_same_size() {
         let datatype = fixed_type(16, false, ByteOrder::BigEndian);
@@ -1099,6 +1308,24 @@ mod tests {
         raw.extend_from_slice(&42i16.to_le_bytes());
         let values = conversion.bytes_into_vec::<i32>(raw).unwrap();
         assert_eq!(values, vec![-7, 42]);
+    }
+
+    #[test]
+    fn numeric_conversion_preserves_output_on_wrong_output_length() {
+        let datatype = fixed_type(4, true, ByteOrder::LittleEndian);
+        let conversion = ReadConversion::for_dataset::<i16>(&datatype).unwrap();
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&10i32.to_le_bytes());
+        raw.extend_from_slice(&20i32.to_le_bytes());
+        raw.extend_from_slice(&30i32.to_le_bytes());
+        let mut out = [-7i16, -8];
+
+        let err = conversion.bytes_into_slice(&raw, &mut out).unwrap_err();
+        assert!(
+            err.to_string().contains("conversion output buffer"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(out, [-7, -8]);
     }
 
     #[test]
@@ -1188,6 +1415,68 @@ mod tests {
             convert_between_datatypes(&bitfield_raw, &bitfield_source, &unsigned_dest)
                 .expect("bitfield payloads should convert as unsigned integer-like data");
         assert_eq!(bitfield_converted, vec![0xab, 0xff]);
+    }
+
+    #[test]
+    fn converts_array_datatype_base_numeric_payloads() {
+        let source = array_type(&[2, 3], DtypeSpec::I16);
+        let destination = array_type(&[2, 3], DtypeSpec::I32);
+        let mut raw = Vec::new();
+        for value in [-3i16, -1, 0, 1, 127, 128, 255, 256, i16::MAX, -4, -5, -6] {
+            raw.extend_from_slice(&value.to_le_bytes());
+        }
+
+        let converted = convert_between_datatypes(&raw, &source, &destination).unwrap();
+        let values = converted
+            .chunks_exact(4)
+            .map(|chunk| i32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            values,
+            vec![
+                -3,
+                -1,
+                0,
+                1,
+                127,
+                128,
+                255,
+                256,
+                i16::MAX as i32,
+                -4,
+                -5,
+                -6
+            ]
+        );
+    }
+
+    #[test]
+    fn converts_array_datatype_base_byte_order_payloads() {
+        let source = DatatypeMessage {
+            version: 3,
+            class: DatatypeClass::Array,
+            class_bits: [0, 0, 0],
+            size: 8,
+            properties: {
+                let mut properties = vec![2];
+                properties.extend_from_slice(&2u32.to_le_bytes());
+                properties.extend_from_slice(&2u32.to_le_bytes());
+                properties.extend_from_slice(&encoded_big_endian_u16_type());
+                properties
+            },
+        };
+        let destination = array_type(&[2, 2], DtypeSpec::U16);
+        let mut raw = Vec::new();
+        for value in [1u16, 0x0203, 0x1020, 0xff00] {
+            raw.extend_from_slice(&value.to_be_bytes());
+        }
+
+        let converted = convert_between_datatypes(&raw, &source, &destination).unwrap();
+        let values = converted
+            .chunks_exact(2)
+            .map(|chunk| u16::from_le_bytes(chunk.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(values, vec![1, 0x0203, 0x1020, 0xff00]);
     }
 
     #[test]

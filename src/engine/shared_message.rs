@@ -42,6 +42,7 @@ impl SharedMessage {
 
     /// Compute the encoded size in bytes, returning an error on overflow.
     pub fn encoded_len_checked(&self) -> Result<usize> {
+        self.validate_encodable()?;
         13usize
             .checked_add(self.data.len())
             .ok_or_else(|| Error::InvalidFormat("shared message image length overflow".into()))
@@ -49,14 +50,18 @@ impl SharedMessage {
 
     /// Append this shared message's encoded representation to `out`.
     pub fn encode_into(&self, out: &mut impl Extend<u8>) -> Result<()> {
-        let data_len = u32::try_from(self.data.len()).map_err(|_| {
-            Error::InvalidFormat("shared message payload is too large to encode".into())
-        })?;
+        let data_len = self.validate_encodable()?;
         out.extend([self.msg_type]);
         out.extend(self.heap_addr.to_le_bytes());
         out.extend(data_len.to_le_bytes());
         out.extend(self.data.iter().copied());
         Ok(())
+    }
+
+    fn validate_encodable(&self) -> Result<u32> {
+        u32::try_from(self.data.len()).map_err(|_| {
+            Error::InvalidFormat("shared message payload is too large to encode".into())
+        })
     }
 }
 
@@ -95,9 +100,12 @@ impl SharedMessageStore {
 
     /// Append the serialized shared message table image to `out`.
     pub fn cache_table_serialize_into(&self, out: &mut impl Extend<u8>) -> Result<()> {
+        let image_len = self.cache_table_image_len_checked()?;
+        let mut image = Vec::with_capacity(image_len);
         for message in self.messages.values() {
-            message.encode_into(out)?;
+            message.encode_into(&mut image)?;
         }
+        out.extend(image);
         Ok(())
     }
 
@@ -131,7 +139,7 @@ impl SharedMessageStore {
     /// Deserialize a SOHM message list into this store, reusing the map allocation.
     pub fn cache_list_deserialize_into(&mut self, bytes: &[u8]) -> Result<()> {
         let mut pos = 0usize;
-        self.messages.clear();
+        let mut messages = BTreeMap::new();
         while pos < bytes.len() {
             let remaining = bytes.len() - pos;
             if remaining < 13 {
@@ -158,9 +166,9 @@ impl SharedMessageStore {
                 })?
                 .to_vec();
             pos = data_end;
-            self.messages
-                .insert(heap_addr, SharedMessage::new(msg_type, heap_addr, data));
+            messages.insert(heap_addr, SharedMessage::new(msg_type, heap_addr, data));
         }
+        self.messages = messages;
         Ok(())
     }
 
@@ -956,5 +964,70 @@ mod tests {
                 .contains("shared message cache list data is truncated"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn shared_message_encode_into_appends_to_existing_output() {
+        let msg = SharedMessage::new(7, 0x0102_0304_0506_0708, vec![9, 8, 7]);
+
+        let mut bytes = vec![0xaa, 0xbb];
+        msg.encode_into(&mut bytes).unwrap();
+        assert_eq!(&bytes[..2], &[0xaa, 0xbb]);
+        assert_eq!(bytes[2], 7);
+        assert_eq!(&bytes[3..11], &0x0102_0304_0506_0708u64.to_le_bytes());
+        assert_eq!(&bytes[11..15], &3u32.to_le_bytes());
+        assert_eq!(&bytes[15..], &[9, 8, 7]);
+
+        let mut wrapper_bytes = vec![0xcc];
+        H5SM__message_encode_into(&msg, &mut wrapper_bytes).unwrap();
+        assert_eq!(wrapper_bytes[0], 0xcc);
+        assert_eq!(&wrapper_bytes[1..], &bytes[2..]);
+    }
+
+    #[test]
+    fn shared_message_cache_serialize_into_appends_to_existing_output() {
+        let store = SharedMessageStore::reconstitute([
+            (20, SharedMessage::new(2, 20, vec![1, 2])),
+            (10, SharedMessage::new(1, 10, vec![3])),
+        ]);
+
+        let mut direct = Vec::new();
+        store.cache_table_serialize_into(&mut direct).unwrap();
+
+        let mut table_bytes = vec![0xee];
+        H5SM__cache_table_serialize_into(&store, &mut table_bytes).unwrap();
+        assert_eq!(table_bytes[0], 0xee);
+        assert_eq!(&table_bytes[1..], direct.as_slice());
+
+        let mut list_bytes = vec![0xdd, 0xcc];
+        H5SM__cache_list_serialize_into(&store, &mut list_bytes).unwrap();
+        assert_eq!(&list_bytes[..2], &[0xdd, 0xcc]);
+        assert_eq!(&list_bytes[2..], direct.as_slice());
+    }
+
+    #[test]
+    fn shared_message_cache_list_deserialize_into_preserves_store_on_error() {
+        let original = SharedMessageStore::reconstitute([
+            (11, SharedMessage::new(4, 11, vec![1, 1])),
+            (22, SharedMessage::new(5, 22, vec![2, 2])),
+        ]);
+        let mut malformed = Vec::new();
+        malformed.push(1);
+        malformed.extend_from_slice(&42u64.to_le_bytes());
+        malformed.extend_from_slice(&4u32.to_le_bytes());
+        malformed.extend_from_slice(&[1, 2, 3]);
+
+        let mut store = original.clone();
+        let err = store.cache_list_deserialize_into(&malformed).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("shared message cache list data is truncated"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(store, original);
+
+        let mut wrapper_store = original.clone();
+        assert!(H5SM__cache_list_deserialize_into(&mut wrapper_store, &[0]).is_err());
+        assert_eq!(wrapper_store, original);
     }
 }
